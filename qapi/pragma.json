@@ -84,6 +84,7 @@
     'member-name-exceptions': [     # visible in:
         'ACPISlotType',             # query-acpi-ospm-status
         'AcpiTableOptions',         # -acpitable
+        'BalloonInfo',              # query-balloon
         'BlkdebugEvent',            # blockdev-add, -blockdev
         'BlkdebugSetStateOptions',  # blockdev-add, -blockdev
         'BlockDeviceInfo',          # query-block

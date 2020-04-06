@@ -199,7 +199,35 @@ void hmp_info_balloon(MonitorHMP *hmp, const QDict *qdict)
         return;
     }
 
-    monitor_hmp_printf(hmp, "balloon: actual=%" PRId64 "\n", info->actual >> 20);
+    monitor_hmp_printf(hmp, "balloon: actual=%" PRId64, info->actual >> 20);
+    monitor_hmp_printf(hmp, " max_mem=%" PRId64, info->max_mem >> 20);
+    if (info->has_total_mem) {
+        monitor_hmp_printf(hmp, " total_mem=%" PRId64, info->total_mem >> 20);
+    }
+    if (info->has_free_mem) {
+        monitor_hmp_printf(hmp, " free_mem=%" PRId64, info->free_mem >> 20);
+    }
+
+    if (info->has_mem_swapped_in) {
+        monitor_hmp_printf(hmp, " mem_swapped_in=%" PRId64, info->mem_swapped_in);
+    }
+    if (info->has_mem_swapped_out) {
+        monitor_hmp_printf(hmp, " mem_swapped_out=%" PRId64, info->mem_swapped_out);
+    }
+    if (info->has_major_page_faults) {
+        monitor_hmp_printf(hmp, " major_page_faults=%" PRId64,
+                       info->major_page_faults);
+    }
+    if (info->has_minor_page_faults) {
+        monitor_hmp_printf(hmp, " minor_page_faults=%" PRId64,
+                       info->minor_page_faults);
+    }
+    if (info->has_last_update) {
+        monitor_hmp_printf(hmp, " last_update=%" PRId64,
+                       info->last_update);
+    }
+
+    monitor_hmp_printf(hmp, "\n");
 
     qapi_free_BalloonInfo(info);
 }
