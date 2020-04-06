@@ -176,8 +176,7 @@ static void monitor_qmp_emit_event(Monitor *mon, QAPIEvent event, QDict *qdict)
 
 static bool monitor_qmp_requires_iothread(const Monitor *mon)
 {
-    return qemu_chr_has_feature(mon->chr.chr,
-                                QEMU_CHAR_FEATURE_GCONTEXT);
+    return false;
 }
 
 static bool qmp_oob_enabled(MonitorQMP *mon)
