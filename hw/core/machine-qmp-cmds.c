@@ -180,6 +180,12 @@ MachineInfoList *qmp_query_machines(bool has_compat_props, bool compat_props,
         info->numa_mem_supported = mc->numa_mem_supported;
         info->deprecated = !!mc->deprecation_reason;
         info->acpi = !!object_class_property_find(OBJECT_CLASS(mc), "acpi");
+
+        if (strcmp(mc->name, MACHINE_GET_CLASS(current_machine)->name) == 0) {
+            info->has_is_current = true;
+            info->is_current = true;
+        }
+
         if (default_cpu_type) {
             info->default_cpu_type = g_strdup(default_cpu_type);
         }
