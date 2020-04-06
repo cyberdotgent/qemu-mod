@@ -212,6 +212,10 @@ Parameters to convert subcommand:
 
 Parameters to dd subcommand:
 
+.. option:: -n
+
+  Skip the creation of the target volume
+
 .. program:: qemu-img-dd
 
 .. option:: bs=BLOCK_SIZE
@@ -496,7 +500,7 @@ Command description:
   it doesn't need to be specified separately in this case.
 
 
-.. option:: dd [--image-opts] [-U] [-f FMT] [-O OUTPUT_FMT] [bs=BLOCK_SIZE] [count=BLOCKS] [skip=BLOCKS] if=INPUT of=OUTPUT
+.. option:: dd [--image-opts] [-U] [-f FMT] [-O OUTPUT_FMT] [-n] [bs=BLOCK_SIZE] [count=BLOCKS] [skip=BLOCKS] if=INPUT of=OUTPUT
 
   dd copies from *INPUT* file to *OUTPUT* file converting it from
   *FMT* format to *OUTPUT_FMT* format.
@@ -506,6 +510,11 @@ Command description:
   dd will stop reading input after reading *BLOCKS* input blocks.
 
   The size syntax is similar to :manpage:`dd(1)`'s size syntax.
+
+  If the ``-n`` option is specified, the target volume creation will be
+  skipped. This is useful for formats such as ``rbd`` if the target
+  volume has already been created with site specific options that cannot
+  be supplied through ``qemu-img``.
 
 .. option:: info [--object OBJECTDEF] [--image-opts] [-f FMT] [--output=OFMT] [--backing-chain] [--limits] [-t CACHE] [-U] FILENAME
 
