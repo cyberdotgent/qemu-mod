@@ -4635,6 +4635,10 @@ if have_tools
   vma = executable('vma', files('vma.c', 'vma-reader.c') + genh,
                    dependencies: [authz, block, crypto, io, qemuutil, qom], install: true)
 
+  pbs_restore = executable('pbs-restore', files('pbs-restore.c') + genh,
+                  dependencies: [authz, block, crypto, io, qemuutil, qom,
+                    libproxmox_backup_qemu], install: true)
+
   subdir('storage-daemon')
 
   foreach exe: [ 'qemu-img', 'qemu-io', 'qemu-nbd', 'qemu-storage-daemon']
