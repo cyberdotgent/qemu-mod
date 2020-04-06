@@ -2533,6 +2533,7 @@ static MachineClass *select_machine(QDict *qdict, Error **errp)
 {
     ERRP_GUARD();
     const char *machine_type = qdict_get_try_str(qdict, "type");
+    const char *pvever = qdict_get_try_str(qdict, "pvever");
     g_autoptr(GSList) machines = object_class_get_list(TYPE_MACHINE, false);
     MachineClass *machine_class = NULL;
 
@@ -2552,7 +2553,11 @@ static MachineClass *select_machine(QDict *qdict, Error **errp)
     if (!machine_class) {
         error_append_hint(errp,
                           "Use -machine help to list supported machines\n");
+    } else {
+        machine_class->pve_version = g_strdup(pvever);
+        qdict_del(qdict, "pvever");
     }
+
     return machine_class;
 }
 
@@ -4418,12 +4423,31 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_machine:
                 {
                     bool help;
+                    size_t pvever_index, name_len;
+                    const gchar *name;
+                    gchar *name_clean, *pvever;
 
                     keyval_parse_into(machine_opts_dict, optarg, "type", &help, &error_fatal);
                     if (help) {
                         machine_help_func(machine_opts_dict);
                         exit(EXIT_SUCCESS);
                     }
+
+                    // PVE version is specified with '+' as seperator, e.g. pc-i440fx+pvever
+                    name = qdict_get_try_str(machine_opts_dict, "type");
+                    if (name != NULL) {
+                        name_len = strlen(name);
+                        pvever_index = strcspn(name, "+");
+                        if (pvever_index < name_len) {
+                            name_clean = g_strndup(name, pvever_index);
+                            pvever = g_strndup(name + pvever_index + 1, name_len - pvever_index - 1);
+                            qdict_put_str(machine_opts_dict, "pvever", pvever);
+                            qdict_put_str(machine_opts_dict, "type", name_clean);
+                            g_free(name_clean);
+                            g_free(pvever);
+                        }
+                    }
+
                     break;
                 }
             case QEMU_OPTION_accel:

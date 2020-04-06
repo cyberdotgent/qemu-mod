@@ -184,6 +184,11 @@ MachineInfoList *qmp_query_machines(bool has_compat_props, bool compat_props,
         if (strcmp(mc->name, MACHINE_GET_CLASS(current_machine)->name) == 0) {
             info->has_is_current = true;
             info->is_current = true;
+
+            // PVE version string only exists for current machine
+            if (mc->pve_version) {
+                info->pve_version = g_strdup(mc->pve_version);
+            }
         }
 
         if (default_cpu_type) {

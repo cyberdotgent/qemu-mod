@@ -274,6 +274,8 @@ struct MachineClass {
     const char *desc;
     const char *deprecation_reason;
 
+    const char *pve_version;
+
     void (*init)(MachineState *state);
     void (*reset)(MachineState *state, ResetType type);
     void (*wakeup)(MachineState *state);

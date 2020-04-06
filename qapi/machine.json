@@ -187,6 +187,8 @@
 #
 # @acpi: machine type supports ACPI (since 8.0)
 #
+# @pve-version: custom PVE version suffix specified as 'machine+pveN'
+#
 # @compat-props: The machine type's compatibility properties.  Only
 #     present when `query-machines` argument @compat-props is true.
 #     (since 9.1)
@@ -208,6 +210,7 @@
             'hotpluggable-cpus': 'bool',  'numa-mem-supported': 'bool',
             'deprecated': 'bool', '*default-cpu-type': 'str',
             '*default-ram-id': 'str', 'acpi': 'bool',
+            '*pve-version': 'str',
             '*compat-props': { 'type': ['CompatProperty'],
                                'features': ['unstable'] },
             'secure': 'bool' } }
