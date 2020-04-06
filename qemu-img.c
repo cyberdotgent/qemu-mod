@@ -3191,7 +3191,8 @@ static int img_info(const img_cmd_t *ccmd, int argc, char **argv)
     list = collect_image_info_list(image_opts, filename, fmt, cache, chain,
                                    limits, force_share);
     if (!list) {
-        return 1;
+ 	// return success if snapshot does not exist
+        return 0;
     }
 
     switch (output_format) {
