@@ -30,6 +30,7 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
+#include "qapi/qapi-commands-migration.h"
 #include "qapi/qapi-commands-misc.h"
 #include "block/block-hmp-cmds.h"
 #include "qobject/qdict.h"
@@ -507,6 +508,43 @@ void hmp_dumpdtb(MonitorHMP *hmp, const QDict *qdict)
     monitor_hmp_printf(hmp, "DTB dumped to '%s'\n", filename);
 }
 #endif
+
+void hmp_savevm_start(MonitorHMP *hmp, const QDict *qdict)
+{
+    Error *errp = NULL;
+    const char *statefile = qdict_get_try_str(qdict, "statefile");
+
+    qmp_savevm_start(statefile, false, false, &errp);
+    hmp_handle_error(hmp, errp);
+}
+
+void coroutine_fn hmp_savevm_end(MonitorHMP *hmp, const QDict *qdict)
+{
+    Error *errp = NULL;
+
+    qmp_savevm_end(&errp);
+    hmp_handle_error(hmp, errp);
+}
+
+void hmp_info_savevm(MonitorHMP *hmp, const QDict *qdict)
+{
+    SaveVMInfo *info;
+    info = qmp_query_savevm(NULL);
+
+    if (info->status) {
+        monitor_hmp_printf(hmp, "savevm status: %s\n", info->status);
+        monitor_hmp_printf(hmp, "total time: %" PRIu64 " milliseconds\n",
+                           info->total_time);
+    } else {
+        monitor_hmp_printf(hmp, "savevm status: not running\n");
+    }
+    if (info->has_bytes) {
+        monitor_hmp_printf(hmp, "Bytes saved: %"PRIu64"\n", info->bytes);
+    }
+    if (info->error) {
+        monitor_hmp_printf(hmp, "Error: %s\n", info->error);
+    }
+}
 
 /* Set the current CPU defined by the user. Callers must hold BQL. */
 int monitor_hmp_set_cpu(MonitorHMP *hmp, int cpu_index)

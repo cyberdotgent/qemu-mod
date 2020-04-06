@@ -448,6 +448,31 @@
 { 'command': 'query-fdsets', 'returns': ['FdsetInfo'] }
 
 ##
+# @savevm-start:
+#
+# Prepare for snapshot and halt VM.  Save VM state to statefile.  When
+# a @statefile is used, then the VM is only halted before completion.
+# Use @query-savevm to check the state of the operation.
+#
+# @statefile: target file that state should be written to.
+#
+# @skip-vm-start: Do not resume the VM after the snapshot is done
+#                 successfully, even if the VM was running before
+#                 snapshot completion.  Useful for hibernation.
+#
+##
+{ 'command': 'savevm-start', 'data': { '*statefile': 'str',
+                                       '*skip-vm-start': 'bool' } }
+
+##
+# @savevm-end:
+#
+# Resume VM after a snapshot.
+#
+##
+{ 'command': 'savevm-end' }
+
+##
 # @CommandLineParameterType:
 #     Possible types for an option parameter.
 #

@@ -176,6 +176,7 @@ static const char *accelerators;
 static bool have_custom_ram_size;
 static const char *ram_memdev_id;
 static QDict *machine_opts_dict;
+static const char *loadstate;
 static QTAILQ_HEAD(, ObjectOption) object_opts = QTAILQ_HEAD_INITIALIZER(object_opts);
 static QTAILQ_HEAD(, DeviceOption) device_opts = QTAILQ_HEAD_INITIALIZER(device_opts);
 static int display_remote;
@@ -3739,6 +3740,12 @@ void qmp_x_exit_preconfig(Error **errp)
         RunState state = autostart ? RUN_STATE_RUNNING : runstate_get();
         load_snapshot(loadvm, NULL, false, NULL, &error_fatal);
         load_snapshot_resume(state);
+    } else if (loadstate) {
+        Error *local_err = NULL;
+        if (load_snapshot_from_blockdev(loadstate, &local_err) < 0) {
+            error_report_err(local_err);
+            autostart = 0;
+        }
     }
     if (replay_mode != REPLAY_MODE_NONE) {
         replay_vmstate_init();
@@ -4364,6 +4371,9 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_loadvm:
                 loadvm = optarg;
+                break;
+            case QEMU_OPTION_loadstate:
+                loadstate = optarg;
                 break;
             case QEMU_OPTION_full_screen:
                 dpy.has_full_screen = true;

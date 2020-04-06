@@ -34,6 +34,7 @@ system_ss.add(files(
   'postcopy-ram.c',
   'ram.c',
   'savevm.c',
+  'savevm-async.c',
   'socket.c',
   'tls.c',
 ), gnutls, zlib)

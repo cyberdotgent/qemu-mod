@@ -1869,6 +1869,33 @@ SRST
   List event channels in the guest
 ERST
 
+    {
+        .name       = "savevm-start",
+        .args_type  = "statefile:s?",
+        .params     = "[statefile]",
+        .help       = "Prepare for snapshot and halt VM. Save VM state to statefile.",
+        .cmd = hmp_savevm_start,
+    },
+
+SRST
+``savevm-start``
+  Prepare for snapshot and halt VM. Optionally, save VM state to statefile.
+ERST
+
+    {
+        .name       = "savevm-end",
+        .args_type  = "",
+        .params     = "",
+        .help       = "Resume VM after snaphot.",
+        .cmd        = hmp_savevm_end,
+        .coroutine  = true,
+    },
+
+SRST
+``savevm-end``
+  Resume VM after snaphot.
+ERST
+
 HXCOMM *** MUST BE LAST ENTRY **
     {
         .name       = "info",

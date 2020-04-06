@@ -68,4 +68,6 @@ bool delete_snapshot(const char *name,
  */
 void load_snapshot_resume(RunState state);
 
+int load_snapshot_from_blockdev(const char *filename, Error **errp);
+
 #endif
