@@ -856,8 +856,8 @@ static int mirror_exit_common(Job *job)
              job->ret == 0 && ret == 0)) {
             /* Success; synchronize copy back to sync. */
             bdrv_clear_dirty_bitmap(s->sync_bitmap, NULL);
-            bdrv_merge_dirty_bitmap(s->sync_bitmap, s->dirty_bitmap,
-                                    NULL, &error_abort);
+            bdrv_dirty_bitmap_merge_internal(s->sync_bitmap, s->dirty_bitmap,
+                                             NULL, true);
         }
     }
     bdrv_release_dirty_bitmap(s->dirty_bitmap);
@@ -2110,11 +2110,8 @@ static BlockJob *mirror_start_job(
     }
 
     if (s->sync_mode == MIRROR_SYNC_MODE_BITMAP) {
-        bdrv_merge_dirty_bitmap(s->dirty_bitmap, s->sync_bitmap,
-                                NULL, &local_err);
-        if (local_err) {
-            goto fail;
-        }
+        bdrv_dirty_bitmap_merge_internal(s->dirty_bitmap, s->sync_bitmap,
+                                         NULL, true);
     }
 
     bdrv_graph_wrlock_drained();
