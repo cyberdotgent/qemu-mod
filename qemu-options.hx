@@ -1586,6 +1586,9 @@ legacy PC, they are not recommended for modern configurations.
 
 ERST
 
+DEF("id", HAS_ARG, QEMU_OPTION_id,
+    "-id n           set the VMID", QEMU_ARCH_ALL)
+
 DEF("fda", HAS_ARG, QEMU_OPTION_fda,
     "-fda/-fdb file  use 'file' as floppy disk 0/1 image\n", QEMU_ARCH_ALL)
 DEF("fdb", HAS_ARG, QEMU_OPTION_fdb, "", QEMU_ARCH_ALL)

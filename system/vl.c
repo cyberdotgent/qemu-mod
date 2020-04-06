@@ -3778,6 +3778,7 @@ void qemu_init(int argc, char **argv)
     MachineClass *machine_class;
     bool userconfig = true;
     FILE *vmstate_dump_file = NULL;
+    long vm_id;
 
     qemu_add_opts(&qemu_drive_opts);
     qemu_add_drive_opts(&qemu_legacy_drive_opts);
@@ -4478,6 +4479,13 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_smp:
                 machine_parse_property_opt(qemu_find_opts("smp-opts"),
                                            "smp", optarg);
+                break;
+            case QEMU_OPTION_id:
+                vm_id = strtol(optarg, (char **)&optarg, 10);
+                if (*optarg != 0 || vm_id < 100 || vm_id > INT_MAX) {
+                    error_report("invalid -id argument %s", optarg);
+                    exit(1);
+                }
                 break;
 #ifdef CONFIG_VNC
             case QEMU_OPTION_vnc:
