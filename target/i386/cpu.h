@@ -2826,9 +2826,9 @@ uint64_t cpu_get_tsc(CPUX86State *env);
 #define CPU_RESOLVING_TYPE TYPE_X86_CPU
 
 #ifdef TARGET_X86_64
-#define TARGET_DEFAULT_CPU_TYPE X86_CPU_TYPE_NAME("qemu64")
+#define TARGET_DEFAULT_CPU_TYPE X86_CPU_TYPE_NAME("kvm64")
 #else
-#define TARGET_DEFAULT_CPU_TYPE X86_CPU_TYPE_NAME("qemu32")
+#define TARGET_DEFAULT_CPU_TYPE X86_CPU_TYPE_NAME("kvm32")
 #endif
 
 /* MMU modes definitions */
