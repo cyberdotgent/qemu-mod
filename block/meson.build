@@ -4,6 +4,7 @@ block_ss.add(files(
   'aio_task.c',
   'amend.c',
   'backup.c',
+  'backup-dump.c',
   'blkdebug.c',
   'blklogwrites.c',
   'blkverify.c',

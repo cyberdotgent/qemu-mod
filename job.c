@@ -337,7 +337,8 @@ static bool job_started_locked(Job *job)
 }
 
 /* Called with job_mutex held. */
-static bool job_should_pause_locked(Job *job)
+bool job_should_pause_locked(Job *job);
+bool job_should_pause_locked(Job *job)
 {
     return job->pause_count > 0;
 }

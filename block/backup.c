@@ -29,28 +29,6 @@
 
 #include "block/copy-before-write.h"
 
-typedef struct BackupBlockJob {
-    BlockJob common;
-    BlockDriverState *cbw;
-    BlockDriverState *source_bs;
-    BlockDriverState *target_bs;
-
-    BdrvDirtyBitmap *sync_bitmap;
-
-    MirrorSyncMode sync_mode;
-    BitmapSyncMode bitmap_mode;
-    BlockdevOnError on_source_error;
-    BlockdevOnError on_target_error;
-    uint64_t len;
-    int64_t cluster_size;
-    BackupPerf perf;
-
-    BlockCopyState *bcs;
-
-    bool wait;
-    BlockCopyCallState *bg_bcs_call;
-} BackupBlockJob;
-
 static const BlockJobDriver backup_job_driver;
 
 static void backup_cleanup_sync_bitmap(BackupBlockJob *job, int ret)
@@ -481,6 +459,14 @@ BlockJob *backup_job_create(const char *job_id, BlockDriverState *bs,
     }
 
     cluster_size = block_copy_cluster_size(bcs);
+    if (cluster_size < 0) {
+        goto error;
+    }
+
+    BlockDriverInfo bdi;
+    if (bdrv_get_info(bs, &bdi) == 0) {
+        cluster_size = MAX(cluster_size, bdi.cluster_size);
+    }
 
     if (perf->max_chunk && perf->max_chunk < cluster_size) {
         error_setg(errp, "Required max-chunk (%" PRIi64 ") is less than backup "

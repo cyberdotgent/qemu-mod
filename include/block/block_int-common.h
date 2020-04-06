@@ -25,6 +25,7 @@
 #define BLOCK_INT_COMMON_H
 
 #include "block/block-common.h"
+#include "block/block-copy.h"
 #include "block/block-global-state.h"
 #include "block/snapshot.h"
 #include "qemu/aiocb.h"
@@ -59,6 +60,40 @@
 #define BLOCK_OPT_KEEP_DATA_FILE    "keep_data_file"
 
 #define BLOCK_PROBE_BUF_SIZE        512
+
+typedef int BackupDumpFunc(void *opaque, uint64_t offset, uint64_t bytes, const void *buf);
+
+BlockDriverState *coroutine_fn bdrv_co_backup_dump_create(
+    int dump_cb_block_size,
+    uint64_t byte_size,
+    BackupDumpFunc *dump_cb,
+    void *dump_cb_data,
+    Error **errp);
+
+// Needs to be defined here, since it's used in blockdev.c to detect PVE backup
+// jobs with source_bs
+typedef struct BlockCopyState BlockCopyState;
+typedef struct BackupBlockJob {
+    BlockJob common;
+    BlockDriverState *cbw;
+    BlockDriverState *source_bs;
+    BlockDriverState *target_bs;
+
+    BdrvDirtyBitmap *sync_bitmap;
+
+    MirrorSyncMode sync_mode;
+    BitmapSyncMode bitmap_mode;
+    BlockdevOnError on_source_error;
+    BlockdevOnError on_target_error;
+    uint64_t len;
+    int64_t cluster_size;
+    BackupPerf perf;
+
+    BlockCopyState *bcs;
+
+    bool wait;
+    BlockCopyCallState *bg_bcs_call;
+} BackupBlockJob;
 
 enum BdrvTrackedRequestType {
     BDRV_TRACKED_READ,
