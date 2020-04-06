@@ -44,6 +44,11 @@ block_ss.add(files(
 ), zstd, zlib)
 
 block_ss.add(files('../vma-writer.c'), libuuid)
+block_ss.add(files(
+  '../proxmox-backup-client.c',
+  '../pve-backup.c',
+), libproxmox_backup_qemu)
+
 
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
 system_ss.add(files('block-ram-registrar.c'))

@@ -28,6 +28,7 @@
 #include "monitor/monitor-hmp-internal.h"
 #include "monitor/qdev.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-block-core.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-migration.h"
@@ -172,6 +173,77 @@ void hmp_sync_profile(MonitorHMP *hmp, const QDict *qdict)
                    " expecting 'on', 'off', or 'reset'", op);
         hmp_handle_error(hmp, err);
     }
+}
+
+void hmp_info_backup(MonitorHMP *hmp, const QDict *qdict)
+{
+    BackupStatus *info;
+    PBSBitmapInfoList *bitmap_info;
+
+    info = qmp_query_backup(NULL);
+
+    if (!info) {
+       monitor_hmp_printf(hmp, "Backup status: not initialized\n");
+       return;
+    }
+
+    if (info->status) {
+        if (info->errmsg) {
+            monitor_hmp_printf(hmp, "Backup status: %s - %s\n",
+                               info->status, info->errmsg);
+        } else {
+            monitor_hmp_printf(hmp, "Backup status: %s\n", info->status);
+        }
+    }
+
+    if (info->backup_file) {
+        monitor_hmp_printf(hmp, "Start time: %s", ctime(&info->start_time));
+        if (info->end_time) {
+            monitor_hmp_printf(hmp, "End time: %s", ctime(&info->end_time));
+        }
+
+        monitor_hmp_printf(hmp, "Backup file: %s\n", info->backup_file);
+        monitor_hmp_printf(hmp, "Backup uuid: %s\n", info->uuid);
+
+        if (!(info->has_total && info->total))  {
+            // this should not happen normally
+            monitor_hmp_printf(hmp, "Total size: %d\n", 0);
+        } else {
+            size_t total_or_dirty = info->total;
+            bitmap_info = qmp_query_pbs_bitmap_info(NULL);
+
+            while (bitmap_info) {
+                monitor_hmp_printf(hmp, "Drive %s:\n",
+                            bitmap_info->value->drive);
+                monitor_hmp_printf(hmp, "  bitmap action: %s\n",
+                            PBSBitmapAction_str(bitmap_info->value->action));
+                monitor_hmp_printf(hmp, "  size: %zd\n",
+                            bitmap_info->value->size);
+                monitor_hmp_printf(hmp, "  dirty: %zd\n",
+                            bitmap_info->value->dirty);
+                bitmap_info = bitmap_info->next;
+            }
+
+            qapi_free_PBSBitmapInfoList(bitmap_info);
+
+            int zero_per = (info->has_zero_bytes && info->zero_bytes) ?
+                (info->zero_bytes * 100)/info->total : 0;
+            monitor_hmp_printf(hmp, "Total size: %zd\n", info->total);
+            int trans_per = (info->transferred * 100)/total_or_dirty;
+            monitor_hmp_printf(hmp, "Transferred bytes: %zd (%d%%)\n",
+                               info->transferred, trans_per);
+            monitor_hmp_printf(hmp, "Zero bytes: %zd (%d%%)\n",
+                               info->zero_bytes, zero_per);
+
+            if (info->has_reused) {
+                int reused_per = (info->reused * 100)/total_or_dirty;
+                monitor_hmp_printf(hmp, "Reused bytes: %zd (%d%%)\n",
+                                   info->reused, reused_per);
+            }
+        }
+    }
+
+    qapi_free_BackupStatus(info);
 }
 
 void hmp_exit_preconfig(MonitorHMP *hmp, const QDict *qdict)

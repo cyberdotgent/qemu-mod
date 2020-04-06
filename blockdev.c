@@ -37,6 +37,7 @@
 #include "block/blockjob.h"
 #include "block/dirty-bitmap.h"
 #include "block/qdict.h"
+#include "block/blockjob_int.h"
 #include "block/throttle-groups.h"
 #include "monitor/monitor.h"
 #include "qemu/error-report.h"

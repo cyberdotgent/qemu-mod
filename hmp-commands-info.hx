@@ -465,6 +465,20 @@ SRST
     Show the current VM UUID.
 ERST
 
+
+    {
+        .name       = "backup",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show backup status",
+        .cmd        = hmp_info_backup,
+    },
+
+SRST
+  ``info backup``
+    Show backup status.
+ERST
+
 #if defined(CONFIG_SLIRP)
     {
         .name       = "usernet",

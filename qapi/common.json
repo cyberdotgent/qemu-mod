@@ -275,3 +275,16 @@
   'prefix': 'UFS_FAULT_INJECT',
   'data': [ 'abort-success', 'abort-failed', 'in-transition', 'timeout',
             'ssu-timeout' ] }
+
+##
+# @UuidInfo:
+#     Guest UUID information (Universally Unique Identifier).
+#
+# @UUID: the UUID of the guest
+#
+# Since: 0.14
+#
+# .. note:: If no UUID was specified for the guest, the nil UUID (all
+#    zeroes) is returned.
+##
+{ 'struct': 'UuidInfo', 'data': {'UUID': 'str'} }

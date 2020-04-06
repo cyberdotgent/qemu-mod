@@ -75,6 +75,7 @@ void hmp_info_savevm(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_migrate(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_migrate_capabilities(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_migrate_parameters(MonitorHMP *hmp, const QDict *qdict);
+void hmp_info_backup(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_cpus(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_vnc(MonitorHMP *hmp, const QDict *qdict);
 void hmp_info_spice(MonitorHMP *hmp, const QDict *qdict);
@@ -124,6 +125,8 @@ void hmp_change_vnc(MonitorHMP *hmp, const char *device, const char *target,
 void hmp_change_medium(MonitorHMP *hmp, const char *device, const char *target,
                        const char *arg, const char *read_only, bool force,
                        Error **errp);
+void hmp_backup(MonitorHMP *hmp, const QDict *qdict);
+void hmp_backup_cancel(MonitorHMP *hmp, const QDict *qdict);
 void hmp_migrate(MonitorHMP *hmp, const QDict *qdict);
 void hmp_device_add(MonitorHMP *hmp, const QDict *qdict);
 void hmp_device_del(MonitorHMP *hmp, const QDict *qdict);

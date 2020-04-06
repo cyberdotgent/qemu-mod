@@ -951,3 +951,42 @@ void hmp_change_medium(MonitorHMP *hmp, const char *device, const char *target,
     qmp_blockdev_change_medium(device, NULL, target, arg, true, force,
                                !!read_only, read_only_mode, errp);
 }
+
+void coroutine_fn hmp_backup_cancel(MonitorHMP *hmp, const QDict *qdict)
+{
+    Error *error = NULL;
+
+    qmp_backup_cancel(&error);
+
+    hmp_handle_error(hmp, error);
+}
+
+void coroutine_fn hmp_backup(MonitorHMP *hmp, const QDict *qdict)
+{
+    Error *error = NULL;
+
+    const char *backup_file = qdict_get_str(qdict, "backupfile");
+    const char *devlist = qdict_get_try_str(qdict, "devlist");
+    int64_t speed = qdict_get_try_int(qdict, "speed", 0);
+
+    qmp_backup(
+        backup_file,
+        NULL, // PBS password
+        NULL, // PBS keyfile
+        NULL, // PBS key_password
+        NULL, // PBS master_keyfile
+        NULL, // PBS fingerprint
+        NULL, // PBS backup-ns
+        NULL, // PBS backup-id
+        false, 0, // PBS backup-time
+        false, false, // PBS use-dirty-bitmap
+        false, false, // PBS compress
+        false, false, // PBS encrypt
+        true, BACKUP_FORMAT_VMA,
+        NULL, NULL,
+        devlist, qdict_haskey(qdict, "speed"), speed,
+        false, 0, // BackupPerf max-workers
+        &error);
+
+    hmp_handle_error(hmp, error);
+}

@@ -117,6 +117,35 @@ SRST
   Copy data from a backing file into a block device.
 ERST
 
+   {
+        .name       = "backup",
+        .args_type  = "backupfile:s,speed:o?,devlist:s?",
+        .params     = "backupfile [speed [devlist]]",
+        .help       = "create a VM backup (VMA format).",
+        .cmd = hmp_backup,
+        .coroutine  = true,
+    },
+
+SRST
+``backup``
+  Create a VM backup.
+ERST
+
+    {
+        .name       = "backup_cancel",
+        .args_type  = "",
+        .params     = "",
+        .help       = "cancel the current VM backup",
+        .cmd        = hmp_backup_cancel,
+        .coroutine  = true,
+    },
+
+SRST
+``backup_cancel``
+  Cancel the current VM backup.
+
+ERST
+
     {
         .name       = "block_job_set_speed",
         .args_type  = "device:B,speed:o",

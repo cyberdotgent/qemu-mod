@@ -2148,6 +2148,7 @@ endif
 has_gettid = cc.has_function('gettid')
 
 libuuid = cc.find_library('uuid', required: true)
+libproxmox_backup_qemu = cc.find_library('proxmox_backup_qemu', required: true)
 
 # libselinux
 selinux = dependency('libselinux',

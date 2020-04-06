@@ -976,6 +976,248 @@
   'allow-preconfig': true }
 
 ##
+# @BackupStatus:
+#
+# Detailed backup status.
+#
+# @status: string describing the current backup status.
+#          This can be 'active', 'done', 'error'.  If this field is
+#          not returned, no backup process has been initiated
+#
+# @errmsg: error message (only returned if status is 'error')
+#
+# @total: total amount of bytes involved in the backup process
+#
+# @dirty: with incremental mode (PBS) this is the amount of bytes
+#         involved in the backup process which are marked dirty.
+#
+# @transferred: amount of bytes already backed up.
+#
+# @reused: amount of bytes reused due to deduplication.
+#
+# @zero-bytes: amount of 'zero' bytes detected.
+#
+# @start-time: time (epoch) when backup job started.
+#
+# @end-time: time (epoch) when backup job finished.
+#
+# @backup-file: backup file name
+#
+# @uuid: uuid for this backup job
+#
+# @finishing: if status='active' and finishing=true, then the backup
+#             process is waiting for the target to finish.
+#
+##
+{ 'struct': 'BackupStatus',
+  'data': {'*status': 'str', '*errmsg': 'str', '*total': 'int', '*dirty': 'int',
+           '*transferred': 'int', '*zero-bytes': 'int', '*reused': 'int',
+           '*start-time': 'int', '*end-time': 'int',
+           '*backup-file': 'str', '*uuid': 'str', 'finishing': 'bool' } }
+
+##
+# @BackupFormat:
+#
+# An enumeration of supported backup formats.
+#
+# @vma: Proxmox vma backup format
+#
+# @pbs: Proxmox backup server format
+#
+##
+{ 'enum': 'BackupFormat',
+  'data': [ 'vma', 'pbs' ] }
+
+##
+# @backup:
+#
+# Starts a VM backup.
+#
+# @backup-file: the backup file name
+#
+# @format: format of the backup file
+#
+# @config-file: a configuration file to include into
+#               the backup archive.
+#
+# @firewall-file: a firewall configuration file to include into the
+#     backup archive.
+#
+# @speed: the maximum speed, in bytes per second
+#
+# @devlist: list of block device names (separated by ',', ';' or ':').
+#     By default the backup includes all writable block devices.
+#
+# @password: backup server passsword (required for format 'pbs')
+#
+# @keyfile: keyfile used for encryption (optional for format 'pbs')
+#
+# @key-password: password for keyfile (optional for format 'pbs')
+#
+# @master-keyfile: PEM-formatted master public keyfile (optional for
+#     format 'pbs')
+#
+# @fingerprint: server cert fingerprint (optional for format 'pbs')
+#
+# @backup-ns: backup namespace (required for format 'pbs')
+#
+# @backup-id: backup ID (required for format 'pbs')
+#
+# @backup-time: backup timestamp (Unix epoch, required for format
+#     'pbs')
+#
+# @use-dirty-bitmap: use dirty bitmap to detect incremental changes
+#     since last job (optional for format 'pbs')
+#
+# @compress: use compression (optional for format 'pbs', defaults to
+#     true)
+#
+# @encrypt: use encryption ((optional for format 'pbs', defaults to
+#     true if there is a keyfile)
+#
+# @max-workers: see @BackupPerf for details.  Default 16.
+#
+# Returns: the uuid of the backup job
+#
+##
+{ 'command': 'backup', 'data': { 'backup-file': 'str',
+                                    '*password': 'str',
+                                    '*keyfile': 'str',
+                                    '*key-password': 'str',
+                                    '*master-keyfile': 'str',
+                                    '*fingerprint': 'str',
+                                    '*backup-ns': 'str',
+                                    '*backup-id': 'str',
+                                    '*backup-time': 'int',
+                                    '*use-dirty-bitmap': 'bool',
+                                    '*compress': 'bool',
+                                    '*encrypt': 'bool',
+                                    '*format': 'BackupFormat',
+                                    '*config-file': 'str',
+                                    '*firewall-file': 'str',
+                                    '*devlist': 'str',
+                                    '*speed': 'int',
+                                    '*max-workers': 'int' },
+  'returns': 'UuidInfo', 'coroutine': true }
+
+##
+# @query-backup:
+#
+# Returns information about current/last backup task.
+#
+# Returns: @BackupStatus
+#
+##
+{ 'command': 'query-backup', 'returns': 'BackupStatus' }
+
+##
+# @backup-cancel:
+#
+# Cancel the current executing backup process.
+#
+# .. note:: This command succeeds even if there is no backup process
+#     running.
+#
+##
+{ 'command': 'backup-cancel', 'coroutine': true }
+
+##
+# @ProxmoxSupportStatus:
+#
+# Contains info about supported features added by Proxmox.
+#
+# @pbs-dirty-bitmap: True if dirty-bitmap-incremental backups to PBS
+#     are supported.
+#
+# @query-bitmap-info: True if the 'query-pbs-bitmap-info' QMP call is
+#     supported.
+#
+# @pbs-dirty-bitmap-savevm: True if 'dirty-bitmaps' migration
+#     capability can safely be set for savevm-async.
+#
+# @pbs-masterkey: True if the QMP backup call supports the
+#     'master_keyfile' parameter.
+#
+# @pbs-library-version: Running version of libproxmox-backup-qemu0
+#     library.
+#
+# @backup-max-workers: Whether the 'max-workers' @BackupPerf setting
+#     is supported or not.
+#
+##
+{ 'struct': 'ProxmoxSupportStatus',
+  'data': { 'pbs-dirty-bitmap': 'bool',
+            'query-bitmap-info': 'bool',
+            'pbs-dirty-bitmap-savevm': 'bool',
+            'pbs-masterkey': 'bool',
+            'pbs-library-version': 'str',
+            'backup-max-workers': 'bool' } }
+
+##
+# @query-proxmox-support:
+#
+# Returns information about supported features added by Proxmox.
+#
+# Returns: @ProxmoxSupportStatus
+#
+##
+{ 'command': 'query-proxmox-support', 'returns': 'ProxmoxSupportStatus' }
+
+##
+# @PBSBitmapAction:
+#
+# An action taken on a dirty-bitmap when a backup job was started.
+#
+# @not-used: Bitmap mode was not enabled.
+#
+# @not-used-removed: Bitmap mode was not enabled, but a bitmap from a
+#                    previous backup still existed and was removed.
+#
+# @new: A new bitmap was attached to the drive for this backup.
+#
+# @used: An existing bitmap will be used to only backup changed data.
+#
+# @invalid: A bitmap existed, but had to be cleared since it's
+#     associated base snapshot did not match the base given for the
+#     current job or the crypt mode has changed.
+#
+##
+{ 'enum': 'PBSBitmapAction',
+  'data': ['not-used', 'not-used-removed', 'new', 'used', 'invalid'] }
+
+##
+# @PBSBitmapInfo:
+#
+# Contains information about dirty bitmaps used for each drive in a
+# PBS backup.
+#
+# @drive: The underlying drive.
+#
+# @action: The action that was taken when the backup started.
+#
+# @size: The total size of the drive.
+#
+# @dirty: How much of the drive is considered dirty and will be backed
+#     up, or 'size' if everything will be.
+#
+##
+{ 'struct': 'PBSBitmapInfo',
+  'data': { 'drive': 'str', 'action': 'PBSBitmapAction', 'size': 'int',
+            'dirty': 'int' } }
+
+##
+# @query-pbs-bitmap-info:
+#
+# Returns information about dirty bitmaps used on the most recently
+# started backup.  Returns nothing when the last backup was not using
+# PBS or if no backup occured in this session.
+#
+# Returns: @PBSBitmapInfo
+#
+##
+{ 'command': 'query-pbs-bitmap-info', 'returns': ['PBSBitmapInfo'] }
+
+##
 # @BlockDeviceTimedStats:
 #     Statistics of a block device during a given interval of time.
 #

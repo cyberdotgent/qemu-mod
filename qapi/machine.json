@@ -4,6 +4,8 @@
 # This work is licensed under the terms of the GNU GPL, version 2 or later.
 # See the COPYING file in the top-level directory.
 
+{ 'include': 'common.json' }
+
 ##
 # ********
 # Machines
@@ -295,19 +297,6 @@
 # Since: 1.2
 ##
 { 'command': 'query-target', 'returns': 'QemuTargetInfo' }
-
-##
-# @UuidInfo:
-#     Guest UUID information (Universally Unique Identifier).
-#
-# @UUID: the UUID of the guest
-#
-# Since: 0.14
-#
-# .. note:: If no UUID was specified for the guest, the nil UUID (all
-#    zeroes) is returned.
-##
-{ 'struct': 'UuidInfo', 'data': {'UUID': 'str'} }
 
 ##
 # @query-uuid:
