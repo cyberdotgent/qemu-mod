@@ -42,6 +42,8 @@ block_ss.add(files(
   'zeroinit.c',
 ), zstd, zlib)
 
+block_ss.add(files('../vma-writer.c'), libuuid)
+
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
 system_ss.add(files('block-ram-registrar.c'))
 

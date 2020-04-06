@@ -2147,6 +2147,8 @@ endif
 
 has_gettid = cc.has_function('gettid')
 
+libuuid = cc.find_library('uuid', required: true)
+
 # libselinux
 selinux = dependency('libselinux',
                      required: get_option('selinux'),
@@ -4628,6 +4630,9 @@ if have_tools
                link_args: tools_link_args, link_depends: block_syms,
                dependencies: [blockdev, qemuutil, selinux],
                install: true)
+
+  vma = executable('vma', files('vma.c', 'vma-reader.c') + genh,
+                   dependencies: [authz, block, crypto, io, qemuutil, qom], install: true)
 
   subdir('storage-daemon')
 
