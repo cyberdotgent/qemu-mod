@@ -5327,11 +5327,13 @@ static int img_bitmap(const img_cmd_t *ccmd, int argc, char **argv)
 #define C_OF      010
 #define C_SKIP    020
 #define C_OSIZE   040
+#define C_ISIZE   0100
 
 struct DdInfo {
     unsigned int flags;
     int64_t count;
     int64_t osize;
+    int64_t isize;
 };
 
 struct DdIo {
@@ -5420,6 +5422,19 @@ static int img_dd_osize(const char *arg,
     return 0;
 }
 
+static int img_dd_isize(const char *arg,
+                        struct DdIo *in, struct DdIo *out,
+                        struct DdInfo *dd)
+{
+    dd->isize = cvtnum("isize", arg, true);
+
+    if (dd->isize < 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
 {
     int ret = 0;
@@ -5434,12 +5449,14 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
     int c, i;
     const char *out_fmt = "raw";
     const char *fmt = NULL;
-    int64_t size = 0;
+    int64_t size = 0, readsize = 0;
     int64_t out_pos, in_pos;
     bool force_share = false;
     struct DdInfo dd = {
         .flags = 0,
         .count = 0,
+        .osize = 0,
+        .isize = -1,
     };
     struct DdIo in = {
         .bsz = 512, /* Block size is by default 512 bytes */
@@ -5461,6 +5478,7 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
         { "of", img_dd_of, C_OF },
         { "skip", img_dd_skip, C_SKIP },
         { "osize", img_dd_osize, C_OSIZE },
+        { "isize", img_dd_isize, C_ISIZE },
         { NULL, NULL, 0 }
     };
     const struct option long_options[] = {
@@ -5679,9 +5697,10 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
 
     in.buf = g_new(uint8_t, in.bsz);
 
-    for (out_pos = 0; in_pos < size; ) {
+    readsize = (dd.isize > 0) ? dd.isize : size;
+    for (out_pos = 0; in_pos < readsize; ) {
         int in_ret, out_ret;
-        int bytes = (in_pos + in.bsz > size) ? size - in_pos : in.bsz;
+        int bytes = (in_pos + in.bsz > readsize) ? readsize - in_pos : in.bsz;
         if (blk1) {
             in_ret = blk_pread(blk1, in_pos, bytes, in.buf, 0);
             if (in_ret == 0) {
@@ -5690,6 +5709,9 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
         } else {
             in_ret = read(STDIN_FILENO, in.buf, bytes);
             if (in_ret == 0) {
+                if (dd.isize == 0) {
+                    goto out;
+                }
                 /* early EOF is considered an error */
                 error_report("Input ended unexpectedly");
                 ret = -1;
