@@ -34,8 +34,8 @@
 #include "rdma.h"
 #include "io/channel-file.h"
 
-#define IO_BUF_SIZE 32768
-#define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 64)
+#define DEFAULT_IO_BUF_SIZE 32768
+#define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 256)
 
 typedef struct FdEntry {
     QTAILQ_ENTRY(FdEntry) entry;
@@ -48,7 +48,8 @@ struct QEMUFile {
 
     int buf_index;
     int buf_size; /* 0 when writing */
-    uint8_t buf[IO_BUF_SIZE];
+    size_t buf_allocated_size;
+    uint8_t *buf;
 
     DECLARE_BITMAP(may_free, MAX_IOV_SIZE);
     struct iovec iov[MAX_IOV_SIZE];
@@ -108,7 +109,9 @@ int qemu_file_shutdown(QEMUFile *f)
     return 0;
 }
 
-static QEMUFile *qemu_file_new_impl(QIOChannel *ioc, bool is_writable)
+static QEMUFile *qemu_file_new_impl(QIOChannel *ioc,
+                                    bool is_writable,
+                                    size_t buffer_size)
 {
     QEMUFile *f;
 
@@ -119,6 +122,8 @@ static QEMUFile *qemu_file_new_impl(QIOChannel *ioc, bool is_writable)
     f->is_writable = is_writable;
     f->can_pass_fd = qio_channel_has_feature(ioc, QIO_CHANNEL_FEATURE_FD_PASS);
     QTAILQ_INIT(&f->fds);
+    f->buf_allocated_size = buffer_size;
+    f->buf = g_malloc(buffer_size);
 
     return f;
 }
@@ -128,17 +133,27 @@ static QEMUFile *qemu_file_new_impl(QIOChannel *ioc, bool is_writable)
  */
 QEMUFile *qemu_file_get_return_path(QEMUFile *f)
 {
-    return qemu_file_new_impl(f->ioc, !f->is_writable);
+    return qemu_file_new_impl(f->ioc, !f->is_writable, DEFAULT_IO_BUF_SIZE);
 }
 
 QEMUFile *qemu_file_new_output(QIOChannel *ioc)
 {
-    return qemu_file_new_impl(ioc, true);
+    return qemu_file_new_impl(ioc, true, DEFAULT_IO_BUF_SIZE);
+}
+
+QEMUFile *qemu_file_new_output_sized(QIOChannel *ioc, size_t buffer_size)
+{
+    return qemu_file_new_impl(ioc, true, buffer_size);
 }
 
 QEMUFile *qemu_file_new_input(QIOChannel *ioc)
 {
-    return qemu_file_new_impl(ioc, false);
+    return qemu_file_new_impl(ioc, false, DEFAULT_IO_BUF_SIZE);
+}
+
+QEMUFile *qemu_file_new_input_sized(QIOChannel *ioc, size_t buffer_size)
+{
+    return qemu_file_new_impl(ioc, false, buffer_size);
 }
 
 /*
@@ -338,7 +353,7 @@ static ssize_t coroutine_mixed_fn qemu_fill_buffer(QEMUFile *f)
     }
 
     do {
-        struct iovec iov = { f->buf + pending, IO_BUF_SIZE - pending };
+        struct iovec iov = { f->buf + pending, f->buf_allocated_size - pending };
         len = qio_channel_readv_full(f->ioc, &iov, 1, pfds, pnfd,
                                      QIO_CHANNEL_READ_FLAG_FD_PRESERVE_BLOCKING,
                                      &local_error);
@@ -444,6 +459,9 @@ int qemu_fclose(QEMUFile *f)
         g_free(fde);
     }
     g_clear_pointer(&f->ioc, object_unref);
+
+    g_free(f->buf);
+
     error_free(f->last_error_obj);
     g_free(f);
     trace_qemu_file_fclose();
@@ -492,7 +510,7 @@ static void add_buf_to_iovec(QEMUFile *f, size_t len)
 {
     if (!add_to_iovec(f, f->buf + f->buf_index, len, false)) {
         f->buf_index += len;
-        if (f->buf_index == IO_BUF_SIZE) {
+        if (f->buf_index == f->buf_allocated_size) {
             qemu_fflush(f);
         }
     }
@@ -517,7 +535,7 @@ void qemu_put_buffer(QEMUFile *f, const uint8_t *buf, size_t size)
     }
 
     while (size > 0) {
-        l = IO_BUF_SIZE - f->buf_index;
+        l = f->buf_allocated_size - f->buf_index;
         if (l > size) {
             l = size;
         }
@@ -631,8 +649,8 @@ size_t coroutine_mixed_fn qemu_peek_buffer(QEMUFile *f, uint8_t **buf, size_t si
     size_t index;
 
     assert(!qemu_file_is_writable(f));
-    assert(offset < IO_BUF_SIZE);
-    assert(size <= IO_BUF_SIZE - offset);
+    assert(offset < f->buf_allocated_size);
+    assert(size <= f->buf_allocated_size - offset);
 
     /* The 1st byte to read from */
     index = f->buf_index + offset;
@@ -682,7 +700,7 @@ size_t coroutine_mixed_fn qemu_get_buffer(QEMUFile *f, uint8_t *buf, size_t size
         size_t res;
         uint8_t *src;
 
-        res = qemu_peek_buffer(f, &src, MIN(pending, IO_BUF_SIZE), 0);
+        res = qemu_peek_buffer(f, &src, MIN(pending, f->buf_allocated_size), 0);
         if (res == 0) {
             return done;
         }
@@ -716,7 +734,7 @@ size_t coroutine_mixed_fn qemu_get_buffer(QEMUFile *f, uint8_t *buf, size_t size
  */
 size_t coroutine_mixed_fn qemu_get_buffer_in_place(QEMUFile *f, uint8_t **buf, size_t size)
 {
-    if (size < IO_BUF_SIZE) {
+    if (size < f->buf_allocated_size) {
         size_t res;
         uint8_t *src = NULL;
 
@@ -741,7 +759,7 @@ int coroutine_mixed_fn qemu_peek_byte(QEMUFile *f, int offset)
     int index = f->buf_index + offset;
 
     assert(!qemu_file_is_writable(f));
-    assert(offset < IO_BUF_SIZE);
+    assert(offset < f->buf_allocated_size);
 
     if (index >= f->buf_size) {
         qemu_fill_buffer(f);

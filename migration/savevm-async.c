@@ -433,7 +433,7 @@ void qmp_savevm_start(const char *statefile, bool has_skip_vm_start,
 
     QIOChannel *ioc = QIO_CHANNEL(qio_channel_savevm_async_new(snap_state.target,
                                                                &snap_state.bs_pos));
-    snap_state.file = qemu_file_new_output(ioc);
+    snap_state.file = qemu_file_new_output_sized(ioc, 4 * 1024 * 1024);
     object_unref(ioc);
 
     if (!snap_state.file) {
@@ -572,7 +572,7 @@ int load_snapshot_from_blockdev(const char *filename, Error **errp)
 
     /* restore the VM state */
     QIOChannel *ioc = QIO_CHANNEL(qio_channel_savevm_async_new(be, &bs_pos));
-    f = qemu_file_new_input(ioc);
+    f = qemu_file_new_input_sized(ioc, 4 * 1024 * 1024);
     object_unref(ioc);
     if (!f) {
         error_setg(errp, "Could not open VM state file");

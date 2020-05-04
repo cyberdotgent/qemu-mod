@@ -29,7 +29,9 @@
 #include "io/channel.h"
 
 QEMUFile *qemu_file_new_input(QIOChannel *ioc);
+QEMUFile *qemu_file_new_input_sized(QIOChannel *ioc, size_t buffer_size);
 QEMUFile *qemu_file_new_output(QIOChannel *ioc);
+QEMUFile *qemu_file_new_output_sized(QIOChannel *ioc, size_t buffer_size);
 int qemu_fclose(QEMUFile *f);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(QEMUFile, qemu_fclose)
