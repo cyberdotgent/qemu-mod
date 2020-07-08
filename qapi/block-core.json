@@ -3590,6 +3590,7 @@
             'parallels', 'preallocate', 'qcow', 'qcow2', 'qed', 'quorum',
             'raw', 'rbd',
             { 'name': 'replication', 'if': 'CONFIG_REPLICATION' },
+            'pbs',
             'ssh', 'throttle', 'vdi', 'vhdx',
             { 'name': 'virtio-blk-vfio-pci', 'if': 'CONFIG_BLKIO' },
             { 'name': 'virtio-blk-vhost-user', 'if': 'CONFIG_BLKIO' },
@@ -3690,6 +3691,33 @@
 ##
 { 'struct': 'BlockdevOptionsNull',
   'data': { '*size': 'int', '*latency-ns': 'uint64', '*read-zeroes': 'bool' } }
+
+##
+# @BlockdevOptionsPbs:
+#
+# Driver specific block device options for the PBS backend.
+#
+# @repository: Proxmox Backup Server repository.
+#
+# @snapshot: backup snapshots ID.
+#
+# @archive: archive name.
+#
+# @keyfile: keyfile to use for encryption.
+#
+# @password: password to use for connection.
+#
+# @fingerprint: backup server fingerprint.
+#
+# @key_password: password to unlock key.
+#
+# @namespace: namespace where backup snapshot lives.
+#
+##
+{ 'struct': 'BlockdevOptionsPbs',
+  'data': { 'repository': 'str', 'snapshot': 'str', 'archive': 'str',
+            '*keyfile': 'str', '*password': 'str', '*fingerprint': 'str',
+            '*key_password': 'str', '*namespace': 'str' } }
 
 ##
 # @BlockdevOptionsNVMe:
@@ -5071,6 +5099,7 @@
       'nfs':        'BlockdevOptionsNfs',
       'null-aio':   'BlockdevOptionsNull',
       'null-co':    'BlockdevOptionsNull',
+      'pbs':        'BlockdevOptionsPbs',
       'nvme':       'BlockdevOptionsNVMe',
       'nvme-io_uring': { 'type': 'BlockdevOptionsNvmeIoUring',
                          'if': 'CONFIG_BLKIO' },

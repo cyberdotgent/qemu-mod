@@ -94,6 +94,7 @@
         'BlockInfo',                # query-block
         'BlockdevAioOptions',       # blockdev-add, -blockdev
         'BlockdevDriver',           # blockdev-add, query-blockstats, ...
+        'BlockdevOptionsPbs',       # for PBS backwards compat
         'BlockdevVmdkAdapterType',  # blockdev-create (to match VMDK spec)
         'BlockdevVmdkSubformat',    # blockdev-create (to match VMDK spec)
         'ColoCompareProperties',    # object_add, -object

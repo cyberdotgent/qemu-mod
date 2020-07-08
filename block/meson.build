@@ -49,6 +49,8 @@ block_ss.add(files(
   '../pve-backup.c',
 ), libproxmox_backup_qemu)
 
+block_ss.add(files('pbs.c'), libproxmox_backup_qemu)
+
 
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
 system_ss.add(files('block-ram-registrar.c'))
