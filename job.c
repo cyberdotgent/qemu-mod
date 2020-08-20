@@ -94,6 +94,8 @@ struct JobTxn {
 
     /* Reference count */
     int refcnt;
+
+    bool sequential;
 };
 
 void job_lock(void)
@@ -117,6 +119,25 @@ JobTxn *job_txn_new(void)
     QLIST_INIT(&txn->jobs);
     txn->refcnt = 1;
     return txn;
+}
+
+JobTxn *job_txn_new_seq(void)
+{
+    JobTxn *txn = job_txn_new();
+    txn->sequential = true;
+    return txn;
+}
+
+void job_txn_start_seq(JobTxn *txn)
+{
+    assert(txn->sequential);
+    assert(!txn->aborting);
+
+    Job *first = QLIST_FIRST(&txn->jobs);
+    assert(first);
+    assert(first->status == JOB_STATUS_CREATED);
+
+    job_start(first);
 }
 
 /* Called with job_mutex held. */
@@ -1055,6 +1076,12 @@ static void job_completed_txn_success_locked(Job *job)
      */
     QLIST_FOREACH(other_job, &txn->jobs, txn_list) {
         if (!job_is_completed_locked(other_job)) {
+            if (txn->sequential) {
+                job_unlock();
+                /* Needs to be called without holding the job lock */
+                job_start(other_job);
+                job_lock();
+            }
             return;
         }
         assert(other_job->ret == 0);
@@ -1264,6 +1291,13 @@ int job_finish_sync_locked(Job *job,
         error_propagate(errp, local_err);
         job_unref_locked(job);
         return -EBUSY;
+    }
+
+    /* in a sequential transaction jobs with status CREATED can appear at time
+     * of cancelling, these have not begun work so job_enter won't do anything,
+     * let's ensure they are marked as ABORTING if required */
+    if (job->status == JOB_STATUS_CREATED && job->txn->sequential) {
+        job_update_rc_locked(job);
     }
 
     job_unlock();
