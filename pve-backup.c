@@ -1089,6 +1089,7 @@ ProxmoxSupportStatus *qmp_query_proxmox_support(Error **errp)
     ret->pbs_library_version = g_strdup(proxmox_backup_qemu_version());
     ret->pbs_dirty_bitmap = true;
     ret->pbs_dirty_bitmap_savevm = true;
+    ret->pbs_dirty_bitmap_migration = true;
     ret->query_bitmap_info = true;
     ret->pbs_masterkey = true;
     ret->backup_max_workers = true;

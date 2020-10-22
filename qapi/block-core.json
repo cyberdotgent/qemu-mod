@@ -1135,6 +1135,11 @@
 # @pbs-dirty-bitmap-savevm: True if 'dirty-bitmaps' migration
 #     capability can safely be set for savevm-async.
 #
+# @pbs-dirty-bitmap-migration: True if safe migration of dirty-bitmaps
+#     including PBS state is supported.  Enabling 'dirty-bitmaps'
+#     migration cap if this is false/unset may lead to crashes on
+#     migration!
+#
 # @pbs-masterkey: True if the QMP backup call supports the
 #     'master_keyfile' parameter.
 #
@@ -1149,6 +1154,7 @@
   'data': { 'pbs-dirty-bitmap': 'bool',
             'query-bitmap-info': 'bool',
             'pbs-dirty-bitmap-savevm': 'bool',
+            'pbs-dirty-bitmap-migration': 'bool',
             'pbs-masterkey': 'bool',
             'pbs-library-version': 'str',
             'backup-max-workers': 'bool' } }

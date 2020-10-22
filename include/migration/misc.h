@@ -168,4 +168,7 @@ void migration_request_switchover_ack_legacy(const char *requester);
 
 bool migrate_local(void);
 
+/* migration/pbs-state.c */
+void pbs_state_mig_init(void);
+
 #endif
