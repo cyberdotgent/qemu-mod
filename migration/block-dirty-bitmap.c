@@ -540,7 +540,11 @@ static int add_bitmaps_to_list(DBMSaveState *s, BlockDriverState *bs,
         }
 
         if (bdrv_dirty_bitmap_check(bitmap, BDRV_BITMAP_DEFAULT, errp)) {
-            return -1;
+            if (errp != NULL) {
+                error_report_err(*errp);
+                *errp = NULL;
+            }
+            continue;
         }
 
         if (bitmap_aliases) {
