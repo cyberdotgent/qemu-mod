@@ -1380,10 +1380,40 @@ static char *get_initiator_name(QemuOpts *opts)
     const char *name;
     char *iscsi_name;
     UuidInfo *uuid_info;
+    FILE *name_fh;
 
     name = qemu_opt_get(opts, "initiator-name");
     if (name) {
         return g_strdup(name);
+    }
+
+    name_fh = fopen("/etc/iscsi/initiatorname.iscsi", "r");
+    if (name_fh) {
+        const char *key = "InitiatorName";
+        char buffer[4096];
+        char *line;
+
+        while ((line = fgets(buffer, sizeof(buffer), name_fh))) {
+            line = g_strstrip(line);
+            if (!strncmp(line, key, strlen(key))) {
+                line = strchr(line, '=');
+                if (!line || strlen(line) == 1) {
+                    continue;
+                }
+                line++;
+                g_strstrip(line);
+                if (!strlen(line)) {
+                    continue;
+                }
+                name = line;
+                break;
+            }
+        }
+        fclose(name_fh);
+
+        if (name) {
+            return g_strdup(name);
+        }
     }
 
     uuid_info = qmp_query_uuid(NULL);
