@@ -3583,7 +3583,8 @@
 # Since: 2.9
 ##
 { 'enum': 'BlockdevDriver',
-  'data': [ 'blkdebug', 'blklogwrites', 'blkreplay', 'blkverify', 'bochs',
+  'data': [ 'alloc-track',
+            'blkdebug', 'blklogwrites', 'blkreplay', 'blkverify', 'bochs',
             'cloop', 'compress', 'copy-before-write', 'copy-on-read', 'dmg',
             'file', 'snapshot-access', 'ftp', 'ftps',
             {'name': 'host_cdrom', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
@@ -3697,6 +3698,21 @@
 ##
 { 'struct': 'BlockdevOptionsNull',
   'data': { '*size': 'int', '*latency-ns': 'uint64', '*read-zeroes': 'bool' } }
+
+##
+# @BlockdevOptionsAllocTrack:
+#
+# Driver specific block device options for the alloc-track backend.
+#
+# @backing: backing file with the data.
+#
+# @auto-remove: whether the alloc-track driver should drop itself
+#     after completing the stream.
+#
+##
+{ 'struct': 'BlockdevOptionsAllocTrack',
+  'base': 'BlockdevOptionsGenericFormat',
+  'data': { 'auto-remove': 'bool', 'backing': 'BlockdevRefOrNull' } }
 
 ##
 # @BlockdevOptionsPbs:
@@ -5078,6 +5094,7 @@
             '*detect-zeroes': 'BlockdevDetectZeroesOptions' },
   'discriminator': 'driver',
   'data': {
+      'alloc-track':'BlockdevOptionsAllocTrack',
       'blkdebug':   'BlockdevOptionsBlkdebug',
       'blklogwrites':'BlockdevOptionsBlklogwrites',
       'blkverify':  'BlockdevOptionsBlkverify',

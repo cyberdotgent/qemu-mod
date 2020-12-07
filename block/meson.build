@@ -2,6 +2,7 @@ block_ss.add(genh)
 block_ss.add(files(
   'accounting.c',
   'aio_task.c',
+  'alloc-track.c',
   'amend.c',
   'backup.c',
   'backup-dump.c',

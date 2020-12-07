@@ -118,6 +118,40 @@ static int GRAPH_UNLOCKED stream_prepare(Job *job)
             ret = -EPERM;
             goto out;
         }
+
+        /*
+         * This cannot be done in the co_change_backing_file callback, because
+         * bdrv_replace_node() cannot be done in a coroutine. The latter also
+         * requires the graph lock exclusively. Only required for the
+         * alloc-track driver.
+         *
+         * The long-term plan is to either have an explicit parameter for the
+         * stream job or use the upcoming blockdev-replace QMP command.
+         */
+        if (base_id == NULL && strcmp(unfiltered_bs->drv->format_name, "alloc-track") == 0) {
+            BlockDriverState *file_bs;
+
+            bdrv_graph_rdlock_main_loop();
+            file_bs = unfiltered_bs->file->bs;
+            bdrv_graph_rdunlock_main_loop();
+
+            bdrv_ref(unfiltered_bs); // unrefed by bdrv_replace_node()
+            bdrv_drained_begin(file_bs);
+            bdrv_graph_wrlock();
+
+            bdrv_replace_node(unfiltered_bs, file_bs, &local_err);
+
+            bdrv_graph_wrunlock();
+            bdrv_drained_end(file_bs);
+            bdrv_unref(unfiltered_bs);
+
+            if (local_err) {
+                error_prepend(&local_err, "failed to replace alloc-track node: ");
+                error_report_err(local_err);
+                ret = -EPERM;
+                goto out;
+            }
+        }
     }
 
 out:
