@@ -2148,6 +2148,7 @@ endif
 has_gettid = cc.has_function('gettid')
 
 libuuid = cc.find_library('uuid', required: true)
+libsystemd = cc.find_library('systemd', required: true)
 libproxmox_backup_qemu = cc.find_library('proxmox_backup_qemu', required: true)
 
 # libselinux
@@ -3899,7 +3900,7 @@ if have_block
   elif host_os == 'emscripten'
     blockdev_ss.add(files('os-wasm.c'))
   else
-    blockdev_ss.add(files('os-posix.c'))
+    blockdev_ss.add(files('os-posix.c'), libsystemd)
   endif
 endif
 
