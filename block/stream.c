@@ -27,7 +27,7 @@ enum {
      * large enough to process multiple clusters in a single call, so
      * that populating contiguous regions of the image is efficient.
      */
-    STREAM_CHUNK = 512 * 1024, /* in bytes */
+    STREAM_CHUNK = 4 * 1024 * 1024, /* in bytes */
 };
 
 typedef struct StreamBlockJob {
