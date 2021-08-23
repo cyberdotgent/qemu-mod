@@ -170,6 +170,20 @@ bool monitor_requires_iothread(const Monitor *mon)
     return cls->requires_iothread && cls->requires_iothread(mon);
 }
 
+/**
+ * If @mon is a QMP monitor, return the connection_nr, otherwise -1.
+ */
+int monitor_get_connection_nr(const Monitor *mon)
+{
+    MonitorClass *cls = MONITOR_GET_CLASS(mon);
+
+    if (!cls->get_connection_nr) {
+        return -1;
+    }
+
+    return cls->get_connection_nr(mon);
+}
+
 static gboolean monitor_unblocked(void *do_not_use, GIOCondition cond,
                                   void *opaque)
 {

@@ -54,6 +54,8 @@ struct MonitorClass {
      * is required for processing the monitor
      */
     bool (*requires_iothread)(const Monitor *mon);
+
+    int (*get_connection_nr)(const Monitor *mon);
 };
 
 struct Monitor {
@@ -106,6 +108,13 @@ struct MonitorQMP {
     QemuMutex qmp_queue_lock;
     /* Input queue that holds all the parsed QMP requests */
     GQueue *qmp_requests;
+
+    /*
+     * A sequential number that gets incremented on every new CHR_EVENT_OPENED.
+     * Used to avoid leftover responses in BHs from being sent to the wrong
+     * client. Access with atomics.
+     */
+    int connection_nr;
 };
 
 typedef QTAILQ_HEAD(MonitorList, Monitor) MonitorList;

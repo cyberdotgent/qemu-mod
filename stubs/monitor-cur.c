@@ -12,3 +12,8 @@ Monitor *monitor_set_cur(Coroutine *co, Monitor *mon)
 {
     return NULL;
 }
+
+int monitor_get_connection_nr(const Monitor *mon)
+{
+    return -1;
+}

@@ -21,6 +21,7 @@ extern QemuOptsList qemu_mon_opts;
 
 Monitor *monitor_cur(void);
 Monitor *monitor_set_cur(Coroutine *co, Monitor *mon);
+int monitor_get_connection_nr(const Monitor *mon);
 
 void monitor_init_globals(void);
 void monitor_init_globals_core(void);
