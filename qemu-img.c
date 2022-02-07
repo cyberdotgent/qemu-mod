@@ -5443,6 +5443,7 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
     BlockDriver *drv = NULL, *proto_drv = NULL;
     BlockBackend *blk1 = NULL, *blk2 = NULL;
     QemuOpts *opts = NULL;
+    QemuOpts *sn_opts = NULL;
     QemuOptsList *create_opts = NULL;
     Error *local_err = NULL;
     bool image_opts = false;
@@ -5452,6 +5453,7 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
     int64_t size = 0, readsize = 0;
     int64_t out_pos, in_pos;
     bool force_share = false, skip_create = false;
+    const char *snapshot_name = NULL;
     struct DdInfo dd = {
         .flags = 0,
         .count = 0,
@@ -5491,7 +5493,7 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
         { 0, 0, 0, 0 }
     };
 
-    while ((c = getopt_long(argc, argv, "hf:O:Un", long_options, NULL))) {
+    while ((c = getopt_long(argc, argv, "hf:O:l:Un", long_options, NULL))) {
         if (c == EOF) {
             break;
         }
@@ -5534,6 +5536,19 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
             break;
         case 'n':
             skip_create = true;
+            break;
+        case 'l':
+            if (strstart(optarg, SNAPSHOT_OPT_BASE, NULL)) {
+                sn_opts = qemu_opts_parse_noisily(&internal_snapshot_opts,
+                                                  optarg, false);
+                if (!sn_opts) {
+                    error_report("Failed in parsing snapshot param '%s'",
+                                 optarg);
+                    goto out;
+                }
+            } else {
+                snapshot_name = optarg;
+            }
             break;
         case 'U':
             force_share = true;
@@ -5593,8 +5608,21 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
     if (dd.flags & C_IF) {
         blk1 = img_open(image_opts, in.filename, fmt, 0, false, false,
                         force_share);
-
         if (!blk1) {
+            ret = -1;
+            goto out;
+        }
+        if (sn_opts) {
+            bdrv_snapshot_load_tmp(blk_bs(blk1),
+                                   qemu_opt_get(sn_opts, SNAPSHOT_OPT_ID),
+                                   qemu_opt_get(sn_opts, SNAPSHOT_OPT_NAME),
+                                   &local_err);
+        } else if (snapshot_name != NULL) {
+            bdrv_snapshot_load_tmp_by_id_or_name(blk_bs(blk1), snapshot_name,
+                                                 &local_err);
+        }
+        if (local_err) {
+            error_reportf_err(local_err, "Failed to load snapshot: ");
             ret = -1;
             goto out;
         }
@@ -5752,6 +5780,7 @@ static int img_dd(const img_cmd_t *ccmd, int argc, char **argv)
 out:
     g_free(arg);
     qemu_opts_del(opts);
+    qemu_opts_del(sn_opts);
     qemu_opts_free(create_opts);
     blk_unref(blk1);
     blk_unref(blk2);

@@ -500,10 +500,10 @@ Command description:
   it doesn't need to be specified separately in this case.
 
 
-.. option:: dd [--image-opts] [-U] [-f FMT] [-O OUTPUT_FMT] [-n] [bs=BLOCK_SIZE] [count=BLOCKS] [skip=BLOCKS] if=INPUT of=OUTPUT
+.. option:: dd [--image-opts] [-U] [-f FMT] [-O OUTPUT_FMT] [-n] [-l SNAPSHOT_PARAM] [bs=BLOCK_SIZE] [count=BLOCKS] [skip=BLOCKS] if=INPUT of=OUTPUT
 
-  dd copies from *INPUT* file to *OUTPUT* file converting it from
-  *FMT* format to *OUTPUT_FMT* format.
+  dd copies from *INPUT* file or snapshot *SNAPSHOT_PARAM* to *OUTPUT* file
+  converting it from *FMT* format to *OUTPUT_FMT* format.
 
   The data is by default read and written using blocks of 512 bytes but can be
   modified by specifying *BLOCK_SIZE*. If count=\ *BLOCKS* is specified
