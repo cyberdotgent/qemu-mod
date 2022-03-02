@@ -237,8 +237,8 @@ static void backup_init_bcs_bitmap(BackupBlockJob *job)
                                          true);
     } else if (job->sync_mode == MIRROR_SYNC_MODE_TOP) {
         /*
-         * We can't hog the coroutine to initialize this thoroughly.
-         * Set a flag and resume work when we are able to yield safely.
+         * Initialization is costly here. Simply set a flag and let the
+         * backup_run coroutine resume work once it can yield safely.
          */
         block_copy_set_skip_unallocated(job->bcs, true);
     }
@@ -287,8 +287,6 @@ static int coroutine_fn backup_run(Job *job, Error **errp)
 {
     BackupBlockJob *s = container_of(job, BackupBlockJob, common.job);
     int ret;
-
-    backup_init_bcs_bitmap(s);
 
     switch (s->sync_mode) {
     case MIRROR_SYNC_MODE_TOP:
@@ -520,6 +518,8 @@ BlockJob *backup_job_create(const char *job_id, BlockDriverState *bs,
     block_job_add_bdrv(&job->common, "target", target, 0, BLK_PERM_ALL,
                        &error_abort);
     bdrv_graph_wrunlock();
+
+    backup_init_bcs_bitmap(job);
 
     return &job->common;
 
