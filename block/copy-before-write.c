@@ -27,6 +27,7 @@
 #include "qobject/qjson.h"
 
 #include "system/block-backend.h"
+#include "qemu/atomic.h"
 #include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "block/block_int.h"
@@ -75,7 +76,8 @@ typedef struct BDRVCopyBeforeWriteState {
      * @snapshot_error is normally zero. But on first copy-before-write failure
      * when @on_cbw_error == ON_CBW_ERROR_BREAK_SNAPSHOT, @snapshot_error takes
      * value of this error (<0). After that all in-flight and further
-     * snapshot-API requests will fail with that error.
+     * snapshot-API requests will fail with that error. To be accessed with
+     * atomics.
      */
     int snapshot_error;
 } BDRVCopyBeforeWriteState;
@@ -115,7 +117,7 @@ static coroutine_fn int cbw_do_copy_before_write(BlockDriverState *bs,
         return 0;
     }
 
-    if (s->snapshot_error) {
+    if (qatomic_read(&s->snapshot_error)) {
         return 0;
     }
 
@@ -139,9 +141,7 @@ static coroutine_fn int cbw_do_copy_before_write(BlockDriverState *bs,
     WITH_QEMU_LOCK_GUARD(&s->lock) {
         if (ret < 0) {
             assert(s->on_cbw_error == ON_CBW_ERROR_BREAK_SNAPSHOT);
-            if (!s->snapshot_error) {
-                s->snapshot_error = ret;
-            }
+            qatomic_cmpxchg(&s->snapshot_error, 0, ret);
         } else {
             bdrv_set_dirty_bitmap(s->done_bitmap, off, end - off);
         }
@@ -215,7 +215,7 @@ cbw_snapshot_read_lock(BlockDriverState *bs, int64_t offset, int64_t bytes,
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    if (s->snapshot_error) {
+    if (qatomic_read(&s->snapshot_error)) {
         g_free(req);
         return NULL;
     }
@@ -595,6 +595,12 @@ void bdrv_cbw_drop(BlockDriverState *bs)
     GLOBAL_STATE_CODE();
     bdrv_drop_filter(bs, &error_abort);
     bdrv_unref(bs);
+}
+
+int bdrv_cbw_snapshot_error(BlockDriverState *bs)
+{
+    BDRVCopyBeforeWriteState *s = bs->opaque;
+    return qatomic_read(&s->snapshot_error);
 }
 
 static void cbw_init(void)

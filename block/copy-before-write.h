@@ -45,5 +45,6 @@ BlockDriverState *bdrv_cbw_append(BlockDriverState *source,
                                   OnCbwError on_cbw_error,
                                   Error **errp);
 void bdrv_cbw_drop(BlockDriverState *bs);
+int bdrv_cbw_snapshot_error(BlockDriverState *bs);
 
 #endif /* COPY_BEFORE_WRITE_H */

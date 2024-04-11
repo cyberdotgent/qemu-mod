@@ -986,6 +986,7 @@ void coroutine_fn hmp_backup(MonitorHMP *hmp, const QDict *qdict)
         NULL, NULL,
         devlist, qdict_haskey(qdict, "speed"), speed,
         false, 0, // BackupPerf max-workers
+        false, false, // fleecing
         &error);
 
     hmp_handle_error(hmp, error);
