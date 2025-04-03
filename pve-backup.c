@@ -811,6 +811,23 @@ err:
     return di_list;
 }
 
+/*
+ * To be called with the backup_state.stat mutex held.
+ */
+static void clear_backup_state_bitmap_list(void) {
+
+    if (backup_state.stat.bitmap_list) {
+        GList *bl = backup_state.stat.bitmap_list;
+        while (bl) {
+            g_free(((PBSBitmapInfo *)bl->data)->drive);
+            g_free(bl->data);
+            bl = g_list_next(bl);
+        }
+        g_list_free(backup_state.stat.bitmap_list);
+        backup_state.stat.bitmap_list = NULL;
+    }
+}
+
 UuidInfo coroutine_fn *qmp_backup(
     const char *backup_file,
     const char *password,
@@ -898,16 +915,7 @@ UuidInfo coroutine_fn *qmp_backup(
     backup_state.stat.reused = 0;
 
     /* clear previous backup's bitmap_list */
-    if (backup_state.stat.bitmap_list) {
-        GList *bl = backup_state.stat.bitmap_list;
-        while (bl) {
-            g_free(((PBSBitmapInfo *)bl->data)->drive);
-            g_free(bl->data);
-            bl = g_list_next(bl);
-        }
-        g_list_free(backup_state.stat.bitmap_list);
-        backup_state.stat.bitmap_list = NULL;
-    }
+    clear_backup_state_bitmap_list();
 
     if (format == BACKUP_FORMAT_PBS) {
         if (!password) {
