@@ -70,6 +70,7 @@ static struct PVEBackupState {
     JobTxn *txn;
     CoMutex backup_mutex;
     CoMutex dump_callback_mutex;
+    char *target_id;
 } backup_state;
 
 static void pvebackup_init(void)
@@ -865,6 +866,16 @@ static void initialize_backup_state_stat(
     backup_state.stat.starting = true;
 }
 
+/*
+ * To be called with the backup_state mutex held.
+ */
+static void backup_state_set_target_id(const char *target_id) {
+    if (backup_state.target_id) {
+        g_free(backup_state.target_id);
+    }
+    backup_state.target_id = g_strdup(target_id);
+}
+
 UuidInfo coroutine_fn *qmp_backup(
     const char *backup_file,
     const char *password,
@@ -904,7 +915,7 @@ UuidInfo coroutine_fn *qmp_backup(
 
     if (backup_state.di_list) {
         error_set(errp, ERROR_CLASS_GENERIC_ERROR,
-                  "previous backup not finished");
+                  "previous backup for target '%s' not finished", backup_state.target_id);
         qemu_co_mutex_unlock(&backup_state.backup_mutex);
         return NULL;
     }
@@ -1121,6 +1132,8 @@ UuidInfo coroutine_fn *qmp_backup(
 
     backup_state.vmaw = vmaw;
     backup_state.pbs = pbs;
+
+    backup_state_set_target_id("Proxmox");
 
     backup_state.di_list = di_list;
 
