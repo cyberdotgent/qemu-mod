@@ -1,4 +1,5 @@
 #include "proxmox-backup-client.h"
+#include "pve-backup.h"
 #include "vma.h"
 
 #include "qemu/osdep.h"
@@ -14,6 +15,7 @@
 #include "qobject/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 
 #if defined(CONFIG_MALLOC_TRIM)
 #include <malloc.h>
@@ -40,6 +42,7 @@
  */
 
 const char *PBS_BITMAP_NAME = "pbs-incremental-dirty-bitmap";
+const char *BACKGROUND_BITMAP_NAME = "backup-access-background-bitmap";
 
 static struct PVEBackupState {
     struct {
@@ -98,8 +101,11 @@ typedef struct PVEBackupDevInfo {
     char* device_name;
     int completed_ret; // INT_MAX if not completed
     BdrvDirtyBitmap *bitmap;
+    BdrvDirtyBitmap *background_bitmap; // used for external backup access
+    PBSBitmapAction bitmap_action;
     BlockDriverState *target;
     BlockJob *job;
+    BackupAccessSetupBitmapMode requested_bitmap_mode;
 } PVEBackupDevInfo;
 
 static void pvebackup_propagate_error(Error *err)
@@ -361,6 +367,67 @@ static void coroutine_fn pvebackup_co_complete_stream(void *opaque)
     qemu_co_mutex_unlock(&backup_state.backup_mutex);
 }
 
+/*
+ * New writes since the backup access was set up are in the background bitmap. Because of failure,
+ * the previously tracked writes in di->bitmap are still required too. Thus, merge with the
+ * background bitmap to get all new writes since the last backup.
+ */
+static void handle_backup_access_bitmaps_in_error_case(PVEBackupDevInfo *di)
+{
+    Error *local_err = NULL;
+
+    if (di->bs && di->background_bitmap) {
+        bdrv_drained_begin(di->bs);
+        if (di->bitmap) {
+            bdrv_enable_dirty_bitmap(di->bitmap);
+            if (!bdrv_merge_dirty_bitmap(di->bitmap, di->background_bitmap, NULL, &local_err)) {
+                warn_report("backup access: %s - could not merge bitmaps in error path - %s",
+                            di->device_name,
+                            local_err ? error_get_pretty(local_err) : "unknown error");
+                /*
+                 * Could not merge, drop original bitmap too.
+                 */
+                bdrv_release_dirty_bitmap(di->bitmap);
+            }
+        } else {
+            warn_report("backup access: %s - expected bitmap not present", di->device_name);
+        }
+        bdrv_release_dirty_bitmap(di->background_bitmap);
+        bdrv_drained_end(di->bs);
+    }
+}
+
+/*
+ * Continue tracking for next incremental backup in di->bitmap. New writes since the backup access
+ * was set up are in the background bitmap. Because the backup was successful, clear di->bitmap and
+ * merge back the background bitmap to get only the new writes.
+ */
+static void handle_backup_access_bitmaps_after_success(PVEBackupDevInfo *di)
+{
+    Error *local_err = NULL;
+
+    if (di->bs && di->background_bitmap) {
+        bdrv_drained_begin(di->bs);
+        if (di->bitmap) {
+            bdrv_enable_dirty_bitmap(di->bitmap);
+            bdrv_clear_dirty_bitmap(di->bitmap, NULL);
+            if (!bdrv_merge_dirty_bitmap(di->bitmap, di->background_bitmap, NULL, &local_err)) {
+                warn_report("backup access: %s - could not merge bitmaps after backup - %s",
+                            di->device_name,
+                            local_err ? error_get_pretty(local_err) : "unknown error");
+                /*
+                 * Could not merge, drop original bitmap too.
+                 */
+                bdrv_release_dirty_bitmap(di->bitmap);
+            }
+        } else {
+            warn_report("backup access: %s - expected bitmap not present", di->device_name);
+        }
+        bdrv_release_dirty_bitmap(di->background_bitmap);
+        bdrv_drained_end(di->bs);
+    }
+}
+
 static void cleanup_snapshot_access(PVEBackupDevInfo *di)
 {
     if (di->fleecing.snapshot_access) {
@@ -588,6 +655,51 @@ static int setup_snapshot_access(PVEBackupDevInfo *di, Error **errp)
     return 0;
 }
 
+static void setup_all_snapshot_access_bh(void *opaque)
+{
+    assert(!qemu_in_coroutine());
+
+    CoCtxData *data = (CoCtxData*)opaque;
+    Error **errp = (Error**)data->data;
+
+    Error *local_err = NULL;
+
+    GList *l =  backup_state.di_list;
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        bdrv_drained_begin(di->bs);
+
+        if (di->bitmap) {
+            BdrvDirtyBitmap *background_bitmap =
+                bdrv_create_dirty_bitmap(di->bs, PROXMOX_BACKUP_DEFAULT_CHUNK_SIZE,
+                                         BACKGROUND_BITMAP_NAME, &local_err);
+            if (!background_bitmap) {
+                error_setg(errp, "%s - creating background bitmap for backup access failed: %s",
+                           di->device_name,
+                           local_err ? error_get_pretty(local_err) : "unknown error");
+                bdrv_drained_end(di->bs);
+                break;
+            }
+            di->background_bitmap = background_bitmap;
+            bdrv_disable_dirty_bitmap(di->bitmap);
+        }
+
+        if (setup_snapshot_access(di, &local_err) < 0) {
+            bdrv_drained_end(di->bs);
+            error_setg(errp, "%s - setting up snapshot access failed: %s", di->device_name,
+                       local_err ? error_get_pretty(local_err) : "unknown error");
+            break;
+        }
+
+        bdrv_drained_end(di->bs);
+    }
+
+    /* return */
+    aio_co_enter(data->ctx, data->co);
+}
+
 /*
  * backup_job_create can *not* be run from a coroutine, so this can't either.
  * The caller is responsible that backup_mutex is held nonetheless.
@@ -724,6 +836,62 @@ static bool fleecing_no_efi_tpm(const char *device_id)
     return strncmp(device_id, "drive-efidisk", 13) && strncmp(device_id, "drive-tpmstate", 14);
 }
 
+static bool fleecing_all(const char *device_id)
+{
+    return true;
+}
+
+static PVEBackupDevInfo coroutine_fn GRAPH_RDLOCK *get_single_device_info(
+    const char *device,
+    bool (*device_uses_fleecing)(const char*),
+    Error **errp)
+{
+    BlockBackend *blk = blk_by_name(device);
+    if (!blk) {
+        error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                  "Device '%s' not found", device);
+        return NULL;
+    }
+    BlockDriverState *bs = blk_bs(blk);
+    if (!bdrv_co_is_inserted(bs)) {
+        error_setg(errp, "Device '%s' has no medium", device);
+        return NULL;
+    }
+    PVEBackupDevInfo *di = g_new0(PVEBackupDevInfo, 1);
+    di->bs = bs;
+    di->device_name = g_strdup(bdrv_get_device_name(bs));
+
+    if (device_uses_fleecing && device_uses_fleecing(device)) {
+        g_autofree gchar *fleecing_devid = g_strconcat(device, "-fleecing", NULL);
+        BlockBackend *fleecing_blk = blk_by_name(fleecing_devid);
+        if (!fleecing_blk) {
+            error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                      "Device '%s' not found", fleecing_devid);
+            goto fail;
+        }
+        BlockDriverState *fleecing_bs = blk_bs(fleecing_blk);
+        if (!bdrv_co_is_inserted(fleecing_bs)) {
+            error_setg(errp, "Device '%s' has no medium", fleecing_devid);
+            goto fail;
+        }
+        /*
+         * Fleecing image needs to be the same size to act as a cbw target.
+         */
+        if (bs->total_sectors != fleecing_bs->total_sectors) {
+            error_setg(errp, "Size mismatch for '%s' - sector count %ld != %ld",
+                       fleecing_devid, fleecing_bs->total_sectors, bs->total_sectors);
+            goto fail;
+        }
+        di->fleecing.bs = fleecing_bs;
+    }
+
+    return di;
+fail:
+    g_free(di->device_name);
+    g_free(di);
+    return NULL;
+}
+
 /*
  * Returns a list of device infos, which needs to be freed by the caller. In
  * case of an error, errp will be set, but the returned value might still be a
@@ -742,45 +910,10 @@ static GList coroutine_fn GRAPH_RDLOCK *get_device_info(
 
         gchar **d = devs;
         while (d && *d) {
-            BlockBackend *blk = blk_by_name(*d);
-            if (!blk) {
-                error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                          "Device '%s' not found", *d);
+            PVEBackupDevInfo *di = get_single_device_info(*d, device_uses_fleecing, errp);
+            if (!di) {
                 goto err;
             }
-            BlockDriverState *bs = blk_bs(blk);
-            if (!bdrv_co_is_inserted(bs)) {
-                error_setg(errp, "Device '%s' has no medium", *d);
-                goto err;
-            }
-            PVEBackupDevInfo *di = g_new0(PVEBackupDevInfo, 1);
-            di->bs = bs;
-            di->device_name = g_strdup(bdrv_get_device_name(bs));
-
-            if (device_uses_fleecing && device_uses_fleecing(*d)) {
-                g_autofree gchar *fleecing_devid = g_strconcat(*d, "-fleecing", NULL);
-                BlockBackend *fleecing_blk = blk_by_name(fleecing_devid);
-                if (!fleecing_blk) {
-                    error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                              "Device '%s' not found", fleecing_devid);
-                    goto err;
-                }
-                BlockDriverState *fleecing_bs = blk_bs(fleecing_blk);
-                if (!bdrv_co_is_inserted(fleecing_bs)) {
-                    error_setg(errp, "Device '%s' has no medium", fleecing_devid);
-                    goto err;
-                }
-                /*
-                 * Fleecing image needs to be the same size to act as a cbw target.
-                 */
-                if (bs->total_sectors != fleecing_bs->total_sectors) {
-                    error_setg(errp, "Size mismatch for '%s' - sector count %ld != %ld",
-                               fleecing_devid, fleecing_bs->total_sectors, bs->total_sectors);
-                    goto err;
-                }
-                di->fleecing.bs = fleecing_bs;
-            }
-
             di_list = g_list_append(di_list, di);
             d++;
         }
@@ -839,8 +972,9 @@ static void clear_backup_state_bitmap_list(void) {
  */
 static void initialize_backup_state_stat(
     const char *backup_file,
-    uuid_t uuid,
-    size_t total)
+    uuid_t *uuid,
+    size_t total,
+    bool starting)
 {
     if (backup_state.stat.error) {
         error_free(backup_state.stat.error);
@@ -855,15 +989,19 @@ static void initialize_backup_state_stat(
     }
     backup_state.stat.backup_file = g_strdup(backup_file);
 
-    uuid_copy(backup_state.stat.uuid, uuid);
-    uuid_unparse_lower(uuid, backup_state.stat.uuid_str);
+    if (uuid) {
+        uuid_copy(backup_state.stat.uuid, *uuid);
+        uuid_unparse_lower(*uuid, backup_state.stat.uuid_str);
+    } else {
+        backup_state.stat.uuid_str[0] = '\0';
+    }
 
     backup_state.stat.total = total;
     backup_state.stat.dirty = total - backup_state.stat.reused;
     backup_state.stat.transferred = 0;
     backup_state.stat.zero_bytes = 0;
     backup_state.stat.finishing = false;
-    backup_state.stat.starting = true;
+    backup_state.stat.starting = starting;
 }
 
 /*
@@ -874,6 +1012,299 @@ static void backup_state_set_target_id(const char *target_id) {
         g_free(backup_state.target_id);
     }
     backup_state.target_id = g_strdup(target_id);
+}
+
+BackupAccessInfoList *coroutine_fn qmp_backup_access_setup(
+    const char *target_id,
+    BackupAccessSourceDeviceList *devices,
+    Error **errp)
+{
+    assert(qemu_in_coroutine());
+
+    qemu_co_mutex_lock(&backup_state.backup_mutex);
+
+    Error *local_err = NULL;
+    GList *di_list = NULL;
+    GList *l;
+
+    if (backup_state.di_list) {
+        error_set(errp, ERROR_CLASS_GENERIC_ERROR,
+                  "previous backup for target '%s' not finished", backup_state.target_id);
+        qemu_co_mutex_unlock(&backup_state.backup_mutex);
+        return NULL;
+    }
+
+    bdrv_graph_co_rdlock();
+    for (BackupAccessSourceDeviceList *it = devices; it; it = it->next) {
+        PVEBackupDevInfo *di = get_single_device_info(it->value->device, fleecing_all, &local_err);
+        if (!di) {
+            bdrv_graph_co_rdunlock();
+            error_propagate(errp, local_err);
+            goto err;
+        }
+        di->requested_bitmap_mode = it->value->bitmap_mode;
+        di_list = g_list_append(di_list, di);
+    }
+    bdrv_graph_co_rdunlock();
+    assert(di_list);
+
+    size_t total = 0;
+
+    l = di_list;
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        ssize_t size = bdrv_getlength(di->bs);
+        if (size < 0) {
+            error_setg_errno(errp, -size, "bdrv_getlength failed");
+            goto err;
+        }
+        di->size = size;
+        total += size;
+
+        di->completed_ret = INT_MAX;
+    }
+
+    qemu_mutex_lock(&backup_state.stat.lock);
+    backup_state.stat.reused = 0;
+
+    /* clear previous backup's bitmap_list */
+    clear_backup_state_bitmap_list();
+
+    const char *bitmap_name = target_id;
+
+    /* create bitmaps if requested */
+    l = di_list;
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        di->block_size = PROXMOX_BACKUP_DEFAULT_CHUNK_SIZE;
+
+        PBSBitmapAction action = PBS_BITMAP_ACTION_NOT_USED;
+        size_t dirty = di->size;
+
+        if (di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_NONE ||
+            di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_NEW) {
+            BdrvDirtyBitmap *old_bitmap = bdrv_find_dirty_bitmap(di->bs, bitmap_name);
+            if (old_bitmap) {
+                bdrv_release_dirty_bitmap(old_bitmap);
+                action = PBS_BITMAP_ACTION_NOT_USED_REMOVED; // set below for new
+            }
+        }
+
+        BdrvDirtyBitmap *bitmap = NULL;
+        if (di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_NEW ||
+            di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_USE) {
+            bitmap = bdrv_find_dirty_bitmap(di->bs, bitmap_name);
+            if (!bitmap) {
+                bitmap = bdrv_create_dirty_bitmap(di->bs, PROXMOX_BACKUP_DEFAULT_CHUNK_SIZE,
+                                                  bitmap_name, errp);
+                if (!bitmap) {
+                    qemu_mutex_unlock(&backup_state.stat.lock);
+                    goto err;
+                }
+                bdrv_set_dirty_bitmap(bitmap, 0, di->size);
+                if (di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_USE) {
+                    action = PBS_BITMAP_ACTION_MISSING_RECREATED;
+                } else {
+                    action = PBS_BITMAP_ACTION_NEW;
+                }
+            } else {
+                if (di->requested_bitmap_mode == BACKUP_ACCESS_SETUP_BITMAP_MODE_NEW) {
+                    qemu_mutex_unlock(&backup_state.stat.lock);
+                    error_setg(errp, "internal error - removed old bitmap still present");
+                    goto err;
+                }
+                /* track clean chunks as reused */
+                dirty = MIN(bdrv_get_dirty_count(bitmap), di->size);
+                backup_state.stat.reused += di->size - dirty;
+                action = PBS_BITMAP_ACTION_USED;
+            }
+        }
+
+        PBSBitmapInfo *info = g_malloc(sizeof(*info));
+        info->drive = g_strdup(di->device_name);
+        info->action = action;
+        info->size = di->size;
+        info->dirty = dirty;
+        backup_state.stat.bitmap_list = g_list_append(backup_state.stat.bitmap_list, info);
+
+        di->bitmap = bitmap;
+        di->bitmap_action = action;
+    }
+
+    /* starting=false, because there is no associated QEMU job */
+    initialize_backup_state_stat(NULL, NULL, total, false);
+
+    qemu_mutex_unlock(&backup_state.stat.lock);
+
+    backup_state_set_target_id(target_id);
+
+    backup_state.vmaw = NULL;
+    backup_state.pbs = NULL;
+
+    backup_state.di_list = di_list;
+
+    /* Run setup_all_snapshot_access_bh outside of coroutine (in BH) but keep
+    * backup_mutex locked. This is fine, a CoMutex can be held across yield
+    * points, and we'll release it as soon as the BH reschedules us.
+    */
+    CoCtxData waker = {
+        .co = qemu_coroutine_self(),
+        .ctx = qemu_get_current_aio_context(),
+        .data = &local_err,
+    };
+    aio_bh_schedule_oneshot(waker.ctx, setup_all_snapshot_access_bh, &waker);
+    qemu_coroutine_yield();
+
+    if (local_err) {
+        error_propagate(errp, local_err);
+        goto err;
+    }
+
+    qemu_co_mutex_unlock(&backup_state.backup_mutex);
+
+    BackupAccessInfoList *bai_head = NULL, **p_bai_next = &bai_head;
+
+    l = di_list;
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        BackupAccessInfoList *info = g_malloc0(sizeof(*info));
+        info->value = g_malloc0(sizeof(*info->value));
+        info->value->node_name = g_strdup(bdrv_get_node_name(di->fleecing.snapshot_access));
+        info->value->device = g_strdup(di->device_name);
+        info->value->size = di->size;
+        if (di->bitmap) {
+            info->value->bitmap_node_name = g_strdup(bdrv_get_node_name(di->bs));
+            info->value->bitmap_name = g_strdup(bitmap_name);
+            info->value->bitmap_action = di->bitmap_action;
+            info->value->has_bitmap_action = true;
+        }
+
+        *p_bai_next = info;
+        p_bai_next = &info->next;
+    }
+
+    return bai_head;
+
+err:
+
+    l = di_list;
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        handle_backup_access_bitmaps_in_error_case(di);
+
+        g_free(di->device_name);
+        di->device_name = NULL;
+
+        g_free(di);
+    }
+    g_list_free(di_list);
+    backup_state.di_list = NULL;
+
+    qemu_co_mutex_unlock(&backup_state.backup_mutex);
+    return NULL;
+}
+
+/*
+ * Caller needs to hold the backup mutex or the BQL.
+ */
+void backup_access_teardown(bool success)
+{
+    GList *l = backup_state.di_list;
+
+    qemu_mutex_lock(&backup_state.stat.lock);
+    backup_state.stat.finishing = true;
+    qemu_mutex_unlock(&backup_state.stat.lock);
+
+    while (l) {
+        PVEBackupDevInfo *di = (PVEBackupDevInfo *)l->data;
+        l = g_list_next(l);
+
+        if (di->fleecing.snapshot_access) {
+            bdrv_unref(di->fleecing.snapshot_access);
+            di->fleecing.snapshot_access = NULL;
+        }
+        if (di->fleecing.cbw) {
+            bdrv_cbw_drop(di->fleecing.cbw);
+            di->fleecing.cbw = NULL;
+        }
+
+        if (success) {
+            handle_backup_access_bitmaps_after_success(di);
+        } else {
+            handle_backup_access_bitmaps_in_error_case(di);
+        }
+
+        g_free(di->device_name);
+        di->device_name = NULL;
+
+        g_free(di);
+    }
+    g_list_free(backup_state.di_list);
+    backup_state.di_list = NULL;
+
+    qemu_mutex_lock(&backup_state.stat.lock);
+    backup_state.stat.end_time = time(NULL);
+    backup_state.stat.finishing = false;
+    qemu_mutex_unlock(&backup_state.stat.lock);
+}
+
+// Not done in a coroutine, because bdrv_co_unref() and cbw_drop() would just spawn BHs anyways.
+// Caller needs to hold the backup_state.backup_mutex lock
+static void backup_access_teardown_bh(void *opaque)
+{
+    CoCtxData *data = (CoCtxData*)opaque;
+
+    backup_access_teardown(*((bool*)data->data));
+
+    /* return */
+    aio_co_enter(data->ctx, data->co);
+}
+
+void coroutine_fn qmp_backup_access_teardown(const char *target_id, bool success, Error **errp)
+{
+    assert(qemu_in_coroutine());
+
+    qemu_co_mutex_lock(&backup_state.backup_mutex);
+
+    if (!backup_state.target_id) { // nothing to do
+        qemu_co_mutex_unlock(&backup_state.backup_mutex);
+        return;
+    }
+
+    /*
+     * Continue with target_id == NULL, used by the callback registered for qemu_cleanup()
+     */
+    if (target_id && strcmp(backup_state.target_id, target_id)) {
+        error_setg(errp, "cannot teardown backup access - got target %s instead of %s",
+                   target_id, backup_state.target_id);
+        qemu_co_mutex_unlock(&backup_state.backup_mutex);
+        return;
+    }
+
+    if (!strcmp(backup_state.target_id, "Proxmox VE")) {
+        error_setg(errp, "cannot teardown backup access for PVE - use backup-cancel instead");
+        qemu_co_mutex_unlock(&backup_state.backup_mutex);
+        return;
+    }
+
+    CoCtxData waker = {
+        .co = qemu_coroutine_self(),
+        .ctx = qemu_get_current_aio_context(),
+        .data = &success,
+    };
+    aio_bh_schedule_oneshot(waker.ctx, backup_access_teardown_bh, &waker);
+    qemu_coroutine_yield();
+
+    qemu_co_mutex_unlock(&backup_state.backup_mutex);
+    return;
 }
 
 UuidInfo coroutine_fn *qmp_backup(
@@ -1068,6 +1499,7 @@ UuidInfo coroutine_fn *qmp_backup(
             }
 
             di->dev_id = dev_id;
+            di->bitmap_action = action;
 
             PBSBitmapInfo *info = g_malloc(sizeof(*info));
             info->drive = g_strdup(di->device_name);
@@ -1119,7 +1551,7 @@ UuidInfo coroutine_fn *qmp_backup(
         }
     }
     /* initialize global backup_state now */
-    initialize_backup_state_stat(backup_file, uuid, total);
+    initialize_backup_state_stat(backup_file, &uuid, total, true);
     char *uuid_str = g_strdup(backup_state.stat.uuid_str);
 
     qemu_mutex_unlock(&backup_state.stat.lock);
@@ -1298,5 +1730,6 @@ ProxmoxSupportStatus *qmp_query_proxmox_support(Error **errp)
     ret->pbs_masterkey = true;
     ret->backup_max_workers = true;
     ret->backup_fleecing = true;
+    ret->backup_access_api = true;
     return ret;
 }

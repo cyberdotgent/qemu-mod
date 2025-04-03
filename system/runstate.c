@@ -66,6 +66,7 @@
 #include "ui/console.h"
 
 #include "trace.h"
+#include "pve-backup.h"
 
 static NotifierList exit_notifiers =
     NOTIFIER_LIST_INITIALIZER(exit_notifiers);
@@ -1168,6 +1169,11 @@ void qemu_cleanup(int status)
      * requests happening from here on anyway.
      */
     bdrv_drain_all_begin();
+    /*
+     * The backup access is set up by a QMP command, but is neither owned by a monitor nor
+     * associated to a BlockBackend. Need to tear it down manually here.
+     */
+    backup_access_teardown(false);
     job_cancel_sync_all();
     bdrv_close_all();
 
