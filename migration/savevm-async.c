@@ -399,7 +399,7 @@ void qmp_savevm_start(const char *statefile, bool has_skip_vm_start,
         return;
     }
 
-    if (qemu_savevm_state_blocked(errp)) {
+    if (savevm_async_is_blocked(errp)) {
         goto fail;
     }
 

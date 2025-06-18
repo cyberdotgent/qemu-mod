@@ -604,6 +604,7 @@ int migration_call_notifiers(MigrationEventType type, Error **errp);
 
 int migrate_init(MigrationState *s, Error **errp);
 bool migration_is_blocked(Error **errp);
+bool savevm_async_is_blocked(Error **errp);
 /* True if outgoing migration has entered postcopy phase */
 bool migration_in_postcopy(void);
 bool migration_postcopy_is_alive(MigrationStatus state);

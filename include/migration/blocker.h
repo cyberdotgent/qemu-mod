@@ -16,6 +16,8 @@
 
 #include "qapi/qapi-types-migration.h"
 
+#define MIGRATION_BLOCKER_VMDK "The vmdk format used by a disk does not support live migration"
+
 /**
  * @migrate_add_blocker - prevent all modes of migration from proceeding
  *

@@ -1429,9 +1429,7 @@ static int vmdk_open(BlockDriverState *bs, QDict *options, int flags,
     qemu_co_mutex_init(&s->lock);
 
     /* Disable migration when VMDK images are used */
-    error_setg(&s->migration_blocker, "The vmdk format used by node '%s' "
-               "does not support live migration",
-               bdrv_get_device_or_node_name(bs));
+    error_setg(&s->migration_blocker, "%s", MIGRATION_BLOCKER_VMDK);
     ret = migrate_add_blocker_normal(&s->migration_blocker, errp);
     if (ret < 0) {
         goto fail;
