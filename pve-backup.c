@@ -847,29 +847,56 @@ static PVEBackupDevInfo coroutine_fn GRAPH_RDLOCK *get_single_device_info(
     Error **errp)
 {
     BlockBackend *blk = blk_by_name(device);
-    if (!blk) {
-        error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                  "Device '%s' not found", device);
-        return NULL;
+    BlockDriverState *root_bs, *bs;
+
+    if (blk) {
+        root_bs = bs = blk_bs(blk);
+    } else {
+        /* TODO PVE 10 - fleecing will always be attached without blk */
+        root_bs = bs = bdrv_find_node(device);
+        if (!bs) {
+            error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                      "Device '%s' not found", device);
+            return NULL;
+        }
+        /* For TPM, bs is already correct, otherwise need the file child. */
+        if (!strncmp(bs->drv->format_name, "throttle", 8)) {
+            if (!bs->file || !bs->file->bs) {
+                error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                          "Device '%s' not found (no file child)", device);
+                return NULL;
+            }
+            bs = bs->file->bs;
+        }
     }
-    BlockDriverState *bs = blk_bs(blk);
+
     if (!bdrv_co_is_inserted(bs)) {
         error_setg(errp, "Device '%s' has no medium", device);
         return NULL;
     }
+
     PVEBackupDevInfo *di = g_new0(PVEBackupDevInfo, 1);
     di->bs = bs;
-    di->device_name = g_strdup(bdrv_get_device_name(bs));
+    /* Need the name of the root node, e.g. drive-scsi0 */
+    di->device_name = g_strdup(bdrv_get_device_or_node_name(root_bs));
 
     if (device_uses_fleecing && device_uses_fleecing(device)) {
         g_autofree gchar *fleecing_devid = g_strconcat(device, "-fleecing", NULL);
+        BlockDriverState *fleecing_bs;
+
         BlockBackend *fleecing_blk = blk_by_name(fleecing_devid);
-        if (!fleecing_blk) {
-            error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                      "Device '%s' not found", fleecing_devid);
-            goto fail;
+        if (fleecing_blk) {
+            fleecing_bs = blk_bs(fleecing_blk);
+        } else {
+            /* TODO PVE 10 - fleecing will always be attached without blk */
+            fleecing_bs = bdrv_find_node(fleecing_devid);
+            if (!fleecing_bs) {
+                error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                          "Device '%s' not found", fleecing_devid);
+                goto fail;
+            }
         }
-        BlockDriverState *fleecing_bs = blk_bs(fleecing_blk);
+
         if (!bdrv_co_is_inserted(fleecing_bs)) {
             error_setg(errp, "Device '%s' has no medium", fleecing_devid);
             goto fail;
@@ -927,7 +954,7 @@ static GList coroutine_fn GRAPH_RDLOCK *get_device_info(
 
             PVEBackupDevInfo *di = g_new0(PVEBackupDevInfo, 1);
             di->bs = bs;
-            di->device_name = g_strdup(bdrv_get_device_name(bs));
+            di->device_name = g_strdup(bdrv_get_device_or_node_name(bs));
             di_list = g_list_append(di_list, di);
         }
     }
