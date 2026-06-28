@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# group: rw quick
+#
+# Test that qemu's read-only VMware seSparse support tolerates the reserved1
+# const-header bit that newer VMware products (observed with vSphere 8) set,
+# while still rejecting any other reserved bit.
+#
+# Copyright (C) 2026 Proxmox Server Solutions GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# creator
+owner=support@proxmox.com
+
+seq=`basename $0`
+echo "QA output created by $seq"
+
+status=1	# failure is the default!
+
+_cleanup()
+{
+    _cleanup_test_img
+    rm -f "$TEST_IMG-sesparse.vmdk"
+}
+trap "_cleanup; exit \$status" 0 1 2 3 15
+
+# get standard environment, filters and checks
+cd ..
+. ./common.rc
+. ./common.filter
+
+_supported_fmt vmdk
+_supported_proto file
+_supported_os Linux
+
+# qemu-img cannot create seSparse images, so synthesize a minimal, all
+# unallocated one (descriptor plus extent). The grain directory is all zero,
+# so every read returns zeros without touching grain tables or grains; only
+# the const header, volatile header and grain directory need to be present.
+# Args: <descriptor-path> <reserved1> <reserved2>
+make_sesparse()
+{
+    python3 - "$@" <<'EOF'
+import struct, sys
+out, r1, r2 = sys.argv[1], int(sys.argv[2], 0), int(sys.argv[3], 0)
+SECTOR, CAP, GRAIN, GT = 512, 32768, 8, 64
+const = [
+    0x00000000cafebabe, 0x0000000200000001, CAP, GRAIN, GT, 0,
+    r1, r2, 0, 0,
+    1, 1, 2, 1, 3, 1, 4, 1, 5, GT, 69, 1, 70, 1, 71, CAP,
+]
+hdr = b"".join(struct.pack("<Q", v) for v in const)
+hdr += bytes(SECTOR - len(hdr))
+vol = struct.pack("<QQQQ", 0x00000000cafecafe, 0, 0, 0)
+vol += bytes(SECTOR - len(vol))
+img = bytearray(5 * SECTOR)
+img[0:SECTOR] = hdr
+img[SECTOR:2 * SECTOR] = vol
+extent = out + "-sesparse.vmdk"
+with open(extent, "wb") as f:
+    f.write(img)
+with open(out, "w") as f:
+    f.write(
+        '# Disk DescriptorFile\nversion=3\nencoding="UTF-8"\n'
+        'CID=fffffffe\nparentCID=ffffffff\ncreateType="seSparse"\n\n'
+        '# Extent description\n'
+        'RW %d SESPARSE "%s"\n\n'
+        '# The Disk Data Base\n#DDB\nddb.grain = "8"\n'
+        % (CAP, extent.split("/")[-1])
+    )
+EOF
+}
+
+echo
+echo "=== the 0x200 reserved1 bit set by newer VMware is accepted as zeros ==="
+make_sesparse "$TEST_IMG" 0x200 0
+$QEMU_IMG info -f vmdk "$TEST_IMG" | _filter_testdir | \
+    grep -e "file format" -e "create type"
+$QEMU_IO -r -f vmdk -c "read -P 0 0 64k" "$TEST_IMG" | _filter_qemu_io
+
+echo
+echo "=== any other reserved1 bit is still rejected ==="
+make_sesparse "$TEST_IMG" 0x400 0
+$QEMU_IMG info -f vmdk "$TEST_IMG" 2>&1 | _filter_testdir
+
+echo
+echo "=== a non-zero reserved2 is still rejected ==="
+make_sesparse "$TEST_IMG" 0 0x1
+$QEMU_IMG info -f vmdk "$TEST_IMG" 2>&1 | _filter_testdir
+
+# success, all done
+echo "*** done"
+status=0

@@ -1,0 +1,14 @@
+QA output created by vmdk-sesparse-reserved
+
+=== the 0x200 reserved1 bit set by newer VMware is accepted as zeros ===
+file format: vmdk
+    create type: seSparse
+read 65536/65536 bytes at offset 0
+64 KiB, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+
+=== any other reserved1 bit is still rejected ===
+qemu-img: Could not open 'TEST_DIR/t.vmdk': Unsupported reserved bits: 0x0000000000000400 0x0000000000000000 0x0000000000000000 0x0000000000000000
+
+=== a non-zero reserved2 is still rejected ===
+qemu-img: Could not open 'TEST_DIR/t.vmdk': Unsupported reserved bits: 0x0000000000000000 0x0000000000000001 0x0000000000000000 0x0000000000000000
+*** done

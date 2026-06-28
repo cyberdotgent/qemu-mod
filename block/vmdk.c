@@ -788,7 +788,8 @@ static int check_se_sparse_const_header(VMDKSESparseConstHeader *header,
         return -ENOTSUP;
     }
 
-    if (header->reserved1 != 0 || header->reserved2 != 0 ||
+    /* vSphere 8 sets reserved1 to 0x200, the 512-byte const header size. */
+    if ((header->reserved1 & ~UINT64_C(0x200)) != 0 || header->reserved2 != 0 ||
         header->reserved3 != 0 || header->reserved4 != 0) {
         error_setg(errp, "Unsupported reserved bits:"
                    " 0x%016" PRIx64 " 0x%016" PRIx64
