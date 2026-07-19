@@ -115,6 +115,10 @@
 /* BRANCH AND SAVE */
     C(0x0d00, BASR,    RR_a,  Z,   0, r2_nz, r1, 0, bas, 0)
     C(0x4d00, BAS,     RX_a,  Z,   0, a2, r1, 0, bas, 0)
+/* BRANCH AND SAVE AND SET MODE */
+    C(0x0c00, BASSM,   RR_a,  Z,   0, r2_nz, r1, 0, bassm, 0)
+/* BRANCH AND SET MODE */
+    C(0x0b00, BSM,     RR_a,  Z,   0, r2_nz, 0, 0, bsm, 0)
 /* BRANCH RELATIVE AND SAVE */
     C(0xa705, BRAS,    RI_b,  Z,   0, 0, r1, 0, basi, 0)
     C(0xc005, BRASL,   RIL_b, Z,   0, 0, r1, 0, basi, 0)
@@ -364,6 +368,11 @@
 /* DIVIDE TO INTEGER */
     D(0xb35b, DIDBR,   RRF_b, Z,   0, 0, 0, 0, dib, 0, 64)
     D(0xb353, DIEBR,   RRF_b, Z,   0, 0, 0, 0, dib, 0, 32)
+
+/* EDIT */
+    D(0xde00, ED,      SS_a,  Z,   la1, a2, 0, 0, ed, 0, 0)
+/* EDIT AND MARK */
+    D(0xdf00, EDMK,    SS_a,  Z,   la1, a2, 0, 0, ed, 0, 1)
 
 /* EXCLUSIVE OR */
     C(0x1700, XR,      RR_a,  Z,   r1, r2, new, r1_32, xor, nz32)

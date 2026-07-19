@@ -130,18 +130,104 @@ static uint64_t get_max_kernel_cmdline_size(void)
     return LEGACY_KERN_PARM_AREA_SIZE;
 }
 
+static bool s390_ipl_is_ins_file(const char *filename)
+{
+    const char *suffix = strrchr(filename, '.');
+
+    return suffix && !g_ascii_strcasecmp(suffix, ".ins");
+}
+
+static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
+                             Error **errp)
+{
+    g_autofree char *contents = NULL;
+    g_autofree char *directory = g_path_get_dirname(filename);
+    g_auto(GStrv) lines = NULL;
+    int loaded = 0;
+
+    if (!g_file_get_contents(filename, &contents, NULL, NULL)) {
+        error_setg(errp, "could not read INS file '%s'", filename);
+        return -1;
+    }
+
+    lines = g_strsplit(contents, "\n", -1);
+    for (unsigned int line_no = 0; lines[line_no]; line_no++) {
+        g_autofree char *line = g_strdup(lines[line_no]);
+        g_auto(GStrv) fields = NULL;
+        g_autofree char *component = NULL;
+        const char *component_name = NULL;
+        const char *address_string = NULL;
+        char *p = g_strstrip(line);
+        uint64_t addr;
+        int size;
+
+        if (!*p || *p == '*') {
+            continue;
+        }
+
+        fields = g_strsplit_set(p, " \t\r", -1);
+        for (unsigned int i = 0; fields[i]; i++) {
+            if (!*fields[i]) {
+                continue;
+            }
+            if (!component_name) {
+                component_name = fields[i];
+            } else if (!address_string) {
+                address_string = fields[i];
+            } else {
+                error_setg(errp, "%s:%u: expected component and address",
+                           filename, line_no + 1);
+                return -1;
+            }
+        }
+        if (!component_name || !address_string ||
+            qemu_strtou64(address_string, NULL, 0, &addr)) {
+            error_setg(errp, "%s:%u: expected component and address",
+                       filename, line_no + 1);
+            return -1;
+        }
+
+        if (addr > PSW_MASK_SHORT_ADDR || addr >= ram_size) {
+            error_setg(errp, "%s:%u: load address 0x%" PRIx64
+                       " is outside list-load memory", filename,
+                       line_no + 1, addr);
+            return -1;
+        }
+        component = g_build_filename(directory, component_name, NULL);
+        size = load_image_targphys(component, addr,
+                                   MIN(ram_size, 0x80000000ULL) - addr, NULL);
+        if (size < 0) {
+            error_setg(errp, "%s:%u: could not load component '%s'",
+                       filename, line_no + 1, component);
+            return -1;
+        }
+        loaded++;
+    }
+
+    if (!loaded) {
+        error_setg(errp, "INS file '%s' contains no loadable components",
+                   filename);
+        return -1;
+    }
+    return loaded;
+}
+
 static void s390_ipl_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
     S390CcwMachineState *s390ms = S390_CCW_MACHINE(ms);
     S390IPLState *ipl = S390_IPL(dev);
     uint32_t *ipl_psw;
+    uint32_t *ipl_psw_mask;
     uint64_t pentry;
     char *magic;
     int kernel_size;
+    bool short_psw_image = false;
 
     int bios_size;
     char *bios_filename;
+
+    ipl->start_mask = IPL_PSW_MASK;
 
     if (ipl->kernel && s390ms->ipl_devno_set) {
         error_setg(errp, "-ipl and -kernel cannot be used together");
@@ -193,25 +279,41 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
     }
 
     if (ipl->kernel) {
-        kernel_size = load_elf(ipl->kernel, NULL, NULL, NULL,
-                               &pentry, NULL,
-                               NULL, NULL, ELFDATA2MSB, EM_S390, 0, 0);
+        if (s390_ipl_is_ins_file(ipl->kernel)) {
+            kernel_size = s390_ipl_load_ins(ipl->kernel, ms->ram_size, errp);
+            short_psw_image = kernel_size >= 0;
+        } else {
+            kernel_size = load_elf(ipl->kernel, NULL, NULL, NULL,
+                                   &pentry, NULL, NULL, NULL,
+                                   ELFDATA2MSB, EM_S390, 0, 0);
+        }
         if (kernel_size < 0) {
-            kernel_size = load_image_targphys(ipl->kernel, 0, ms->ram_size,
-                                              NULL);
+            if (s390_ipl_is_ins_file(ipl->kernel)) {
+                return;
+            }
+            kernel_size = load_image_targphys(ipl->kernel, 0,
+                                              ms->ram_size, NULL);
             if (kernel_size < 0) {
                 error_setg(errp, "could not load kernel '%s'", ipl->kernel);
                 return;
             }
-            /* if this is Linux use KERN_IMAGE_START */
+            short_psw_image = true;
+        }
+        if (short_psw_image) {
             magic = rom_ptr(LINUX_MAGIC_ADDR, 6);
             if (magic && !memcmp(magic, "S390EP", 6)) {
                 pentry = KERN_IMAGE_START;
             } else {
-                /* if not Linux load the address of the (short) IPL PSW */
+                /* Load the address and mode from the short IPL PSW. */
                 ipl_psw = rom_ptr(4, 4);
-                if (ipl_psw) {
+                ipl_psw_mask = rom_ptr(0, 4);
+                if (ipl_psw && ipl_psw_mask) {
                     pentry = be32_to_cpu(*ipl_psw) & PSW_MASK_SHORT_ADDR;
+                    ipl->start_mask =
+                        (uint64_t)be32_to_cpu(*ipl_psw_mask) << 32;
+                    /* Convert the format bit, not just the short layout. */
+                    ipl->start_mask &= ~PSW_MASK_SHORTPSW;
+                    ipl->start_mask |= be32_to_cpu(*ipl_psw) & PSW_MASK_32;
                 } else {
                     error_setg(errp, "Could not get IPL PSW");
                     return;
@@ -891,10 +993,11 @@ void s390_ipl_prepare_cpu(S390CPU *cpu)
     S390IPLState *ipl = get_ipl_device();
 
     cpu->env.psw.addr = ipl->start_addr;
-    cpu->env.psw.mask = IPL_PSW_MASK;
+    cpu->env.psw.mask = ipl->start_mask;
 
     if (!ipl->kernel || ipl->iplb_valid) {
         cpu->env.psw.addr = ipl->bios_start_addr;
+        cpu->env.psw.mask = IPL_PSW_MASK;
         if (!ipl->iplb_valid) {
             ipl->iplb_valid = s390_init_all_iplbs(ipl);
         } else {

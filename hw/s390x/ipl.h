@@ -70,6 +70,7 @@ struct S390IPLState {
     IplParameterBlock iplb_pv;
     QemuIplParameters qipl;
     uint64_t start_addr;
+    uint64_t start_mask;
     uint64_t compat_start_addr;
     uint64_t bios_start_addr;
     uint64_t compat_bios_start_addr;

@@ -4627,6 +4627,11 @@ SRST
 ``-kernel bzImage``
     Use bzImage as kernel image. The kernel can be either a Linux kernel
     or in multiboot format.
+
+    On s390x, a filename ending in ``.INS`` is treated as an HMC
+    list-directed-load control file. Its raw components are loaded at their
+    specified addresses and execution starts from the short IPL PSW at address
+    zero.
 ERST
 
 DEF("ipl", HAS_ARG, QEMU_OPTION_ipl,

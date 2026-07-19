@@ -28,6 +28,29 @@ devices. A future emulated DASD, FBA, tape, or card-reader device can opt in by
 providing the CCW IPL-parameter-block operation; the command-line syntax and
 selection code do not need device-specific changes.
 
+HMC list-directed loads
+-----------------------
+
+On s390x, ``-kernel`` also accepts an HMC list-directed-load control file whose
+name ends in ``.INS`` (case-insensitive). Each non-comment line contains a
+component filename and its hexadecimal load address. Component filenames are
+resolved relative to the control file. For example::
+
+ * Install image
+ NUCLEUS 0x00000000
+ RAMDISK 0x01800000
+
+QEMU loads every component as raw data, then obtains the initial address and
+24-bit or 31-bit addressing mode from the short IPL PSW at address zero. This
+matches the loading part of the HMC ``Load from Removable Media or Server``
+operation and avoids a separate ``loader`` device for every component::
+
+ qemu-system-s390x -m 2G -kernel media/BOOT.INS -loadparm CONS0009
+
+The INS control file only describes the initial memory image. Any later files
+that the installer retrieves from the HMC media still require an emulated
+device or another QEMU service that implements that media protocol.
+
 Booting with bootindex parameter
 --------------------------------
 

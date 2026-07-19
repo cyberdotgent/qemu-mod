@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include <glib/gstdio.h>
 
 static void assert_machine_string(QTestState *qts, const char *property,
                                   const char *expected)
@@ -106,11 +107,51 @@ static void test_ipl_errors(void)
     assert_qemu_fails(kernel, "-ipl and -kernel cannot be used together");
 }
 
+static void test_ins_list_load(void)
+{
+    const uint8_t nucleus[] = {
+        0x00, 0x08, 0x00, 0x00, 0x80, 0x00, 0x01, 0x00,
+        0x11, 0x22, 0x33, 0x44,
+    };
+    const uint8_t ramdisk[] = { 0xaa, 0xbb, 0xcc, 0xdd };
+    const char control[] =
+        "* list-directed load test\n"
+        "NUCLEUS 0x00000000\n"
+        "RAMDISK 0x00001000\n";
+    g_autofree char *directory = g_dir_make_tmp("qemu-s390-ins-XXXXXX", NULL);
+    g_autofree char *nucleus_path =
+        g_build_filename(directory, "NUCLEUS", NULL);
+    g_autofree char *ramdisk_path =
+        g_build_filename(directory, "RAMDISK", NULL);
+    g_autofree char *ins_path = g_build_filename(directory, "BOOT.INS", NULL);
+    uint8_t actual[sizeof(nucleus)];
+    QTestState *qts;
+
+    g_assert_true(g_file_set_contents(nucleus_path, (const char *)nucleus,
+                                      sizeof(nucleus), NULL));
+    g_assert_true(g_file_set_contents(ramdisk_path, (const char *)ramdisk,
+                                      sizeof(ramdisk), NULL));
+    g_assert_true(g_file_set_contents(ins_path, control, -1, NULL));
+
+    qts = qtest_initf("-nodefaults -S -kernel %s", ins_path);
+    qtest_memread(qts, 0, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), nucleus, sizeof(nucleus));
+    qtest_memread(qts, 0x1000, actual, sizeof(ramdisk));
+    g_assert_cmpmem(actual, sizeof(ramdisk), ramdisk, sizeof(ramdisk));
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_remove(ins_path), ==, 0);
+    g_assert_cmpint(g_remove(ramdisk_path), ==, 0);
+    g_assert_cmpint(g_remove(nucleus_path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/s390x/ipl/short-address", test_ipl_short_address);
     qtest_add_func("/s390x/ipl/full-address", test_ipl_full_address);
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
+    qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     return g_test_run();
 }

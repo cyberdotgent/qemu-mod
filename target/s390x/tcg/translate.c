@@ -1402,6 +1402,72 @@ static DisasJumpType op_bas(DisasContext *s, DisasOps *o)
     }
 }
 
+static void set_addressing_mode_and_target(TCGv_i64 target)
+{
+    TCGv_i64 mode = tcg_temp_new_i64();
+    TCGv_i64 target31 = tcg_temp_new_i64();
+    TCGv_i64 target24 = tcg_temp_new_i64();
+    TCGv_i64 is64 = tcg_temp_new_i64();
+
+    /*
+     * A one in bit 63 of the branch address selects 64-bit mode.  Otherwise,
+     * bit 32 selects 31-bit mode and zero selects 24-bit mode.  QEMU records
+     * 64-bit mode as the combination of PSW_MASK_32 and PSW_MASK_64.
+     */
+    tcg_gen_andi_i64(is64, target, 1);
+    tcg_gen_shli_i64(mode, is64, 32);
+    tcg_gen_shli_i64(is64, is64, 31);
+    tcg_gen_or_i64(mode, mode, is64);
+    tcg_gen_andi_i64(is64, target, 0x80000000);
+    tcg_gen_or_i64(mode, mode, is64);
+    tcg_gen_andi_i64(psw_mask, psw_mask,
+                     ~(PSW_MASK_32 | PSW_MASK_64));
+    tcg_gen_or_i64(psw_mask, psw_mask, mode);
+
+    tcg_gen_andi_i64(target24, target, 0xffffff);
+    tcg_gen_andi_i64(target31, target, 0x7fffffff);
+    tcg_gen_movcond_i64(TCG_COND_NE, target31, is64,
+                        tcg_constant_i64(0), target31, target24);
+    tcg_gen_andi_i64(is64, target, 1);
+    tcg_gen_andi_i64(target, target, -2);
+    tcg_gen_movcond_i64(TCG_COND_NE, target, is64,
+                        tcg_constant_i64(0), target, target31);
+}
+
+static DisasJumpType op_bassm(DisasContext *s, DisasOps *o)
+{
+    pc_to_link_info(o->out, s, s->pc_tmp);
+    if (s->base.tb->flags & FLAG_MASK_64) {
+        tcg_gen_ori_i64(o->out, o->out, 1);
+    }
+    if (o->in2) {
+        set_addressing_mode_and_target(o->in2);
+        return help_goto_indirect(s, o->in2);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_bsm(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+
+    if (r1) {
+        if (s->base.tb->flags & FLAG_MASK_64) {
+            tcg_gen_ori_i64(regs[r1], regs[r1], 1);
+        } else if (s->base.tb->flags & FLAG_MASK_32) {
+            tcg_gen_ori_i64(regs[r1], regs[r1], 0x80000000);
+        } else {
+            tcg_gen_andi_i64(regs[r1], regs[r1], ~0x80000000ULL);
+        }
+    }
+
+    if (o->in2) {
+        set_addressing_mode_and_target(o->in2);
+        return help_goto_indirect(s, o->in2);
+    }
+    return DISAS_NEXT;
+}
+
 static void save_link_info(DisasContext *s, DisasOps *o)
 {
     TCGv_i64 t;
@@ -2315,6 +2381,16 @@ static DisasJumpType op_ear(DisasContext *s, DisasOps *o)
 {
     int r2 = get_field(s, r2);
     tcg_gen_ld32u_i64(o->out, tcg_env, offsetof(CPUS390XState, aregs[r2]));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ed(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
+    TCGv_i32 mark = tcg_constant_i32(s->insn->data);
+
+    gen_helper_ed(cc_op, tcg_env, l, o->addr1, o->in2, mark);
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 

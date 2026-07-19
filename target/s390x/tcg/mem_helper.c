@@ -1530,6 +1530,74 @@ void HELPER(unpk)(CPUS390XState *env, uint32_t len, uint64_t dest,
     }
 }
 
+uint32_t HELPER(ed)(CPUS390XState *env, uint32_t len, uint64_t dest,
+                    uint64_t src, uint32_t mark)
+{
+    uintptr_t ra = GETPC();
+    uint8_t fill = 0;
+    uint8_t source = 0;
+    uint32_t cc = 0;
+    bool significance = false;
+    bool right_digit = false;
+    uint32_t i;
+
+    for (i = 0; i <= len; i++) {
+        uint8_t pattern = cpu_ldub_data_ra(env, dest, ra);
+        uint8_t result = pattern;
+
+        if (i == 0) {
+            fill = pattern;
+        }
+
+        if (pattern == 0x20 || pattern == 0x21) {
+            uint8_t digit;
+
+            if (!right_digit) {
+                source = cpu_ldub_data_ra(env, src, ra);
+                digit = source >> 4;
+                source &= 0x0f;
+                right_digit = true;
+                src = wrap_address(env, src + 1);
+                if (digit > 9) {
+                    tcg_s390_data_exception(env, 0, ra);
+                }
+            } else {
+                digit = source;
+                right_digit = false;
+            }
+
+            if (mark && digit && !significance) {
+                set_address(env, 1, dest);
+            }
+            result = (!significance && !digit) ? fill : 0xf0 | digit;
+            if (digit) {
+                cc = 2;
+            }
+            if (pattern == 0x21 || digit) {
+                significance = true;
+            }
+
+            if (right_digit && source > 9) {
+                if (source != 0x0b && source != 0x0d) {
+                    significance = false;
+                }
+                right_digit = false;
+            }
+        } else if (pattern == 0x22) {
+            result = fill;
+            significance = false;
+            cc = 0;
+        } else if (!significance) {
+            result = fill;
+        }
+
+        cpu_stb_data_ra(env, dest, result, ra);
+        dest = wrap_address(env, dest + 1);
+    }
+
+    return significance && cc == 2 ? 1 : cc;
+}
+
 static inline uint32_t do_unpkau(CPUS390XState *env, uint64_t dest,
                                  uint32_t destlen, int dsize, uint64_t src,
                                  uintptr_t ra)
