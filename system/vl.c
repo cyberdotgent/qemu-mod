@@ -529,6 +529,36 @@ static QemuOptsList qemu_dev3270_opts = {
     },
 };
 
+static QemuOptsList qemu_dev9336_opts = {
+    .name = "dev9336",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_dev9336_opts.head),
+    .desc = {
+        {
+            .name = "file",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "drive",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "devno",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "format",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "readonly",
+            .type = QEMU_OPT_BOOL,
+        },{
+            .name = "blocks",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "id",
+            .type = QEMU_OPT_STRING,
+        },
+        { /* end of list */ }
+    },
+};
+
 const char *qemu_get_vm_name(void)
 {
     return qemu_name;
@@ -1307,6 +1337,105 @@ static bool dev3270_add(const char *optarg, Error **errp)
 fail:
     qemu_opts_del(device_opts);
     qemu_opts_del(chardev_opts);
+    qemu_opts_del(opts);
+    return false;
+}
+
+static bool dev9336_add(const char *optarg, Error **errp)
+{
+    static unsigned int index;
+    g_autofree char *generated_drive_id = NULL;
+    g_autofree char *generated_device_id = NULL;
+    g_autofree char *normalized_devno = NULL;
+    g_autofree char *blocks_str = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *drive_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    const char *file;
+    const char *drive;
+    const char *format;
+    const char *devno;
+    const char *id;
+    uint64_t blocks;
+    unsigned int short_devno;
+    int consumed;
+
+    opts = qemu_opts_parse(&qemu_dev9336_opts, optarg, false, errp);
+    if (!opts) {
+        return false;
+    }
+
+    file = qemu_opt_get(opts, "file");
+    drive = qemu_opt_get(opts, "drive");
+    format = qemu_opt_get(opts, "format");
+    devno = qemu_opt_get(opts, "devno");
+    id = qemu_opts_id(opts);
+    if (!!file == !!drive) {
+        error_setg(errp, "Exactly one of 'file' and 'drive' is required");
+        goto fail;
+    }
+    if (drive && (format || qemu_opt_get(opts, "readonly"))) {
+        error_setg(errp, "'format' and 'readonly' are valid only with 'file'");
+        goto fail;
+    }
+
+    generated_device_id = id ? g_strdup(id) :
+                               g_strdup_printf("dev9336-%u", index);
+    if (file) {
+        generated_drive_id = id ? g_strdup_printf("%s-drive", id) :
+                                  g_strdup_printf("dev9336-drive%u", index);
+        drive = generated_drive_id;
+        drive_opts = qemu_opts_create(qemu_find_opts("drive"), drive, 1,
+                                      errp);
+        if (!drive_opts ||
+            !qemu_opt_set(drive_opts, "if", "none", errp) ||
+            !qemu_opt_set(drive_opts, "file", file, errp) ||
+            !qemu_opt_set(drive_opts, "format", format ?: "raw", errp) ||
+            !qemu_opt_set_bool(drive_opts, "read-only",
+                               qemu_opt_get_bool(opts, "readonly", false),
+                               errp)) {
+            goto fail;
+        }
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"),
+                                   generated_device_id, 1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "fba-ccw", errp) ||
+        !qemu_opt_set(device_opts, "drive", drive, errp)) {
+        goto fail;
+    }
+
+    if (devno) {
+        if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&
+            !devno[consumed] && short_devno <= UINT16_MAX) {
+            normalized_devno = g_strdup_printf("fe.0.%04x", short_devno);
+            devno = normalized_devno;
+        }
+        if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
+    }
+
+    if (qemu_opt_get(opts, "blocks")) {
+        blocks = qemu_opt_get_number(opts, "blocks", 0);
+        if (!blocks || blocks > UINT32_MAX) {
+            error_setg(errp, "'blocks' must be between 1 and %u", UINT32_MAX);
+            goto fail;
+        }
+        blocks_str = g_strdup_printf("%" PRIu64, blocks);
+        if (!qemu_opt_set(device_opts, "blocks", blocks_str, errp)) {
+            goto fail;
+        }
+    }
+
+    index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(drive_opts);
     qemu_opts_del(opts);
     return false;
 }
@@ -3344,6 +3473,15 @@ void qemu_init(int argc, char **argv)
                 Error *err = NULL;
 
                 if (!dev3270_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
+            case QEMU_OPTION_dev9336: {
+                Error *err = NULL;
+
+                if (!dev9336_add(optarg, &err)) {
                     error_report_err(err);
                     exit(1);
                 }

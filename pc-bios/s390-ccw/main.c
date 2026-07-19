@@ -114,6 +114,7 @@ static int is_dev_possibly_bootable(int dev_no, int sch_no)
             return false;
         case CU_TYPE_DASD_3990:
         case CU_TYPE_DASD_2107:
+        case CU_TYPE_DASD_FBA:
             return true;
         default:
             return false;
@@ -305,6 +306,9 @@ static void ipl_ccw_device(void)
     case CU_TYPE_DASD_3990:
     case CU_TYPE_DASD_2107:
         dasd_ipl(blk_schid, cutype);
+        break;
+    case CU_TYPE_DASD_FBA:
+        fba_ipl(blk_schid, cutype);
         break;
     case CU_TYPE_VIRTIO:
         if (virtio_setup() == 0) {

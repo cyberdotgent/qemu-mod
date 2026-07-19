@@ -243,3 +243,40 @@ int dasd_ipl(SubChannelId schid, uint16_t cutype)
     jump_to_low_kernel();
     return -1;
 }
+
+/*
+ * IPL an emulated FBA device.  Unlike the vfio-ccw CKD path above, an
+ * emulated FBA device can execute the IPL channel program without splitting
+ * or rewriting it.  Read IPL installs the IPL PSW and the channel program at
+ * absolute addresses 0 and 8; execute that program and then enter the PSW.
+ */
+int fba_ipl(SubChannelId schid, uint16_t cutype)
+{
+    PSWLegacy *pswl = (PSWLegacy *)0x00;
+    Ccw0 *read_ipl = (Ccw0 *)0x1000;
+
+    memset(read_ipl, 0, sizeof(*read_ipl));
+    read_ipl->cmd_code = CCW_CMD_READ_IPL;
+    read_ipl->cda = 0;
+    read_ipl->sli = 1;
+    read_ipl->count = 0x18;
+    if (do_cio(schid, cutype, 0x1000, CCW_FMT0)) {
+        puts("Failed to read FBA IPL record");
+        return -EIO;
+    }
+    /*
+     * QEMU's virtual channel subsystem does not accept zero as an ORB channel
+     * program address.  Continue at the IPL CCW loaded at absolute address 8
+     * in a second start, preserving the architectural post-Read-IPL position
+     * in the emulated device.
+     */
+    if (do_cio(schid, cutype, 0x08, CCW_FMT0)) {
+        puts("Failed to run FBA IPL channel program");
+        return -EIO;
+    }
+
+    pswl->mask |= PSW_MASK_EAMODE;
+    pswl->addr |= PSW_MASK_BAMODE;
+    jump_to_low_kernel();
+    return -1;
+}

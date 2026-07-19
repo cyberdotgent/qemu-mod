@@ -229,7 +229,6 @@ typedef struct ccw1 {
 #define CCW_CMD_DASD_SEEK             0x07
 #define CCW_CMD_DASD_SEARCH_ID_EQ     0x31
 #define CCW_CMD_DASD_READ_MT          0x86
-
 /*
  * Command-mode operation request block
  */
@@ -263,6 +262,7 @@ struct ciw {
 
 #define CU_TYPE_UNKNOWN         0x0000
 #define CU_TYPE_DASD_2107       0x2107
+#define CU_TYPE_DASD_FBA        0x6310
 #define CU_TYPE_VIRTIO          0x3832
 #define CU_TYPE_DASD_3990       0x3990
 

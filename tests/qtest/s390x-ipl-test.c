@@ -48,6 +48,18 @@ static void test_ipl_full_address(void)
     qtest_quit(qts);
 }
 
+static void test_ipl_fba(void)
+{
+    QTestState *qts = qtest_init(
+        "-nodefaults "
+        "-blockdev driver=null-co,node-name=fba,size=1048576 "
+        "-device fba-ccw,drive=fba,devno=fe.0.0200 "
+        "-ipl 200");
+
+    assert_machine_string(qts, "ipl", "0200");
+    qtest_quit(qts);
+}
+
 static void assert_qemu_fails(const char *const extra_argv[],
                               const char *message)
 {
@@ -151,6 +163,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/s390x/ipl/short-address", test_ipl_short_address);
     qtest_add_func("/s390x/ipl/full-address", test_ipl_full_address);
+    qtest_add_func("/s390x/ipl/fba", test_ipl_fba);
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     return g_test_run();

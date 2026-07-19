@@ -1136,6 +1136,22 @@ SRST
     different ports.
 ERST
 
+DEF("dev9336", HAS_ARG, QEMU_OPTION_dev9336,
+    "-dev9336 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,blocks=n][,id=id]\n"
+    "-dev9336 drive=node[,devno=ccw-address][,blocks=n][,id=id]\n"
+    "                add an emulated 9336-20 FBA disk\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev9336 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,blocks=n][,id=id]``
+  \
+``-dev9336 drive=node[,devno=ccw-address][,blocks=n][,id=id]``
+    Add an emulated 9336 model 20 fixed-block disk. With ``file``, QEMU
+    creates an ``if=none`` block backend; ``format`` defaults to ``raw``.
+    Alternatively, ``drive`` attaches an existing block node or ``-drive``
+    backend. A short hexadecimal ``devno`` such as ``200`` means
+    ``fe.0.0200``. The option can be repeated for multiple disks.
+ERST
+
 DEF("device", HAS_ARG, QEMU_OPTION_device,
     "-device driver[,prop=value[,...]]\n"
     "                add device (based on driver)\n"
