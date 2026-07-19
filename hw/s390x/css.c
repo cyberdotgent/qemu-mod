@@ -1883,6 +1883,9 @@ void css_do_tsch_update_subch(SubchDev *sch)
         if (schib->pmcw.chars & PMCW_CHARS_MASK_CSENSE) {
             memset(sch->sense_data, 0 , sizeof(sch->sense_data));
         }
+        if (sch->status_clear_cb) {
+            sch->status_clear_cb(sch);
+        }
     }
 }
 

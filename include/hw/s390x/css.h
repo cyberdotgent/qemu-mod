@@ -142,6 +142,7 @@ struct SubchDev {
     void (*disable_cb)(SubchDev *);
     IOInstEnding (*do_subchannel_work) (SubchDev *);
     void (*irb_cb)(SubchDev *, IRB *);
+    void (*status_clear_cb)(SubchDev *);
     SenseId id;
     void *driver_data;
     ESW esw;

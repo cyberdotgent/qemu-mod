@@ -103,6 +103,7 @@ struct Terminal3270 {
     uint16_t current_start_pos;
     uint32_t queued_bytes;
     uint16_t queued_records;
+    bool attention_pending;
 
     uint8_t record_buf[TN3270_MAX_RECORD_SIZE];
     uint32_t record_len;
@@ -248,6 +249,7 @@ static void terminal_clear_records(Terminal3270 *t)
     t->current_start_pos = 0;
     t->queued_bytes = 0;
     t->queued_records = 0;
+    t->attention_pending = false;
 }
 
 static void terminal_set_unit_check(Terminal3270 *t, uint8_t sense)
@@ -333,6 +335,9 @@ static void terminal_signal_ready(Terminal3270 *t)
     }
     t->reconnect_restore = false;
     sch->curr_status.scsw.dstat = SCSW_DSTAT_DEVICE_END;
+    if (t->queued_records) {
+        t->attention_pending = true;
+    }
     css_conditional_io_interrupt(sch);
 }
 
@@ -439,12 +444,23 @@ static bool terminal_append_record_byte(Terminal3270 *t, uint8_t byte)
     return true;
 }
 
-static void terminal_raise_attention(Terminal3270 *t)
+static void terminal_try_attention(Terminal3270 *t)
 {
     SubchDev *sch = terminal_sch(t);
 
+    if (!t->attention_pending ||
+        !(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||
+        (sch->curr_status.scsw.ctrl & SCSW_STCTL_STATUS_PEND)) {
+        return;
+    }
+    t->attention_pending = false;
     sch->curr_status.scsw.dstat = SCSW_DSTAT_ATTENTION;
     css_conditional_io_interrupt(sch);
+}
+
+static void terminal_status_cleared(SubchDev *sch)
+{
+    terminal_try_attention(TERMINAL_3270(sch->driver_data));
 }
 
 static int terminal_transfer_record(Terminal3270 *t, CCW1 *ccw);
@@ -501,7 +517,8 @@ static void terminal_finish_record(Terminal3270 *t)
     if (t->read_pending) {
         terminal_complete_pending_read(t);
     } else if (was_empty) {
-        terminal_raise_attention(t);
+        t->attention_pending = true;
+        terminal_try_attention(t);
     }
 }
 
@@ -673,6 +690,7 @@ static void terminal_init(EmulatedCcw3270Device *dev, Error **errp)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
 
+    terminal_sch(t)->status_clear_cb = terminal_status_cleared;
     qemu_chr_fe_set_handlers(&t->chr, terminal_can_read,
                              terminal_read, chr_event, NULL, t, NULL, true);
     migration_add_notifier(&t->migration_notifier,
@@ -1031,6 +1049,9 @@ static TN3270Record *terminal_pop_record(Terminal3270 *t)
     QTAILQ_REMOVE(&t->records, record, next);
     t->queued_records--;
     t->queued_bytes -= record->len;
+    if (!t->queued_records) {
+        t->attention_pending = false;
+    }
     return record;
 }
 
@@ -1488,6 +1509,7 @@ static void terminal_unrealize(DeviceState *dev)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
 
+    terminal_sch(t)->status_clear_cb = NULL;
     migration_remove_notifier(&t->migration_notifier);
     qemu_chr_fe_deinit(&t->chr, false);
 }
