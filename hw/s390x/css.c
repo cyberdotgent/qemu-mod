@@ -867,7 +867,7 @@ static inline int ida_read_next_idaw(CcwDataStream *cds)
         ret = address_space_read(&address_space_memory, idaw_addr,
                                  MEMTXATTRS_UNSPECIFIED, &idaw.fmt1,
                                  sizeof(idaw.fmt1));
-        cds->cda = be64_to_cpu(idaw.fmt1);
+        cds->cda = be32_to_cpu(idaw.fmt1);
         if (cds->cda & 0x80000000) {
             return -EINVAL; /* channel program check */
         }
