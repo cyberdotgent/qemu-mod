@@ -929,6 +929,7 @@ static int ccw_dstream_rw_ida(CcwDataStream *cds, void *buff, int len,
         }
         cds->at_byte += iter_len;
         cds->cda += iter_len;
+        buff = (uint8_t *)buff + iter_len;
         len -= iter_len;
         if (!len) {
             break;
