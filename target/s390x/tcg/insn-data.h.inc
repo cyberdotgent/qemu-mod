@@ -116,9 +116,9 @@
     C(0x0d00, BASR,    RR_a,  Z,   0, r2_nz, r1, 0, bas, 0)
     C(0x4d00, BAS,     RX_a,  Z,   0, a2, r1, 0, bas, 0)
 /* BRANCH AND SAVE AND SET MODE */
-    C(0x0c00, BASSM,   RR_a,  Z,   0, r2_nz, r1, 0, bassm, 0)
+    C(0x0c00, BASSM,   RR_a,  Z,   0, r2, r1, 0, bassm, 0)
 /* BRANCH AND SET MODE */
-    C(0x0b00, BSM,     RR_a,  Z,   0, r2_nz, 0, 0, bsm, 0)
+    C(0x0b00, BSM,     RR_a,  Z,   0, r2, 0, 0, bsm, 0)
 /* BRANCH RELATIVE AND SAVE */
     C(0xa705, BRAS,    RI_b,  Z,   0, 0, r1, 0, basi, 0)
     C(0xc005, BRASL,   RIL_b, Z,   0, 0, r1, 0, basi, 0)
@@ -424,6 +424,10 @@
     D(0xa503, IILL,    RI_a,  Z,   r1_o, i2_16u, r1, 0, insi, 0, 0x1000)
 /* INSERT PROGRAM MASK */
     C(0xb222, IPM,     RRE,   Z,   0, 0, r1, 0, ipm, 0)
+/* INSERT PSW KEY */
+    C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
+/* INSERT ADDRESS SPACE CONTROL */
+    C(0xb224, IAC,     RRE,   Z,   0, 0, 0, 0, iac, 0)
 
 /* LOAD */
     C(0x1800, LR,      RR_a,  Z,   0, r2_o, 0, cond_r1r2_32, mov2, 0)
@@ -1381,7 +1385,8 @@
     F(0xb22a, RRBE,    RRE,   Z,   0, r2_o, 0, 0, rrbe, 0, IF_PRIV)
 /* SERVICE CALL LOGICAL PROCESSOR (PV hypercall) */
     F(0xb220, SERVC,   RRE,   Z,   r1_o, r2_o, 0, 0, servc, 0, IF_PRIV | IF_IO)
-/* SET ADDRESS SPACE CONTROL FAST */
+/* SET ADDRESS SPACE CONTROL */
+    C(0xb219, SAC,     S,     Z,   0, a2, 0, 0, sacf, 0)
     C(0xb279, SACF,    S,     Z,   0, a2, 0, 0, sacf, 0)
 /* SET CLOCK */
     F(0xb204, SCK,     S,     Z,   0, m2_64a, 0, 0, sck, 0, IF_PRIV | IF_IO)

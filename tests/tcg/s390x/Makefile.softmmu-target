@@ -17,10 +17,12 @@ LDFLAGS=-nostdlib -static
 
 ASM_TESTS =                                                                    \
     bal                                                                        \
+    bassm                                                                      \
     cksm                                                                       \
     clm                                                                        \
     exrl-ssm-early                                                             \
     icm                                                                        \
+    ipk                                                                        \
     sam                                                                        \
     lpsw                                                                       \
     lpswe-early                                                                \

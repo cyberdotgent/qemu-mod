@@ -1436,11 +1436,13 @@ static void set_addressing_mode_and_target(TCGv_i64 target)
 
 static DisasJumpType op_bassm(DisasContext *s, DisasOps *o)
 {
+    int r2 = get_field(s, r2);
+
     pc_to_link_info(o->out, s, s->pc_tmp);
     if (s->base.tb->flags & FLAG_MASK_64) {
         tcg_gen_ori_i64(o->out, o->out, 1);
     }
-    if (o->in2) {
+    if (r2) {
         set_addressing_mode_and_target(o->in2);
         return help_goto_indirect(s, o->in2);
     }
@@ -1450,6 +1452,7 @@ static DisasJumpType op_bassm(DisasContext *s, DisasOps *o)
 static DisasJumpType op_bsm(DisasContext *s, DisasOps *o)
 {
     int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
 
     if (r1) {
         if (s->base.tb->flags & FLAG_MASK_64) {
@@ -1461,7 +1464,7 @@ static DisasJumpType op_bsm(DisasContext *s, DisasOps *o)
         }
     }
 
-    if (o->in2) {
+    if (r2) {
         set_addressing_mode_and_target(o->in2);
         return help_goto_indirect(s, o->in2);
     }
@@ -2595,6 +2598,49 @@ static DisasJumpType op_ipm(DisasContext *s, DisasOps *o)
 }
 
 #ifndef CONFIG_USER_ONLY
+static void gen_check_extract_authority(DisasContext *s)
+{
+    if (s->base.tb->flags & FLAG_MASK_PSTATE) {
+        TCGv_i64 cr0 = tcg_temp_new_i64();
+        TCGLabel *authorized = gen_new_label();
+
+        tcg_gen_ld_i64(cr0, tcg_env, offsetof(CPUS390XState, cregs[0]));
+        tcg_gen_andi_i64(cr0, cr0, CR0_EXT_AUTH);
+        tcg_gen_brcondi_i64(TCG_COND_NE, cr0, 0, authorized);
+        gen_program_exception(s, PGM_PRIVILEGED);
+        gen_set_label(authorized);
+    }
+}
+
+static DisasJumpType op_iac(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 asc = tcg_temp_new_i64();
+    int r1 = get_field(s, r1);
+
+    if (!(s->base.tb->flags & FLAG_MASK_DAT)) {
+        gen_program_exception(s, PGM_SPECIAL_OP);
+        return DISAS_NORETURN;
+    }
+    gen_check_extract_authority(s);
+    tcg_gen_extract_i64(asc, psw_mask, PSW_SHIFT_ASC, 2);
+    tcg_gen_extrl_i64_i32(cc_op, asc);
+    set_cc_static(s);
+    tcg_gen_deposit_i64(regs[r1], regs[r1], asc, 8, 8);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ipk(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 key = tcg_temp_new_i64();
+
+    gen_check_extract_authority(s);
+
+    tcg_gen_extract_i64(key, psw_mask, PSW_SHIFT_KEY, 4);
+    tcg_gen_shli_i64(key, key, 4);
+    tcg_gen_deposit_i64(regs[2], regs[2], key, 0, 8);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_idte(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 m4;

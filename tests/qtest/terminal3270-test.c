@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/sockets.h"
+#include "hw/s390x/ebcdic.h"
 #include "libqtest.h"
 
 #define TERMINAL_PATH "/machine/peripheral/dev3270-0"
@@ -76,6 +77,23 @@ static void socket_write_fragmented(int fd, const uint8_t *buf, size_t len)
     for (i = 0; i < len; i++) {
         g_assert_cmpint(send(fd, buf + i, 1, 0), ==, 1);
     }
+}
+
+static GByteArray *socket_read_record(int fd)
+{
+    GByteArray *record = g_byte_array_new();
+
+    while (record->len < 65537) {
+        uint8_t byte;
+
+        socket_read_all(fd, &byte, 1);
+        g_byte_array_append(record, &byte, 1);
+        if (record->len >= 2 && record->data[record->len - 2] == TN_IAC &&
+            record->data[record->len - 1] == 0xef) {
+            return record;
+        }
+    }
+    g_assert_not_reached();
 }
 
 static int64_t qom_get_int(QTestState *qts, const char *path,
@@ -265,6 +283,8 @@ static void test_tn3270_negotiation_and_records(void)
         0x6d, 0x40, 0x40, 0xc2, TN_IAC, 0xef,
     };
     g_autofree char *type = NULL;
+    g_autoptr(GByteArray) banner = NULL;
+    uint8_t qemu_ebcdic[4];
     QTestState *qts;
     int port = get_free_port();
     int fd;
@@ -274,6 +294,14 @@ static void test_tn3270_negotiation_and_records(void)
     fd = connect_terminal(port);
     g_assert_false(qtest_qom_get_bool(qts, TERMINAL_PATH, "ready"));
     negotiate_terminal(qts, fd);
+
+    banner = socket_read_record(fd);
+    ebcdic_put(qemu_ebcdic, "QEMU", sizeof(qemu_ebcdic));
+    g_assert_cmpuint(banner->len, >, 4);
+    g_assert_cmphex(banner->data[0], ==, 0xf5);
+    g_assert_cmphex(banner->data[1], ==, 0x42);
+    g_assert_nonnull(memmem(banner->data, banner->len,
+                           qemu_ebcdic, sizeof(qemu_ebcdic)));
 
     type = qom_get_string(qts, TERMINAL_PATH, "terminal-type");
     g_assert_cmpstr(type, ==, "IBM-3278-2-E");

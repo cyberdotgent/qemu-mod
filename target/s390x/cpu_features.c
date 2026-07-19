@@ -77,6 +77,11 @@ void s390_fill_feat_block(const S390FeatBitmap features, S390FeatType type,
             set_be_bit(138, data); /* Configuration-z-architectural-mode */
         }
         break;
+    case S390_FEAT_TYPE_SCLP_CONF_CHAR:
+        if (test_bit(S390_FEAT_ZARCH, features)) {
+            set_be_bit(47, data); /* ESAME mode is installed. */
+        }
+        break;
     case S390_FEAT_TYPE_PTFF:
     case S390_FEAT_TYPE_KMAC:
     case S390_FEAT_TYPE_KMC:

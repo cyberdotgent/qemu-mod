@@ -19,6 +19,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/s390x/3270-ccw.h"
+#include "hw/s390x/ebcdic.h"
 #include "migration/misc.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
@@ -178,6 +179,48 @@ static inline CcwDataStream *terminal_cds(Terminal3270 *t)
 
 static bool terminal_send_record(Terminal3270 *t,
                                  const uint8_t *buf, size_t len);
+
+static void terminal_banner_line(GByteArray *record, Terminal3270 *t,
+                                 unsigned int row, const char *text)
+{
+    int col = MAX(0, ((int)t->cols - (int)strlen(text)) / 2);
+    uint16_t pos = row * t->cols + col;
+    uint8_t address[] = { O3270_SBA, 0, 0, O3270_SF, 0x60 };
+    g_autofree uint8_t *ebcdic = g_malloc(strlen(text));
+
+    if (pos < 4096) {
+        address[1] = sba_code[pos >> 6];
+        address[2] = sba_code[pos & 0x3f];
+    } else {
+        address[1] = pos >> 8;
+        address[2] = pos;
+    }
+    ebcdic_put(ebcdic, text, strlen(text));
+    g_byte_array_append(record, address, sizeof(address));
+    g_byte_array_append(record, ebcdic, strlen(text));
+}
+
+static bool terminal_send_banner(Terminal3270 *t)
+{
+    SubchDev *sch = terminal_sch(t);
+    g_autoptr(GByteArray) record = g_byte_array_new();
+    g_autofree char *address = NULL;
+    g_autofree char *terminal = NULL;
+    const uint8_t header[] = { TN3270_CMD_EWRITE, 0x42 };
+
+    address = g_strdup_printf("CCW device %02x.%x.%04x  subchannel %04x",
+                              sch->cssid, sch->ssid, sch->devno, sch->schid);
+    terminal = g_strdup_printf("%s  model %u  %ux%u%s",
+                               t->terminal_type, t->model, t->cols, t->rows,
+                               t->eab ? "  extended attributes" : "");
+    g_byte_array_append(record, header, sizeof(header));
+    terminal_banner_line(record, t, 4, "QEMU s390x 3270 terminal");
+    terminal_banner_line(record, t, 7, address);
+    terminal_banner_line(record, t, 9, terminal);
+    terminal_banner_line(record, t, 13,
+                         "Connected - press Enter to signal attention");
+    return terminal_send_record(t, record->data, record->len);
+}
 static int terminal_migration_notify(NotifierWithReturn *notifier,
                                      MigrationEvent *event, Error **errp);
 
@@ -267,6 +310,15 @@ static void terminal_signal_ready(Terminal3270 *t)
     }
     t->ready = true;
     trace_terminal3270_ready(sch->devno, (char *)t->terminal_type);
+
+    /*
+     * A newly attached display is inhibited until it receives its first
+     * output.  Real console controllers and Hercules present an initial
+     * connection screen before reporting device end.
+     */
+    if (!t->reconnect_restore && !terminal_send_banner(t)) {
+        return;
+    }
 
     while (offset + sizeof(uint32_t) <= t->replay->len) {
         uint32_t len = ldl_be_p(t->replay->data + offset);
