@@ -2679,24 +2679,38 @@ void HELPER(purge)(CPUS390XState *env)
 }
 
 /* load real address */
-uint64_t HELPER(lra)(CPUS390XState *env, uint64_t r1, uint64_t addr)
+uint64_t HELPER(lra)(CPUS390XState *env, uint64_t r1, uint64_t addr,
+                     uint32_t is_long)
 {
     uint64_t asc = env->psw.mask & PSW_MASK_ASC;
     uint64_t ret, tec;
-    int flags, exc, cc;
+    int flags, exc, cc, lra_cc;
 
-    /* XXX incomplete - has more corner cases */
+    /* The effective address must fit the current addressing mode. */
     if (!(env->psw.mask & PSW_MASK_64) && (addr >> 32)) {
         tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
     }
 
-    exc = mmu_translate(env, addr, MMU_S390_LRA, asc, &ret, &flags, &tec);
+    exc = mmu_translate(env, addr, MMU_S390_LRA, asc, &ret, &flags, &tec,
+                        &lra_cc);
     if (exc) {
-        cc = 3;
-        ret = (r1 & 0xFFFFFFFF00000000ULL) | exc | 0x80000000;
+        cc = lra_cc;
+        if (cc < 0 || (cc == 3 && ret > 0x7fffffff)) {
+            cc = 3;
+            ret = (r1 & 0xffffffff00000000ULL) | 0x80000000 | exc;
+        } else if (!is_long &&
+                   (!(env->psw.mask & PSW_MASK_64) || cc == 3)) {
+            ret = (r1 & 0xffffffff00000000ULL) | (uint32_t)ret;
+        }
     } else {
         cc = 0;
         ret |= addr & ~TARGET_PAGE_MASK;
+        if (!is_long && !(env->psw.mask & PSW_MASK_64)) {
+            if (ret > 0x7fffffff) {
+                tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+            }
+            ret = (r1 & 0xffffffff00000000ULL) | (uint32_t)ret;
+        }
     }
 
     env->cc_op = cc;

@@ -3140,7 +3140,10 @@ static DisasJumpType op_lctlg(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_lra(DisasContext *s, DisasOps *o)
 {
-    gen_helper_lra(o->out, tcg_env, o->out, o->in2);
+    TCGv_i32 is_long = tcg_constant_i32(s->fields.op == 0xe3 &&
+                                        s->fields.op2 == 0x03);
+
+    gen_helper_lra(o->out, tcg_env, o->out, o->in2, is_long);
     set_cc_static(s);
     return DISAS_NEXT;
 }

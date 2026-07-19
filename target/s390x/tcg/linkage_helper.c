@@ -320,7 +320,7 @@ static int linkage_access_prepare(CPUS390XState *env,
 
         g_assert(nr_pages < LINKAGE_ACCESS_MAX_PAGES);
         exc = mmu_translate(env, addr, rw, PSW_ASC_HOME,
-                            &raddr, &flags, &tec);
+                            &raddr, &flags, &tec, NULL);
         if (exc) {
             env->tlb_fill_exc = exc;
             env->tlb_fill_tec = tec;

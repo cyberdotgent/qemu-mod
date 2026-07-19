@@ -170,7 +170,8 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         if (!(env->psw.mask & PSW_MASK_64)) {
             vaddr &= 0x7fffffff;
         }
-        excp = mmu_translate(env, vaddr, access_type, asc, &raddr, &prot, &tec);
+        excp = mmu_translate(env, vaddr, access_type, asc, &raddr, &prot, &tec,
+                             NULL);
         env->tlb_fill_arn = mmu_idx >= MMU_ACCREG_IDX_BASE ?
                             mmu_idx - MMU_ACCREG_IDX_BASE : 0;
     } else if (mmu_idx == MMU_REAL_IDX) {

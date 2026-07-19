@@ -232,7 +232,7 @@ static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
 
 static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
                               uint64_t asc, uint64_t asce, hwaddr *raddr,
-                              int *flags)
+                              int *flags, int *lra_cc)
 {
     const bool edat1 = (env->cregs[0] & CR0_EDAT) &&
                        s390_has_feat(S390_FEAT_EDAT);
@@ -280,10 +280,12 @@ static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
             VADDR_REGION3_TX(vaddr)) {
             return PGM_ASCE_TYPE;
         }
+        gaddr += VADDR_SEGMENT_TX(vaddr) * 8;
         if (VADDR_SEGMENT_TL(vaddr) > asce_tl) {
+            *raddr = gaddr;
+            *lra_cc = 3;
             return PGM_SEGMENT_TRANS;
         }
-        gaddr += VADDR_SEGMENT_TX(vaddr) * 8;
         break;
     }
 
@@ -350,17 +352,22 @@ static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
                      (vaddr & ~REGION3_ENTRY_RFAA);
             return 0;
         }
+        gaddr = (entry & REGION_ENTRY_ORIGIN) +
+                VADDR_SEGMENT_TX(vaddr) * 8;
         if (VADDR_SEGMENT_TL(vaddr) < (entry & REGION_ENTRY_TF) >> 6 ||
             VADDR_SEGMENT_TL(vaddr) > (entry & REGION_ENTRY_TL)) {
+            *raddr = gaddr;
+            *lra_cc = 3;
             return PGM_SEGMENT_TRANS;
         }
-        gaddr = (entry & REGION_ENTRY_ORIGIN) + VADDR_SEGMENT_TX(vaddr) * 8;
         /* fall through */
     case ASCE_TYPE_SEGMENT:
         if (!read_table_entry(env, gaddr, &entry)) {
             return PGM_ADDRESSING;
         }
         if (entry & SEGMENT_ENTRY_I) {
+            *raddr = gaddr;
+            *lra_cc = 1;
             return PGM_SEGMENT_TRANS;
         }
         if ((entry & SEGMENT_ENTRY_TT) != SEGMENT_ENTRY_TT_SEGMENT) {
@@ -388,6 +395,8 @@ static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
         return PGM_ADDRESSING;
     }
     if (entry & PAGE_ENTRY_I) {
+        *raddr = gaddr;
+        *lra_cc = 2;
         return PGM_PAGE_TRANS;
     }
     if (entry & PAGE_ENTRY_0) {
@@ -487,21 +496,28 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
  * @param flags  the PAGE_READ/WRITE/EXEC flags are stored to this pointer
  * @param tec    the translation exception code if stored to this pointer if
  *               there is an exception to raise
+ * @param lra_cc the LRA condition code for a translation exception, or -1
+ *               when the exception code must be returned; may be NULL
  * @return       0 = success, != 0, the exception to raise
  */
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
-                  hwaddr *raddr, int *flags, uint64_t *tec)
+                  hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc)
 {
     uint64_t logical_addr = vaddr;
     uint64_t asc_mode = asc & PSW_MASK_ASC;
     uint64_t asce = 0;
     unsigned int arn = asc & 0xf;
     bool art_fetch_only = false;
+    int unused_lra_cc;
     int r;
 
     *tec = (vaddr & TARGET_PAGE_MASK) | (asc_mode >> 46) |
             (rw == MMU_DATA_STORE ? FS_WRITE : FS_READ);
     *flags = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+    if (!lra_cc) {
+        lra_cc = &unused_lra_cc;
+    }
+    *lra_cc = -1;
 
     vaddr &= TARGET_PAGE_MASK;
 
@@ -543,7 +559,8 @@ int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
     }
 
     if (env->psw.mask & PSW_MASK_DAT || rw == MMU_S390_LRA) {
-        r = mmu_translate_asce(env, vaddr, asc_mode, asce, raddr, flags);
+        r = mmu_translate_asce(env, vaddr, asc_mode, asce, raddr, flags,
+                               lra_cc);
         if (unlikely(r)) {
             return r;
         }
@@ -588,7 +605,8 @@ static int translate_pages(S390CPU *cpu, vaddr addr, int nr_pages,
     int ret, i, pflags;
 
     for (i = 0; i < nr_pages; i++) {
-        ret = mmu_translate(env, addr, is_write, asc, &pages[i], &pflags, tec);
+        ret = mmu_translate(env, addr, is_write, asc, &pages[i], &pflags, tec,
+                            NULL);
         if (ret) {
             return ret;
         }
