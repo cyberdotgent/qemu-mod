@@ -37,6 +37,22 @@
 #define FS_READ  0x800
 #define FS_WRITE 0x400
 
+#define ALET_RESERVED      0xfe000000U
+#define ALET_PRIMARY_LIST  0x01000000U
+#define ALET_SEQUENCE      0x00ff0000U
+#define ALET_ALEN          0x0000ffffU
+#define ALD_ORIGIN         0x7fffff00U
+#define ALD_LENGTH         0x000000ffU
+#define ALE_INVALID        0x80000000U
+#define ALE_FETCH_ONLY     0x02000000U
+#define ALE_PRIVATE        0x01000000U
+#define ALE_SEQUENCE       0x00ff0000U
+#define ALE_AUTH_INDEX     0x0000ffffU
+#define ALE_ASTE_ORIGIN    0x7fffffc0U
+#define ASTE_INVALID       0x80000000U
+#define ASTE_AUTH_ORIGIN   0x7ffffffcU
+#define ASTE_AUTH_LENGTH   0x0000fff0U
+
 static void trigger_access_exception(CPUS390XState *env, uint32_t type,
                                      uint64_t tec)
 {
@@ -62,7 +78,7 @@ static bool is_low_address(uint64_t addr)
 }
 
 /* check whether Low-Address Protection is enabled for mmu_translate() */
-static bool lowprot_enabled(const CPUS390XState *env, uint64_t asc)
+static bool lowprot_enabled(const CPUS390XState *env, uint64_t asce)
 {
     if (!(env->cregs[0] & CR0_LOWPROT)) {
         return false;
@@ -70,20 +86,7 @@ static bool lowprot_enabled(const CPUS390XState *env, uint64_t asc)
     if (!(env->psw.mask & PSW_MASK_DAT)) {
         return true;
     }
-
-    /* Check the private-space control bit */
-    switch (asc) {
-    case PSW_ASC_PRIMARY:
-        return !(env->cregs[1] & ASCE_PRIVATE_SPACE);
-    case PSW_ASC_SECONDARY:
-        return !(env->cregs[7] & ASCE_PRIVATE_SPACE);
-    case PSW_ASC_HOME:
-        return !(env->cregs[13] & ASCE_PRIVATE_SPACE);
-    default:
-        /* We don't support access register mode */
-        error_report("unsupported addressing mode");
-        exit(1);
-    }
+    return !(asce & ASCE_PRIVATE_SPACE);
 }
 
 /**
@@ -124,6 +127,107 @@ static inline bool read_table_entry(CPUS390XState *env, hwaddr gaddr,
     *entry = address_space_ldq_be(cs->as, gaddr, MEMTXATTRS_UNSPECIFIED, &ret);
 
     return ret == MEMTX_OK;
+}
+
+static bool mmu_read_real(CPUS390XState *env, uint32_t raddr,
+                          void *buf, size_t len)
+{
+    return address_space_read(env_cpu(env)->as, mmu_real2abs(env, raddr),
+                              MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
+}
+
+static int mmu_authorize_extended(CPUS390XState *env,
+                                  const uint32_t aste[16], uint16_t eax)
+{
+    uint32_t atl = (aste[1] & ASTE_AUTH_LENGTH) >> 4;
+    uint32_t addr;
+    uint8_t entry;
+
+    if ((eax >> 4) > atl) {
+        return PGM_EXT_AUTH;
+    }
+    addr = ((aste[0] & ASTE_AUTH_ORIGIN) + (eax >> 2)) & 0x7fffffffU;
+    if (!mmu_read_real(env, addr, &entry, sizeof(entry))) {
+        return PGM_ADDRESSING;
+    }
+    return entry & (0x40 >> ((eax & 3) * 2)) ? 0 : PGM_EXT_AUTH;
+}
+
+static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
+                             uint64_t *asce, bool *fetch_only)
+{
+    uint32_t alet = arn ? env->aregs[arn] : 0;
+    uint32_t ale[4];
+    uint32_t aste[16];
+    uint32_t cb;
+    uint32_t ald;
+    uint32_t ale_addr;
+    uint32_t aste_addr;
+    uint16_t eax = env->cregs[8] >> 16;
+    int exc;
+
+    *fetch_only = false;
+    if (alet == 0) {
+        *asce = env->cregs[1];
+        return 0;
+    }
+    if (alet == 1) {
+        *asce = env->cregs[7];
+        return 0;
+    }
+    if (alet & ALET_RESERVED) {
+        return PGM_ALET_SPEC;
+    }
+
+    cb = alet & ALET_PRIMARY_LIST ? env->cregs[5] : env->cregs[2];
+    cb &= 0x7fffffc0U;
+    if (!mmu_read_real(env, cb + 16, &ald, sizeof(ald))) {
+        return PGM_ADDRESSING;
+    }
+    ald = be32_to_cpu(ald);
+    if (((alet & ALET_ALEN) >> 4) > (ald & ALD_LENGTH)) {
+        return PGM_ALEN_SPEC;
+    }
+
+    ale_addr = ((ald & ALD_ORIGIN) + (alet & ALET_ALEN) * 16) &
+               0x7fffffffU;
+    if (!mmu_read_real(env, ale_addr, ale, sizeof(ale))) {
+        return PGM_ADDRESSING;
+    }
+    for (int i = 0; i < ARRAY_SIZE(ale); i++) {
+        ale[i] = be32_to_cpu(ale[i]);
+    }
+    if (ale[0] & ALE_INVALID) {
+        return PGM_ALEN_SPEC;
+    }
+    if ((ale[0] & ALE_SEQUENCE) != (alet & ALET_SEQUENCE)) {
+        return PGM_ALE_SEQ;
+    }
+
+    aste_addr = ale[2] & ALE_ASTE_ORIGIN;
+    if (!mmu_read_real(env, aste_addr, aste, sizeof(aste))) {
+        return PGM_ADDRESSING;
+    }
+    for (int i = 0; i < ARRAY_SIZE(aste); i++) {
+        aste[i] = be32_to_cpu(aste[i]);
+    }
+    if (aste[0] & ASTE_INVALID) {
+        return PGM_ASTE_VALID;
+    }
+    if (aste[5] != ale[3]) {
+        return PGM_ASTE_SEQ;
+    }
+
+    if ((ale[0] & ALE_PRIVATE) && (ale[0] & ALE_AUTH_INDEX) != eax) {
+        exc = mmu_authorize_extended(env, aste, eax);
+        if (exc) {
+            return exc;
+        }
+    }
+    *fetch_only = (ale[0] & ALE_FETCH_ONLY) && rw == MMU_DATA_STORE;
+
+    *asce = (uint64_t)aste[2] << 32 | aste[3];
+    return 0;
 }
 
 static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
@@ -388,74 +492,75 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
                   hwaddr *raddr, int *flags, uint64_t *tec)
 {
-    uint64_t asce;
+    uint64_t logical_addr = vaddr;
+    uint64_t asc_mode = asc & PSW_MASK_ASC;
+    uint64_t asce = 0;
+    unsigned int arn = asc & 0xf;
+    bool art_fetch_only = false;
     int r;
 
-    *tec = (vaddr & TARGET_PAGE_MASK) | (asc >> 46) |
+    *tec = (vaddr & TARGET_PAGE_MASK) | (asc_mode >> 46) |
             (rw == MMU_DATA_STORE ? FS_WRITE : FS_READ);
     *flags = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
-
-    if (is_low_address(vaddr & TARGET_PAGE_MASK) && lowprot_enabled(env, asc)) {
-        /*
-         * If any part of this page is currently protected, make sure the
-         * TLB entry will not be reused.
-         *
-         * As the protected range is always the first 512 bytes of the
-         * two first pages, we are able to catch all writes to these areas
-         * just by looking at the start address (triggering the tlb miss).
-         */
-        *flags |= PAGE_WRITE_INV;
-        if (is_low_address(vaddr) && rw == MMU_DATA_STORE) {
-            /* LAP sets bit 56 */
-            *tec |= 0x80;
-            return PGM_PROTECTION;
-        }
-    }
 
     vaddr &= TARGET_PAGE_MASK;
 
     if (rw != MMU_S390_LRA && !(env->psw.mask & PSW_MASK_DAT)) {
         *raddr = vaddr;
-        goto nodat;
+    } else {
+        switch (asc_mode) {
+        case PSW_ASC_PRIMARY:
+            asce = env->cregs[1];
+            break;
+        case PSW_ASC_HOME:
+            asce = env->cregs[13];
+            break;
+        case PSW_ASC_SECONDARY:
+            asce = env->cregs[7];
+            break;
+        case PSW_ASC_ACCREG:
+            r = mmu_translate_arn(env, arn, rw, &asce, &art_fetch_only);
+            if (r) {
+                return r;
+            }
+            break;
+        default:
+            g_assert_not_reached();
+        }
     }
 
-    switch (asc) {
-    case PSW_ASC_PRIMARY:
-        asce = env->cregs[1];
-        break;
-    case PSW_ASC_HOME:
-        asce = env->cregs[13];
-        break;
-    case PSW_ASC_SECONDARY:
-        asce = env->cregs[7];
-        break;
-    case PSW_ASC_ACCREG:
-    default:
-        hw_error("guest switched to unknown asc mode\n");
-        break;
+    if (is_low_address(vaddr & TARGET_PAGE_MASK) &&
+        lowprot_enabled(env, asce)) {
+        /*
+         * If any part of this page is currently protected, make sure the
+         * TLB entry will not be reused.
+         */
+        *flags |= PAGE_WRITE_INV;
+        if (is_low_address(logical_addr) && rw == MMU_DATA_STORE) {
+            *tec |= 0x80;
+            return PGM_PROTECTION;
+        }
     }
 
-    /* perform the DAT translation */
-    r = mmu_translate_asce(env, vaddr, asc, asce, raddr, flags);
-    if (unlikely(r)) {
-        return r;
+    if (env->psw.mask & PSW_MASK_DAT || rw == MMU_S390_LRA) {
+        r = mmu_translate_asce(env, vaddr, asc_mode, asce, raddr, flags);
+        if (unlikely(r)) {
+            return r;
+        }
+
+        if (art_fetch_only) {
+            *flags &= ~PAGE_WRITE;
+        }
+        if (unlikely(rw == MMU_DATA_STORE && !(*flags & PAGE_WRITE))) {
+            *tec |= 0x4;
+            return PGM_PROTECTION;
+        }
+        if (unlikely(rw == MMU_INST_FETCH && !(*flags & PAGE_EXEC))) {
+            *tec |= 0x84;
+            return PGM_PROTECTION;
+        }
     }
 
-    /* check for DAT protection */
-    if (unlikely(rw == MMU_DATA_STORE && !(*flags & PAGE_WRITE))) {
-        /* DAT sets bit 61 only */
-        *tec |= 0x4;
-        return PGM_PROTECTION;
-    }
-
-    /* check for Instruction-Execution-Protection */
-    if (unlikely(rw == MMU_INST_FETCH && !(*flags & PAGE_EXEC))) {
-        /* IEP sets bit 56 and 61 */
-        *tec |= 0x84;
-        return PGM_PROTECTION;
-    }
-
-nodat:
     if (rw >= 0) {
         /* Convert real address -> absolute address */
         *raddr = mmu_real2abs(env, *raddr);

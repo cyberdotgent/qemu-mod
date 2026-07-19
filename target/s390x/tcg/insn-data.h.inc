@@ -1395,6 +1395,7 @@
 /* MOVE TO SECONDARY */
     C(0xdb00, MVCS,    SS_d,  Z,   la1, a2, 0, 0, mvcs, 0)
 /* PURGE TLB */
+    F(0xb248, PALB,    RRE,   Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
     F(0xb20d, PTLB,    S,     Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
 /* RESET REFERENCE BIT EXTENDED */
     F(0xb22a, RRBE,    RRE,   Z,   0, r2_o, 0, 0, rrbe, 0, IF_PRIV)

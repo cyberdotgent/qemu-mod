@@ -16,6 +16,7 @@ LDFLAGS=-nostdlib -static
 	$(CC) $< -o $@ $(LDFLAGS)
 
 ASM_TESTS =                                                                    \
+    art                                                                        \
     bal                                                                        \
     bakr                                                                       \
     bassm                                                                      \

@@ -133,6 +133,10 @@ void s390_cpu_record_sigbus(CPUState *cs, vaddr address,
 
 static inline uint64_t cpu_mmu_idx_to_asc(int mmu_idx)
 {
+    if (mmu_idx >= MMU_ACCREG_IDX_BASE) {
+        return PSW_ASC_ACCREG | (mmu_idx - MMU_ACCREG_IDX_BASE);
+    }
+
     switch (mmu_idx) {
     case MMU_PRIMARY_IDX:
         return PSW_ASC_PRIMARY;
@@ -160,13 +164,15 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     vaddr = address;
 
-    if (mmu_idx < MMU_REAL_IDX) {
+    if (mmu_idx < MMU_REAL_IDX || mmu_idx >= MMU_ACCREG_IDX_BASE) {
         asc = cpu_mmu_idx_to_asc(mmu_idx);
         /* 31-Bit mode */
         if (!(env->psw.mask & PSW_MASK_64)) {
             vaddr &= 0x7fffffff;
         }
         excp = mmu_translate(env, vaddr, access_type, asc, &raddr, &prot, &tec);
+        env->tlb_fill_arn = mmu_idx >= MMU_ACCREG_IDX_BASE ?
+                            mmu_idx - MMU_ACCREG_IDX_BASE : 0;
     } else if (mmu_idx == MMU_REAL_IDX) {
         /* 31-Bit mode */
         if (!(env->psw.mask & PSW_MASK_64)) {
@@ -236,7 +242,6 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_SEC_AUTH:
     case PGM_LFX_TRANS:
     case PGM_LSX_TRANS:
-    case PGM_ALET_SPEC:
     case PGM_ALEN_SPEC:
     case PGM_ALE_SEQ:
     case PGM_ASTE_VALID:
@@ -245,6 +250,10 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_LSTE_SEQ:
     case PGM_ASTE_INSTANCE:
         set_trans_exc_code = true;
+        break;
+    case PGM_ALET_SPEC:
+        set_trans_exc_code = true;
+        advance = true;
         break;
     case PGM_PROTECTION:
         assert(env->int_pgm_code == env->tlb_fill_exc);
@@ -286,6 +295,19 @@ static void do_program_interrupt(CPUS390XState *env)
                   env->psw.addr);
 
     lowcore = cpu_map_lowcore(env);
+
+    switch (env->int_pgm_code) {
+    case PGM_ALET_SPEC:
+    case PGM_ALEN_SPEC:
+    case PGM_ALE_SEQ:
+    case PGM_ASTE_VALID:
+    case PGM_ASTE_SEQ:
+    case PGM_EXT_AUTH:
+        lowcore->exc_access_id = env->tlb_fill_arn;
+        break;
+    default:
+        break;
+    }
 
     /* Signal PER events with the exception.  */
     if (env->per_perc_atmid) {

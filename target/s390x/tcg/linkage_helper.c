@@ -592,6 +592,7 @@ void HELPER(pr)(CPUS390XState *env)
     }
 
     env->cregs[15] = preceding_desc_addr & ~0x7ULL;
+    tlb_flush(env_cpu(env));
     s390_cpu_set_psw(env, new_mask, new_addr);
     cpu_loop_exit(env_cpu(env));
 }
@@ -640,6 +641,7 @@ void HELPER(ereg)(CPUS390XState *env, uint32_t r1, uint32_t r2,
         }
         reg = (reg + 1) & 15;
     }
+    tlb_flush(env_cpu(env));
 }
 
 uint32_t HELPER(esta)(CPUS390XState *env, uint32_t r1, uint32_t r2)

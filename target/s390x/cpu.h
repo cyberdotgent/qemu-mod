@@ -112,6 +112,7 @@ typedef struct CPUArchState {
 
 #if !defined(CONFIG_USER_ONLY)
     uint64_t tlb_fill_tec;   /* translation exception code during tlb_fill */
+    uint8_t tlb_fill_arn;    /* access register used during tlb_fill */
     int tlb_fill_exc;        /* exception number seen during tlb_fill */
 #endif
 
@@ -390,6 +391,8 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 #define MMU_SECONDARY_IDX       1
 #define MMU_HOME_IDX            2
 #define MMU_REAL_IDX            3
+#define MMU_ACCREG_IDX_BASE     4
+#define MMU_ACCREG_IDX(arn)     (MMU_ACCREG_IDX_BASE + (arn))
 
 static inline int s390x_env_mmu_index(CPUS390XState *env, bool ifetch)
 {
@@ -415,7 +418,7 @@ static inline int s390x_env_mmu_index(CPUS390XState *env, bool ifetch)
     case PSW_ASC_HOME:
         return MMU_HOME_IDX;
     case PSW_ASC_ACCREG:
-        /* Fallthrough: access register mode is not yet supported */
+        return MMU_ACCREG_IDX(0);
     default:
         abort();
     }
