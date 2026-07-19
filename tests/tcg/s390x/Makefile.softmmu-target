@@ -30,6 +30,7 @@ ASM_TESTS =                                                                    \
     lra                                                                        \
     mc                                                                         \
     pc                                                                         \
+    pc-ss                                                                      \
     per                                                                        \
     precise-smc-softmmu                                                        \
     sckc                                                                       \

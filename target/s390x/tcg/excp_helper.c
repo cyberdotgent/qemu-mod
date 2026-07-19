@@ -227,6 +227,25 @@ static void do_program_interrupt(CPUS390XState *env)
         assert(env->int_pgm_code == env->tlb_fill_exc);
         set_trans_exc_code = true;
         break;
+    case PGM_SPACE_SWITCH:
+    case PGM_AFX_TRANS:
+    case PGM_ASX_TRANS:
+    case PGM_LX_TRANS:
+    case PGM_EX_TRANS:
+    case PGM_PRIM_AUTH:
+    case PGM_SEC_AUTH:
+    case PGM_LFX_TRANS:
+    case PGM_LSX_TRANS:
+    case PGM_ALET_SPEC:
+    case PGM_ALEN_SPEC:
+    case PGM_ALE_SEQ:
+    case PGM_ASTE_VALID:
+    case PGM_ASTE_SEQ:
+    case PGM_EXT_AUTH:
+    case PGM_LSTE_SEQ:
+    case PGM_ASTE_INSTANCE:
+        set_trans_exc_code = true;
+        break;
     case PGM_PROTECTION:
         assert(env->int_pgm_code == env->tlb_fill_exc);
         set_trans_exc_code = true;
@@ -251,7 +270,6 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_OPERAND:
     case PGM_HFP_SQRT:
     case PGM_PC_TRANS_SPEC:
-    case PGM_ALET_SPEC:
     case PGM_MONITOR:
         advance = true;
         break;

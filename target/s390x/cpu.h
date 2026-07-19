@@ -239,6 +239,7 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_ASTE_SEQ                    0x002c
 #define PGM_EXT_AUTH                    0x002d
 #define PGM_LSTE_SEQ                    0x002e
+#define PGM_ASTE_INSTANCE               0x002f
 #define PGM_STACK_FULL                  0x0030
 #define PGM_STACK_EMPTY                 0x0031
 #define PGM_STACK_SPEC                  0x0032
@@ -371,6 +372,11 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 
 /* Control register 14 bits */
 #define CR14_CHANNEL_REPORT_SC  0x0000000010000000ULL
+#define CR14_ASN_TRANSLATION    0x0000000000080000ULL
+#define CR14_ASN_FIRST_ORIGIN   0x000000000007ffffULL
+
+/* Address-space-control-element bits */
+#define ASCE_SPACE_SWITCH_EVENT 0x0000000000000040ULL
 
 /* Control register 12 bits */
 #define CR12_BRANCH_TRACE       0x8000000000000000ULL
