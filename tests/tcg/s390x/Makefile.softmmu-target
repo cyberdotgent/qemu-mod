@@ -17,6 +17,7 @@ LDFLAGS=-nostdlib -static
 
 ASM_TESTS =                                                                    \
     bal                                                                        \
+    bakr                                                                       \
     bassm                                                                      \
     cksm                                                                       \
     clm                                                                        \
@@ -28,6 +29,7 @@ ASM_TESTS =                                                                    \
     lpswe-early                                                                \
     lra                                                                        \
     mc                                                                         \
+    pc                                                                         \
     per                                                                        \
     precise-smc-softmmu                                                        \
     sckc                                                                       \

@@ -230,12 +230,15 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_EX_TRANS                    0x0023
 #define PGM_PRIM_AUTH                   0x0024
 #define PGM_SEC_AUTH                    0x0025
+#define PGM_LFX_TRANS                   0x0026
+#define PGM_LSX_TRANS                   0x0027
 #define PGM_ALET_SPEC                   0x0028
 #define PGM_ALEN_SPEC                   0x0029
 #define PGM_ALE_SEQ                     0x002a
 #define PGM_ASTE_VALID                  0x002b
 #define PGM_ASTE_SEQ                    0x002c
 #define PGM_EXT_AUTH                    0x002d
+#define PGM_LSTE_SEQ                    0x002e
 #define PGM_STACK_FULL                  0x0030
 #define PGM_STACK_EMPTY                 0x0031
 #define PGM_STACK_SPEC                  0x0032
@@ -355,6 +358,7 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 #define CR0_LOWPROT             0x0000000010000000ULL
 #define CR0_EXT_AUTH            0x0000000008000000ULL
 #define CR0_SECONDARY           0x0000000004000000ULL
+#define CR0_ASN_LX_REUSE        0x0000000000080000ULL
 #define CR0_EDAT                0x0000000000800000ULL
 #define CR0_AFP                 0x0000000000040000ULL
 #define CR0_VECTOR              0x0000000000020000ULL
@@ -367,6 +371,13 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 
 /* Control register 14 bits */
 #define CR14_CHANNEL_REPORT_SC  0x0000000010000000ULL
+
+/* Control register 12 bits */
+#define CR12_BRANCH_TRACE       0x8000000000000000ULL
+#define CR12_MODE_TRACE         0x4000000000000000ULL
+#define CR12_TRACE_ENTRY_MASK   0x3ffffffffffffffcULL
+#define CR12_ASN_TRACE          0x0000000000000002ULL
+#define CR12_EXPLICIT_TRACE     0x0000000000000001ULL
 
 /* MMU */
 #define MMU_PRIMARY_IDX         0

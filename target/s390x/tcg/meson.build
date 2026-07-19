@@ -1,5 +1,6 @@
 s390x_ss.add(when: 'CONFIG_TCG', if_true: files(
   'int_helper.c',
+  'linkage_helper.c',
   'mem_helper.c',
   'misc_helper.c',
 ))

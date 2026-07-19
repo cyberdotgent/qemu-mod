@@ -1187,6 +1187,73 @@ static DisasJumpType op_abs(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+#ifndef CONFIG_USER_ONLY
+static DisasJumpType op_bakr(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    gen_helper_bakr(dest, tcg_env, tcg_constant_i32(r1),
+                    tcg_constant_i32(r2), tcg_constant_i64(s->pc_tmp));
+    if (r2) {
+        return help_goto_indirect(s, dest);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pr(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pr(tcg_env);
+    return DISAS_NORETURN;
+}
+
+static DisasJumpType do_ereg(DisasContext *s, bool is_64)
+{
+    gen_helper_ereg(tcg_env, tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, r2)),
+                    tcg_constant_i32(is_64));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ereg(DisasContext *s, DisasOps *o)
+{
+    return do_ereg(s, false);
+}
+
+static DisasJumpType op_eregg(DisasContext *s, DisasOps *o)
+{
+    return do_ereg(s, true);
+}
+
+static DisasJumpType op_esta(DisasContext *s, DisasOps *o)
+{
+    gen_helper_esta(cc_op, tcg_env,
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, r2)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_msta(DisasContext *s, DisasOps *o)
+{
+    gen_helper_msta(tcg_env, tcg_constant_i32(get_field(s, r1)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pc(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    gen_helper_pc(dest, tcg_env, o->in2, tcg_constant_i64(s->pc_tmp));
+    return help_goto_indirect(s, dest);
+}
+#endif
+
 static DisasJumpType op_absf32(DisasContext *s, DisasOps *o)
 {
     tcg_gen_andi_i64(o->out, o->in2, 0x7fffffffull);

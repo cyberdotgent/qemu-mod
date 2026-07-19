@@ -1346,6 +1346,17 @@
     F(0xe74a, VFTCI,   VRI_e, V,   0, 0, 0, 0, vftci, 0, IF_VEC)
 
 #ifndef CONFIG_USER_ONLY
+/* PROGRAM RETURN */
+    C(0x0101, PR,      E,     Z,   0, 0, 0, 0, pr, 0)
+/* PROGRAM CALL */
+    C(0xb218, PC,      S,     Z,   0, a2, 0, 0, pc, 0)
+/* EXTRACT STACKED REGISTERS */
+    C(0xb249, EREG,    RRE,   Z,   0, 0, 0, 0, ereg, 0)
+    C(0xb90e, EREGG,   RRE,   Z,   0, 0, 0, 0, eregg, 0)
+/* EXTRACT STACKED STATE */
+    C(0xb24a, ESTA,    RRE,   Z,   0, 0, 0, 0, esta, 0)
+/* MODIFY STACKED STATE */
+    C(0xb247, MSTA,    RRE,   Z,   0, 0, 0, 0, msta, 0)
 /* COMPARE AND SWAP AND PURGE */
     E(0xb250, CSP,     RRE,   Z,   r1_32u, ra2, r1_P, 0, csp, 0, MO_BEUL, IF_PRIV)
     E(0xb98a, CSPG,    RRE, DAT_ENH, r1_o, ra2, r1_P, 0, csp, 0, MO_BEUQ, IF_PRIV)
@@ -1359,6 +1370,8 @@
     F(0xb229, ISKE,    RRE,   Z,   0, r2_o, new, r1_8, iske, 0, IF_PRIV)
 /* INVALIDATE DAT TABLE ENTRY */
     F(0xb98e, IPDE,    RRF_b, Z,   r1_o, r2_o, 0, 0, idte, 0, IF_PRIV)
+/* BRANCH AND STACK */
+    C(0xb240, BAKR,    RRE,   Z,   0, 0, 0, 0, bakr, 0)
 /* INVALIDATE PAGE TABLE ENTRY */
     F(0xb221, IPTE,    RRF_a, Z,   r1_o, r2_o, 0, 0, ipte, 0, IF_PRIV)
 /* LOAD CONTROL */
