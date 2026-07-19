@@ -29,6 +29,7 @@ TESTS+=branch-relative-long
 TESTS+=noexec
 TESTS+=div
 TESTS+=clst
+TESTS+=cuse
 TESTS+=long-double
 TESTS+=cdsg
 TESTS+=chrl

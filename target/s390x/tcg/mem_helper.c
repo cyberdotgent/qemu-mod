@@ -916,6 +916,103 @@ Int128 HELPER(clst)(CPUS390XState *env, uint64_t c, uint64_t s1, uint64_t s2)
     return int128_make128(s2 + len, s1 + len);
 }
 
+static int64_t get_signed_length(CPUS390XState *env, int reg)
+{
+    if (env->psw.mask & PSW_MASK_64) {
+        return env->regs[reg];
+    }
+    return (int32_t)env->regs[reg];
+}
+
+static void cuse_set_pair(CPUS390XState *env, int reg, uint64_t address,
+                          int64_t original_length, uint64_t processed)
+{
+    set_address_zero(env, reg, address + processed);
+    if (original_length >= 0) {
+        set_length(env, reg + 1, original_length - processed);
+    }
+}
+
+void HELPER(cuse)(CPUS390XState *env, uint32_t r1, uint32_t r2)
+{
+    const uint64_t address1 = get_address(env, r1);
+    const uint64_t address2 = get_address(env, r2);
+    const int64_t original_length1 = get_signed_length(env, r1 + 1);
+    const int64_t original_length2 = get_signed_length(env, r2 + 1);
+    const uint64_t length1 = MAX(original_length1, 0);
+    const uint64_t length2 = MAX(original_length2, 0);
+    const uint64_t length = MAX(length1, length2);
+    const uint8_t substring_length = env->regs[0];
+    const uint8_t pad = env->regs[1];
+    uintptr_t ra = GETPC();
+    uint64_t equal_start = 0;
+    uint64_t equal_length = 0;
+    uint64_t i;
+
+    /* Address bits outside the current addressing mode are always cleared. */
+    cuse_set_pair(env, r1, address1, original_length1, 0);
+    cuse_set_pair(env, r2, address2, original_length2, 0);
+
+    if (substring_length == 0) {
+        env->cc_op = 0;
+        return;
+    }
+    if (length == 0) {
+        env->cc_op = 2;
+        return;
+    }
+    if (r1 == r2) {
+        env->cc_op = length1 >= substring_length ? 0 : 1;
+        return;
+    }
+
+    for (i = 0; i < length; i++) {
+        uint8_t byte1 = i < length1 ?
+            cpu_ldub_data_ra(env, wrap_address(env, address1 + i), ra) : pad;
+        uint8_t byte2 = i < length2 ?
+            cpu_ldub_data_ra(env, wrap_address(env, address2 + i), ra) : pad;
+
+        if (byte1 == byte2) {
+            if (equal_length == 0) {
+                equal_start = i;
+            }
+            if (++equal_length == substring_length) {
+                uint64_t processed1 = MIN(equal_start, length1);
+                uint64_t processed2 = MIN(equal_start, length2);
+
+                cuse_set_pair(env, r1, address1, original_length1,
+                              processed1);
+                cuse_set_pair(env, r2, address2, original_length2,
+                              processed2);
+                env->cc_op = 0;
+                return;
+            }
+        } else {
+            equal_length = 0;
+            if (i + 1 >= 4096) {
+                cuse_set_pair(env, r1, address1, original_length1,
+                              MIN(i + 1, length1));
+                cuse_set_pair(env, r2, address2, original_length2,
+                              MIN(i + 1, length2));
+                env->cc_op = 3;
+                return;
+            }
+        }
+    }
+
+    if (equal_length) {
+        cuse_set_pair(env, r1, address1, original_length1,
+                      MIN(equal_start, length1));
+        cuse_set_pair(env, r2, address2, original_length2,
+                      MIN(equal_start, length2));
+        env->cc_op = 1;
+    } else {
+        cuse_set_pair(env, r1, address1, original_length1, length1);
+        cuse_set_pair(env, r2, address2, original_length2, length2);
+        env->cc_op = 2;
+    }
+}
+
 /* move page */
 uint32_t HELPER(mvpg)(CPUS390XState *env, uint64_t r0, uint32_t r1, uint32_t r2)
 {

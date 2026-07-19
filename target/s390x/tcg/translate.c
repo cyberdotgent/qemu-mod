@@ -2079,6 +2079,21 @@ static DisasJumpType op_clst(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static DisasJumpType op_cuse(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+
+    if ((r1 | r2) & 1) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+
+    gen_helper_cuse(tcg_env, tcg_constant_i32(r1), tcg_constant_i32(r2));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_cps(DisasContext *s, DisasOps *o)
 {
     TCGv_i64 t = tcg_temp_new_i64();

@@ -163,6 +163,9 @@
 /* CHECKSUM */
     C(0xb241, CKSM,    RRE,   Z,   r1_o, ra2_E, new, r1_32, cksm, 0)
 
+/* COMPARE UNTIL SUBSTRING EQUAL */
+    C(0xb257, CUSE,    RRE,   Z,   0, 0, 0, 0, cuse, 0)
+
 /* COPY SIGN */
     F(0xb372, CPSDR,   RRF_b, FPSSH, f3, f2, new, f1, cps, 0, IF_AFP1 | IF_AFP2 | IF_AFP3)
 
