@@ -16,6 +16,7 @@
 #include "qemu/module.h"
 #include "virtio-ccw.h"
 #include "hw/virtio/virtio-blk.h"
+#include "hw/s390x/ipl.h"
 
 #define TYPE_VIRTIO_BLK_CCW "virtio-blk-ccw"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtIOBlkCcw, VIRTIO_BLK_CCW)
@@ -55,8 +56,10 @@ static void virtio_ccw_blk_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOCCWDeviceClass *k = VIRTIO_CCW_DEVICE_CLASS(klass);
+    CCWDeviceClass *ccw_dc = CCW_DEVICE_CLASS(klass);
 
     k->realize = virtio_ccw_blk_realize;
+    ccw_dc->build_iplb = s390_ipl_build_ccw_iplb;
     device_class_set_props(dc, virtio_ccw_blk_properties);
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }

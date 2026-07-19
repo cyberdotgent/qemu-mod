@@ -16,6 +16,7 @@
 #include "qemu/module.h"
 #include "virtio-ccw.h"
 #include "hw/virtio/virtio-net.h"
+#include "hw/s390x/ipl.h"
 
 #define TYPE_VIRTIO_NET_CCW "virtio-net-ccw"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtIONetCcw, VIRTIO_NET_CCW)
@@ -58,8 +59,10 @@ static void virtio_ccw_net_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOCCWDeviceClass *k = VIRTIO_CCW_DEVICE_CLASS(klass);
+    CCWDeviceClass *ccw_dc = CCW_DEVICE_CLASS(klass);
 
     k->realize = virtio_ccw_net_realize;
+    ccw_dc->build_iplb = s390_ipl_build_ccw_iplb;
     device_class_set_props(dc, virtio_ccw_net_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }

@@ -58,6 +58,17 @@ class S390Boot4k(QemuSystemTest):
         self.vm.launch()
         self.wait_for_pattern("Linux version 5.6.6-300.fc32.s390x")
 
+    def test_ipl_address(self):
+        '''
+        Check operator-style IPL selection and its loadparm shorthand
+        '''
+        self.basic_machine_setup()
+        self.vm.add_args("-device",
+                         "virtio-blk-ccw,drive=d1,devno=fe.0.1000",
+                         "-ipl", "1000", "-loadparm", "2")
+        self.vm.launch()
+        self.wait_for_pattern("Linux version 5.6.6-300.fc32.s390x")
+
     def test_loadparm_device(self):
         '''
         Check that we can select a kernel via  "-device ...,loadparm=..."

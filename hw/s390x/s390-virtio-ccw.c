@@ -788,6 +788,76 @@ static void machine_set_loadparm(Object *obj, Visitor *v,
     g_free(val);
 }
 
+static void machine_get_ipl(Object *obj, Visitor *v,
+                            const char *name, void *opaque, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+    g_autofree char *str = NULL;
+
+    if (!ms->ipl_devno_set) {
+        str = g_strdup("");
+    } else if (ms->ipl_devno_full) {
+        str = g_strdup_printf("%x.%x.%04x", ms->ipl_devno.cssid,
+                              ms->ipl_devno.ssid, ms->ipl_devno.devid);
+    } else {
+        str = g_strdup_printf("%04x", ms->ipl_devno.devid);
+    }
+    visit_type_str(v, name, &str, errp);
+}
+
+static void machine_set_ipl(Object *obj, Visitor *v,
+                            const char *name, void *opaque, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+    g_autofree char *str = NULL;
+    unsigned int cssid, ssid, devno;
+    int num, n1, n2;
+    size_t len;
+
+    if (!visit_type_str(v, name, &str, errp)) {
+        return;
+    }
+    if (phase_check(PHASE_MACHINE_READY)) {
+        error_setg(errp, "IPL device cannot be changed after machine startup");
+        return;
+    }
+
+    len = strlen(str);
+    if (!strchr(str, '.')) {
+        if (len < 1 || len > 4 ||
+            strspn(str, "0123456789abcdefABCDEF") != len ||
+            sscanf(str, "%x", &devno) != 1) {
+            error_setg(errp, "Invalid IPL device address '%s'; expected "
+                       "1-4 hexadecimal digits or cssid.ssid.devno", str);
+            return;
+        }
+        ms->ipl_devno = (CssDevId) { .devid = devno, .valid = true };
+        ms->ipl_devno_full = false;
+    } else {
+        num = sscanf(str, "%2x.%1x%n.%4x%n", &cssid, &ssid, &n1,
+                     &devno, &n2);
+        if (num != 3 || (n2 - n1) != 5 || len != n2 ||
+            cssid > MAX_CSSID || ssid > MAX_SSID) {
+            error_setg(errp, "Invalid IPL device address '%s'; expected "
+                       "cssid.ssid.devno (for example fe.0.1000)", str);
+            return;
+        }
+        ms->ipl_devno = (CssDevId) {
+            .cssid = cssid, .ssid = ssid, .devid = devno, .valid = true,
+        };
+        ms->ipl_devno_full = true;
+    }
+    ms->ipl_devno_set = true;
+}
+
+static void s390_machine_ipl_notify(Notifier *notifier, void *data)
+{
+    S390CcwMachineState *ms = container_of(notifier, S390CcwMachineState,
+                                           ipl_notifier);
+
+    s390_ipl_validate_ipl_device(ms, &error_fatal);
+}
+
  /*
   * S390x-specific global compatibility properties.
   *
@@ -856,6 +926,11 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             "Up to 8 chars in set of [A-Za-z0-9. ] (lower case chars converted"
             " to upper case) to pass to machine loader, boot manager,"
             " and guest kernel");
+
+    object_class_property_add(oc, "ipl", "str", machine_get_ipl,
+                              machine_set_ipl, NULL, NULL);
+    object_class_property_set_description(oc, "ipl",
+            "CCW device address to IPL from, as devno or cssid.ssid.devno");
 }
 
 static inline void s390_machine_initfn(Object *obj)
@@ -864,6 +939,16 @@ static inline void s390_machine_initfn(Object *obj)
 
     ms->aes_key_wrap = true;
     ms->dea_key_wrap = true;
+    ms->ipl_notifier.notify = s390_machine_ipl_notify;
+    qemu_add_machine_init_done_notifier(&ms->ipl_notifier);
+}
+
+static void s390_machine_finalize(Object *obj)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    qemu_remove_machine_init_done_notifier(&ms->ipl_notifier);
+    object_unref(ms->ipl_device);
 }
 
 static const TypeInfo ccw_machine_info = {
@@ -872,6 +957,7 @@ static const TypeInfo ccw_machine_info = {
     .abstract      = true,
     .instance_size = sizeof(S390CcwMachineState),
     .instance_init = s390_machine_initfn,
+    .instance_finalize = s390_machine_finalize,
     .class_size = sizeof(S390CcwMachineClass),
     .class_init    = ccw_machine_class_init,
     .interfaces = (const InterfaceInfo[]) {

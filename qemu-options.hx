@@ -1120,6 +1120,22 @@ SRST
         ``qemu.wav``.
 ERST
 
+DEF("dev3270", HAS_ARG, QEMU_OPTION_dev3270,
+    "-dev3270 port=port[,devno=ccw-address]\n"
+    "                add a 3270 terminal listening on the loopback interface\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3270 port=port[,devno=ccw-address]``
+    Add a 3270 terminal backed by a TN3270 socket server listening on the
+    loopback interface. The server does not wait for a client when QEMU starts.
+    If ``devno`` is omitted, QEMU assigns an available CCW device number.
+
+    This option is equivalent to creating a socket chardev with
+    ``server=on,wait=off,tn3270=on`` and attaching an ``x-terminal3270`` device
+    to it. It can be specified multiple times to create terminals listening on
+    different ports.
+ERST
+
 DEF("device", HAS_ARG, QEMU_OPTION_device,
     "-device driver[,prop=value[,...]]\n"
     "                add device (based on driver)\n"
@@ -4611,6 +4627,31 @@ SRST
 ``-kernel bzImage``
     Use bzImage as kernel image. The kernel can be either a Linux kernel
     or in multiboot format.
+ERST
+
+DEF("ipl", HAS_ARG, QEMU_OPTION_ipl,
+    "-ipl ccw-address IPL from the specified CCW device (s390x only)\n",
+    QEMU_ARCH_S390X)
+SRST
+``-ipl ccw-address``
+    On s390x, IPL from the specified CCW device. ``ccw-address`` can be a
+    one-to-four-digit hexadecimal device number (for example ``1000``), or a
+    full QEMU CCW address such as ``fe.0.1000``. A short device number must be
+    unique across channel-subsystem and subchannel-set IDs.
+
+    This is a convenience form of the ``ipl`` property on the
+    ``s390-ccw-virtio`` machine. It cannot be combined with ``-kernel`` or a
+    device ``bootindex`` property.
+ERST
+
+DEF("loadparm", HAS_ARG, QEMU_OPTION_loadparm,
+    "-loadparm string set the s390x IPL load parameter\n", QEMU_ARCH_S390X)
+SRST
+``-loadparm string``
+    Set the s390x IPL load parameter. Up to eight characters from
+    ``[A-Za-z0-9. ]`` are accepted; lower-case letters are converted to upper
+    case. This is a convenience form of the ``loadparm`` property on the
+    ``s390-ccw-virtio`` machine.
 ERST
 
 DEF("shim", HAS_ARG, QEMU_OPTION_shim, \

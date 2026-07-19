@@ -133,6 +133,7 @@ static uint64_t get_max_kernel_cmdline_size(void)
 static void s390_ipl_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
+    S390CcwMachineState *s390ms = S390_CCW_MACHINE(ms);
     S390IPLState *ipl = S390_IPL(dev);
     uint32_t *ipl_psw;
     uint64_t pentry;
@@ -141,6 +142,11 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
 
     int bios_size;
     char *bios_filename;
+
+    if (ipl->kernel && s390ms->ipl_devno_set) {
+        error_setg(errp, "-ipl and -kernel cannot be used together");
+        return;
+    }
 
     /*
      * Always load the bios if it was enforced,
@@ -299,7 +305,8 @@ static void s390_ipl_set_boot_menu(S390IPLState *ipl)
 {
     unsigned long splash_time = 0;
 
-    if (!get_boot_device(0)) {
+    if (!get_boot_device(0) &&
+        !S390_CCW_MACHINE(qdev_get_machine())->ipl_device) {
         if (current_machine->boot_config.has_menu && current_machine->boot_config.menu) {
             error_report("boot menu requires a bootindex to be specified for "
                          "the IPL device");
@@ -454,9 +461,104 @@ void s390_ipl_convert_loadparm(char *ascii_lp, uint8_t *ebcdic_lp)
     }
 }
 
-static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb)
+typedef struct S390IPLDeviceSearch {
+    S390CcwMachineState *ms;
+    CcwDevice *match;
+    unsigned int matches;
+} S390IPLDeviceSearch;
+
+static int s390_ipl_find_ccw_device(Object *obj, void *opaque)
+{
+    S390IPLDeviceSearch *search = opaque;
+    CcwDevice *ccw = (CcwDevice *)object_dynamic_cast(obj, TYPE_CCW_DEVICE);
+    SubchDev *sch;
+
+    if (!ccw) {
+        return 0;
+    }
+    sch = ccw->sch;
+    if (!sch || sch->devno != search->ms->ipl_devno.devid) {
+        return 0;
+    }
+    if (search->ms->ipl_devno_full &&
+        (sch->cssid != search->ms->ipl_devno.cssid ||
+         sch->ssid != search->ms->ipl_devno.ssid)) {
+        return 0;
+    }
+
+    search->match = ccw;
+    search->matches++;
+    return 0;
+}
+
+void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
+{
+    S390IPLDeviceSearch search = { .ms = ms };
+    CCWDeviceClass *ccw_dc;
+    g_autofree char *address = NULL;
+
+    if (!ms->ipl_devno_set) {
+        return;
+    }
+    if (MACHINE(ms)->kernel_filename) {
+        error_setg(errp, "-ipl and -kernel cannot be used together");
+        return;
+    }
+    if (get_boot_device(0)) {
+        error_setg(errp, "-ipl cannot be combined with a bootindex property");
+        return;
+    }
+
+    object_child_foreach_recursive(object_get_root(),
+                                   s390_ipl_find_ccw_device, &search);
+    if (ms->ipl_devno_full) {
+        address = g_strdup_printf("%x.%x.%04x", ms->ipl_devno.cssid,
+                                  ms->ipl_devno.ssid, ms->ipl_devno.devid);
+    } else {
+        address = g_strdup_printf("%04x", ms->ipl_devno.devid);
+    }
+
+    if (!search.matches) {
+        error_setg(errp, "IPL device %s was not found", address);
+        return;
+    }
+    if (search.matches > 1) {
+        error_setg(errp, "IPL device number %s is ambiguous; use "
+                   "cssid.ssid.devno", address);
+        return;
+    }
+
+    ccw_dc = CCW_DEVICE_GET_CLASS(search.match);
+    if (!ccw_dc->build_iplb) {
+        error_setg(errp, "CCW device %s (%s) does not support IPL", address,
+                   object_get_typename(OBJECT(search.match)));
+        return;
+    }
+    ms->ipl_device = DEVICE(object_ref(search.match));
+}
+
+bool s390_ipl_build_ccw_iplb(CcwDevice *dev, IplParameterBlock *iplb,
+                             Error **errp)
+{
+    if (!dev->sch) {
+        error_setg(errp, "CCW device is not realized");
+        return false;
+    }
+
+    iplb->len = cpu_to_be32(S390_IPLB_MIN_CCW_LEN);
+    iplb->blk0_len =
+        cpu_to_be32(S390_IPLB_MIN_CCW_LEN - S390_IPLB_HEADER_LEN);
+    iplb->pbt = S390_IPL_TYPE_CCW;
+    iplb->ccw.devno = cpu_to_be16(dev->sch->devno);
+    iplb->ccw.ssid = dev->sch->ssid & 3;
+    return true;
+}
+
+static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb,
+                            Error **errp)
 {
     CcwDevice *ccw_dev = NULL;
+    CCWDeviceClass *ccw_dc;
     S390PCIBusDevice *pbdev = NULL;
     SCSIDevice *sd;
     int devtype;
@@ -464,12 +566,22 @@ static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb)
     g_autofree void *scsi_lp = NULL;
     g_autofree void *pci_lp = NULL;
 
-    ccw_dev = s390_get_ccw_device(dev_st, &devtype);
+    if (!dev_st) {
+        error_setg(errp, "No IPL device was specified");
+        return false;
+    }
+
+    ccw_dev = (CcwDevice *)object_dynamic_cast(OBJECT(dev_st),
+                                                TYPE_CCW_DEVICE);
+    if (ccw_dev) {
+        devtype = S390_DEVTYPE_NONE;
+    } else {
+        ccw_dev = s390_get_ccw_device(dev_st, &devtype);
+    }
     if (ccw_dev) {
         lp = ccw_dev->loadparm;
 
-        switch (devtype) {
-        case CCW_DEVTYPE_SCSI:
+        if (devtype == CCW_DEVTYPE_SCSI) {
             sd = SCSI_DEVICE(dev_st);
             scsi_lp = object_property_get_str(OBJECT(sd), "loadparm", NULL);
             if (scsi_lp && strlen(scsi_lp) > 0) {
@@ -484,22 +596,18 @@ static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb)
             iplb->scsi.channel = cpu_to_be16(sd->channel);
             iplb->scsi.devno = cpu_to_be16(ccw_dev->sch->devno);
             iplb->scsi.ssid = ccw_dev->sch->ssid & 3;
-            break;
-        case CCW_DEVTYPE_VFIO:
-            iplb->len = cpu_to_be32(S390_IPLB_MIN_CCW_LEN);
-            iplb->pbt = S390_IPL_TYPE_CCW;
-            iplb->ccw.devno = cpu_to_be16(ccw_dev->sch->devno);
-            iplb->ccw.ssid = ccw_dev->sch->ssid & 3;
-            break;
-        case CCW_DEVTYPE_VIRTIO_NET:
-        case CCW_DEVTYPE_VIRTIO:
-            iplb->len = cpu_to_be32(S390_IPLB_MIN_CCW_LEN);
-            iplb->blk0_len =
-                cpu_to_be32(S390_IPLB_MIN_CCW_LEN - S390_IPLB_HEADER_LEN);
-            iplb->pbt = S390_IPL_TYPE_CCW;
-            iplb->ccw.devno = cpu_to_be16(ccw_dev->sch->devno);
-            iplb->ccw.ssid = ccw_dev->sch->ssid & 3;
-            break;
+        } else {
+            ccw_dc = CCW_DEVICE_GET_CLASS(ccw_dev);
+            if (!ccw_dc->build_iplb) {
+                error_setg(errp, "CCW device %02x.%x.%04x (%s) cannot be "
+                           "used as an IPL device", ccw_dev->sch->cssid,
+                           ccw_dev->sch->ssid, ccw_dev->sch->devno,
+                           object_get_typename(OBJECT(ccw_dev)));
+                return false;
+            }
+            if (!ccw_dc->build_iplb(ccw_dev, iplb, errp)) {
+                return false;
+            }
         }
 
         /* If the device loadparm is empty use the global machine loadparm */
@@ -530,6 +638,7 @@ static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb)
             iplb->pci.fid = cpu_to_be32(pbdev->fid);
             break;
         default:
+            error_setg(errp, "PCI device type cannot be used for IPL");
             return false;
         }
 
@@ -539,16 +648,22 @@ static bool s390_build_iplb(DeviceState *dev_st, IplParameterBlock *iplb)
         return true;
     }
 
+    error_setg(errp, "Device '%s' cannot be used as an IPL device",
+               object_get_typename(OBJECT(dev_st)));
     return false;
 }
 
 void s390_rebuild_iplb(uint16_t dev_index, IplParameterBlock *iplb)
 {
     S390IPLState *ipl = get_ipl_device();
+    Error *err = NULL;
     uint16_t index;
     index = ipl->rebuilt_iplb ? ipl->iplb_index : dev_index;
 
-    ipl->rebuilt_iplb = s390_build_iplb(get_boot_device(index), iplb);
+    ipl->rebuilt_iplb = s390_build_iplb(get_boot_device(index), iplb, &err);
+    if (err) {
+        warn_report_err(err);
+    }
     ipl->iplb_index = index;
 }
 
@@ -556,7 +671,8 @@ static bool s390_init_all_iplbs(S390IPLState *ipl)
 {
     int iplb_num = 0;
     IplParameterBlock iplb_chain[7];
-    DeviceState *dev_st = get_boot_device(0);
+    S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
+    DeviceState *dev_st = ms->ipl_device ?: get_boot_device(0);
     Object *machine = qdev_get_machine();
 
     /*
@@ -574,7 +690,14 @@ static bool s390_init_all_iplbs(S390IPLState *ipl)
     }
 
     iplb_num = 1;
-    s390_build_iplb(dev_st, &ipl->iplb);
+    if (!s390_build_iplb(dev_st, &ipl->iplb, &error_fatal)) {
+        return false;
+    }
+
+    if (ms->ipl_device) {
+        ipl->qipl.chain_len = 0;
+        return true;
+    }
 
     /*  Index any fallback boot devices */
     while (get_boot_device(iplb_num)) {
@@ -599,7 +722,9 @@ static bool s390_init_all_iplbs(S390IPLState *ipl)
         /* Start at 1 because the IPLB for boot index 0 is not chained */
         for (int i = 1; i < iplb_num; i++) {
             dev_st = get_boot_device(i);
-            s390_build_iplb(dev_st, &iplb_chain[i - 1]);
+            if (!s390_build_iplb(dev_st, &iplb_chain[i - 1], &error_fatal)) {
+                return false;
+            }
         }
 
         ipl->qipl.next_iplb = cpu_to_be64(s390_ipl_map_iplb_chain(iplb_chain));

@@ -20,6 +20,15 @@ virtio_console_flush_buf(unsigned int port, size_t len, ssize_t ret) "port %u, i
 virtio_console_chr_read(unsigned int port, int size) "port %u, size %d"
 virtio_console_chr_event(unsigned int port, int event) "port %u, event %d"
 
+# terminal3270.c
+terminal3270_connection(uint16_t devno, bool connected) "devno=0x%04x connected=%d"
+terminal3270_ready(uint16_t devno, const char *type) "devno=0x%04x terminal-type=%s"
+terminal3270_record_queue(uint16_t devno, uint16_t records, uint32_t bytes) "devno=0x%04x records=%u bytes=%u"
+terminal3270_remote_command(uint16_t devno, uint8_t command, size_t len) "devno=0x%04x command=0x%02x len=%zu"
+terminal3270_pending_read(uint16_t devno, uint8_t command, uint16_t count) "devno=0x%04x command=0x%02x count=%u"
+terminal3270_complete_read(uint16_t devno, int result, uint16_t residual) "devno=0x%04x result=%d residual=%u"
+terminal3270_cancel(uint16_t devno) "devno=0x%04x"
+
 # goldfish_tty.c
 goldfish_tty_read(void *dev, unsigned int addr, unsigned int size, uint64_t value) "tty: %p reg: 0x%02x size: %d value: 0x%"PRIx64
 goldfish_tty_write(void *dev, unsigned int addr, unsigned int size, uint64_t value) "tty: %p reg: 0x%02x size: %d value: 0x%"PRIx64

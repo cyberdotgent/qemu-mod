@@ -13,7 +13,9 @@
 
 #include "hw/core/boards.h"
 #include "qom/object.h"
+#include "qemu/notify.h"
 #include "hw/s390x/sclp.h"
+#include "hw/s390x/css.h"
 
 #define TYPE_S390_CCW_MACHINE               "s390-ccw-machine"
 
@@ -29,6 +31,11 @@ struct S390CcwMachineState {
     bool dea_key_wrap;
     bool pv;
     uint8_t loadparm[8];
+    CssDevId ipl_devno;
+    bool ipl_devno_set;
+    bool ipl_devno_full;
+    DeviceState *ipl_device;
+    Notifier ipl_notifier;
     uint64_t memory_limit;
     uint64_t max_pagesize;
 

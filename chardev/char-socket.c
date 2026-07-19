@@ -176,6 +176,11 @@ static void tcp_chr_process_IAC_bytes(Chardev *chr,
     int i;
     int j = 0;
 
+    /* The 3270 frontend owns its complete TELNET session state machine. */
+    if (s->is_tn3270) {
+        return;
+    }
+
     for (i = 0; i < *size; i++) {
         if (s->do_telnetopt > 1) {
             if ((unsigned char)buf[i] == IAC && s->do_telnetopt == 2) {

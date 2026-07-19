@@ -514,6 +514,21 @@ static QemuOptsList qemu_action_opts = {
     },
 };
 
+static QemuOptsList qemu_dev3270_opts = {
+    .name = "dev3270",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3270_opts.head),
+    .desc = {
+        {
+            .name = "port",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "devno",
+            .type = QEMU_OPT_STRING,
+        },
+        { /* end of list */ }
+    },
+};
+
 const char *qemu_get_vm_name(void)
 {
     return qemu_name;
@@ -1222,6 +1237,78 @@ static int device_init_func(void *opaque, QemuOpts *opts, Error **errp)
         object_unref(OBJECT(dev));
     }
     return 0;
+}
+
+static bool dev3270_add(const char *optarg, Error **errp)
+{
+    static unsigned int index;
+    g_autofree char *chardev_id = NULL;
+    g_autofree char *device_id = NULL;
+    g_autofree char *port_str = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *chardev_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    const char *devno;
+    uint64_t port;
+
+    opts = qemu_opts_parse(&qemu_dev3270_opts, optarg, false, errp);
+    if (!opts) {
+        return false;
+    }
+
+    if (qemu_opts_id(opts)) {
+        error_setg(errp, "Parameter 'id' is not supported");
+        goto fail;
+    }
+    if (!qemu_opt_get(opts, "port")) {
+        error_setg(errp, "Parameter 'port' is required");
+        goto fail;
+    }
+
+    port = qemu_opt_get_number(opts, "port", 0);
+    if (port > 65535) {
+        error_setg(errp, "Parameter 'port' must be between 0 and 65535");
+        goto fail;
+    }
+
+    chardev_id = g_strdup_printf("dev3270-chardev%u", index);
+    device_id = g_strdup_printf("dev3270-%u", index);
+    port_str = g_strdup_printf("%" PRIu64, port);
+
+    chardev_opts = qemu_opts_create(qemu_find_opts("chardev"), chardev_id,
+                                    1, errp);
+    if (!chardev_opts ||
+        !qemu_opt_set(chardev_opts, "backend", "socket", errp) ||
+        !qemu_opt_set(chardev_opts, "host", "127.0.0.1", errp) ||
+        !qemu_opt_set(chardev_opts, "port", port_str, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "server", true, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "wait", false, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "tn3270", true, errp)) {
+        goto fail;
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"), device_id,
+                                   1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "x-terminal3270", errp) ||
+        !qemu_opt_set(device_opts, "chardev", chardev_id, errp)) {
+        goto fail;
+    }
+
+    devno = qemu_opt_get(opts, "devno");
+    if (devno && !qemu_opt_set(device_opts, "devno", devno, errp)) {
+        goto fail;
+    }
+
+    index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(chardev_opts);
+    qemu_opts_del(opts);
+    return false;
 }
 
 static int chardev_init_func(void *opaque, QemuOpts *opts, Error **errp)
@@ -3019,6 +3106,12 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_kernel:
                 qdict_put_str(machine_opts_dict, "kernel", optarg);
                 break;
+            case QEMU_OPTION_ipl:
+                qdict_put_str(machine_opts_dict, "ipl", optarg);
+                break;
+            case QEMU_OPTION_loadparm:
+                qdict_put_str(machine_opts_dict, "loadparm", optarg);
+                break;
             case QEMU_OPTION_shim:
                 qdict_put_str(machine_opts_dict, "shim", optarg);
                 break;
@@ -3247,6 +3340,15 @@ void qemu_init(int argc, char **argv)
                 }
                 default_monitor = 0;
                 break;
+            case QEMU_OPTION_dev3270: {
+                Error *err = NULL;
+
+                if (!dev3270_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
             case QEMU_OPTION_chardev:
                 if (!qemu_opts_parse_noisily(qemu_find_opts("chardev"),
                                              optarg, true)) {

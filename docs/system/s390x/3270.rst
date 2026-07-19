@@ -4,16 +4,17 @@
 The 3270 is the classic 'green-screen' console of the mainframes (see the
 `IBM 3270 Wikipedia article <https://en.wikipedia.org/wiki/IBM_3270>`__).
 
-The 3270 data stream is not implemented within QEMU; the device only provides
-TN3270 (a telnet extension; see `RFC 854 <https://tools.ietf.org/html/rfc854>`__
-and `RFC 1576 <https://tools.ietf.org/html/rfc1576>`__) and leaves the heavy
-lifting to an external 3270 terminal emulator (such as ``x3270``) to make a
-single 3270 device available to a guest. Note that this supports basic
-features only.
+QEMU implements a local 3274-style display controller and transports its
+records over TN3270 (a telnet extension; see
+`RFC 854 <https://tools.ietf.org/html/rfc854>`__ and
+`RFC 1576 <https://tools.ietf.org/html/rfc1576>`__). Rendering and keyboard
+input remain the job of an external terminal emulator such as ``x3270`` or
+``c3270``.
 
-To provide a 3270 device to a guest, create a ``x-terminal3270`` linked to
-a ``tn3270`` chardev. The guest will see a 3270 channel device. In order
-to actually be able to use it, attach the ``x3270`` emulator to the chardev.
+To provide a 3270 device to a guest, use ``-dev3270`` to create an
+``x-terminal3270`` linked to a listening ``tn3270`` chardev. The guest will
+see a 3270 channel device. In order to actually be able to use it, attach the
+``x3270`` emulator to the chardev.
 
 Example configuration
 ---------------------
@@ -22,7 +23,17 @@ Example configuration
   ``CONFIG_TN3270`` and at least one of ``CONFIG_TN3270_TTY`` (for additional
   ttys) or ``CONFIG_TN3270_CONSOLE`` (for a 3270 console).
 
-* Add a ``tn3270`` chardev and a ``x-terminal3270`` to the QEMU command line::
+* Add a 3270 device and its listening TCP port to the QEMU command line::
+
+   -dev3270 port=2300,devno=fe.0.000a
+
+  ``-dev3270`` listens on the loopback interface. It can be repeated to create
+  additional devices on different ports::
+
+   -dev3270 port=2301,devno=fe.0.000b
+
+  To listen on another interface or configure additional chardev options, use
+  the expanded form instead::
 
    -chardev socket,id=ch0,host=0.0.0.0,port=2300,wait=off,server=on,tn3270=on
    -device x-terminal3270,chardev=ch0,devno=fe.0.000a,id=terminal0
@@ -32,7 +43,7 @@ Example configuration
 
 * On the host, start the ``x3270`` emulator::
 
-    x3270 <host>:2300
+    x3270 127.0.0.1:2300
 
 * In the guest, locate the 3270 device node under ``/dev/3270/`` (say,
   ``tty1``) and start a getty on it::
@@ -49,15 +60,29 @@ Example configuration
 Restrictions
 ------------
 
-3270 support is very basic. In particular:
+Each device accepts one terminal session. QEMU does not provide Hercules-style
+terminal pooling or LU routing; configure multiple devices and ports instead.
+The display controller supports Write, Erase/Write, Erase/Write Alternate,
+Erase All Unprotected, Write Structured Field, Read Buffer, Read Modified,
+Select, NOP, Sense, and Sense ID, including command/data chaining and
+asynchronous reads.
 
-* Only one 3270 device is supported.
+The supported terminal types are ``IBM-DYNAMIC``, ``IBM-3179-2``,
+``IBM-3180-2``, ``IBM-3277-2``, and IBM 3278/3279 models 2 through 5, with or
+without the ``-E`` extended-attribute suffix.
 
-* It has only been tested with Linux guests and the x3270 emulator.
+Migration disconnects the external TCP peer; it is not possible to migrate a
+live TCP stream transparently. Controller state, queued complete records, a
+partial chained record, and a bounded display replay log are migrated. After
+the terminal reconnects at the destination, QEMU renegotiates TN3270 and
+replays the display state. If it reconnects with a different model, QEMU drops
+geometry-dependent queued and replay state. The replay log contains
+guest-issued display commands; keyboard edits which have not yet been sent by
+the terminal client are external state and cannot be preserved. The log is
+limited to 4 MiB; a display command which would exceed that limit completes
+with data check without being sent.
 
-* TLS/SSL is not supported.
-
-* Resizing on reattach is not supported.
-
-* Multiple commands in one inbound buffer (for example, when the reset key
-  is pressed while the network is slow) are not supported.
+The ``-dev3270`` shorthand deliberately listens only on loopback and exposes
+only ``port`` and ``devno``. Use the expanded chardev/device form for TLS,
+non-loopback listeners, or other socket options. 3287 printer emulation is not
+provided; use a separate printer device when one becomes available.

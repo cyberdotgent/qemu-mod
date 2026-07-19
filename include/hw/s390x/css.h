@@ -137,13 +137,19 @@ struct SubchDev {
     CcwDataStream cds;
     /* transport-provided data: */
     int (*ccw_cb) (SubchDev *, CCW1);
+    bool ccw_cb_first;
+    void (*cancel_cb)(SubchDev *);
     void (*disable_cb)(SubchDev *);
     IOInstEnding (*do_subchannel_work) (SubchDev *);
     void (*irb_cb)(SubchDev *, IRB *);
     SenseId id;
     void *driver_data;
     ESW esw;
+    bool ccw_async_pending;
 };
+
+/* A virtual device owns the current CCW and will complete it asynchronously. */
+#define CSS_CCW_PENDING (-EINPROGRESS)
 
 static inline void sch_gen_unit_exception(SubchDev *sch)
 {
@@ -203,6 +209,7 @@ void css_subch_assign(uint8_t cssid, uint8_t ssid, uint16_t schid,
 void css_sch_build_virtual_schib(SubchDev *sch, uint8_t chpid, uint8_t type);
 int css_sch_build_schib(SubchDev *sch, CssDevId *dev_id);
 unsigned int css_find_free_chpid(uint8_t cssid);
+unsigned int css_find_virtual_chpid(uint8_t cssid, uint8_t type);
 uint16_t css_build_subchannel_id(SubchDev *sch);
 void copy_scsw_to_guest(SCSW *dest, const SCSW *src);
 void copy_esw_to_guest(ESW *dest, const ESW *src);
@@ -219,6 +226,7 @@ void css_generate_css_crws(uint8_t cssid);
 void css_clear_sei_pending(void);
 IOInstEnding s390_ccw_cmd_request(SubchDev *sch);
 IOInstEnding do_subchannel_work_virtual(SubchDev *sub);
+void css_virtual_ccw_complete(SubchDev *sch, int ret);
 IOInstEnding do_subchannel_work_passthrough(SubchDev *sub);
 void build_irb_passthrough(SubchDev *sch, IRB *irb);
 void build_irb_virtual(SubchDev *sch, IRB *irb);

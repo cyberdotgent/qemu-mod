@@ -1,6 +1,33 @@
 Boot devices on s390x
 =====================
 
+Selecting an IPL device by address
+----------------------------------
+
+The ``-ipl`` option provides an operator-style way to select one CCW device by
+its device number, without adding a ``bootindex`` property to the device. For
+example::
+
+ qemu-system-s390x -drive if=none,id=dr1,file=guest.qcow2 \
+                   -device virtio-blk-ccw,drive=dr1,devno=fe.0.1000 \
+                   -ipl 1000 -loadparm 2
+
+Device numbers are hexadecimal. A short address containing one to four digits
+is accepted when it uniquely identifies a device. The full QEMU CCW address
+form, such as ``fe.0.1000``, can be used to distinguish devices with the same
+device number in different channel-subsystem images or subchannel sets.
+
+``-loadparm`` is a convenience spelling of the machine ``loadparm`` property.
+It accepts the same value and validation rules. ``-ipl`` cannot be combined
+with ``-kernel`` or with device ``bootindex`` properties. It selects one device
+only, so there is no fallback boot chain.
+
+The selected device must implement direct CCW IPL. QEMU currently supports
+direct selection of virtio block, virtio network, and assigned vfio-ccw
+devices. A future emulated DASD, FBA, tape, or card-reader device can opt in by
+providing the CCW IPL-parameter-block operation; the command-line syntax and
+selection code do not need device-specific changes.
+
 Booting with bootindex parameter
 --------------------------------
 
@@ -64,6 +91,8 @@ which can be used to select the kernel on the disk of the guest that the
 s390-ccw bios should boot. When starting QEMU, it can be specified like this::
 
  qemu-system-s390x -machine s390-ccw-virtio,loadparm=<string>
+
+The equivalent short form is ``-loadparm <string>``.
 
 The first way to use this parameter is to use the word ``PROMPT`` as the
 ``<string>`` here. In that case the s390-ccw bios will show a list of
