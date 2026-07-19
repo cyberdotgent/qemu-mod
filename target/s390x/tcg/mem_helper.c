@@ -1728,7 +1728,8 @@ void HELPER(unpk)(CPUS390XState *env, uint32_t len, uint64_t dest,
     while (len_dest > 0) {
         uint8_t cur_byte = 0;
 
-        if (len_src > 0) {
+        /* len_src is the inclusive index of the remaining source byte. */
+        if (len_src >= 0) {
             cur_byte = cpu_ldub_data_ra(env, src, ra);
         }
 
