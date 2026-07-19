@@ -424,11 +424,6 @@
     D(0xa503, IILL,    RI_a,  Z,   r1_o, i2_16u, r1, 0, insi, 0, 0x1000)
 /* INSERT PROGRAM MASK */
     C(0xb222, IPM,     RRE,   Z,   0, 0, r1, 0, ipm, 0)
-/* INSERT PSW KEY */
-    C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
-/* INSERT ADDRESS SPACE CONTROL */
-    C(0xb224, IAC,     RRE,   Z,   0, 0, 0, 0, iac, 0)
-
 /* LOAD */
     C(0x1800, LR,      RR_a,  Z,   0, r2_o, 0, cond_r1r2_32, mov2, 0)
     D(0x5800, L,       RX_a,  Z,   0, a2, new, r1_32, ld32s, 0, 0)
@@ -1353,6 +1348,10 @@
     E(0xb98a, CSPG,    RRE, DAT_ENH, r1_o, ra2, r1_P, 0, csp, 0, MO_BEUQ, IF_PRIV)
 /* DIAGNOSE (KVM hypercall) */
     F(0x8300, DIAG,    RSI,   Z,   0, 0, 0, 0, diag, 0, IF_PRIV | IF_IO)
+/* INSERT ADDRESS SPACE CONTROL */
+    C(0xb224, IAC,     RRE,   Z,   0, 0, 0, 0, iac, 0)
+/* INSERT PSW KEY */
+    C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
 /* INSERT STORAGE KEY EXTENDED */
     F(0xb229, ISKE,    RRE,   Z,   0, r2_o, new, r1_8, iske, 0, IF_PRIV)
 /* INVALIDATE DAT TABLE ENTRY */
