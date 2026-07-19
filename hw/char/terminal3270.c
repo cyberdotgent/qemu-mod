@@ -1195,7 +1195,15 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     uint32_t len;
     int ret;
 
-    if (ccw->cmd_code != TC_SENSE && (!t->connected || !t->ready)) {
+    /*
+     * A disconnected terminal is not ready for normal I/O, but its
+     * configured identity remains available.  Hercules likewise treats both
+     * Basic Sense (0x04) and Sense ID (0xe4) as sense commands here.  This is
+     * needed so that guests can discover and define terminal addresses before
+     * a client connects.
+     */
+    if (ccw->cmd_code != TC_SENSE && ccw->cmd_code != TC_SENSEID &&
+        (!t->connected || !t->ready)) {
         sch->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return -EIO;
     }
