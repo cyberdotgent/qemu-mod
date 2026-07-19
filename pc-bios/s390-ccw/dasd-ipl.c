@@ -252,7 +252,6 @@ int dasd_ipl(SubChannelId schid, uint16_t cutype)
  */
 int fba_ipl(SubChannelId schid, uint16_t cutype)
 {
-    PSWLegacy *pswl = (PSWLegacy *)0x00;
     Ccw0 *read_ipl = (Ccw0 *)0x1000;
 
     memset(read_ipl, 0, sizeof(*read_ipl));
@@ -260,7 +259,9 @@ int fba_ipl(SubChannelId schid, uint16_t cutype)
     read_ipl->cda = 0;
     read_ipl->sli = 1;
     read_ipl->count = 0x18;
+    enable_prefixing();
     if (do_cio(schid, cutype, 0x1000, CCW_FMT0)) {
+        disable_prefixing();
         puts("Failed to read FBA IPL record");
         return -EIO;
     }
@@ -270,13 +271,19 @@ int fba_ipl(SubChannelId schid, uint16_t cutype)
      * in a second start, preserving the architectural post-Read-IPL position
      * in the emulated device.
      */
-    if (do_cio(schid, cutype, 0x08, CCW_FMT0)) {
+    if (do_cio_32bit_ida(schid, cutype, 0x08, CCW_FMT0)) {
+        disable_prefixing();
         puts("Failed to run FBA IPL channel program");
         return -EIO;
     }
+    disable_prefixing();
 
-    pswl->mask |= PSW_MASK_EAMODE;
-    pswl->addr |= PSW_MASK_BAMODE;
+    /*
+     * Enter the IPL PSW exactly as supplied by the medium.  In particular,
+     * an ESA/390 loader must be allowed to select z/Architecture itself with
+     * SIGP Set Architecture Mode; forcing the addressing-mode bits here
+     * changes the architected IPL state underneath it.
+     */
     jump_to_low_kernel();
     return -1;
 }
