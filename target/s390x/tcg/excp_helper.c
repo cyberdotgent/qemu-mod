@@ -217,7 +217,8 @@ static void do_program_interrupt(CPUS390XState *env)
     bool set_trans_exc_code = false;
     bool advance = false;
 
-    assert((env->int_pgm_code == PGM_SPECIFICATION && ilen == 0) ||
+    assert(((env->int_pgm_code == PGM_SPECIFICATION ||
+             env->int_pgm_code == PGM_SPACE_SWITCH) && ilen == 0) ||
            ilen == 2 || ilen == 4 || ilen == 6);
 
     switch (env->int_pgm_code) {

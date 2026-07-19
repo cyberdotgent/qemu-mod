@@ -17,6 +17,7 @@ LDFLAGS=-nostdlib -static
 
 ASM_TESTS =                                                                    \
     art                                                                        \
+    linkage-exceptions                                                         \
     bal                                                                        \
     bakr                                                                       \
     bassm                                                                      \

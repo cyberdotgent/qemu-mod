@@ -15,6 +15,7 @@ _start:
     lctlg %c1,%c1,real_asce
     lctlg %c13,%c13,real_asce
     lctlg %c5,%c5,primary_aste_address
+    lctlg %c12,%c12,initial_cr12
     lctlg %c15,%c15,initial_cr15
     lpswe dat_psw
 
@@ -25,6 +26,17 @@ after_basic_pc:
 after_stacking_pc:
     stctg %c15,%c15,result_cr15
     clc result_cr15(8),initial_cr15
+    jne failure
+    stctg %c12,%c12,result_cr12
+    clc result_cr12(8),expected_cr12
+    jne failure
+    larl %r2,trace_area
+    larl %r3,expected_trace
+    clc 0(12,%r2),0(%r3)
+    jne failure
+    clc 12(12,%r2),12(%r3)
+    jne failure
+    clc 24(12,%r2),24(%r3)
     jne failure
     lpswe success_psw
 
@@ -38,6 +50,8 @@ stacking_target:
     clc result_cr15(8),expected_stacked_cr15
     jne failure
     pr
+after_pr:
+    j failure
 
 failure:
     lpswe failure_psw
@@ -49,6 +63,8 @@ primary_aste_address:
     .quad primary_aste
 initial_cr15:
     .quad stack_header_desc
+initial_cr12:
+    .quad trace_area + 2               /* ASN trace */
 dat_psw:
     .quad DAT_64_PSW,start_dat
 result_cr15:
@@ -57,6 +73,22 @@ expected_basic_link:
     .quad after_basic_pc
 expected_stacked_cr15:
     .quad stack_state+288
+result_cr12:
+    .quad 0
+expected_cr12:
+    .quad trace_area + 36 + 2
+expected_trace:
+    .byte 0x22,0
+    .short 1
+    .quad after_basic_pc
+    .byte 0x22,0
+    .short 2
+    .quad after_stacking_pc
+    .byte 0x32,0x0a
+    .short 0
+    .long after_stacking_pc
+    .long after_pr - 2
+    .align 8
 success_psw:
     .quad 0x0002000180000000,0xfff
 failure_psw:
@@ -110,3 +142,7 @@ stacking_ete:                         /* EX 2 */
     .short 0
     .byte 0xc0                        /* T + G */
     .space 15
+
+    .org 0x3000
+trace_area:
+    .space 64

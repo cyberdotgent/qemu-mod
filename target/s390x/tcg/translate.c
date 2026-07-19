@@ -1268,6 +1268,7 @@ static DisasJumpType op_pc(DisasContext *s, DisasOps *o)
     TCGv_i64 dest = tcg_temp_new_i64();
 
     update_cc_op(s);
+    per_breaking_event(s);
     gen_helper_pc(dest, tcg_env, o->in2, tcg_constant_i64(s->pc_tmp));
     return help_goto_indirect(s, dest);
 }

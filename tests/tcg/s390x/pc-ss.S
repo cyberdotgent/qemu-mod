@@ -7,12 +7,13 @@
 #define DAT_64_PSW 0x0400000180000000
 
     .org 0x1d0                         /* program-new PSW */
-    .quad 0x0000000180000000,failure
+    .quad 0x0000000180000000,event_handler
     .org 0x200
 
     .globl _start
 _start:
     lctlg %c1,%c1,real_asce
+    lctlg %c2,%c2,initial_cr2
     lctlg %c3,%c5,initial_cr3
     lctlg %c7,%c7,real_asce
     lctlg %c13,%c15,home_controls
@@ -34,6 +35,16 @@ after_pc:
     clc result_cr15(8),initial_cr15
     jne failure
     lpswe success_psw
+
+event_handler:
+    clc 0x8e(2),expected_space_switch
+    jne failure
+    clc 0xa8(8),expected_tea
+    jne failure
+    clc 0x158(8),expected_target
+    jne failure
+    lctlg %c1,%c1,real_asce
+    lpswe event_resume_psw
 
 space_switch_target:
     stctg %c1,%c1,result_cr1
@@ -60,6 +71,8 @@ initial_cr4:
     .quad 0x11110001               /* AX, PASN 1 */
 initial_cr5:
     .quad primary_aste
+initial_cr2:
+    .quad duct
 home_controls:
     .quad 0x20                     /* CR13 */
 initial_cr14:
@@ -84,6 +97,15 @@ expected_return_cr3:
     .quad 0xffff000000000003
     .quad 0x00330001               /* AX reloaded by ASN translation */
     .quad return_aste
+expected_space_switch:
+    .short 0x001c
+    .align 8
+expected_tea:
+    .quad 1
+expected_target:
+    .quad space_switch_target
+event_resume_psw:
+    .quad DAT_64_PSW,space_switch_target
 success_psw:
     .quad 0x0002000180000000,0xfff
 failure_psw:
@@ -162,5 +184,21 @@ authority_table:
 called_aste:
     .long 0
     .long 0x22220000              /* AX */
-    .quad 0x20                    /* ASCE */
+    .quad 0x260                   /* real, SSE, subspace-group controls */
     .space 48
+
+    .org 0x6000
+duct:
+    .long called_aste             /* base ASTE origin */
+    .long 0x80006100              /* subspace active, subspace ASTE */
+    .long 0
+    .long 0x12345678              /* subspace ASTE sequence */
+
+    .org 0x6100
+subspace_aste:
+    .long 0
+    .long 0
+    .quad 0x20                    /* replacement ASCE */
+    .long 0
+    .long 0x12345678
+    .space 40
