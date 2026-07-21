@@ -129,6 +129,8 @@ struct SubchDev {
     hwaddr channel_prog;
     CCW1 last_cmd;
     bool last_cmd_valid;
+    /* TIC execution is synchronous, so this state need not migrate. */
+    bool last_ccw_was_tic;
     bool ccw_fmt_1;
     bool thinint_active;
     uint8_t ccw_no_data_cnt;

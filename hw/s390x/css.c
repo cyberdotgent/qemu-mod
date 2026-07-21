@@ -691,6 +691,7 @@ static void sch_handle_clear_func(SubchDev *sch)
     /* We always 'attempt to issue the clear signal', and we always succeed. */
     sch->channel_prog = 0x0;
     sch->last_cmd_valid = false;
+    sch->last_ccw_was_tic = false;
     schib->scsw.ctrl &= ~SCSW_ACTL_CLEAR_PEND;
     schib->scsw.ctrl |= SCSW_STCTL_STATUS_PEND;
 
@@ -712,6 +713,7 @@ static void sch_handle_halt_func(SubchDev *sch)
     /* We always 'attempt to issue the halt signal', and we always succeed. */
     sch->channel_prog = 0x0;
     sch->last_cmd_valid = false;
+    sch->last_ccw_was_tic = false;
     schib->scsw.ctrl &= ~SCSW_ACTL_HALT_PEND;
     schib->scsw.ctrl |= SCSW_STCTL_STATUS_PEND;
 
@@ -1077,7 +1079,7 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
         break;
     }
     case CCW_CMD_TIC:
-        if (sch->last_cmd_valid && (sch->last_cmd.cmd_code == CCW_CMD_TIC)) {
+        if (sch->last_ccw_was_tic) {
             ret = -EINVAL;
             break;
         }
@@ -1105,8 +1107,14 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
         break;
     }
     }
-    sch->last_cmd = ccw;
-    sch->last_cmd_valid = true;
+    if (ccw.cmd_code == CCW_CMD_TIC) {
+        /* TIC does not initiate an I/O operation or signal the device. */
+        sch->last_ccw_was_tic = true;
+    } else {
+        sch->last_ccw_was_tic = false;
+        sch->last_cmd = ccw;
+        sch->last_cmd_valid = true;
+    }
     if (ret == 0) {
         if (ccw.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) {
             sch->channel_prog += 8;
@@ -1158,6 +1166,7 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
         schib->scsw.flags |= (sch->ccw_fmt_1) ? SCSW_FLAGS_MASK_FMT : 0;
         sch->ccw_no_data_cnt = 0;
         sch->ccw_tic_cnt = 0;
+        sch->last_ccw_was_tic = false;
         suspend_allowed = !!(orb->ctrl0 & ORB_CTRL0_MASK_SPND);
     } else {
         /* Start Function resumed via rsch */
@@ -1167,6 +1176,7 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
     }
     if (!completing) {
         sch->last_cmd_valid = false;
+        sch->last_ccw_was_tic = false;
         ret = -EAGAIN;
     }
     do {
@@ -1560,6 +1570,7 @@ IOInstEnding css_do_xsch(SubchDev *sch)
                  SCSW_ACTL_SUSP);
     sch->channel_prog = 0x0;
     sch->last_cmd_valid = false;
+    sch->last_ccw_was_tic = false;
     schib->scsw.dstat = 0;
     schib->scsw.cstat = 0;
     return IOINST_CC_EXPECTED;
@@ -2519,6 +2530,7 @@ void css_reset_sch(SubchDev *sch)
 
     sch->channel_prog = 0x0;
     sch->last_cmd_valid = false;
+    sch->last_ccw_was_tic = false;
     sch->thinint_active = false;
 }
 

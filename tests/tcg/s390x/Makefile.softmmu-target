@@ -57,7 +57,17 @@ $(MULTIARCH_TESTS): $(S390X_MULTIARCH_RUNTIME_OBJS)
 $(MULTIARCH_TESTS): LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
 $(MULTIARCH_TESTS): CFLAGS += $(MINILIB_INC) \
 			      -I$(SRC_PATH)/roms/SLOF/lib/libc/include/
+fba-tic: $(S390X_MULTIARCH_RUNTIME_OBJS)
+fba-tic: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+TESTS += fba-tic
 memory: CFLAGS += -DCHECK_UNALIGNED=0
+
+fba-tic: CFLAGS += -I$(SRC_PATH)/pc-bios/s390-ccw
+fba-tic: fba-tic.o
+run-fba-tic: QEMU_OPTS := -action panic=exit-failure -nographic \
+	-serial chardev:output $(EXTFLAGS) -nodefaults \
+	-blockdev driver=null-co$(COMMA)node-name=fba$(COMMA)size=1048576 \
+	-device fba-ccw$(COMMA)drive=fba$(COMMA)devno=fe.0.0200 -kernel
 
 # s390x clears the BSS section so we need to account for that
 run-plugin-memory-with-libmem.so: 		\
