@@ -133,6 +133,11 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
         /* yield */
         r = 0;
         break;
+    case 0x204:
+        /* LPAR RMF interface */
+        handle_diag_204(env, r1, r3, GETPC());
+        r = 0;
+        break;
     case 0x308:
         /* ipl */
         bql_lock();

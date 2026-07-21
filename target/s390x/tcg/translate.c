@@ -2412,6 +2412,9 @@ static DisasJumpType op_diag(DisasContext *s, DisasOps *o)
     TCGv_i32 func_code = tcg_constant_i32(get_field(s, i2));
 
     gen_helper_diag(tcg_env, r1, r3, func_code);
+    if (get_field(s, i2) == 0x204) {
+        gen_op_movi_cc(s, 0);
+    }
     return DISAS_NEXT;
 }
 #endif

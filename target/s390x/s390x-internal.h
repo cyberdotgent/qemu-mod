@@ -389,6 +389,8 @@ int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
 
 /* misc_helper.c */
 int handle_diag_288(CPUS390XState *env, uint64_t r1, uint64_t r3);
+bool handle_diag_204(CPUS390XState *env, uint64_t r1, uint64_t r3,
+                     uintptr_t ra);
 /* Return whether a CPU reset is pending */
 bool handle_diag_308(CPUS390XState *env, uint64_t r1, uint64_t r3,
                      uintptr_t ra);

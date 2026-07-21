@@ -96,6 +96,7 @@
 #define PRIV_E3_MPCIFC                  0xd0
 #define PRIV_E3_STPCIFC                 0xd4
 
+#define DIAG_LPAR_RMF                   0x204
 #define DIAG_TIMEREVENT                 0x288
 #define DIAG_IPL                        0x308
 #define DIAG_SET_CONTROL_PROGRAM_CODES  0x318
@@ -1482,6 +1483,15 @@ static void kvm_handle_diag_308(S390CPU *cpu, struct kvm_run *run)
     handle_diag_308(&cpu->env, r1, r3, RA_IGNORED);
 }
 
+static void kvm_handle_diag_204(S390CPU *cpu, struct kvm_run *run)
+{
+    uint64_t r1, r3;
+
+    r1 = (run->s390_sieic.ipa & 0x00f0) >> 4;
+    r3 = run->s390_sieic.ipa & 0x000f;
+    handle_diag_204(&cpu->env, r1, r3, RA_IGNORED);
+}
+
 static int handle_sw_breakpoint(S390CPU *cpu, struct kvm_run *run)
 {
     CPUS390XState *env = &cpu->env;
@@ -1546,6 +1556,9 @@ static int handle_diag(S390CPU *cpu, struct kvm_run *run, uint32_t ipb)
      */
     func_code = decode_basedisp_rs(&cpu->env, ipb, NULL) & DIAG_KVM_CODE_MASK;
     switch (func_code) {
+    case DIAG_LPAR_RMF:
+        kvm_handle_diag_204(cpu, run);
+        break;
     case DIAG_TIMEREVENT:
         kvm_handle_diag_288(cpu, run);
         break;
