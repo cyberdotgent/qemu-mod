@@ -1411,6 +1411,8 @@
 /* PURGE TLB */
     F(0xb248, PALB,    RRE,   Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
     F(0xb20d, PTLB,    S,     Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
+/* PERFORM FRAME MANAGEMENT FUNCTION */
+    F(0xb9af, PFMF,    RRE,   EDAT, 0, 0, 0, 0, pfmf, 0, IF_PRIV)
 /* RESET REFERENCE BIT EXTENDED */
     F(0xb22a, RRBE,    RRE,   Z,   0, r2_o, 0, 0, rrbe, 0, IF_PRIV)
 /* SERVICE CALL LOGICAL PROCESSOR (PV hypercall) */
@@ -1431,7 +1433,7 @@
 /* SET PSW KEY FROM ADDRESS */
     F(0xb20a, SPKA,    S,     Z,   0, a2, 0, 0, spka, 0, IF_PRIV)
 /* SET STORAGE KEY EXTENDED */
-    F(0xb22b, SSKE,    RRF_c, Z,   r1_o, r2_o, 0, 0, sske, 0, IF_PRIV)
+    F(0xb22b, SSKE,    RRF_c, Z,   0, 0, 0, 0, sske, 0, IF_PRIV)
 /* SET SYSTEM MASK */
     F(0x8000, SSM,     S,     Z,   0, m2_8u, 0, 0, ssm, 0, IF_PRIV)
 /* SIGNAL PROCESSOR */

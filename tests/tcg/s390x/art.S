@@ -7,7 +7,7 @@
 #define DAT_AR_PSW 0x0400400180000000
 
     .org 0x1d0
-    .quad 0x0000000180000000,failure
+    .quad 0x0000000180000000,program_exception
     .org 0x200
 
     .globl _start
@@ -74,6 +74,17 @@ start_ar:
     l %r5,data
     cfi %r5,0x11223344
     jne failure
+
+    /* DAT exceptions through an AR-specified ASCE identify that AR. */
+    llill %r4,0x9000
+    l %r8,0(%r4)
+    j failure                       /* the invalid PTE must interrupt */
+
+program_exception:
+    chhsi 0x8e,0x11                /* page-translation exception */
+    jne failure
+    cli 0xa0,4                     /* exception access identification */
+    jne failure
     lpswe success_psw
 
 failure:
@@ -132,6 +143,8 @@ segment_table:
     .org 0x7000
 page_table:
     .quad 0x8000
+    .org 0x7000 + 9 * 8
+    .quad 0x400                     /* invalid PTE for virtual 0x9000 */
 
     .org 0x8000 + data
 selected_data:

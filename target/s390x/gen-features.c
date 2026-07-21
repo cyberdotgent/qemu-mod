@@ -916,6 +916,7 @@ static uint16_t qemu_V7_1[] = {
  * feature set of the current "max" CPU model generation.
  */
 static uint16_t qemu_MAX[] = {
+    S390_FEAT_EDAT,
     S390_FEAT_MSA_EXT_5,
     S390_FEAT_KIMD_SHA_512,
     S390_FEAT_KLMD_SHA_512,

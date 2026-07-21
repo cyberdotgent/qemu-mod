@@ -2425,18 +2425,10 @@ uint64_t HELPER(iske)(CPUS390XState *env, uint64_t r2)
     return key;
 }
 
-/* set storage key extended */
-void HELPER(sske)(CPUS390XState *env, uint64_t r1, uint64_t r2)
+static S390SKeysState *get_skeys_device(CPUS390XState *env)
 {
     static S390SKeysState *ss;
     static S390SKeysClass *skeyclass;
-    uint64_t addr = wrap_address(env, r2);
-    uint8_t key;
-
-    addr = mmu_real2abs(env, addr);
-    if (!mmu_absolute_addr_valid(addr, false)) {
-        tcg_s390_program_interrupt(env, PGM_ADDRESSING, GETPC());
-    }
 
     if (unlikely(!ss)) {
         ss = s390_get_skeys_device();
@@ -2445,14 +2437,157 @@ void HELPER(sske)(CPUS390XState *env, uint64_t r1, uint64_t r2)
             tlb_flush_all_cpus_synced(env_cpu(env));
         }
     }
+    return ss;
+}
 
-    key = r1 & 0xfe;
+static void set_storage_key(CPUS390XState *env, uint64_t addr, uint8_t key)
+{
+    S390SKeysState *ss = get_skeys_device(env);
+
     s390_skeys_set(ss, addr / TARGET_PAGE_SIZE, 1, &key);
-   /*
-    * As we can only flush by virtual address and not all the entries
-    * that point to a physical address we have to flush the whole TLB.
-    */
+    /*
+     * As we can only flush by virtual address and not all the entries
+     * that point to a physical address we have to flush the whole TLB.
+     */
     tlb_flush_all_cpus_synced(env_cpu(env));
+}
+
+/*
+ * Update the address portion of a register after an interruptible
+ * multi-block storage-key operation.  Bits 52-63 (the low 12 bits) are
+ * not part of the operand address and remain unchanged.
+ */
+static void set_storage_key_address(CPUS390XState *env, uint32_t reg,
+                                    uint64_t address)
+{
+    uint64_t old = env->regs[reg];
+
+    if (env->psw.mask & PSW_MASK_64) {
+        env->regs[reg] = (address & TARGET_PAGE_MASK) |
+                         (old & ~TARGET_PAGE_MASK);
+    } else if (env->psw.mask & PSW_MASK_32) {
+        uint32_t low = (address & 0x7ffff000) | (old & 0xfff);
+
+        env->regs[reg] = deposit64(old, 0, 32, low);
+    } else {
+        uint32_t low = (address & 0x00fff000) | (old & 0xfff);
+
+        env->regs[reg] = deposit64(old, 0, 32, low);
+    }
+}
+
+/* set storage key extended */
+void HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2, uint32_t m3)
+{
+    uint64_t addr = wrap_address(env, env->regs[r2]) & TARGET_PAGE_MASK;
+    uint64_t pages = 1;
+    uint8_t key = env->regs[r1] & 0xfe;
+    bool multiple = s390_has_feat(S390_FEAT_EDAT) && (m3 & 1);
+
+    if (multiple) {
+        pages = (0x100000 - (addr & 0xfffff)) / TARGET_PAGE_SIZE;
+    } else {
+        addr = mmu_real2abs(env, addr);
+    }
+
+    while (pages--) {
+        if (!mmu_absolute_addr_valid(addr, false)) {
+            tcg_s390_program_interrupt(env, PGM_ADDRESSING, GETPC());
+        }
+        set_storage_key(env, addr, key);
+        if (multiple) {
+            addr = wrap_address(env, addr + TARGET_PAGE_SIZE);
+            set_storage_key_address(env, r2, addr);
+        }
+    }
+}
+
+#define PFMF_FMFI_SK       0x00020000
+#define PFMF_FMFI_CF       0x00010000
+#define PFMF_FSC_MASK      0x00007000
+#define PFMF_FSC_1M        0x00001000
+#define PFMF_FSC_2G        0x00002000
+#define PFMF_RESERVED      0xfffc0101
+#define PFMF_NQ            0x00000800
+
+static bool pfmf_low_address(uint64_t addr)
+{
+    return addr < 0x2000;
+}
+
+static G_NORETURN void pfmf_access_exception(CPUS390XState *env,
+                                             uint64_t addr, int code)
+{
+    if (code == PGM_PROTECTION) {
+        env->tlb_fill_exc = code;
+        env->tlb_fill_tec = (addr & TARGET_PAGE_MASK) | 0x480;
+    }
+    tcg_s390_program_interrupt(env, code, GETPC());
+}
+
+/* perform frame management function */
+void HELPER(pfmf)(CPUS390XState *env, uint32_t r1, uint32_t r2)
+{
+    CPUState *cs = env_cpu(env);
+    uint64_t control = env->regs[r1];
+    uint64_t addr = wrap_address(env, env->regs[r2]) & TARGET_PAGE_MASK;
+    uint64_t lap_addr = addr;
+    uint64_t pages = 1;
+    uint64_t fsc = control & PFMF_FSC_MASK;
+    uint64_t reserved = PFMF_RESERVED;
+    uint8_t key = control & 0xfe;
+    bool set_key = control & PFMF_FMFI_SK;
+    bool clear = control & PFMF_FMFI_CF;
+    bool multiple = false;
+
+    if (s390_has_feat(S390_FEAT_NONQ_KEY_SETTING)) {
+        reserved &= ~PFMF_NQ;
+    }
+    if (control & reserved) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+
+    switch (fsc) {
+    case 0:
+        addr = mmu_real2abs(env, addr);
+        break;
+    case PFMF_FSC_1M:
+        pages = (0x100000 - (addr & 0xfffff)) / TARGET_PAGE_SIZE;
+        multiple = true;
+        break;
+    case PFMF_FSC_2G:
+        if (!s390_has_feat(S390_FEAT_EDAT_2) ||
+            !(env->psw.mask & (PSW_MASK_32 | PSW_MASK_64))) {
+            tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+        }
+        pages = (0x80000000 - (addr & 0x7fffffff)) / TARGET_PAGE_SIZE;
+        multiple = true;
+        break;
+    default:
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+
+    while (pages--) {
+        if (!mmu_absolute_addr_valid(addr, clear)) {
+            pfmf_access_exception(env, addr, PGM_ADDRESSING);
+        }
+        if (clear && (env->cregs[0] & CR0_LOWPROT) &&
+            pfmf_low_address(lap_addr)) {
+            pfmf_access_exception(env, lap_addr, PGM_PROTECTION);
+        }
+        if (clear && address_space_set(cs->as, addr, 0, TARGET_PAGE_SIZE,
+                                       MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            pfmf_access_exception(env, addr, PGM_ADDRESSING);
+        }
+        if (set_key) {
+            set_storage_key(env, addr, key);
+        }
+        if (multiple) {
+            addr = wrap_address(env, addr + TARGET_PAGE_SIZE);
+            lap_addr = addr;
+            set_storage_key_address(env, r2, addr);
+        }
+    }
 }
 
 /* reset reference bit extended */

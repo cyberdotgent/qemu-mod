@@ -299,6 +299,12 @@ static void do_program_interrupt(CPUS390XState *env)
     lowcore = cpu_map_lowcore(env);
 
     switch (env->int_pgm_code) {
+    case PGM_ASCE_TYPE:
+    case PGM_REG_FIRST_TRANS:
+    case PGM_REG_SEC_TRANS:
+    case PGM_REG_THIRD_TRANS:
+    case PGM_SEGMENT_TRANS:
+    case PGM_PAGE_TRANS:
     case PGM_ALET_SPEC:
     case PGM_ALEN_SPEC:
     case PGM_ALE_SEQ:

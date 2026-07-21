@@ -4337,7 +4337,20 @@ static DisasJumpType op_spka(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_sske(DisasContext *s, DisasOps *o)
 {
-    gen_helper_sske(tcg_env, o->in1, o->in2);
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+    TCGv_i32 m3 = tcg_constant_i32(get_field(s, m3));
+
+    gen_helper_sske(tcg_env, r1, r2, m3);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pfmf(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+
+    gen_helper_pfmf(tcg_env, r1, r2);
     return DISAS_NEXT;
 }
 
@@ -6363,6 +6376,7 @@ enum DisasInsnEnum {
 #define FAC_MVCOS       S390_FEAT_MOVE_WITH_OPTIONAL_SPEC
 #define FAC_LPP         S390_FEAT_SET_PROGRAM_PARAMETERS /* load-program-parameter */
 #define FAC_DAT_ENH     S390_FEAT_DAT_ENH
+#define FAC_EDAT        S390_FEAT_EDAT
 #define FAC_E2          S390_FEAT_EXTENDED_TRANSLATION_2
 #define FAC_EH          S390_FEAT_STFLE_49 /* execution-hint */
 #define FAC_PPA         S390_FEAT_STFLE_49 /* processor-assist */
