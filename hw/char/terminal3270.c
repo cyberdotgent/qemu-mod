@@ -1167,6 +1167,11 @@ static int read_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
         return -EIO;
     }
 
+    /* An independent read starts at the beginning of the device buffer. */
+    if (!terminal_sch(t)->last_cmd_valid) {
+        t->pos = 0;
+    }
+
     if (data_chained) {
         if (t->current_record) {
             return terminal_transfer_record(t, ccw);
