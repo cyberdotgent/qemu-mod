@@ -37,6 +37,19 @@
     F(0xb34a, AXBR,    RRE,   Z,   x1, x2, new_x, x1, axb, f128, IF_BFP)
     F(0xed0a, AEB,     RXE,   Z,   e1, m2_32u, new, e1, aeb, f32, IF_BFP)
     F(0xed1a, ADB,     RXE,   Z,   f1, m2_64, new, f1, adb, f64, IF_BFP)
+/* ADD DECIMAL */
+    C(0xfa00, AP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0)
+/* ADD NORMALIZED (HFP) */
+    E(0x3600, AXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_binary, 0, 0, IF_AFP12)
+    E(0x2a00, ADR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 56, IF_AFP12)
+    E(0x3a00, AER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 24, IF_AFP12)
+    E(0x6a00, AD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 56, IF_AFP1)
+    E(0x7a00, AE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 24, IF_AFP1)
+/* ADD UNNORMALIZED (HFP) */
+    E(0x2e00, AWR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x238, IF_AFP12)
+    E(0x3e00, AUR,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x218, IF_AFP12)
+    E(0x6e00, AW,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x238, IF_AFP1)
+    E(0x7e00, AU,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x218, IF_AFP1)
 /* ADD HIGH */
     C(0xb9c8, AHHHR,   RRF_a, HW,  r2_sr32, r3_sr32, new, r1_32h, add, adds32)
     C(0xb9d8, AHHLR,   RRF_a, HW,  r2_sr32, r3, new, r1_32h, add, adds32)
@@ -184,6 +197,13 @@
     F(0xb349, CXBR,    RRE,   Z,   x1, x2, 0, 0, cxb, 0, IF_BFP)
     F(0xed09, CEB,     RXE,   Z,   e1, m2_32u, 0, 0, ceb, 0, IF_BFP)
     F(0xed19, CDB,     RXE,   Z,   f1, m2_64, 0, 0, cdb, 0, IF_BFP)
+/* COMPARE DECIMAL */
+    D(0xf900, CP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 2)
+/* COMPARE (HFP) */
+    E(0x2900, CDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x438, IF_AFP12)
+    E(0x3900, CER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x418, IF_AFP12)
+    E(0x6900, CD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x438, IF_AFP1)
+    E(0x7900, CE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x418, IF_AFP1)
 /* COMPARE AND SIGNAL */
     F(0xb308, KEBR,    RRE,   Z,   e1, e2, 0, 0, keb, 0, IF_BFP)
     F(0xb318, KDBR,    RRE,   Z,   f1, f2, 0, 0, kdb, 0, IF_BFP)
@@ -365,6 +385,13 @@
     C(0xe397, DL,      RXY_a, Z,   r1_D32, m2_32u, new_P, r1_P32, divu32, 0)
     C(0xb987, DLGR,    RRE,   Z,   0, r2_o, r1_P, 0, divu64, 0)
     C(0xe387, DLG,     RXY_a, Z,   0, m2_64, r1_P, 0, divu64, 0)
+/* DIVIDE DECIMAL */
+    C(0xfd00, DP,      SS_a,  Z,   la1, a2, 0, 0, decimal_div, 0)
+/* DIVIDE (HFP) */
+    E(0x2d00, DDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x538, IF_AFP12)
+    E(0x3d00, DER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x518, IF_AFP12)
+    E(0x6d00, DD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x538, IF_AFP1)
+    E(0x7d00, DE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x518, IF_AFP1)
 /* DIVIDE SINGLE */
     C(0xb90d, DSGR,    RRE,   Z,   r1p1, r2, r1_P, 0, divs64, 0)
     C(0xb91d, DSGFR,   RRE,   Z,   r1p1, r2_32s, r1_P, 0, divs64, 0)
@@ -416,6 +443,9 @@
 /* INSERT CHARACTER */
     C(0x4300, IC,      RX_a,  Z,   0, m2_8u, 0, r1_8, mov2, 0)
     C(0xe373, ICY,     RXY_a, LD,  0, m2_8u, 0, r1_8, mov2, 0)
+/* HALVE (HFP) */
+    E(0x2400, HDR,     RR_a,  Z,   0, 0, 0, 0, hfp_halve, 0, 56, IF_AFP12)
+    E(0x3400, HER,     RR_a,  Z,   0, 0, 0, 0, hfp_halve, 0, 24, IF_AFP12)
 /* INSERT CHARACTERS UNDER MASK */
     D(0xbf00, ICM,     RS_b,  Z,   0, a2, r1, 0, icm, 0, 0)
     D(0xeb81, ICMY,    RSY_b, LD,  0, a2, r1, 0, icm, 0, 0)
@@ -444,6 +474,18 @@
     F(0x7800, LE,      RX_a,  Z,   0, m2_32u, 0, e1, mov2, 0, IF_AFP1)
     F(0xed64, LEY,     RXY_a, LD,  0, m2_32u, 0, e1, mov2, 0, IF_AFP1)
     F(0xb365, LXR,     RRE,   Z,   x2h, x2l, 0, x1_P, movx, 0, IF_AFP1)
+/* LOAD HFP SIGN/TEST OPERATIONS */
+    E(0x2000, LPDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x338, IF_AFP12)
+    E(0x2100, LNDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x238, IF_AFP12)
+    E(0x2200, LTDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x038, IF_AFP12)
+    E(0x2300, LCDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x138, IF_AFP12)
+    E(0x3000, LPER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x318, IF_AFP12)
+    E(0x3100, LNER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x218, IF_AFP12)
+    E(0x3200, LTER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x018, IF_AFP12)
+    E(0x3300, LCER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x118, IF_AFP12)
+/* LOAD ROUNDED (HFP) */
+    F(0x2500, LDXR,    RR_a,  Z,   0, x2, new, 0, hfp_ext_round, 0, IF_AFP12)
+    F(0x3500, LEDR,    RR_a,  Z,   0, 0, 0, 0, hfp_round, 0, IF_AFP12)
 /* LOAD IMMEDIATE */
     C(0xc001, LGFI,    RIL_a, EI,  0, i2, 0, r1, mov2, 0)
 /* LOAD RELATIVE LONG */
@@ -706,6 +748,16 @@
     C(0xe396, ML,      RXY_a, Z,   r1p1_32u, m2_32u, new, r1_D32, mul, 0)
     C(0xb986, MLGR,    RRE,   Z,   r1p1, r2_o, r1_P, 0, mul128, 0)
     C(0xe386, MLG,     RXY_a, Z,   r1p1, m2_64, r1_P, 0, mul128, 0)
+/* MULTIPLY DECIMAL */
+    C(0xfc00, MP,      SS_a,  Z,   la1, a2, 0, 0, decimal_mul, 0)
+/* MULTIPLY (HFP) */
+    E(0x2600, MXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_multiply, 0, 112, IF_AFP12)
+    E(0x2700, MXDR,    RR_a,  Z,   x1, f2, new_x, 0, hfp_ext_multiply, 0, 56, IF_AFP12)
+    E(0x2c00, MDR,     RR_a,  Z,   0, f2, 0, 0, hfp_multiply, 0, 0x3838, IF_AFP12)
+    E(0x3c00, MDER,    RR_a,  Z,   0, e2, 0, 0, hfp_multiply, 0, 0x3818, IF_AFP12)
+    E(0x6700, MXD,     RX_a,  Z,   x1, m2_64, 0, 0, hfp_multiply, 0, 0x7038, IF_AFP1)
+    E(0x6c00, MD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_multiply, 0, 0x3838, IF_AFP1)
+    E(0x7c00, MDE,     RX_a,  Z,   0, m2_32u, 0, 0, hfp_multiply, 0, 0x3818, IF_AFP1)
 /* MULTIPLY SINGLE */
     C(0xb252, MSR,     RRE,   Z,   r1_o, r2_o, new, r1_32, mul, 0)
     C(0xb9fd, MSRKC,   RRF_a, MIE2,r3_32s, r2_32s, new, r1_32, mul, muls32)
@@ -773,6 +825,8 @@
     C(0xe900, PKA,     SS_f,  E2,  la1, a2, 0, 0, pka, 0)
 /* PACK UNICODE */
     C(0xe100, PKU,     SS_f,  E2,  la1, a2, 0, 0, pku, 0)
+/* PERFORM LOCKED OPERATION */
+    C(0xee00, PLO,     SS_e,  Z,   0, 0, 0, 0, plo, 0)
 
 /* POPULATION COUNT */
     C(0xb9e1, POPCNT,  RRF_c, PC,  0, r2_o, r1, 0, popcnt, nz64)
@@ -832,6 +886,8 @@
     D(0x8b00, SLA,     RS_a,  Z,   r1, sh, new, r1_32, sla, 0, 31)
     D(0xebdd, SLAK,    RSY_a, DO,  r3, sh, new, r1_32, sla, 0, 31)
     D(0xeb0b, SLAG,    RSY_a, Z,   r3, sh, r1, 0, sla, 0, 63)
+/* SHIFT AND ROUND DECIMAL */
+    C(0xf000, SRP,     SS_c,  Z,   la1, a2, 0, 0, decimal_srp, 0)
 /* SHIFT LEFT SINGLE LOGICAL */
     C(0x8900, SLL,     RS_a,  Z,   r1_o, sh, new, r1_32, sll, 0)
     C(0xebdf, SLLK,    RSY_a, DO,  r3_o, sh, new, r1_32, sll, 0)
@@ -937,6 +993,19 @@
     F(0xb34b, SXBR,    RRE,   Z,   x1, x2, new_x, x1, sxb, f128, IF_BFP)
     F(0xed0b, SEB,     RXE,   Z,   e1, m2_32u, new, e1, seb, f32, IF_BFP)
     F(0xed1b, SDB,     RXE,   Z,   f1, m2_64, new, f1, sdb, f64, IF_BFP)
+/* SUBTRACT DECIMAL */
+    D(0xfb00, SP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 1)
+/* SUBTRACT NORMALIZED (HFP) */
+    E(0x3700, SXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_binary, 0, 1, IF_AFP12)
+    E(0x2b00, SDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x138, IF_AFP12)
+    E(0x3b00, SER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x118, IF_AFP12)
+    E(0x6b00, SD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x138, IF_AFP1)
+    E(0x7b00, SE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x118, IF_AFP1)
+/* SUBTRACT UNNORMALIZED (HFP) */
+    E(0x2f00, SWR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x338, IF_AFP12)
+    E(0x3f00, SUR,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x318, IF_AFP12)
+    E(0x6f00, SW,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x338, IF_AFP1)
+    E(0x7f00, SU,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x318, IF_AFP1)
 /* SUBTRACT HALFWORD */
     C(0x4b00, SH,      RX_a,  Z,   r1, m2_16s, new, r1_32, sub, subs32)
     C(0xe37b, SHY,     RXY_a, LD,  r1, m2_16s, new, r1_32, sub, subs32)
@@ -1017,6 +1086,9 @@
     C(0xea00, UNPKA,   SS_a,  E2,  la1, a2, 0, 0, unpka, 0)
 /* UNPACK UNICODE */
     C(0xe200, UNPKU,   SS_a,  E2,  la1, a2, 0, 0, unpku, 0)
+
+/* ZERO AND ADD DECIMAL */
+    D(0xf800, ZAP,     SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 3)
 
 /* MSA Instructions */
     D(0xb91e, KMAC,    RRE,   MSA,  0, 0, 0, 0, msa, 0, S390_FEAT_TYPE_KMAC)

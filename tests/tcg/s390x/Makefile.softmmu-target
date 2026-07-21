@@ -51,14 +51,17 @@ $(ASM_TESTS): LDFLAGS += -Wl,-T$(LINK_SCRIPT) -Wl,--build-id=none
 $(ASM_TESTS): $(LINK_SCRIPT)
 TESTS += $(ASM_TESTS)
 
-MULTIARCH_TESTS += mvc-smc diag204 edat
+MULTIARCH_TESTS += mvc-smc diag204 decimal edat hfp plo
 S390X_MULTIARCH_RUNTIME_OBJS = head64.o console.o $(MINILIB_OBJS)
 $(MULTIARCH_TESTS): $(S390X_MULTIARCH_RUNTIME_OBJS)
 $(MULTIARCH_TESTS): LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
 $(MULTIARCH_TESTS): CFLAGS += $(MINILIB_INC) \
 			      -I$(SRC_PATH)/roms/SLOF/lib/libc/include/
 diag204: diag204.o
+decimal: decimal.o
 edat: edat.o
+hfp: hfp.o
+plo: plo.o
 fba-tic: $(S390X_MULTIARCH_RUNTIME_OBJS)
 fba-tic: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
 TESTS += fba-tic

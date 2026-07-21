@@ -1658,6 +1658,492 @@ void HELPER(pack)(CPUS390XState *env, uint32_t len, uint64_t dest, uint64_t src)
     }
 }
 
+static void plo_load(CPUS390XState *env, uint64_t addr, uint8_t *value,
+                     unsigned int len, int mmu_idx, uintptr_t ra)
+{
+    unsigned int i;
+
+    for (i = 0; i < len; i++) {
+        value[i] = cpu_ldub_mmuidx_ra(env, addr + i, mmu_idx, ra);
+    }
+}
+
+static void plo_store(CPUS390XState *env, uint64_t addr, const uint8_t *value,
+                      unsigned int len, int mmu_idx, uintptr_t ra)
+{
+    unsigned int i;
+
+    for (i = 0; i < len; i++) {
+        cpu_stb_mmuidx_ra(env, addr + i, value[i], mmu_idx, ra);
+    }
+}
+
+static uint64_t plo_load_u64(CPUS390XState *env, uint64_t addr,
+                             unsigned int len, int mmu_idx, uintptr_t ra)
+{
+    return len == 4 ? cpu_ldl_be_mmuidx_ra(env, addr, mmu_idx, ra) :
+                      cpu_ldq_be_mmuidx_ra(env, addr, mmu_idx, ra);
+}
+
+static void plo_store_u64(CPUS390XState *env, uint64_t addr, uint64_t value,
+                          unsigned int len, int mmu_idx, uintptr_t ra)
+{
+    if (len == 4) {
+        cpu_stl_be_mmuidx_ra(env, addr, value, mmu_idx, ra);
+    } else {
+        cpu_stq_be_mmuidx_ra(env, addr, value, mmu_idx, ra);
+    }
+}
+
+static uint64_t plo_pl_addr(CPUS390XState *env, uint64_t pl,
+                            unsigned int offset, int mmu_idx, uintptr_t ra)
+{
+    return wrap_address(env,
+        cpu_ldq_be_mmuidx_ra(env, pl + offset, mmu_idx, ra));
+}
+
+static bool plo_compare_pl(CPUS390XState *env, uint64_t pl,
+                           unsigned int compare_offset, uint64_t operand_addr,
+                           unsigned int len, int pl_idx, int operand_idx,
+                           uintptr_t ra)
+{
+    uint8_t compare[16], operand[16];
+
+    plo_load(env, pl + compare_offset, compare, len, pl_idx, ra);
+    plo_load(env, operand_addr, operand, len, operand_idx, ra);
+    if (memcmp(compare, operand, len) == 0) {
+        return true;
+    }
+    plo_store(env, pl + compare_offset, operand, len, pl_idx, ra);
+    return false;
+}
+
+static void plo_probe_store(CPUS390XState *env, uint64_t addr,
+                            unsigned int len, int mmu_idx, uintptr_t ra)
+{
+    S390Access access;
+
+    access_prepare(&access, env, addr, len, MMU_DATA_STORE, mmu_idx, ra);
+}
+
+uint32_t HELPER(plo)(CPUS390XState *env, uint32_t r1, uint32_t r3,
+                     uint64_t a2, uint64_t a4,
+                     uint32_t mmu_idx2, uint32_t mmu_idx4)
+{
+    uintptr_t ra = GETPC();
+    uint32_t control = env->regs[0];
+    unsigned int fc = control & 0xff;
+    unsigned int group, variant, len;
+    bool pl_form, equal = true;
+    uint64_t pl = a4;
+    unsigned int cmp1, repl1, value_base;
+    unsigned int i, stores;
+    int indirect_idx = mmu_idx_from_reg(env, r3);
+
+    if (control & 0xfffffe00U) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    if (control & 0x100) {
+        return fc < 24 ? 0 : 3;
+    }
+    if (fc >= 24) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+
+    group = fc / 4;
+    variant = fc & 3;
+    pl_form = variant & 1;
+    len = variant < 2 ? (pl_form ? 8 : 4) : (pl_form ? 16 : 8);
+    if (a2 & (len - 1)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    if (pl_form || group >= 4) {
+        if (pl & 7) {
+            tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+        }
+    } else if ((group == 0 || group == 2 || group == 3) &&
+               (a4 & (len - 1))) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    if (!pl_form && group >= 1 && (r1 & 1)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    if (!pl_form && group == 2 && (r3 & 1)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+
+    cmp1 = len == 16 ? 0 : 8;
+    repl1 = len == 16 ? 16 : 24;
+    value_base = len == 16 ? 48 : len == 8 ? 56 : 60;
+
+    if (pl_form) {
+        equal = plo_compare_pl(env, pl, cmp1, a2, len,
+                               mmu_idx4, mmu_idx2, ra);
+    } else {
+        uint64_t actual = plo_load_u64(env, a2, len, mmu_idx2, ra);
+        uint64_t compare = len == 4 ? (uint32_t)env->regs[r1] : env->regs[r1];
+
+        equal = compare == actual;
+        if (!equal) {
+            if (len == 4) {
+                env->regs[r1] = deposit64(env->regs[r1], 0, 32, actual);
+            } else {
+                env->regs[r1] = actual;
+            }
+        }
+    }
+
+    if (!equal) {
+        return 1;
+    }
+
+    if (group == 2) {
+        bool second_equal;
+
+        if (pl_form) {
+            second_equal = plo_compare_pl(env, pl, len == 16 ? 32 : 40,
+                plo_pl_addr(env, pl, 72, mmu_idx4, ra), len,
+                mmu_idx4, indirect_idx, ra);
+        } else {
+            uint64_t actual = plo_load_u64(env, a4, len, mmu_idx4, ra);
+            uint64_t compare = len == 4 ? (uint32_t)env->regs[r3] :
+                                         env->regs[r3];
+
+            second_equal = compare == actual;
+            if (!second_equal) {
+                if (len == 4) {
+                    env->regs[r3] = deposit64(env->regs[r3], 0, 32, actual);
+                } else {
+                    env->regs[r3] = actual;
+                }
+            }
+        }
+        if (!second_equal) {
+            return 2;
+        }
+    }
+
+    if (group == 0) {
+        if (pl_form) {
+            uint8_t value[16];
+            uint64_t addr = plo_pl_addr(env, pl, 72, mmu_idx4, ra);
+
+            plo_load(env, addr, value, len, indirect_idx, ra);
+            plo_store(env, pl + (len == 16 ? 32 : 40), value, len,
+                      mmu_idx4, ra);
+        } else {
+            uint64_t value = plo_load_u64(env, a4, len, mmu_idx4, ra);
+
+            if (len == 4) {
+                env->regs[r3] = deposit64(env->regs[r3], 0, 32, value);
+            } else {
+                env->regs[r3] = value;
+            }
+        }
+        return 0;
+    }
+
+    {
+        uint8_t replacement[16], values[3][16];
+        uint64_t addresses[3];
+        int extra_idx;
+
+        if (pl_form) {
+            plo_load(env, pl + repl1, replacement, len, mmu_idx4, ra);
+        }
+
+        stores = group >= 4 ? group - 2 : group >= 2 ? 1 : 0;
+        extra_idx = pl_form || group >= 4 ? indirect_idx : mmu_idx4;
+        for (i = 0; i < stores; i++) {
+            if (pl_form || group >= 4) {
+                addresses[i] = plo_pl_addr(env, pl, 72 + i * 32,
+                                           mmu_idx4, ra);
+                plo_load(env, pl + value_base + i * 32, values[i], len,
+                         mmu_idx4, ra);
+            } else {
+                addresses[i] = a4;
+            }
+        }
+
+        /* Recognize every store exception before changing any operand. */
+        plo_probe_store(env, a2, len, mmu_idx2, ra);
+        for (i = 0; i < stores; i++) {
+            plo_probe_store(env, addresses[i], len, extra_idx, ra);
+        }
+
+        if (pl_form) {
+            plo_store(env, a2, replacement, len, mmu_idx2, ra);
+        } else {
+            plo_store_u64(env, a2, env->regs[r1 + 1], len, mmu_idx2, ra);
+        }
+        for (i = 0; i < stores; i++) {
+            if (pl_form || group >= 4) {
+                plo_store(env, addresses[i], values[i], len, extra_idx, ra);
+            } else if (group == 2) {
+                plo_store_u64(env, addresses[i], env->regs[r3 + 1], len,
+                              extra_idx, ra);
+            } else {
+                plo_store_u64(env, addresses[i], env->regs[r3], len,
+                              extra_idx, ra);
+            }
+        }
+    }
+    return 0;
+}
+
+typedef unsigned __int128 DecimalMagnitude;
+
+typedef struct DecimalOperand {
+    DecimalMagnitude magnitude;
+    bool negative;
+} DecimalOperand;
+
+static DecimalMagnitude decimal_pow10(unsigned int n)
+{
+    DecimalMagnitude r = 1;
+
+    while (n--) {
+        r *= 10;
+    }
+    return r;
+}
+
+static DecimalOperand decimal_load(CPUS390XState *env, uint64_t addr,
+                                   unsigned int bytes, int mmu_idx,
+                                   uintptr_t ra)
+{
+    DecimalOperand ret = { 0 };
+    unsigned int i;
+
+    for (i = 0; i < bytes; i++) {
+        uint8_t b = cpu_ldub_mmuidx_ra(env, wrap_address(env, addr + i),
+                                      mmu_idx, ra);
+        unsigned int high = b >> 4;
+        unsigned int low = b & 0xf;
+
+        if (high > 9 || (i + 1 != bytes && low > 9)) {
+            tcg_s390_data_exception(env, 0, ra);
+        }
+        ret.magnitude = ret.magnitude * 10 + high;
+        if (i + 1 == bytes) {
+            if (low < 0xa) {
+                tcg_s390_data_exception(env, 0, ra);
+            }
+            ret.negative = low == 0xb || low == 0xd;
+        } else {
+            ret.magnitude = ret.magnitude * 10 + low;
+        }
+    }
+    return ret;
+}
+
+static void decimal_store(CPUS390XState *env, uint64_t addr,
+                          unsigned int bytes, DecimalMagnitude magnitude,
+                          bool negative, int mmu_idx, uintptr_t ra)
+{
+    int i;
+    uint8_t low = negative ? 0xd : 0xc;
+
+    for (i = bytes - 1; i >= 0; i--) {
+        uint8_t high = magnitude % 10;
+
+        magnitude /= 10;
+        cpu_stb_mmuidx_ra(env, wrap_address(env, addr + i),
+                         (high << 4) | low, mmu_idx, ra);
+        if (i != 0) {
+            low = magnitude % 10;
+            magnitude /= 10;
+        }
+    }
+}
+
+static void decimal_probe_store(CPUS390XState *env, uint64_t addr,
+                                unsigned int bytes, int mmu_idx,
+                                uintptr_t ra)
+{
+    S390Access access;
+
+    access_prepare(&access, env, addr, bytes, MMU_DATA_STORE, mmu_idx, ra);
+}
+
+static uint32_t decimal_cc(DecimalMagnitude magnitude, bool negative,
+                           bool overflow)
+{
+    return overflow ? 3 : magnitude == 0 ? 0 : negative ? 1 : 2;
+}
+
+static void decimal_overflow(CPUS390XState *env, uint32_t cc, uintptr_t ra)
+{
+    if (cc == 3 && (env->psw.mask & (1ULL << (PSW_SHIFT_MASK_PM + 2)))) {
+        env->cc_op = 3;
+        tcg_s390_program_interrupt(env, PGM_DEC_OVERFLOW, ra);
+    }
+}
+
+/* op: 0 AP, 1 SP, 2 CP, 3 ZAP. */
+uint32_t HELPER(decimal)(CPUS390XState *env, uint32_t op, uint32_t len,
+                         uint64_t dest, uint64_t src,
+                         uint32_t dest_idx, uint32_t src_idx)
+{
+    uintptr_t ra = GETPC();
+    unsigned int dbytes = (len >> 4) + 1;
+    unsigned int sbytes = (len & 0xf) + 1;
+    DecimalOperand d = { 0 }, s;
+    DecimalMagnitude limit = decimal_pow10(2 * dbytes - 1);
+    DecimalMagnitude result;
+    bool negative, overflow;
+    uint32_t cc;
+
+    if (op != 3) {
+        d = decimal_load(env, dest, dbytes, dest_idx, ra);
+    }
+    s = decimal_load(env, src, sbytes, src_idx, ra);
+
+    if (op == 2) {
+        if (d.magnitude == 0 && s.magnitude == 0) {
+            return 0;
+        }
+        if (d.negative != s.negative) {
+            return d.negative ? 1 : 2;
+        }
+        if (d.magnitude == s.magnitude) {
+            return 0;
+        }
+        return (d.magnitude < s.magnitude) != d.negative ? 1 : 2;
+    }
+
+    if (op == 3) {
+        result = s.magnitude;
+        negative = s.negative;
+    } else {
+        bool snegative = s.negative ^ (op == 1);
+
+        if (d.negative == snegative) {
+            result = d.magnitude + s.magnitude;
+            negative = d.negative;
+        } else if (d.magnitude >= s.magnitude) {
+            result = d.magnitude - s.magnitude;
+            negative = d.negative;
+        } else {
+            result = s.magnitude - d.magnitude;
+            negative = snegative;
+        }
+    }
+
+    overflow = result >= limit;
+    result %= limit;
+    if (!overflow && result == 0) {
+        negative = false;
+    }
+    decimal_probe_store(env, dest, dbytes, dest_idx, ra);
+    decimal_store(env, dest, dbytes, result, negative, dest_idx, ra);
+    cc = decimal_cc(result, negative, overflow);
+    decimal_overflow(env, cc, ra);
+    return cc;
+}
+
+void HELPER(decimal_mul)(CPUS390XState *env, uint32_t len,
+                         uint64_t dest, uint64_t src,
+                         uint32_t dest_idx, uint32_t src_idx)
+{
+    uintptr_t ra = GETPC();
+    unsigned int dbytes = (len >> 4) + 1;
+    unsigned int sbytes = (len & 0xf) + 1;
+    DecimalOperand d, s;
+
+    if (sbytes > 8 || sbytes >= dbytes) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    d = decimal_load(env, dest, dbytes, dest_idx, ra);
+    s = decimal_load(env, src, sbytes, src_idx, ra);
+    if (d.magnitude >= decimal_pow10(2 * (dbytes - sbytes) - 1)) {
+        tcg_s390_data_exception(env, 0, ra);
+    }
+    decimal_probe_store(env, dest, dbytes, dest_idx, ra);
+    decimal_store(env, dest, dbytes, d.magnitude * s.magnitude,
+                  d.negative != s.negative, dest_idx, ra);
+}
+
+void HELPER(decimal_div)(CPUS390XState *env, uint32_t len,
+                         uint64_t dest, uint64_t src,
+                         uint32_t dest_idx, uint32_t src_idx)
+{
+    uintptr_t ra = GETPC();
+    unsigned int dbytes = (len >> 4) + 1;
+    unsigned int sbytes = (len & 0xf) + 1;
+    unsigned int qbytes;
+    DecimalOperand d, s;
+    DecimalMagnitude quotient, remainder;
+
+    if (sbytes > 8 || sbytes >= dbytes) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+    d = decimal_load(env, dest, dbytes, dest_idx, ra);
+    s = decimal_load(env, src, sbytes, src_idx, ra);
+    qbytes = dbytes - sbytes;
+    if (s.magnitude == 0) {
+        tcg_s390_program_interrupt(env, PGM_DEC_DIVIDE, ra);
+    }
+    quotient = d.magnitude / s.magnitude;
+    remainder = d.magnitude % s.magnitude;
+    if (quotient >= decimal_pow10(2 * qbytes - 1)) {
+        tcg_s390_program_interrupt(env, PGM_DEC_DIVIDE, ra);
+    }
+    decimal_probe_store(env, dest, dbytes, dest_idx, ra);
+    decimal_store(env, dest + qbytes, sbytes, remainder, d.negative,
+                  dest_idx, ra);
+    decimal_store(env, dest, qbytes, quotient, d.negative != s.negative,
+                  dest_idx, ra);
+}
+
+uint32_t HELPER(decimal_srp)(CPUS390XState *env, uint32_t len,
+                             uint64_t dest, uint64_t shift_addr,
+                             uint32_t round, uint32_t dest_idx)
+{
+    uintptr_t ra = GETPC();
+    unsigned int bytes = len + 1;
+    unsigned int digits = 2 * bytes - 1;
+    int shift = shift_addr & 0x3f;
+    DecimalOperand d;
+    DecimalMagnitude limit = decimal_pow10(digits);
+    DecimalMagnitude result;
+    bool overflow = false;
+    uint32_t cc;
+
+    shift = (shift ^ 0x20) - 0x20;
+    d = decimal_load(env, dest, bytes, dest_idx, ra);
+    if (round > 9) {
+        tcg_s390_data_exception(env, 0, ra);
+    }
+    if (shift > 0) {
+        if (shift >= digits) {
+            overflow = d.magnitude != 0;
+            result = 0;
+        } else {
+            DecimalMagnitude scale = decimal_pow10(shift);
+            DecimalMagnitude keep = limit / scale;
+
+            overflow = d.magnitude >= keep;
+            result = (d.magnitude % keep) * scale;
+        }
+    } else if (shift < 0) {
+        unsigned int n = -shift;
+        DecimalMagnitude scale = decimal_pow10(n);
+
+        result = (d.magnitude + round * (scale / 10)) / scale;
+    } else {
+        result = d.magnitude;
+    }
+    if (!overflow && result == 0) {
+        d.negative = false;
+    }
+    decimal_probe_store(env, dest, bytes, dest_idx, ra);
+    decimal_store(env, dest, bytes, result, d.negative, dest_idx, ra);
+    cc = decimal_cc(result, d.negative, overflow);
+    decimal_overflow(env, cc, ra);
+    return cc;
+}
+
 static inline void do_pkau(CPUS390XState *env, uint64_t dest, uint64_t src,
                            uint32_t srclen, int ssize, uintptr_t ra)
 {

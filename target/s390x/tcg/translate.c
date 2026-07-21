@@ -1057,6 +1057,7 @@ typedef struct {
 #define IF_AFP1     0x0001      /* r1 is a fp reg for HFP/FPS instructions */
 #define IF_AFP2     0x0002      /* r2 is a fp reg for HFP/FPS instructions */
 #define IF_AFP3     0x0004      /* r3 is a fp reg for HFP/FPS instructions */
+#define IF_AFP12    (IF_AFP1 | IF_AFP2)
 #define IF_BFP      0x0008      /* binary floating point instruction */
 #define IF_DFP      0x0010      /* decimal floating point instruction */
 #define IF_PRIV     0x0020      /* privileged instruction */
@@ -2303,6 +2304,141 @@ static DisasJumpType op_csp(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 #endif
+
+static DisasJumpType op_decimal(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal(cc_op, tcg_env,
+                       tcg_constant_i32(s->insn->data),
+                       tcg_constant_i32(get_field(s, l1)),
+                       o->addr1, o->in2,
+                       tcg_constant_i32(get_mem_index1(s)),
+                       tcg_constant_i32(get_mem_index(s)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_mul(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_mul(tcg_env, tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_mem_index1(s)),
+                           tcg_constant_i32(get_mem_index(s)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_div(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_div(tcg_env, tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_mem_index1(s)),
+                           tcg_constant_i32(get_mem_index(s)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_srp(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_srp(cc_op, tcg_env,
+                           tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_field(s, i3)),
+                           tcg_constant_i32(get_mem_index1(s)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_binary(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+    TCGv_i32 result = data >> 8 == 5 ? tcg_temp_new_i32() : cc_op;
+
+    if (data >> 8 == 5) {
+        update_cc_op(s);
+    }
+    gen_helper_hfp_binary(result, tcg_env,
+                          tcg_constant_i32(get_field(s, r1)), o->in2,
+                          tcg_constant_i32(data & 0xff),
+                          tcg_constant_i32(data >> 8));
+    if (data >> 8 != 5) {
+        set_cc_static(s);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_multiply(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+
+    update_cc_op(s);
+    gen_helper_hfp_multiply(tcg_env,
+                            tcg_constant_i32(get_field(s, r1)), o->in2,
+                            tcg_constant_i32(data & 0xff),
+                            tcg_constant_i32(data >> 8));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_halve(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_halve(tcg_env,
+                         tcg_constant_i32(get_field(s, r1)),
+                         tcg_constant_i32(get_field(s, r2)),
+                         tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_load(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+
+    gen_helper_hfp_load(cc_op, tcg_env,
+                        tcg_constant_i32(get_field(s, r1)), o->in2,
+                        tcg_constant_i32(data & 0xff),
+                        tcg_constant_i32(data >> 8));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_round(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_round(tcg_env,
+                         tcg_constant_i32(get_field(s, r1)),
+                         tcg_constant_i32(get_field(s, r2)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_binary(DisasContext *s, DisasOps *o)
+{
+    gen_helper_hfp_ext_binary(cc_op, tcg_env,
+                              tcg_constant_i32(get_field(s, r1)),
+                              tcg_constant_i32(get_field(s, r2)),
+                              tcg_constant_i32(s->insn->data));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_multiply(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_ext_multiply(tcg_env,
+                                tcg_constant_i32(get_field(s, r1)),
+                                tcg_constant_i32(get_field(s, r2)),
+                                tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_round(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_ext_round(tcg_env,
+                             tcg_constant_i32(get_field(s, r1)),
+                             tcg_constant_i32(get_field(s, r2)));
+    return DISAS_NEXT;
+}
 
 static DisasJumpType op_cvb(DisasContext *s, DisasOps *o)
 {
@@ -3816,6 +3952,31 @@ static DisasJumpType op_pack(DisasContext *s, DisasOps *o)
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
     gen_helper_pack(tcg_env, l, o->addr1, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_plo(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 a2 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    TCGv_i64 a4 = get_address(s, 0, get_field(s, b4), get_field(s, d4));
+
+    /* PLO is a single interlocked operation across all of its operands. */
+    if (tb_cflags(s->base.tb) & CF_PARALLEL) {
+        update_psw_addr(s);
+        update_cc_op(s);
+        gen_exception(EXCP_ATOMIC);
+        return DISAS_NORETURN;
+    }
+
+    update_cc_op(s);
+    gen_helper_plo(cc_op, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)),
+                   tcg_constant_i32(get_field(s, r3)), a2, a4,
+                   tcg_constant_i32(get_mem_index_by_base(
+                       s, get_field(s, b2))),
+                   tcg_constant_i32(get_mem_index_by_base(
+                       s, get_field(s, b4))));
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 
