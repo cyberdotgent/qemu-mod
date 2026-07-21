@@ -7,6 +7,7 @@ css_chpid_add(uint8_t cssid, uint8_t chpid, uint8_t type) "CSS: add chpid %x.%02
 css_new_image(uint8_t cssid, const char *default_cssid) "CSS: add css image 0x%02x %s"
 css_assign_subch(const char *do_assign, uint8_t cssid, uint8_t ssid, uint16_t schid, uint16_t devno) "CSS: %s %x.%x.%04x (devno 0x%04x)"
 css_io_interrupt(int cssid, int ssid, int schid, uint32_t intparm, uint8_t isc, const char *conditional) "CSS: I/O interrupt on sch %x.%x.%04x (intparm 0x%08x, isc 0x%x) %s"
+css_tsch_irb(uint16_t devno, uint16_t flags, uint16_t ctrl, uint32_t cpa, uint8_t dstat, uint8_t cstat, uint16_t count) "CSS: TSCH devno=0x%04x flags=0x%04x ctrl=0x%04x cpa=0x%08x dstat=0x%02x cstat=0x%02x count=%u"
 css_adapter_interrupt(uint8_t isc) "CSS: adapter I/O interrupt (isc 0x%x)"
 css_do_sic(uint16_t mode, uint8_t isc) "CSS: set interruption mode 0x%x on isc 0x%x"
 

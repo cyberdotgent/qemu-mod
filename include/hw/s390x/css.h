@@ -217,6 +217,7 @@ uint16_t css_build_subchannel_id(SubchDev *sch);
 void copy_scsw_to_guest(SCSW *dest, const SCSW *src);
 void copy_esw_to_guest(ESW *dest, const ESW *src);
 void css_inject_io_interrupt(SubchDev *sch);
+bool css_generate_unsolicited_io_interrupt(SubchDev *sch, uint8_t dstat);
 void css_reset(void);
 void css_reset_sch(SubchDev *sch);
 void css_crw_add_to_queue(CRW crw);

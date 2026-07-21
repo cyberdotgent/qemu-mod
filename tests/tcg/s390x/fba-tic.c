@@ -10,6 +10,7 @@
 #include "s390-arch.h"
 
 #define FBA_CMD_WRITE          0x41
+#define DATA_CHAIN_IGNORED_CMD 0x00
 #define FBA_CMD_LOCATE         0x43
 #define FBA_CMD_DEFINE_EXTENT  0x63
 
@@ -27,6 +28,7 @@ static uint8_t locate[8] __attribute__((aligned(8))) = {
 };
 static uint8_t data[1024] __attribute__((aligned(8)));
 static Ccw1 write_chain[6] __attribute__((aligned(8)));
+static Ccw1 zero_count_chain[4] __attribute__((aligned(8)));
 static Ccw1 consecutive_tics[4] __attribute__((aligned(8)));
 
 static uint32_t addr32(const void *p)
@@ -92,7 +94,8 @@ int main(void)
         .cda = addr32(&write_chain[5]),
     };
     write_chain[5] = (Ccw1) {
-        .cmd_code = FBA_CMD_WRITE,
+        /* A continuation's command field must not replace WRITE. */
+        .cmd_code = DATA_CHAIN_IGNORED_CMD,
         .flags = CCW_FLAG_SLI,
         .count = 512,
         .cda = addr32(data + 512),
@@ -102,6 +105,20 @@ int main(void)
     if (ret || irb.scsw.cstat ||
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND)) {
         return 3;
+    }
+
+    zero_count_chain[0] = write_chain[0];
+    zero_count_chain[1] = write_chain[1];
+    zero_count_chain[2] = write_chain[2];
+    zero_count_chain[3] = (Ccw1) {
+        .cmd_code = DATA_CHAIN_IGNORED_CMD,
+        .cda = addr32(data + 512),
+    };
+
+    irb = (Irb) { 0 };
+    ret = run_io(schid, zero_count_chain, &irb);
+    if (ret || irb.scsw.cstat != SCSW_CSTAT_PROGCHK || irb.scsw.dstat) {
+        return 4;
     }
 
     consecutive_tics[0] = (Ccw1) {
@@ -127,7 +144,7 @@ int main(void)
     irb = (Irb) { 0 };
     ret = run_io(schid, consecutive_tics, &irb);
     if (ret || irb.scsw.cstat != SCSW_CSTAT_PROGCHK || irb.scsw.dstat) {
-        return 4;
+        return 5;
     }
 
     return 0;

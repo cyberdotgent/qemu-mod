@@ -334,11 +334,10 @@ static void terminal_signal_ready(Terminal3270 *t)
         offset += len;
     }
     t->reconnect_restore = false;
-    sch->curr_status.scsw.dstat = SCSW_DSTAT_DEVICE_END;
     if (t->queued_records) {
         t->attention_pending = true;
     }
-    css_conditional_io_interrupt(sch);
+    css_generate_unsolicited_io_interrupt(sch, SCSW_DSTAT_DEVICE_END);
 }
 
 static void terminal_maybe_ready(Terminal3270 *t)
@@ -448,14 +447,12 @@ static void terminal_try_attention(Terminal3270 *t)
 {
     SubchDev *sch = terminal_sch(t);
 
-    if (!t->attention_pending ||
-        !(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||
-        (sch->curr_status.scsw.ctrl & SCSW_STCTL_STATUS_PEND)) {
+    if (!t->attention_pending) {
         return;
     }
-    t->attention_pending = false;
-    sch->curr_status.scsw.dstat = SCSW_DSTAT_ATTENTION;
-    css_conditional_io_interrupt(sch);
+    if (css_generate_unsolicited_io_interrupt(sch, SCSW_DSTAT_ATTENTION)) {
+        t->attention_pending = false;
+    }
 }
 
 static void terminal_status_cleared(SubchDev *sch)
@@ -675,8 +672,8 @@ static void chr_event(void *opaque, QEMUChrEvent event)
             terminal_set_unit_check(t, SENSE_DATA_CHECK);
             css_virtual_ccw_complete(sch, -EIO);
         } else if (!preserving) {
-            sch->curr_status.scsw.dstat = SCSW_DSTAT_DEVICE_END;
-            css_conditional_io_interrupt(sch);
+            css_generate_unsolicited_io_interrupt(sch,
+                                                  SCSW_DSTAT_DEVICE_END);
         }
         break;
     case CHR_EVENT_BREAK:

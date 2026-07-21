@@ -595,6 +595,28 @@ void css_inject_io_interrupt(SubchDev *sch)
                       isc << 27);
 }
 
+bool css_generate_unsolicited_io_interrupt(SubchDev *sch, uint8_t dstat)
+{
+    if (!(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||
+        (sch->curr_status.scsw.ctrl & (SCSW_CTRL_MASK_FCTL |
+                                       SCSW_CTRL_MASK_ACTL |
+                                       SCSW_STCTL_STATUS_PEND))) {
+        return false;
+    }
+
+    /*
+     * An unsolicited interruption is not the completion status of the
+     * preceding channel program.  In particular, its CPA, residual count,
+     * format, and function/activity controls must not leak from that I/O.
+     */
+    sch->curr_status.scsw = (SCSW) {
+        .ctrl = SCSW_STCTL_ALERT | SCSW_STCTL_STATUS_PEND,
+        .dstat = dstat,
+    };
+    css_inject_io_interrupt(sch);
+    return true;
+}
+
 void css_conditional_io_interrupt(SubchDev *sch)
 {
     /*
@@ -980,6 +1002,7 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
 {
     int ret;
     bool check_len;
+    bool data_chained;
     int len;
     CCW1 ccw;
 
@@ -993,17 +1016,25 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
 
     /* Translate everything to format-1 ccws - the information is the same. */
     ccw = copy_ccw_from_guest(ccw_addr, sch->ccw_fmt_1);
+    data_chained = sch->last_cmd_valid &&
+                   (sch->last_cmd.flags & CCW_FLAG_DC);
 
-    /* Check for invalid command codes. */
-    if ((ccw.cmd_code & 0x0f) == 0) {
-        return -EINVAL;
-    }
-    if (((ccw.cmd_code & 0x0f) == CCW_CMD_TIC) &&
-        ((ccw.cmd_code & 0xf0) != 0)) {
-        return -EINVAL;
+    /* A continuation's command code is ignored unless it specifies TIC. */
+    if (!data_chained) {
+        if ((ccw.cmd_code & 0x0f) == 0) {
+            return -EINVAL;
+        }
+        if (((ccw.cmd_code & 0x0f) == CCW_CMD_TIC) &&
+            ((ccw.cmd_code & 0xf0) != 0)) {
+            return -EINVAL;
+        }
     }
     if (!sch->ccw_fmt_1 && (ccw.count == 0) &&
         (ccw.cmd_code != CCW_CMD_TIC)) {
+        return -EINVAL;
+    }
+    if ((data_chained || (ccw.flags & CCW_FLAG_DC)) &&
+        ccw.count == 0 && ccw.cmd_code != CCW_CMD_TIC) {
         return -EINVAL;
     }
 
@@ -1017,6 +1048,18 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
     }
 
     check_len = !((ccw.flags & CCW_FLAG_SLI) && !(ccw.flags & CCW_FLAG_DC));
+
+    /*
+     * A data-chained CCW continues the operation initiated by the first CCW
+     * in the chain.  Its command-code field is ignored and does not replace
+     * the command presented to the device.  TIC is the exception: it
+     * redirects channel-program execution without initiating an operation,
+     * and the original command remains in last_cmd for the CCW at the TIC
+     * target.
+     */
+    if (data_chained && ccw.cmd_code != CCW_CMD_TIC) {
+        ccw.cmd_code = sch->last_cmd.cmd_code;
+    }
 
     if (!ccw.cda) {
         if (sch->ccw_no_data_cnt == 255) {
@@ -1845,6 +1888,9 @@ int css_do_tsch_get_irb(SubchDev *sch, IRB *target_irb, int *irb_len)
     /* Store the irb to the guest. */
     p = schib->pmcw;
     copy_irb_to_guest(target_irb, &irb, &p, irb_len);
+    trace_css_tsch_irb(sch->devno, irb.scsw.flags, irb.scsw.ctrl,
+                       irb.scsw.cpa, irb.scsw.dstat, irb.scsw.cstat,
+                       irb.scsw.count);
 
     return ((stctl & SCSW_STCTL_STATUS_PEND) == 0);
 }
