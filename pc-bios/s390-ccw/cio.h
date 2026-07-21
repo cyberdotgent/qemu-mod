@@ -111,6 +111,9 @@ struct scsw {
 #define SCSW_CSTAT_ICCHK    0x02
 #define SCSW_CSTAT_CHAINCHK 0x01
 
+/* I/O-interruption-code flags */
+#define IO_INT_WORD_AI      0x80000000
+
 /*
  * subchannel information block
  */

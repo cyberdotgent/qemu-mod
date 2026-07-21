@@ -342,7 +342,32 @@ static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, bool c64,
         return rc;
     }
 
-    consume_io_int();
+    while (true) {
+        SubChannelId interrupt_schid;
+        Irb unexpected_irb;
+
+        consume_io_int();
+        if (lowcore->subchannel_id == schid.sch_id &&
+            lowcore->subchannel_nr == schid.sch_no) {
+            break;
+        }
+
+        /*
+         * Firmware enables every I/O-interruption subclass while waiting for
+         * a synchronous CCW.  A different enabled device can therefore
+         * interrupt first, for example when a user presses Enter on a 3270
+         * during IPL.  Clear that subchannel's pending status and continue
+         * waiting for the CCW we actually started.
+         *
+         * Adapter interrupts have no subchannel status to clear.
+         */
+        if (lowcore->io_int_word & IO_INT_WORD_AI) {
+            continue;
+        }
+        interrupt_schid.sch_id = lowcore->subchannel_id;
+        interrupt_schid.sch_no = lowcore->subchannel_nr;
+        tsch(interrupt_schid, &unexpected_irb);
+    }
 
     /* collect status */
     rc = tsch(schid, irb);
