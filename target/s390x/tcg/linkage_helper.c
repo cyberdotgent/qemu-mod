@@ -32,6 +32,12 @@
 #define ASTE_AX 0xffff0000U
 #define ASTE_ATL 0x0000fff0U
 #define ASTE_ORIGIN 0x7fffffc0U
+#define ASTE_REUSABLE 0x00000001U
+#define LINKAGE_SUBSYSTEM 0x80000000U
+#define ASTE_BASE_SPACE 0x00000001U
+#define DUCT_REDUCED_AUTHORITY 0x00000008U
+#define DUCT_PROBLEM_STATE 0x00000001U
+#define DUCT_SUBSPACE_ACTIVE 0x80000000U
 
 typedef enum S390LinkageEntryType {
     S390_LINKAGE_ENTRY_BRANCH = 0x0c,
@@ -73,6 +79,17 @@ static int subspace_replace(CPUS390XState *env, uint64_t asce,
 static int aste_authorize_secondary(CPUS390XState *env,
                                     const S390ASTE *aste, uint16_t ax,
                                     uint16_t asn);
+static int linkage_real_read(CPUS390XState *env, uint64_t raddr,
+                             void *buf, uint16_t len);
+static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn);
+static int linkage_trace_pt(CPUS390XState *env, uint16_t pasn, uint64_t r2);
+static int linkage_trace_bsg(CPUS390XState *env, uint32_t alet,
+                             uint64_t target);
+static bool linkage_record_per_branch(CPUS390XState *env, uint64_t target);
+static G_NORETURN void linkage_completed_exception(CPUS390XState *env,
+                                                    uint32_t code,
+                                                    uint64_t target,
+                                                    uint16_t ilen);
 
 static int linkage_trace_store(CPUS390XState *env, const void *data,
                                uint16_t len)
@@ -104,6 +121,263 @@ static int linkage_trace_store(CPUS390XState *env, const void *data,
     return 0;
 }
 
+static int linkage_real_write(CPUS390XState *env, uint64_t raddr,
+                              const void *buf, uint16_t len)
+{
+    AddressSpace *as = env_cpu(env)->as;
+    const uint8_t *p = buf;
+    uint32_t remaining = len;
+
+    while (remaining) {
+        uint64_t tec;
+        hwaddr abs;
+        int flags;
+        int exc;
+        uint32_t chunk;
+
+        exc = mmu_translate_real(env, raddr, MMU_DATA_STORE,
+                                 &abs, &flags, &tec);
+        if (exc) {
+            env->tlb_fill_exc = exc;
+            env->tlb_fill_tec = tec;
+            return exc;
+        }
+        chunk = MIN(remaining,
+                    TARGET_PAGE_SIZE -
+                    (uint32_t)(raddr & ~TARGET_PAGE_MASK));
+        if (address_space_write(as, abs | (raddr & ~TARGET_PAGE_MASK),
+                                MEMTXATTRS_UNSPECIFIED, p,
+                                chunk) != MEMTX_OK) {
+            return PGM_ADDRESSING;
+        }
+        remaining -= chunk;
+        raddr = (raddr + chunk) & 0x7fffffff;
+        p += chunk;
+    }
+    return 0;
+}
+
+static int aste_authorize_primary(CPUS390XState *env,
+                                  const S390ASTE *aste, uint16_t ax,
+                                  uint16_t asn)
+{
+    uint8_t entry;
+    uint32_t atl = (aste->words[1] & ASTE_ATL) >> 4;
+    uint32_t addr;
+    int exc;
+
+    if ((ax >> 4) > atl) {
+        linkage_set_tea(env, asn);
+        return PGM_PRIM_AUTH;
+    }
+
+    addr = ((aste->words[0] & ASTE_ATO) + (ax >> 2)) & 0x7fffffffU;
+    exc = linkage_real_read(env, addr, &entry, sizeof(entry));
+    if (exc) {
+        return exc;
+    }
+    if (!(entry & (0x80 >> ((ax & 3) * 2)))) {
+        linkage_set_tea(env, asn);
+        return PGM_PRIM_AUTH;
+    }
+    return 0;
+}
+
+void HELPER(extract_asn)(CPUS390XState *env, uint32_t r1, uint32_t cr)
+{
+    if (!(env->psw.mask & PSW_MASK_DAT)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if ((env->psw.mask & PSW_MASK_PSTATE) &&
+        !(env->cregs[0] & CR0_EXT_AUTH)) {
+        tcg_s390_program_interrupt(env, PGM_PRIVILEGED, GETPC());
+    }
+    env->regs[r1] = deposit64(env->regs[r1], 0, 32,
+                              (uint16_t)env->cregs[cr]);
+}
+
+void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
+{
+    uint16_t sasn = env->regs[r1];
+    uint16_t pasn = env->cregs[4];
+    uint64_t new_sasce;
+    uint32_t new_sastein;
+    uint64_t old_cr12 = env->cregs[12];
+    uint64_t new_cr12 = old_cr12;
+    bool reuse = s390_has_feat(S390_FEAT_ASN_LX_REUSE) &&
+                 (env->cregs[0] & CR0_ASN_LX_REUSE);
+    S390ASTE aste;
+    int exc;
+
+    if (!(env->psw.mask & PSW_MASK_DAT) ||
+        !(env->cregs[14] & CR14_ASN_TRANSLATION)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+
+    exc = linkage_trace_ssar(env, sasn);
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    new_cr12 = env->cregs[12];
+    env->cregs[12] = old_cr12;
+
+    if (sasn == pasn) {
+        new_sasce = env->cregs[1];
+        new_sastein = env->cregs[4] >> 32;
+    } else {
+        exc = asn_translate(env, sasn, &aste);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        if (reuse && (aste.words[1] & ASTE_REUSABLE)) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        exc = aste_authorize_secondary(env, &aste, env->cregs[4] >> 16,
+                                       sasn);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        new_sasce = aste_asce(&aste);
+        exc = subspace_replace(env, new_sasce, aste.origin, &new_sasce);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        new_sastein = aste.words[11];
+    }
+
+    env->cregs[3] = deposit64(env->cregs[3], 0, 16, sasn);
+    if (reuse) {
+        env->cregs[3] = deposit64(env->cregs[3], 32, 32, new_sastein);
+    }
+    env->cregs[7] = new_sasce;
+    env->cregs[12] = new_cr12;
+    tlb_flush(env_cpu(env));
+}
+
+uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                    uint64_t next_pc)
+{
+    uint16_t pkm = env->regs[r1] >> 16;
+    uint16_t pasn = env->regs[r1];
+    uint16_t old_pasn = env->cregs[4];
+    uint64_t r2_value = env->regs[r2];
+    uint64_t old_pasce = env->cregs[1];
+    uint64_t new_pasce = old_pasce;
+    uint64_t target;
+    uint64_t new_mask = env->psw.mask;
+    uint64_t old_cr12 = env->cregs[12];
+    uint64_t new_cr12 = old_cr12;
+    bool reuse = s390_has_feat(S390_FEAT_ASN_LX_REUSE) &&
+                 (env->cregs[0] & CR0_ASN_LX_REUSE);
+    bool space_switch = pasn != old_pasn;
+    S390ASTE aste;
+    uint32_t ltd;
+    int exc;
+
+    if (!(env->psw.mask & PSW_MASK_DAT) ||
+        (env->psw.mask & PSW_MASK_ASC) != PSW_ASC_PRIMARY) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+
+    exc = linkage_trace_pt(env, pasn, r2_value);
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    new_cr12 = env->cregs[12];
+    env->cregs[12] = old_cr12;
+
+    if (env->cregs[0] & CR0_ASF) {
+        exc = linkage_real_read(env,
+                                (env->cregs[5] & ASTE_ORIGIN) + 24,
+                                &ltd, sizeof(ltd));
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        ltd = be32_to_cpu(ltd);
+    } else {
+        ltd = env->cregs[5];
+    }
+    if (!(ltd & LINKAGE_SUBSYSTEM)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+
+    if ((env->psw.mask & PSW_MASK_PSTATE) && !(r2_value & 1)) {
+        tcg_s390_program_interrupt(env, PGM_PRIVILEGED, GETPC());
+    }
+    if (env->psw.mask & PSW_MASK_64) {
+        target = r2_value & ~1ULL;
+    } else {
+        target = (uint32_t)r2_value & 0x7ffffffeU;
+        new_mask &= ~(PSW_MASK_64 | PSW_MASK_32);
+        if (r2_value & 0x80000000U) {
+            new_mask |= PSW_MASK_32;
+        } else if (target > 0xffffffU) {
+            tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+        }
+    }
+    if (r2_value & 1) {
+        new_mask |= PSW_MASK_PSTATE;
+    } else {
+        new_mask &= ~PSW_MASK_PSTATE;
+    }
+
+    if (space_switch) {
+        if (!(env->cregs[14] & CR14_ASN_TRANSLATION)) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        exc = asn_translate(env, pasn, &aste);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        if (reuse && (aste.words[1] & ASTE_REUSABLE)) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        exc = aste_authorize_primary(env, &aste, env->cregs[4] >> 16,
+                                     pasn);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        new_pasce = aste_asce(&aste);
+        exc = subspace_replace(env, new_pasce, aste.origin, &new_pasce);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+    }
+
+    env->cregs[3] = deposit64(env->cregs[3], 16, 16,
+                              (env->cregs[3] >> 16) & pkm);
+    env->cregs[3] = deposit64(env->cregs[3], 0, 16, pasn);
+    if (space_switch) {
+        env->cregs[4] = deposit64(env->cregs[4], 0, 32,
+                                  (aste.words[1] & ASTE_AX) | pasn);
+        if (reuse) {
+            env->cregs[4] = deposit64(env->cregs[4], 32, 32,
+                                      aste.words[11]);
+        }
+        env->cregs[5] = deposit64(env->cregs[5], 0, 32, aste.origin);
+        env->cregs[1] = new_pasce;
+    }
+    if (reuse) {
+        env->cregs[3] = deposit64(env->cregs[3], 32, 32,
+                                  env->cregs[4] >> 32);
+    }
+    env->cregs[7] = new_pasce;
+    env->cregs[12] = new_cr12;
+    env->psw.mask = new_mask;
+    tlb_flush(env_cpu(env));
+    linkage_record_per_branch(env, target);
+
+    if (space_switch &&
+        (((old_pasce | new_pasce) & ASCE_SPACE_SWITCH_EVENT) ||
+         env->per_perc_atmid)) {
+        linkage_set_tea(env, old_pasn |
+                        (old_pasce & ASCE_SPACE_SWITCH_EVENT ?
+                         TEA_SPACE_SWITCH_EVENT : 0));
+        linkage_completed_exception(env, PGM_SPACE_SWITCH, target, 4);
+    }
+    return target;
+}
+
 static int linkage_trace_pc(CPUS390XState *env, uint32_t pc_number,
                             uint64_t return_addr)
 {
@@ -132,22 +406,30 @@ static int linkage_trace_pc(CPUS390XState *env, uint32_t pc_number,
     return linkage_trace_store(env, entry, 8);
 }
 
-static int linkage_trace_branch(CPUS390XState *env, uint64_t target)
+static int linkage_trace_branch_amode(CPUS390XState *env, uint64_t target,
+                                      bool mode64, bool mode31)
 {
     uint8_t entry[12] = { 0 };
 
     if (!(env->cregs[12] & CR12_BRANCH_TRACE)) {
         return 0;
     }
-    if ((env->psw.mask & PSW_MASK_64) && target > UINT32_MAX) {
+    if (mode64 && target > UINT32_MAX) {
         entry[0] = 0x52;
         entry[1] = 0xc0;
         stq_be_p(entry + 4, target);
         return linkage_trace_store(env, entry, 12);
     }
-    stl_be_p(entry, (env->psw.mask & PSW_MASK_32 ? 0x80000000U : 0) |
+    stl_be_p(entry, (mode31 ? 0x80000000U : 0) |
                       (target & 0x7fffffffU));
     return linkage_trace_store(env, entry, 4);
+}
+
+static int linkage_trace_branch(CPUS390XState *env, uint64_t target)
+{
+    return linkage_trace_branch_amode(env, target,
+                                      env->psw.mask & PSW_MASK_64,
+                                      env->psw.mask & PSW_MASK_32);
 }
 
 static int linkage_trace_pr(CPUS390XState *env, uint64_t new_mask,
@@ -254,6 +536,72 @@ static int linkage_trace_mode(CPUS390XState *env, uint64_t next_addr)
     entry[1] = 0x60;
     stq_be_p(entry + 4, next_addr);
     return linkage_trace_store(env, entry, 12);
+}
+
+static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn)
+{
+    uint8_t entry[4] = { 0x10, 0 };
+
+    if (!(env->cregs[12] & CR12_ASN_TRACE)) {
+        return 0;
+    }
+    stw_be_p(entry + 2, sasn);
+    return linkage_trace_store(env, entry, sizeof(entry));
+}
+
+static int linkage_trace_pt(CPUS390XState *env, uint16_t pasn, uint64_t r2)
+{
+    uint8_t entry[12] = { 0 };
+    uint8_t key = extract64(env->psw.mask, PSW_SHIFT_KEY, 4) << 4;
+    int len;
+
+    if (!(env->cregs[12] & CR12_ASN_TRACE)) {
+        return 0;
+    }
+    if ((env->psw.mask & PSW_MASK_64) && r2 > UINT32_MAX) {
+        entry[0] = 0x32;
+        entry[1] = key | 0x0c;
+        stq_be_p(entry + 4, r2);
+        len = 12;
+    } else {
+        entry[0] = 0x31;
+        entry[1] = key | ((env->psw.mask & PSW_MASK_64) ? 0x08 : 0);
+        stl_be_p(entry + 4, r2);
+        len = 8;
+    }
+    stw_be_p(entry + 2, pasn);
+    return linkage_trace_store(env, entry, len);
+}
+
+static int linkage_trace_bsg(CPUS390XState *env, uint32_t alet,
+                             uint64_t target)
+{
+    uint8_t entry[12] = { 0 };
+    int len;
+
+    if (!(env->cregs[12] & CR12_ASN_TRACE)) {
+        return linkage_trace_branch_amode(env, target,
+                                          env->psw.mask & PSW_MASK_64,
+                                          target & 0x80000000U);
+    }
+    entry[0] = env->psw.mask & PSW_MASK_64 ? 0x42 : 0x41;
+    entry[1] = env->psw.mask & PSW_MASK_64 ? alet >> 16 :
+               ((alet >> 17) & 0x80) | ((alet >> 16) & 0x7f);
+    entry[2] = alet >> 8;
+    entry[3] = alet;
+    if (env->psw.mask & PSW_MASK_64) {
+        stq_be_p(entry + 4, target);
+        len = 12;
+    } else {
+        uint32_t encoded = target;
+
+        if (!(encoded & 0x80000000U)) {
+            encoded &= 0x00ffffffU;
+        }
+        stl_be_p(entry + 4, encoded);
+        len = 8;
+    }
+    return linkage_trace_store(env, entry, len);
 }
 
 static G_NORETURN void linkage_completed_exception(CPUS390XState *env,
@@ -1210,6 +1558,317 @@ static int aste_authorize_secondary(CPUS390XState *env,
         return PGM_SEC_AUTH;
     }
     return 0;
+}
+
+uint64_t HELPER(bsa)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                     uint64_t next_pc)
+{
+    uint32_t duct_origin = env->cregs[2] & ASTE_ORIGIN;
+    uint32_t duct_pkrp_raw;
+    uint64_t duct_return_raw;
+    uint32_t duct_pkrp;
+    uint64_t duct_return;
+    uint64_t target;
+    uint64_t old_cr12 = env->cregs[12];
+    uint64_t new_cr12;
+    int exc;
+
+    if (!(env->cregs[0] & CR0_ASF)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    exc = linkage_real_read(env, duct_origin + 20,
+                            &duct_pkrp_raw, sizeof(duct_pkrp_raw));
+    if (!exc) {
+        exc = linkage_real_read(env, duct_origin + 32,
+                                &duct_return_raw, sizeof(duct_return_raw));
+    }
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    duct_pkrp = be32_to_cpu(duct_pkrp_raw);
+    duct_return = be64_to_cpu(duct_return_raw);
+
+    if (!(duct_pkrp & DUCT_REDUCED_AUTHORITY)) {
+        uint8_t key = env->regs[r1] & 0xf0;
+        uint16_t pkm = env->cregs[3] >> 16;
+
+        if (!r2) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        if (env->psw.mask & PSW_MASK_64) {
+            target = env->regs[r2];
+        } else if (env->regs[r2] & 0x80000000U) {
+            target = env->regs[r2] & 0x7fffffffU;
+        } else {
+            target = env->regs[r2] & 0x00ffffffU;
+        }
+        exc = linkage_trace_branch_amode(env, target,
+                                         env->psw.mask & PSW_MASK_64,
+                                         env->regs[r2] & 0x80000000U);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        new_cr12 = env->cregs[12];
+        env->cregs[12] = old_cr12;
+
+        if ((env->psw.mask & PSW_MASK_PSTATE) &&
+            !(pkm & (0x8000U >> (key >> 4)))) {
+            tcg_s390_program_interrupt(env, PGM_PRIVILEGED, GETPC());
+        }
+
+        duct_pkrp = (uint32_t)pkm << 16 | key |
+                    DUCT_REDUCED_AUTHORITY |
+                    !!(env->psw.mask & PSW_MASK_PSTATE);
+        if (env->psw.mask & PSW_MASK_64) {
+            duct_return = next_pc;
+        } else {
+            duct_return = (uint32_t)next_pc |
+                          ((uint64_t)!!(env->psw.mask & PSW_MASK_32) << 31);
+        }
+        duct_pkrp_raw = cpu_to_be32(duct_pkrp);
+        duct_return_raw = cpu_to_be64(duct_return);
+        exc = linkage_real_write(env, duct_origin + 20,
+                                 &duct_pkrp_raw, sizeof(duct_pkrp_raw));
+        if (!exc) {
+            exc = linkage_real_write(env, duct_origin + 32,
+                                     &duct_return_raw,
+                                     sizeof(duct_return_raw));
+        }
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+
+        env->psw.mask = deposit64(env->psw.mask, PSW_SHIFT_KEY, 4,
+                                  key >> 4);
+        env->psw.mask |= PSW_MASK_PSTATE;
+        if (!(env->psw.mask & PSW_MASK_64)) {
+            env->psw.mask &= ~PSW_MASK_32;
+            if (env->regs[r2] & 0x80000000U) {
+                env->psw.mask |= PSW_MASK_32;
+            }
+        }
+        env->cregs[3] = deposit64(env->cregs[3], 16, 16,
+                                  pkm & (uint16_t)(env->regs[r1] >> 16));
+    } else {
+        if (r2) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        target = env->psw.mask & PSW_MASK_64 ?
+                 duct_return : duct_return & 0x7fffffffU;
+        exc = linkage_trace_branch_amode(env, target,
+                                         env->psw.mask & PSW_MASK_64,
+                                         duct_return & 0x80000000U);
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        new_cr12 = env->cregs[12];
+        env->cregs[12] = old_cr12;
+
+        duct_pkrp &= ~DUCT_REDUCED_AUTHORITY;
+        duct_pkrp_raw = cpu_to_be32(duct_pkrp);
+        exc = linkage_real_write(env, duct_origin + 20,
+                                 &duct_pkrp_raw, sizeof(duct_pkrp_raw));
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+
+        if (r1) {
+            uint64_t return_spec = next_pc;
+
+            if (!(env->psw.mask & PSW_MASK_64) &&
+                (env->psw.mask & PSW_MASK_32)) {
+                return_spec |= 0x80000000U;
+            }
+            env->regs[r1] = env->psw.mask & PSW_MASK_64 ?
+                            return_spec :
+                            deposit64(env->regs[r1], 0, 32, return_spec);
+        }
+
+        if (!(env->psw.mask & PSW_MASK_64)) {
+            env->psw.mask &= ~PSW_MASK_32;
+            if (duct_return & 0x80000000U) {
+                env->psw.mask |= PSW_MASK_32;
+            }
+        }
+        env->cregs[3] = deposit64(env->cregs[3], 16, 16,
+                                  duct_pkrp >> 16);
+        env->psw.mask = deposit64(env->psw.mask, PSW_SHIFT_KEY, 4,
+                                  (duct_pkrp >> 4) & 0xf);
+        if (duct_pkrp & DUCT_PROBLEM_STATE) {
+            env->psw.mask |= PSW_MASK_PSTATE;
+        } else {
+            env->psw.mask &= ~PSW_MASK_PSTATE;
+        }
+        if ((duct_return & 1) ||
+            (!(env->psw.mask & PSW_MASK_64) &&
+             !(env->psw.mask & PSW_MASK_32) &&
+             (duct_return & 0x7f000000U))) {
+            env->cregs[12] = new_cr12;
+            linkage_completed_exception(env, PGM_SPECIFICATION,
+                                         duct_return, 0);
+        }
+    }
+
+    env->cregs[12] = new_cr12;
+    linkage_record_per_branch(env, target);
+    return target;
+}
+
+uint64_t HELPER(bsg)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                     uint64_t next_pc)
+{
+    uint32_t duct_origin = env->cregs[2] & ASTE_ORIGIN;
+    uint32_t duct_raw[4];
+    uint32_t duct[4];
+    uint32_t base_origin;
+    uint32_t dest_origin;
+    uint32_t alet = r2 ? env->aregs[r2] : 0;
+    uint32_t aste_words[16] = { 0 };
+    uint64_t dest_asce;
+    uint64_t new_pasce;
+    uint64_t target_spec = env->regs[r2];
+    uint64_t target;
+    uint64_t old_cr12 = env->cregs[12];
+    uint64_t new_cr12;
+    bool fetch_only;
+    bool reuse = s390_has_feat(S390_FEAT_ASN_LX_REUSE) &&
+                 (env->cregs[0] & CR0_ASN_LX_REUSE);
+    int exc;
+
+    if (!(env->psw.mask & PSW_MASK_DAT) ||
+        !(env->cregs[0] & CR0_ASF)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    exc = linkage_trace_bsg(env, alet, target_spec);
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    new_cr12 = env->cregs[12];
+    env->cregs[12] = old_cr12;
+
+    exc = linkage_real_read(env, duct_origin, duct_raw, sizeof(duct_raw));
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    for (int i = 0; i < ARRAY_SIZE(duct); i++) {
+        duct[i] = be32_to_cpu(duct_raw[i]);
+    }
+    base_origin = duct[0] & ASTE_ORIGIN;
+    if ((env->cregs[5] & ASTE_ORIGIN) != base_origin) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+
+    if (alet == 0) {
+        uint32_t raw[2];
+
+        dest_origin = base_origin;
+        exc = linkage_real_read(env, dest_origin + 8, raw, sizeof(raw));
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        aste_words[2] = be32_to_cpu(raw[0]);
+        aste_words[3] = be32_to_cpu(raw[1]);
+        dest_asce = (uint64_t)aste_words[2] << 32 | aste_words[3];
+    } else if (alet == 1) {
+        uint32_t raw[16];
+
+        dest_origin = duct[1] & ASTE_ORIGIN;
+        if (!dest_origin) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        exc = linkage_real_read(env, dest_origin, raw, sizeof(raw));
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        for (int i = 0; i < ARRAY_SIZE(raw); i++) {
+            aste_words[i] = be32_to_cpu(raw[i]);
+        }
+        if (aste_words[0] & ASTE_INVALID) {
+            linkage_set_exception_access_id(env, r2);
+            tcg_s390_program_interrupt(env, PGM_ASTE_VALID, GETPC());
+        }
+        if (aste_words[5] != duct[3]) {
+            linkage_set_exception_access_id(env, r2);
+            tcg_s390_program_interrupt(env, PGM_ASTE_SEQ, GETPC());
+        }
+        dest_asce = (uint64_t)aste_words[2] << 32 | aste_words[3];
+    } else {
+        exc = s390_mmu_translate_alet(env, alet, 0, MMU_DATA_LOAD, true,
+                                      &dest_asce, &fetch_only, &dest_origin,
+                                      aste_words);
+        if (exc) {
+            linkage_set_exception_access_id(env, r2);
+            tcg_s390_program_interrupt(env, exc, GETPC());
+        }
+        if (dest_origin != base_origin &&
+            (!(dest_asce & ASCE_SUBSPACE) ||
+             (aste_words[0] & ASTE_BASE_SPACE))) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+    }
+
+    if (dest_origin == base_origin && alet != 1) {
+        new_pasce = dest_asce;
+    } else {
+        uint64_t events = env->cregs[1] &
+                          (ASCE_SPACE_SWITCH_EVENT | ASCE_ALT_EVENT);
+        new_pasce = (dest_asce &
+                     ~(ASCE_SPACE_SWITCH_EVENT | ASCE_ALT_EVENT)) |
+                    events;
+    }
+    target = env->psw.mask & PSW_MASK_64 ? target_spec :
+             (target_spec & 0x80000000U ?
+              target_spec & 0x7fffffffU : target_spec & 0x00ffffffU);
+
+    if (alet == 1) {
+        duct[1] |= DUCT_SUBSPACE_ACTIVE;
+    } else if (dest_origin == base_origin) {
+        duct[1] &= ~DUCT_SUBSPACE_ACTIVE;
+    } else {
+        duct[1] = DUCT_SUBSPACE_ACTIVE | dest_origin;
+        duct[3] = aste_words[5];
+    }
+    duct_raw[1] = cpu_to_be32(duct[1]);
+    exc = linkage_real_write(env, duct_origin + 4,
+                             &duct_raw[1], sizeof(duct_raw[1]));
+    if (!exc && alet != 0 && alet != 1 && dest_origin != base_origin) {
+        duct_raw[3] = cpu_to_be32(duct[3]);
+        exc = linkage_real_write(env, duct_origin + 12,
+                                 &duct_raw[3], sizeof(duct_raw[3]));
+    }
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+
+    if (r1) {
+        uint64_t return_spec = next_pc;
+
+        if (!(env->psw.mask & PSW_MASK_64) &&
+            (env->psw.mask & PSW_MASK_32)) {
+            return_spec |= 0x80000000U;
+        }
+        env->regs[r1] = env->psw.mask & PSW_MASK_64 ?
+                        return_spec :
+                        deposit64(env->regs[r1], 0, 32, return_spec);
+    }
+    if (!(env->psw.mask & PSW_MASK_64)) {
+        env->psw.mask &= ~PSW_MASK_32;
+        if (target_spec & 0x80000000U) {
+            env->psw.mask |= PSW_MASK_32;
+        }
+    }
+    env->cregs[1] = new_pasce;
+    env->cregs[7] = new_pasce;
+    env->cregs[3] = deposit64(env->cregs[3], 0, 16,
+                              (uint16_t)env->cregs[4]);
+    if (reuse) {
+        env->cregs[3] = deposit64(env->cregs[3], 32, 32,
+                                  env->cregs[4] >> 32);
+    }
+    env->cregs[12] = new_cr12;
+    tlb_flush(env_cpu(env));
+    linkage_record_per_branch(env, target);
+    return target;
 }
 
 static int pc_translate(CPUS390XState *env, uint64_t effective_addr,

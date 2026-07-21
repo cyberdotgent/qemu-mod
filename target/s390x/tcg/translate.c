@@ -2499,6 +2499,22 @@ static DisasJumpType op_ear(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static DisasJumpType op_cpya(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+    TCGv_i32 value = tcg_temp_new_i32();
+
+    tcg_gen_ld_i32(value, tcg_env,
+                   offsetof(CPUS390XState, aregs[r2]));
+    tcg_gen_st_i32(value, tcg_env,
+                   offsetof(CPUS390XState, aregs[r1]));
+#ifndef CONFIG_USER_ONLY
+    gen_helper_ptlb(tcg_env);
+#endif
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_ed(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
@@ -4890,6 +4906,60 @@ static DisasJumpType op_tcxb(DisasContext *s, DisasOps *o)
 }
 
 #ifndef CONFIG_USER_ONLY
+
+static DisasJumpType op_extract_asn(DisasContext *s, DisasOps *o)
+{
+    gen_helper_extract_asn(tcg_env,
+                           tcg_constant_i32(get_field(s, r1)),
+                           tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ssar(DisasContext *s, DisasOps *o)
+{
+    gen_helper_ssar(tcg_env, tcg_constant_i32(get_field(s, r1)));
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_pt(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pt(dest, tcg_env,
+                  tcg_constant_i32(get_field(s, r1)),
+                  tcg_constant_i32(get_field(s, r2)),
+                  tcg_constant_i64(s->pc_tmp));
+    return help_goto_indirect(s, dest);
+}
+
+static DisasJumpType op_linkage_branch(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    if (s->insn->data) {
+        gen_helper_bsg(dest, tcg_env, r1, r2,
+                       tcg_constant_i64(s->pc_tmp));
+    } else {
+        gen_helper_bsa(dest, tcg_env, r1, r2,
+                       tcg_constant_i64(s->pc_tmp));
+    }
+    return help_goto_indirect(s, dest);
+}
+
+static DisasJumpType op_tar(DisasContext *s, DisasOps *o)
+{
+    gen_helper_tar(cc_op, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)),
+                   tcg_constant_i32(get_field(s, r2)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
 
 static DisasJumpType op_testblock(DisasContext *s, DisasOps *o)
 {

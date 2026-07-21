@@ -127,6 +127,12 @@ DEF_HELPER_FLAGS_1(stck, TCG_CALL_NO_RWG_SE, i64, env)
 DEF_HELPER_FLAGS_3(probe_write_access, TCG_CALL_NO_WG, void, env, i64, i64)
 
 #ifndef CONFIG_USER_ONLY
+DEF_HELPER_3(tar, i32, env, i32, i32)
+DEF_HELPER_3(extract_asn, void, env, i32, i32)
+DEF_HELPER_2(ssar, void, env, i32)
+DEF_HELPER_4(pt, i64, env, i32, i32, i64)
+DEF_HELPER_4(bsa, i64, env, i32, i32, i64)
+DEF_HELPER_4(bsg, i64, env, i32, i32, i64)
 DEF_HELPER_4(bakr, i64, env, i32, i32, i64)
 DEF_HELPER_1(pr, noreturn, env)
 DEF_HELPER_4(ereg, void, env, i32, i32, i32)

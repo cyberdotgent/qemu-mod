@@ -20,12 +20,15 @@
 #include "system/address-spaces.h"
 #include "cpu.h"
 #include "s390x-internal.h"
+#include "tcg/tcg_s390x.h"
 #include "kvm/kvm_s390x.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "system/memory.h"
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/helper-retaddr.h"
+#include "exec/helper-proto.h"
 #endif
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
@@ -41,8 +44,9 @@
 #define ALET_PRIMARY_LIST  0x01000000U
 #define ALET_SEQUENCE      0x00ff0000U
 #define ALET_ALEN          0x0000ffffU
-#define ALD_ORIGIN         0x7fffff00U
-#define ALD_LENGTH         0x000000ffU
+#define ALD_ORIGIN         0x7fffff80U
+#define ALD_LENGTH         0x0000007fU
+#define ALD_LENGTH_SHIFT   3
 #define ALE_INVALID        0x80000000U
 #define ALE_FETCH_ONLY     0x02000000U
 #define ALE_PRIVATE        0x01000000U
@@ -153,22 +157,25 @@ static int mmu_authorize_extended(CPUS390XState *env,
     return entry & (0x40 >> ((eax & 3) * 2)) ? 0 : PGM_EXT_AUTH;
 }
 
-static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
-                             uint64_t *asce, bool *fetch_only)
+int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
+                            int rw, bool special_art, uint64_t *asce,
+                            bool *fetch_only, uint32_t *aste_origin,
+                            uint32_t aste_words[16])
 {
-    uint32_t alet = arn ? env->aregs[arn] : 0;
     uint32_t ale[4];
     uint32_t aste[16];
     uint32_t cb;
     uint32_t ald;
     uint32_t ale_addr;
     uint32_t aste_addr;
-    uint16_t eax = env->cregs[8] >> 16;
     int exc;
 
     *fetch_only = false;
     if (alet == 0) {
         *asce = env->cregs[1];
+        if (aste_origin) {
+            *aste_origin = env->cregs[5] & ALE_ASTE_ORIGIN;
+        }
         return 0;
     }
     if (alet == 1) {
@@ -185,7 +192,8 @@ static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
         return PGM_ADDRESSING;
     }
     ald = be32_to_cpu(ald);
-    if (((alet & ALET_ALEN) >> 4) > (ald & ALD_LENGTH)) {
+    if (((alet & ALET_ALEN) >> ALD_LENGTH_SHIFT) >
+        (ald & ALD_LENGTH)) {
         return PGM_ALEN_SPEC;
     }
 
@@ -200,7 +208,8 @@ static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
     if (ale[0] & ALE_INVALID) {
         return PGM_ALEN_SPEC;
     }
-    if ((ale[0] & ALE_SEQUENCE) != (alet & ALET_SEQUENCE)) {
+    if (!special_art &&
+        (ale[0] & ALE_SEQUENCE) != (alet & ALET_SEQUENCE)) {
         return PGM_ALE_SEQ;
     }
 
@@ -218,7 +227,8 @@ static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
         return PGM_ASTE_SEQ;
     }
 
-    if ((ale[0] & ALE_PRIVATE) && (ale[0] & ALE_AUTH_INDEX) != eax) {
+    if (!special_art && (ale[0] & ALE_PRIVATE) &&
+        (ale[0] & ALE_AUTH_INDEX) != eax) {
         exc = mmu_authorize_extended(env, aste, eax);
         if (exc) {
             return exc;
@@ -227,8 +237,55 @@ static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
     *fetch_only = (ale[0] & ALE_FETCH_ONLY) && rw == MMU_DATA_STORE;
 
     *asce = (uint64_t)aste[2] << 32 | aste[3];
+    if (aste_origin) {
+        *aste_origin = aste_addr;
+    }
+    if (aste_words) {
+        memcpy(aste_words, aste, sizeof(aste));
+    }
     return 0;
 }
+
+static int mmu_translate_arn(CPUS390XState *env, unsigned int arn, int rw,
+                             uint64_t *asce, bool *fetch_only)
+{
+    uint32_t alet = arn ? env->aregs[arn] : 0;
+    uint16_t eax = env->cregs[8] >> 16;
+
+    return s390_mmu_translate_alet(env, alet, eax, rw, false,
+                                   asce, fetch_only, NULL, NULL);
+}
+
+#ifdef CONFIG_TCG
+uint32_t HELPER(tar)(CPUS390XState *env, uint32_t r1, uint32_t r2)
+{
+    uint32_t alet = env->aregs[r1];
+    uint16_t eax = env->regs[r2] >> 16;
+    uint64_t asce;
+    bool fetch_only;
+    int exc;
+
+    if (!(env->cregs[0] & CR0_ASF)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if (alet == 0) {
+        return 0;
+    }
+    if (alet == 1) {
+        return 3;
+    }
+
+    exc = s390_mmu_translate_alet(env, alet, eax, MMU_DATA_LOAD, false,
+                                  &asce, &fetch_only, NULL, NULL);
+    if (exc == PGM_ADDRESSING) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+    if (exc) {
+        return 3;
+    }
+    return alet & ALET_PRIMARY_LIST ? 2 : 1;
+}
+#endif
 
 static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
                               uint64_t asc, uint64_t asce, hwaddr *raddr,

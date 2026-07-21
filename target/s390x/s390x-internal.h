@@ -381,6 +381,10 @@ int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
                   hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc);
 int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
                        hwaddr *addr, int *flags, uint64_t *tec);
+int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
+                            int rw, bool special_art, uint64_t *asce,
+                            bool *fetch_only, uint32_t *aste_origin,
+                            uint32_t aste_words[16]);
 
 
 /* misc_helper.c */

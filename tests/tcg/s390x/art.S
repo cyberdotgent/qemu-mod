@@ -12,6 +12,7 @@
 
     .globl _start
 _start:
+    lctlg %c0,%c0,initial_cr0
     lctlg %c1,%c3,initial_cr1
     lctlg %c7,%c7,real_asce
     lctlg %c13,%c13,real_asce
@@ -20,8 +21,35 @@ _start:
 start_ar:
     lgfi %r3,0x00120001             /* ALESN 0x12, ALEN 1 */
     sar %a2,%r3
+    cpya %a4,%a2
+    ear %r8,%a4
+    cgr %r8,%r3
+    jne failure
+    larl %r4,data
+    l %r8,0(%r4)                    /* copied AR4 selects same space */
+    cfi %r8,0x12345678
+    jne failure
+
+    tar %a2,%r3
+    ipm %r8
+    srlg %r8,%r8,28
+    cgfi %r8,1
+    jne failure
     sgr %r6,%r6
     sar %a6,%r6                    /* ALET zero selects primary */
+    tar %a6,%r3
+    ipm %r8
+    srlg %r8,%r8,28
+    ltgr %r8,%r8
+    jne failure
+
+    lghi %r7,1
+    sar %a7,%r7
+    tar %a7,%r3
+    ipm %r8
+    srlg %r8,%r8,28
+    cgfi %r8,3
+    jne failure
     larl %r2,data
     l %r4,0(%r2)                    /* select AR2 */
     cfi %r4,0x12345678
@@ -52,6 +80,8 @@ failure:
     lpswe failure_psw
 
     .align 8
+initial_cr0:
+    .quad 0x0000000000010000       /* address-space function */
 initial_cr1:
     .quad 0x20
 initial_cr2:
@@ -77,7 +107,7 @@ duct:
     .space 16
     .long access_list               /* ALD: ALO, ALL 0 */
 
-    .org 0x3100
+    .org 0x3180                    /* exercise format-0 ALO bit 24 */
 access_list:
     .space 16                       /* ALEN 0 */
 selected_ale:                       /* ALEN 1 */

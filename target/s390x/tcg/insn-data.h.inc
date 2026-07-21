@@ -168,6 +168,8 @@
 
 /* COPY SIGN */
     F(0xb372, CPSDR,   RRF_b, FPSSH, f3, f2, new, f1, cps, 0, IF_AFP1 | IF_AFP2 | IF_AFP3)
+/* COPY ACCESS */
+    C(0xb24d, CPYA,    RRE,   Z,   0, 0, 0, 0, cpya, 0)
 
 /* COMPARE */
     C(0x1900, CR,      RR_a,  Z,   r1_o, r2_o, 0, 0, 0, cmps32)
@@ -1346,6 +1348,18 @@
     F(0xe74a, VFTCI,   VRI_e, V,   0, 0, 0, 0, vftci, 0, IF_VEC)
 
 #ifndef CONFIG_USER_ONLY
+/* BRANCH AND SET AUTHORITY / BRANCH IN SUBSPACE GROUP */
+    D(0xb25a, BSA,     RRE,   Z,   0, 0, 0, 0, linkage_branch, 0, 0)
+    D(0xb258, BSG,     RRE,   Z,   0, 0, 0, 0, linkage_branch, 0, 1)
+/* TEST ACCESS */
+    C(0xb24c, TAR,     RRE,   Z,   0, 0, 0, 0, tar, 0)
+/* EXTRACT PRIMARY/SECONDARY ASN */
+    D(0xb226, EPAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 4)
+    D(0xb227, ESAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 3)
+/* SET SECONDARY ASN */
+    C(0xb225, SSAR,    RRE,   Z,   0, 0, 0, 0, ssar, 0)
+/* PROGRAM TRANSFER */
+    C(0xb228, PT,      RRE,   Z,   0, 0, 0, 0, pt, 0)
 /* PROGRAM RETURN */
     C(0x0101, PR,      E,     Z,   0, 0, 0, 0, pr, 0)
 /* PROGRAM CALL */
