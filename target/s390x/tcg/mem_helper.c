@@ -3383,7 +3383,15 @@ void HELPER(ex)(CPUS390XState *env, uint32_t ilen, uint64_t r1, uint64_t addr)
     }
 
     /* The very most common cases can be sped up by avoiding a new TB.  */
-    if ((opc & 0xf0) == 0xd0) {
+    /*
+     * The helpers in this fast path use the current address-space control
+     * for both operands.  In access-register mode, however, each SS operand
+     * selects its address space using its own base register.  Let the normal
+     * translator path handle that case, where get_mem_indices() preserves
+     * the B1/B2 distinction.
+     */
+    if ((opc & 0xf0) == 0xd0 &&
+        (env->psw.mask & PSW_MASK_ASC) != PSW_ASC_ACCREG) {
         typedef uint32_t (*dx_helper)(CPUS390XState *, uint32_t, uint64_t,
                                       uint64_t, uintptr_t);
         static const dx_helper dx[16] = {

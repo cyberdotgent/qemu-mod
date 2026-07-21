@@ -66,6 +66,21 @@ start_ar:
     cfi %r5,0x12345678
     jne failure
 
+    /* EX must retain the target SS instruction's B1/B2 address spaces. */
+    larl %r4,copy_dest               /* AR4: selected space */
+    larl %r6,data                    /* AR6: primary space */
+    ex 0,ex_mvc
+    l %r8,0(%r4)
+    cfi %r8,0x11223344
+    jne failure
+    l %r5,copy_dest                  /* primary destination unchanged */
+    cfi %r5,0x12345678
+    jne failure
+    j ex_mvc_done
+ex_mvc:
+    mvc 0(4,%r4),0(%r6)
+ex_mvc_done:
+
     ni 0(%r2),0xf0                 /* modify selected space only */
     palb                            /* no separate ALB: purge AR TLB entries */
     l %r4,0(%r2)
