@@ -4,6 +4,7 @@ config S390_CCW_VIRTIO
     depends on S390X
     imply VIRTIO_PCI
     imply TERMINAL3270
+    imply TERMINAL3215
     imply VFIO_AP
     imply VFIO_CCW
     imply WDT_DIAG288

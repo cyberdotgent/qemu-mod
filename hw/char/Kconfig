@@ -66,6 +66,9 @@ config SCLPCONSOLE
 config TERMINAL3270
     bool
 
+config TERMINAL3215
+    bool
+
 config SH_SCI
     bool
 

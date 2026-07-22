@@ -1136,6 +1136,24 @@ SRST
     different ports.
 ERST
 
+DEF("dev3215", HAS_ARG, QEMU_OPTION_dev3215,
+    "-dev3215 [chardev=id][,devno=ccw-address][,id=id]\n"
+    "                add an IBM 3215 console (stdio by default)\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3215 [chardev=id][,devno=ccw-address][,id=id]``
+    Add an IBM 3215 console printer-keyboard. Without ``chardev``, QEMU
+    creates a stdio backend with terminal signal handling disabled and uses
+    local input echo. This claims stdio in the same way as ``-serial stdio``
+    and suppresses the default serial console and monitor. Only one stdio
+    backend can be used unless it is explicitly multiplexed.
+
+    With ``chardev``, attach an existing character backend and leave local
+    echo disabled. A short hexadecimal ``devno`` such as ``009`` means
+    ``fe.0.0009``. If ``devno`` is omitted, QEMU assigns an available CCW
+    device number.
+ERST
+
 DEF("dev9336", HAS_ARG, QEMU_OPTION_dev9336,
     "-dev9336 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,blocks=n][,id=id]\n"
     "-dev9336 drive=node[,devno=ccw-address][,blocks=n][,id=id]\n"

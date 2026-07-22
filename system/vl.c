@@ -529,6 +529,24 @@ static QemuOptsList qemu_dev3270_opts = {
     },
 };
 
+static QemuOptsList qemu_dev3215_opts = {
+    .name = "dev3215",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3215_opts.head),
+    .desc = {
+        {
+            .name = "chardev",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "devno",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "id",
+            .type = QEMU_OPT_STRING,
+        },
+        { /* end of list */ }
+    },
+};
+
 static QemuOptsList qemu_dev9336_opts = {
     .name = "dev9336",
     .head = QTAILQ_HEAD_INITIALIZER(qemu_dev9336_opts.head),
@@ -1328,6 +1346,83 @@ static bool dev3270_add(const char *optarg, Error **errp)
     devno = qemu_opt_get(opts, "devno");
     if (devno && !qemu_opt_set(device_opts, "devno", devno, errp)) {
         goto fail;
+    }
+
+    index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(chardev_opts);
+    qemu_opts_del(opts);
+    return false;
+}
+
+static bool dev3215_add(const char *optarg, Error **errp)
+{
+    static unsigned int index;
+    g_autofree char *generated_chardev_id = NULL;
+    g_autofree char *generated_device_id = NULL;
+    g_autofree char *normalized_devno = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *chardev_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    const char *chardev;
+    const char *devno;
+    const char *id;
+    unsigned int short_devno;
+    int consumed;
+
+    opts = qemu_opts_parse(&qemu_dev3215_opts, optarg, false, errp);
+    if (!opts) {
+        return false;
+    }
+    chardev = qemu_opt_get(opts, "chardev");
+    devno = qemu_opt_get(opts, "devno");
+    id = qemu_opts_id(opts);
+    generated_device_id = id ? g_strdup(id) :
+                               g_strdup_printf("dev3215-%u", index);
+
+    if (!chardev) {
+        generated_chardev_id = id ? g_strdup_printf("%s-chardev", id) :
+                                    g_strdup_printf("dev3215-chardev%u",
+                                                    index);
+        chardev = generated_chardev_id;
+        chardev_opts = qemu_opts_create(qemu_find_opts("chardev"), chardev,
+                                        1, errp);
+        if (!chardev_opts ||
+            !qemu_opt_set(chardev_opts, "backend", "stdio", errp) ||
+            !qemu_opt_set_bool(chardev_opts, "signal", false, errp)) {
+            goto fail;
+        }
+
+        /* Match -serial stdio ownership of the process terminal. */
+        default_serial = 0;
+        default_monitor = 0;
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"),
+                                   generated_device_id, 1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "3215-ccw", errp) ||
+        !qemu_opt_set(device_opts, "chardev", chardev, errp)) {
+        goto fail;
+    }
+    if (generated_chardev_id &&
+        !qemu_opt_set_bool(device_opts, "echo", true, errp)) {
+        goto fail;
+    }
+
+    if (devno) {
+        if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&
+            !devno[consumed] && short_devno <= UINT16_MAX) {
+            normalized_devno = g_strdup_printf("fe.0.%04x", short_devno);
+            devno = normalized_devno;
+        }
+        if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
     }
 
     index++;
@@ -3473,6 +3568,15 @@ void qemu_init(int argc, char **argv)
                 Error *err = NULL;
 
                 if (!dev3270_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
+            case QEMU_OPTION_dev3215: {
+                Error *err = NULL;
+
+                if (!dev3215_add(optarg, &err)) {
                     error_report_err(err);
                     exit(1);
                 }
