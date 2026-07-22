@@ -1171,6 +1171,23 @@ SRST
     disks.
 ERST
 
+DEF("dev3590", HAS_ARG, QEMU_OPTION_dev3590,
+    "-dev3590 [file=file][,devno=ccw-address][,readonly=on|off][,id=id]\n"
+    "-dev3590 drive=node[,devno=ccw-address][,id=id]\n"
+    "                add an AWS-backed IBM 3590 A50 tape drive\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3590 [file=file][,devno=ccw-address][,readonly=on|off][,id=id]``
+  \
+``-dev3590 drive=node[,devno=ccw-address][,id=id]``
+    Add an emulated IBM 3590 A50 tape drive backed by an AWS image. With
+    ``file``, QEMU creates a raw, read-only block backend by default. If both
+    ``file`` and ``drive`` are omitted, the drive starts empty.
+    Alternatively, ``drive`` attaches an existing block backend. A three- or
+    four-digit hexadecimal ``devno`` such as ``580`` or ``0580`` means
+    ``fe.0.0580``. The option can be repeated for multiple tape drives.
+ERST
+
 DEF("device", HAS_ARG, QEMU_OPTION_device,
     "-device driver[,prop=value[,...]]\n"
     "                add device (based on driver)\n"

@@ -284,6 +284,7 @@ qtests_s390x = \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_TERMINAL3215') ? ['terminal3215-test'] : []) + \
   (config_all_devices.has_key('CONFIG_TERMINAL3270') ? ['terminal3270-test'] : []) + \
+  ['3590-ccw-test'] + \
   ['fba-ccw-test'] + \
   ['boot-serial-test',
    's390x-ipl-test',

@@ -39,6 +39,8 @@
 
 /* CPU hotplug SCLP codes */
 #define SCLP_HAS_CPU_INFO                       0x0800000000000000ULL
+#define SCLP_HAS_LOADPARM                       0x0004000000000000ULL
+#define SCLP_HAS_READ_WRITE_EVENT               0x0000004000000000ULL
 #define SCLP_CMDW_READ_CPU_INFO                 0x00010001
 
 /* SCLP PCI codes */
@@ -98,6 +100,7 @@ typedef struct SCCBHeader {
 
 #define SCCB_DATA_LEN (SCCB_SIZE - sizeof(SCCBHeader))
 #define SCCB_CPU_FEATURE_LEN 6
+#define SCLP_CPU_FEATURE_SIE_XA_MODE             0x40
 
 /* CPU information */
 typedef struct CPUEntry {

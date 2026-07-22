@@ -266,6 +266,7 @@ struct ciw {
 #define CU_TYPE_UNKNOWN         0x0000
 #define CU_TYPE_DASD_2107       0x2107
 #define CU_TYPE_DASD_FBA        0x6310
+#define CU_TYPE_TAPE_3590       0x3590
 #define CU_TYPE_VIRTIO          0x3832
 #define CU_TYPE_DASD_3990       0x3990
 

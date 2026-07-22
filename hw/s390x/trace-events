@@ -11,6 +11,9 @@ css_tsch_irb(uint16_t devno, uint16_t flags, uint16_t ctrl, uint32_t cpa, uint8_
 css_adapter_interrupt(uint8_t isc) "CSS: adapter I/O interrupt (isc 0x%x)"
 css_do_sic(uint16_t mode, uint8_t isc) "CSS: set interruption mode 0x%x on isc 0x%x"
 
+# 3590-ccw.c
+tape3590_ccw(uint16_t devno, uint8_t cmd, uint32_t cda, uint16_t count, uint8_t flags, uint32_t block_id) "3590-CCW: devno=0x%04x cmd=0x%02x cda=0x%08x count=0x%04x flags=0x%02x block=0x%08x"
+
 # virtio-ccw.c
 virtio_ccw_interpret_ccw(int cssid, int ssid, int schid, int cmd_code) "VIRTIO-CCW: %x.%x.%04x: interpret command 0x%x"
 virtio_ccw_new_device(int cssid, int ssid, int schid, int devno, const char *devno_mode) "VIRTIO-CCW: add subchannel %x.%x.%04x, devno 0x%04x (%s)"

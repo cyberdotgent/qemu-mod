@@ -287,3 +287,34 @@ int fba_ipl(SubChannelId schid, uint16_t cutype)
     jump_to_low_kernel();
     return -1;
 }
+
+/* IPL a 3590 tape using the architected implied format-0 Read IPL CCW. */
+int tape_3590_ipl(SubChannelId schid, uint16_t cutype)
+{
+    Ccw0 *read_ipl = (Ccw0 *)0;
+
+    /*
+     * CZAM removable-media loaders consume the IPL load parameter from
+     * absolute 0x90 before they are able to query it through SCLP.
+     */
+    if (have_iplb) {
+        memcpy((void *)0x90, iplb.loadparm, LOADPARM_LEN);
+    }
+
+    memset(read_ipl, 0, sizeof(*read_ipl));
+    read_ipl->cmd_code = CCW_CMD_READ_IPL;
+    read_ipl->cda = 0;
+    read_ipl->chain = 1;
+    read_ipl->sli = 1;
+    read_ipl->count = 0x18;
+
+    enable_prefixing();
+    if (do_cio(schid, cutype, 0, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to run 3590 IPL channel program");
+        return -EIO;
+    }
+    disable_prefixing();
+    jump_to_low_kernel();
+    return -1;
+}

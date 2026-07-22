@@ -1,0 +1,68 @@
+Emulated 3590 tapes
+===================
+
+QEMU can expose an AWS tape image as a channel-attached IBM 3590 A50 tape
+drive.  The device reports control-unit type/model ``3590/11`` and device
+type/model ``3590/60``.  AWS record boundaries, multi-chunk records, tape
+marks, forward and backward positioning, and block IDs are maintained by a
+medium layer separate from the guest-visible 3590 command implementation.
+
+The concise command line is::
+
+  -dev3590 file=install.aws,devno=580
+
+This creates a read-only raw backend by default.  ``readonly=off`` allows the
+backend to be opened for writing, although the emulated drive currently
+implements read and positioning commands only.  An existing block node can
+instead be attached with ``drive=NODE``.  Three- and four-digit hexadecimal
+device numbers are accepted, so ``580`` and ``0580`` both select
+``fe.0.0580``.
+
+The implemented commands cover Read IPL, NOP, Sense, Read Forward, Rewind,
+Read Previous, Rewind Unload, Read Block ID, forward and backward block/file
+spacing, Locate, Read Media Characteristics, Read Device Characteristics,
+Medium Sense, Mode Set, and Sense ID.  The maximum logical record size is
+256 KiB.
+
+Runtime media changes
+---------------------
+
+A drive can start empty::
+
+  -dev3590 id=tape0,devno=580
+
+The standard removable-media QMP commands can then mount an AWS image::
+
+  { "execute": "blockdev-add",
+    "arguments": { "node-name": "tape-file", "driver": "file",
+                   "filename": "install.aws" } }
+  { "execute": "blockdev-add",
+    "arguments": { "node-name": "tape-medium", "driver": "raw",
+                   "read-only": true, "file": "tape-file" } }
+  { "execute": "blockdev-insert-medium",
+    "arguments": { "id": "tape0", "node-name": "tape-medium" } }
+  { "execute": "blockdev-close-tray", "arguments": { "id": "tape0" } }
+
+Use ``blockdev-open-tray`` followed by ``blockdev-remove-medium`` to unmount
+it.  A media change resets tape position and raises device attention when the
+subchannel is enabled.
+
+IPL and CZAM recovery media
+---------------------------
+
+Select the tape with the operator-style IPL option::
+
+  qemu-system-s390x -M s390-ccw-virtio \
+    -dev3590 file=install.aws,devno=580 -ipl 580
+
+The s390-ccw firmware executes the architected implied format-0 Read IPL CCW
+at address zero; it does not use QEMU's ``-kernel`` loader.  Recovery media
+for CZAM-only systems can use the first records as self-modifying Read IPL
+channel programs before returning the final IPL PSW and loader.  Those
+records are interpreted by the channel subsystem directly from the mounted
+tape; QEMU does not scan for a private header or reconstruct the AWS image in
+guest storage.
+
+Migration is currently disabled for this device.  A future migration format
+must identify and validate the externally supplied tape medium at the
+destination before restoring its logical position and buffered record.

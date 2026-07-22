@@ -27,6 +27,7 @@ or vfio-ap is also available.
    s390x/3215
    s390x/3270
    s390x/fba
+   s390x/3590
    s390x/vfio-ccw
    s390x/pcidevices
 

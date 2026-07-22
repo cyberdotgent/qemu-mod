@@ -13,5 +13,6 @@
 
 int dasd_ipl(SubChannelId schid, uint16_t cutype);
 int fba_ipl(SubChannelId schid, uint16_t cutype);
+int tape_3590_ipl(SubChannelId schid, uint16_t cutype);
 
 #endif /* DASD_IPL_H */

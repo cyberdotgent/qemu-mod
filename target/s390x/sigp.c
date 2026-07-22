@@ -542,6 +542,14 @@ static int handle_sigp_single_dst(S390CPU *cpu, S390CPU *dst_cpu, uint8_t order,
 static int sigp_set_architecture(S390CPU *cpu, uint32_t param,
                                  uint64_t *status_reg)
 {
+    if ((param & 0xff) == 1) {
+        /*
+         * CZAM starts in z/Arch mode, so a request to enter the mode has
+         * already achieved its architected result.
+         */
+        return SIGP_CC_ORDER_CODE_ACCEPTED;
+    }
+
     *status_reg &= 0xffffffff00000000ULL;
 
     /* Reject set arch order, with czam we're always in z/Arch mode. */

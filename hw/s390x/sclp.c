@@ -85,6 +85,10 @@ static void prepare_cpu_entries(MachineState *ms, CPUEntry *entry, int *count)
     int i;
 
     s390_get_feat_block(S390_FEAT_TYPE_SCLP_CPU, features);
+    /* SIE XA mode is a base processor characteristic, not an assist bit. */
+    if (!s390_is_pv()) {
+        features[0] |= SCLP_CPU_FEATURE_SIE_XA_MODE;
+    }
     for (i = 0, *count = 0; i < ms->possible_cpus->len; i++) {
         if (!ms->possible_cpus->cpus[i].cpu) {
             continue;
@@ -151,6 +155,8 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
     }
 
     read_info->facilities = cpu_to_be64(SCLP_HAS_CPU_INFO |
+                                        SCLP_HAS_LOADPARM |
+                                        SCLP_HAS_READ_WRITE_EVENT |
                                         SCLP_HAS_IOA_RECONFIG);
 
     read_info->mha_pow = s390_get_mha_pow();
