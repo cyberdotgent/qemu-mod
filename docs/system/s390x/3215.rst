@@ -30,10 +30,11 @@ echo is disabled by default in the expanded form and can be enabled with the
 device's ``echo=on`` property.
 
 ``-dev3215`` also accepts ``chardev=ID`` to attach an existing backend without
-creating stdio, and ``id=ID`` to select the QEMU device ID.  A short hexadecimal
-``devno`` is interpreted in the default ``fe.0`` channel subsystem.  Multiple
-devices are supported when each uses a distinct character backend; only one
-backend may own stdio unless the user explicitly configures multiplexing.
+creating stdio, and ``id=ID`` to select the QEMU device ID.  Three-digit S/370
+and four-digit ESA/390 hexadecimal device numbers are both accepted: ``009``
+and ``0009`` both become ``fe.0.0009``.  Multiple devices are supported when
+each uses a distinct character backend; only one backend may own stdio unless
+the user explicitly configures multiplexing.
 
 Guest interface
 ---------------

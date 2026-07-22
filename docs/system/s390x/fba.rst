@@ -19,8 +19,10 @@ The equivalent shorthand for an image file is::
 ``-dev9336`` accepts either ``file=PATH`` or ``drive=NODE``.  For ``file``,
 ``format=FORMAT`` (``raw`` by default) and ``readonly=on`` are also accepted.
 ``blocks=N`` can expose a capacity smaller than the backend, and ``id=ID``
-sets the QEMU device ID.  A short ``devno`` is interpreted in the default
-``fe.0`` channel subsystem.  The option is repeatable, for example::
+sets the QEMU device ID.  Three-digit S/370 and four-digit ESA/390 hexadecimal
+device numbers are both accepted in the default ``fe.0`` channel subsystem;
+for example, ``200`` and ``0200`` both become ``fe.0.0200``.  The option is
+repeatable, for example::
 
   -dev9336 file=sysres.raw,devno=200 \
   -dev9336 file=work01.qcow2,format=qcow2,devno=201 \

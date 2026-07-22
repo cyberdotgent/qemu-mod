@@ -49,7 +49,7 @@ static void test_dev3215_shortcut(void)
 
     qts = qtest_init(
         "-nodefaults -chardev ringbuf,id=operator,size=4096 "
-        "-dev3215 chardev=operator,devno=009,id=console");
+        "-dev3215 chardev=operator,devno=0009,id=console");
     dev_id = qom_get_string(qts, "/machine/peripheral/console", "dev_id");
     g_assert_cmpstr(dev_id, ==, "fe.0.0009");
     qtest_quit(qts);

@@ -60,7 +60,7 @@ static void test_dev9336_shortcut(void)
 
     qts = qtest_initf(
         "-nodefaults "
-        "-dev9336 file=%s,devno=200,id=sysres "
+        "-dev9336 file=%s,devno=0200,id=sysres "
         "-dev9336 file=%s,devno=fe.0.0201,id=work01,readonly=on",
         path0, path1);
     dev_id0 = qom_get_string(qts, "/machine/peripheral/sysres", "dev_id");

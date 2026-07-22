@@ -1149,9 +1149,9 @@ SRST
     backend can be used unless it is explicitly multiplexed.
 
     With ``chardev``, attach an existing character backend and leave local
-    echo disabled. A short hexadecimal ``devno`` such as ``009`` means
-    ``fe.0.0009``. If ``devno`` is omitted, QEMU assigns an available CCW
-    device number.
+    echo disabled. A three- or four-digit hexadecimal ``devno`` such as
+    ``009`` or ``0009`` means ``fe.0.0009``. If ``devno`` is omitted, QEMU
+    assigns an available CCW device number.
 ERST
 
 DEF("dev9336", HAS_ARG, QEMU_OPTION_dev9336,
@@ -1166,8 +1166,9 @@ SRST
     Add an emulated 9336 model 20 fixed-block disk. With ``file``, QEMU
     creates an ``if=none`` block backend; ``format`` defaults to ``raw``.
     Alternatively, ``drive`` attaches an existing block node or ``-drive``
-    backend. A short hexadecimal ``devno`` such as ``200`` means
-    ``fe.0.0200``. The option can be repeated for multiple disks.
+    backend. A three- or four-digit hexadecimal ``devno`` such as ``200`` or
+    ``0200`` means ``fe.0.0200``. The option can be repeated for multiple
+    disks.
 ERST
 
 DEF("device", HAS_ARG, QEMU_OPTION_device,
