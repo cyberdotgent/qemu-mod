@@ -25,7 +25,8 @@ static int handle_payload_3270_read(EmulatedCcw3270Device *dev, CCW1 *ccw)
     CcwDevice *ccw_dev = CCW_DEVICE(dev);
     int len;
 
-    if (!ccw->cda) {
+    /* SKIP suppresses storage references, so the CDA is not inspected. */
+    if (!ccw->cda && !(ccw->flags & CCW_FLAG_SKIP)) {
         return -EFAULT;
     }
 

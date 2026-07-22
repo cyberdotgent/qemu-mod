@@ -96,6 +96,15 @@ run-terminal3215-input: terminal3215-input
 	  exec $(QEMU) -monitor none -display none -nodefaults \
 	  -action panic=exit-failure -dev3215 devno=009 -kernel $<")
 
+terminal3270-skip: $(S390X_MULTIARCH_RUNTIME_OBJS)
+terminal3270-skip: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+terminal3270-skip: CFLAGS += -I$(SRC_PATH)/pc-bios/s390-ccw
+terminal3270-skip: terminal3270-skip.o
+TESTS += terminal3270-skip
+run-terminal3270-skip: terminal3270-skip
+	$(call run-test, $<, $(PYTHON) $(S390X_SRC)/terminal3270-skip.py \
+	  $(QEMU) $<)
+
 # s390x clears the BSS section so we need to account for that
 run-plugin-memory-with-libmem.so: 		\
 	CHECK_PLUGIN_OUTPUT_COMMAND=$(MULTIARCH_SYSTEM_SRC)/validate-memory-counts.py \
