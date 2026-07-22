@@ -30,6 +30,16 @@ start_ar:
     cfi %r8,0x12345678
     jne failure
 
+    /* LAE changes AR4: an AR4 TLB entry for the old ALET must not survive. */
+    lae %r4,data                    /* B2 zero selects primary space */
+    ear %r8,%a4
+    ltgr %r8,%r8
+    jne failure
+    l %r8,0(%r4)
+    cfi %r8,0x11223344
+    jne failure
+    cpya %a4,%a2                    /* restore the selected address space */
+
     tar %a2,%r3
     ipm %r8
     srlg %r8,%r8,28
@@ -42,6 +52,20 @@ start_ar:
     srlg %r8,%r8,28
     ltgr %r8,%r8
     jne failure
+
+    /*
+     * Different ARs may select the same address space.  Destructive overlap
+     * must still have MVC's left-to-right byte propagation semantics.
+     */
+    sgr %r4,%r4
+    sar %a4,%r4                    /* AR4 and AR6 both select primary */
+    larl %r4,overlap_data
+    aghi %r4,1
+    larl %r6,overlap_data
+    mvc 0(8,%r4),0(%r6)
+    clc overlap_data(9),overlap_expected
+    jne failure
+    cpya %a4,%a2                   /* restore selected address space */
 
     lghi %r7,1
     sar %a7,%r7
@@ -107,7 +131,7 @@ failure:
 
     .align 8
 initial_cr0:
-    .quad 0x0000000000010000       /* address-space function */
+    .quad 0                        /* ASF is always enabled in z/Architecture */
 initial_cr1:
     .quad 0x20
 initial_cr2:
@@ -122,6 +146,10 @@ data:
     .long 0x11223344
 copy_dest:
     .long 0
+overlap_data:
+    .byte 0x5a,0,0,0,0,0,0,0,0
+overlap_expected:
+    .fill 9,1,0x5a
     .align 8
 success_psw:
     .quad 0x0002000180000000,0xfff

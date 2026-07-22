@@ -265,9 +265,6 @@ uint32_t HELPER(tar)(CPUS390XState *env, uint32_t r1, uint32_t r2)
     bool fetch_only;
     int exc;
 
-    if (!(env->cregs[0] & CR0_ASF)) {
-        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
-    }
     if (alet == 0) {
         return 0;
     }
@@ -470,7 +467,35 @@ static int mmu_translate_asce(CPUS390XState *env, vaddr vaddr,
     return 0;
 }
 
-static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
+static bool skey_store_protected(const CPUS390XState *env, uint8_t skey,
+                                 int access_key)
+{
+    if (access_key < 0 || !access_key ||
+        access_key == (skey & SK_ACC_MASK)) {
+        return false;
+    }
+    return !((env->cregs[0] & CR0_STORE_PROT_OVERRIDE) &&
+             (skey & SK_ACC_MASK) == 0x90);
+}
+
+static bool skey_fetch_protected(const CPUS390XState *env, uint64_t addr,
+                                 bool private, uint8_t skey,
+                                 int access_key)
+{
+    if (access_key < 0 || !access_key ||
+        access_key == (skey & SK_ACC_MASK) || !(skey & SK_F)) {
+        return false;
+    }
+    if ((env->cregs[0] & CR0_FETCH_PROT_OVERRIDE) && addr < 2048 && !private) {
+        return false;
+    }
+    return !((env->cregs[0] & CR0_STORE_PROT_OVERRIDE) &&
+             (skey & SK_ACC_MASK) == 0x90);
+}
+
+static bool mmu_handle_skey(CPUS390XState *env, uint64_t logical_addr,
+                            bool private, hwaddr addr, int rw, int access_key,
+                            int *flags)
 {
     static S390SKeysClass *skeyclass;
     static S390SKeysState *ss;
@@ -490,7 +515,7 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
      * storage key instruction was issued yet.
      */
     if (!skeyclass->skeys_are_enabled(ss)) {
-        return;
+        return false;
     }
 
     /*
@@ -507,15 +532,21 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
      * Note 2: certain accesses seem to ignore storage keys. For example,
      *         DAT translation does not set reference bits for table accesses.
      *
-     * TODO: key-controlled protection. Only CPU accesses make use of the
-     *       PSW key. CSS accesses are different - we have to pass in the key.
-     *
      * TODO: we have races between getting and setting the key.
      */
     if (s390_skeys_get(ss, addr / TARGET_PAGE_SIZE, 1, &key)) {
-        return;
+        return false;
     }
     old_key = key;
+
+    if (rw == MMU_DATA_STORE) {
+        if (skey_store_protected(env, key, access_key)) {
+            return true;
+        }
+    } else if (skey_fetch_protected(env, logical_addr, private, key,
+                                    access_key)) {
+        return true;
+    }
 
     switch (rw) {
     case MMU_DATA_LOAD:
@@ -526,6 +557,9 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
          * we might miss setting the change bit on write accesses.
          */
         if (!(key & SK_C)) {
+            *flags &= ~PAGE_WRITE;
+        }
+        if (skey_store_protected(env, key, access_key)) {
             *flags &= ~PAGE_WRITE;
         }
         break;
@@ -542,6 +576,7 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
     if (key != old_key) {
         s390_skeys_set(ss, addr / TARGET_PAGE_SIZE, 1, &key);
     }
+    return false;
 }
 
 /**
@@ -549,6 +584,8 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
  * @param vaddr  the virtual address
  * @param rw     0 = read, 1 = write, 2 = code fetch, < 0 = load real address
  * @param asc    address space control (one of the PSW_ASC_* modes)
+ * @param access_key  storage access key in bits 0-3, followed by four zeroes;
+ *                    a negative value bypasses key-controlled protection
  * @param raddr  the translated address is stored to this pointer
  * @param flags  the PAGE_READ/WRITE/EXEC flags are stored to this pointer
  * @param tec    the translation exception code if stored to this pointer if
@@ -557,8 +594,9 @@ static void mmu_handle_skey(hwaddr addr, int rw, int *flags)
  *               when the exception code must be returned; may be NULL
  * @return       0 = success, != 0, the exception to raise
  */
-int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
-                  hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc)
+int mmu_translate_with_key(CPUS390XState *env, vaddr vaddr, int rw,
+                           uint64_t asc, int access_key, hwaddr *raddr,
+                           int *flags, uint64_t *tec, int *lra_cc)
 {
     uint64_t logical_addr = vaddr;
     uint64_t asc_mode = asc & PSW_MASK_ASC;
@@ -644,9 +682,22 @@ int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
             return PGM_ADDRESSING;
         }
 
-        mmu_handle_skey(*raddr, rw, flags);
+        if (mmu_handle_skey(env, logical_addr, asce & ASCE_PRIVATE_SPACE,
+                            *raddr, rw, access_key, flags)) {
+            return PGM_PROTECTION;
+        }
     }
     return 0;
+}
+
+int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
+                  hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc)
+{
+    int access_key =
+        ((env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY) << 4;
+
+    return mmu_translate_with_key(env, vaddr, rw, asc, access_key, raddr,
+                                  flags, tec, lra_cc);
 }
 
 /**
@@ -792,6 +843,10 @@ int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
         return PGM_ADDRESSING;
     }
 
-    mmu_handle_skey(*addr, rw, flags);
+    if (mmu_handle_skey(env, raddr, false, *addr, rw,
+                        ((env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY) << 4,
+                        flags)) {
+        return PGM_PROTECTION;
+    }
     return 0;
 }

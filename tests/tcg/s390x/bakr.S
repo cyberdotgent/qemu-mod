@@ -5,6 +5,7 @@
  */
 
 #define DAT_64_PSW 0x0400000180000000
+#define DAT_64_KEY_A_PSW 0x04a0000180000000
 
     .org 0x150
 program_old_psw:
@@ -14,6 +15,13 @@ program_old_psw:
 
     .globl _start
 _start:
+    /* Normal accesses use key A; linkage-stack accesses bypass page key B. */
+    lghi %r1,0xa0
+    lghi %r2,0
+    sske %r1,%r2
+    lghi %r1,0xb8
+    lghi %r2,0x1000
+    sske %r1,%r2
     lctlg %c1,%c1,real_asce
     lctlg %c13,%c13,real_asce
     lctlg %c15,%c15,initial_cr15
@@ -27,7 +35,11 @@ after_bakr:
     stctg %c15,%c15,result_cr15
     clc result_cr15(8),initial_cr15
     jne failure
-    clc stack_header_desc(8),initial_header_desc
+    larl %r8,stack_header
+    spka 0xb0
+    lg %r4,8(%r8)
+    spka 0xa0
+    cgrl %r4,initial_header_desc
     jne failure
     lpswe success_psw
 
@@ -35,15 +47,23 @@ branch_target:
     stctg %c15,%c15,result_cr15
     clc result_cr15(8),expected_cr15
     jne failure
-    clc stack_header_desc(8),expected_header_desc
+    larl %r8,stack_header
+    spka 0xb0
+    lg %r3,8(%r8)
+    lg %r4,152(%r8)
+    lg %r5,160(%r8)
+    lg %r6,184(%r8)
+    lg %r7,304(%r8)
+    spka 0xa0
+    cgrl %r3,expected_header_desc
     jne failure
-    clc stack_state+136(8),expected_saved_mask
+    cgrl %r4,expected_saved_mask
     jne failure
-    clc stack_state+144(8),expected_call_addr
+    cgrl %r5,expected_call_addr
     jne failure
-    clc stack_state+168(8),expected_return_addr
+    cgrl %r6,expected_return_addr
     jne failure
-    clc stack_state+288(8),expected_state_desc
+    cgrl %r7,expected_state_desc
     jne failure
 
     lgrl %r4,modify_word0
@@ -74,7 +94,7 @@ real_asce:
 initial_cr15:
     .quad stack_header_desc
 dat_psw:
-    .quad DAT_64_PSW,start_dat
+    .quad DAT_64_KEY_A_PSW,start_dat
 result_cr15:
     .quad 0
 expected_cr15:
@@ -90,7 +110,7 @@ initial_header_desc:
     .short 0
     .short 0
 expected_saved_mask:
-    .quad DAT_64_PSW
+    .quad DAT_64_KEY_A_PSW
 expected_call_addr:
     .quad branch_target+1
 expected_return_addr:
@@ -119,7 +139,7 @@ success_psw:
 failure_psw:
     .quad 0x0002000180000000,0
 
-    .org 0x800
+    .org 0x1800
 stack_header:
     .quad 0
 stack_header_desc:

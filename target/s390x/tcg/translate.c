@@ -2649,7 +2649,8 @@ static DisasJumpType op_cpya(DisasContext *s, DisasOps *o)
     tcg_gen_st_i32(value, tcg_env,
                    offsetof(CPUS390XState, aregs[r1]));
 #ifndef CONFIG_USER_ONLY
-    gen_helper_ptlb(tcg_env);
+    gen_helper_flush_ars(tcg_env, tcg_constant_i32(r1),
+                         tcg_constant_i32(r1));
 #endif
     return DISAS_NEXT;
 }
@@ -2937,6 +2938,19 @@ static DisasJumpType op_ipte(DisasContext *s, DisasOps *o)
 static DisasJumpType op_iske(DisasContext *s, DisasOps *o)
 {
     gen_helper_iske(o->out, tcg_env, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ivsk(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 arn = tcg_constant_i32(get_field(s, r2));
+
+    if (!(s->base.tb->flags & FLAG_MASK_DAT)) {
+        gen_program_exception(s, PGM_SPECIAL_OP);
+        return DISAS_NORETURN;
+    }
+    gen_check_extract_authority(s);
+    gen_helper_ivsk(o->out, tcg_env, o->in2, arn);
     return DISAS_NEXT;
 }
 #endif
@@ -3297,8 +3311,9 @@ static DisasJumpType op_lra(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 is_long = tcg_constant_i32(s->fields.op == 0xe3 &&
                                         s->fields.op2 == 0x03);
+    TCGv_i32 arn = tcg_constant_i32(get_field(s, b2));
 
-    gen_helper_lra(o->out, tcg_env, o->out, o->in2, is_long);
+    gen_helper_lra(o->out, tcg_env, o->out, o->in2, is_long, arn);
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -3574,14 +3589,14 @@ static DisasJumpType op_mov2e(DisasContext *s, DisasOps *o)
         tcg_gen_movi_i64(ar1, 0);
         break;
     case PSW_ASC_ACCREG >> FLAG_MASK_PSW_SHIFT:
-        tcg_gen_movi_i64(ar1, 1);
-        break;
-    case PSW_ASC_SECONDARY >> FLAG_MASK_PSW_SHIFT:
         if (b2) {
             tcg_gen_ld32u_i64(ar1, tcg_env, offsetof(CPUS390XState, aregs[b2]));
         } else {
             tcg_gen_movi_i64(ar1, 0);
         }
+        break;
+    case PSW_ASC_SECONDARY >> FLAG_MASK_PSW_SHIFT:
+        tcg_gen_movi_i64(ar1, 1);
         break;
     case PSW_ASC_HOME >> FLAG_MASK_PSW_SHIFT:
         tcg_gen_movi_i64(ar1, 2);
@@ -3589,6 +3604,11 @@ static DisasJumpType op_mov2e(DisasContext *s, DisasOps *o)
     }
 
     tcg_gen_st32_i64(ar1, tcg_env, offsetof(CPUS390XState, aregs[r1]));
+#ifndef CONFIG_USER_ONLY
+    /* The TLB's access-register MMU index identifies the AR, not its ALET. */
+    gen_helper_flush_ars(tcg_env, tcg_constant_i32(r1),
+                         tcg_constant_i32(r1));
+#endif
     return DISAS_NEXT;
 }
 
@@ -3705,6 +3725,31 @@ static DisasJumpType op_mvcs(DisasContext *s, DisasOps *o)
     int r3 = get_field(s, r3);
     gen_helper_mvcs(cc_op, tcg_env, regs[r1], o->addr1, o->in2, regs[r3]);
     set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_mvck(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, l1);
+    int r3 = get_field(s, r3);
+
+    gen_helper_mvck(cc_op, tcg_env, regs[r1], o->addr1, o->in2, regs[r3],
+                    get_mem_indices(s));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_mvcdk(DisasContext *s, DisasOps *o)
+{
+    gen_helper_mvcdk(tcg_env, regs[0], o->addr1, o->in2, regs[1],
+                     get_mem_indices(s));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_mvcsk(DisasContext *s, DisasOps *o)
+{
+    gen_helper_mvcsk(tcg_env, regs[0], o->addr1, o->in2, regs[1],
+                     get_mem_indices(s));
     return DISAS_NEXT;
 }
 #endif
@@ -4265,7 +4310,8 @@ static DisasJumpType op_sar(DisasContext *s, DisasOps *o)
     int r1 = get_field(s, r1);
     tcg_gen_st32_i64(o->in2, tcg_env, offsetof(CPUS390XState, aregs[r1]));
 #ifndef CONFIG_USER_ONLY
-    gen_helper_ptlb(tcg_env);
+    gen_helper_flush_ars(tcg_env, tcg_constant_i32(r1),
+                         tcg_constant_i32(r1));
 #endif
     return DISAS_NEXT;
 }
@@ -4491,9 +4537,8 @@ static DisasJumpType op_ectg(DisasContext *s, DisasOps *o)
 #ifndef CONFIG_USER_ONLY
 static DisasJumpType op_spka(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_shri_i64(o->in2, o->in2, 4);
-    tcg_gen_deposit_i64(psw_mask, psw_mask, o->in2, PSW_SHIFT_KEY, 4);
-    return DISAS_NEXT;
+    gen_helper_spka(tcg_env, o->in2);
+    return DISAS_TOO_MANY;
 }
 
 static DisasJumpType op_sske(DisasContext *s, DisasOps *o)
@@ -4502,7 +4547,9 @@ static DisasJumpType op_sske(DisasContext *s, DisasOps *o)
     TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
     TCGv_i32 m3 = tcg_constant_i32(get_field(s, m3));
 
-    gen_helper_sske(tcg_env, r1, r2, m3);
+    gen_op_calc_cc(s);
+    gen_helper_sske(cc_op, tcg_env, r1, r2, m3);
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 

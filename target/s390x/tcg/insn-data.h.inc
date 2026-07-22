@@ -1454,6 +1454,8 @@
     C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
 /* INSERT STORAGE KEY EXTENDED */
     F(0xb229, ISKE,    RRE,   Z,   0, r2_o, new, r1_8, iske, 0, IF_PRIV)
+/* INSERT VIRTUAL STORAGE KEY */
+    F(0xb223, IVSK,    RRE,   Z,   0, r2_o, new, r1_8, ivsk, 0, 0)
 /* INVALIDATE DAT TABLE ENTRY */
     F(0xb98e, IPDE,    RRF_b, Z,   r1_o, r2_o, 0, 0, idte, 0, IF_PRIV)
 /* BRANCH AND STACK */
@@ -1480,6 +1482,12 @@
     C(0xda00, MVCP,    SS_d,  Z,   la1, a2, 0, 0, mvcp, 0)
 /* MOVE TO SECONDARY */
     C(0xdb00, MVCS,    SS_d,  Z,   la1, a2, 0, 0, mvcs, 0)
+/* MOVE WITH KEY */
+    C(0xd900, MVCK,    SS_d,  Z,   la1, a2, 0, 0, mvck, 0)
+/* MOVE WITH DESTINATION KEY */
+    C(0xe50f, MVCDK,   SSE,   Z,   la1, a2, 0, 0, mvcdk, 0)
+/* MOVE WITH SOURCE KEY */
+    C(0xe50e, MVCSK,   SSE,   Z,   la1, a2, 0, 0, mvcsk, 0)
 /* PURGE TLB */
     F(0xb248, PALB,    RRE,   Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
     F(0xb20d, PTLB,    S,     Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
@@ -1503,7 +1511,7 @@
 /* SET PREFIX */
     F(0xb210, SPX,     S,     Z,   0, m2_32ua, 0, 0, spx, 0, IF_PRIV)
 /* SET PSW KEY FROM ADDRESS */
-    F(0xb20a, SPKA,    S,     Z,   0, a2, 0, 0, spka, 0, IF_PRIV)
+    F(0xb20a, SPKA,    S,     Z,   0, a2, 0, 0, spka, 0, 0)
 /* SET STORAGE KEY EXTENDED */
     F(0xb22b, SSKE,    RRF_c, Z,   0, 0, 0, 0, sske, 0, IF_PRIV)
 /* SET SYSTEM MASK */

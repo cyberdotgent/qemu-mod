@@ -37,6 +37,7 @@
 #include "disas/capstone.h"
 #include "system/tcg.h"
 #ifndef CONFIG_USER_ONLY
+#include "exec/cputlb.h"
 #include "system/reset.h"
 #endif
 #include "hw/s390x/cpu-topology.h"
@@ -87,6 +88,11 @@ void s390_cpu_set_psw(CPUS390XState *env, uint64_t mask, uint64_t addr)
 
         if ((old_mask ^ mask) & PSW_MASK_PER) {
             s390_cpu_recompute_watchpoints(env_cpu(env));
+        }
+
+        /* TLB storage-key permissions are derived from the PSW key. */
+        if ((old_mask ^ mask) & PSW_MASK_KEY) {
+            tlb_flush(env_cpu(env));
         }
 
         if (mask & PSW_MASK_WAIT) {

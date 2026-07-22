@@ -17,6 +17,10 @@ _start:
     lpswe dat_psw
 
 start_dat:
+    /* In z/Architecture ASF is enabled regardless of the ESA/390 CR0 bit. */
+    sac 0x200
+    sac 0
+
     /* EPAR/ESAR replace the low word and preserve the high word. */
     llihf %r8,0x89abcdef
     epar %r8
@@ -134,7 +138,7 @@ failure:
 
     .align 8
 initial_crs:
-    .quad 0x0000000008010000       /* CR0: extraction auth + ASF */
+    .quad 0x000000000c000000       /* extraction auth + secondary */
     .quad 0x20                     /* CR1: real-space ASCE */
     .quad duct                     /* CR2: DUCT origin */
     .quad 0x00000000ffff1234       /* CR3: PKM, SASN */

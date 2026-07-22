@@ -27,6 +27,8 @@ ASM_TESTS =                                                                    \
     exrl-ssm-early                                                             \
     icm                                                                        \
     ipk                                                                        \
+    keyed-move                                                                 \
+    storage-key                                                                \
     sam                                                                        \
     lpsw                                                                       \
     lpswe-early                                                                \

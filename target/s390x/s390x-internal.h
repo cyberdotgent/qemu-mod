@@ -379,6 +379,9 @@ bool mmu_absolute_addr_valid(hwaddr addr, bool is_write);
 #define MMU_S390_LRA        -1
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
                   hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc);
+int mmu_translate_with_key(CPUS390XState *env, vaddr vaddr, int rw,
+                           uint64_t asc, int access_key, hwaddr *raddr,
+                           int *flags, uint64_t *tec, int *lra_cc);
 int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
                        hwaddr *addr, int *flags, uint64_t *tec);
 int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,

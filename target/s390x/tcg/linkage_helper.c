@@ -286,17 +286,12 @@ uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
     new_cr12 = env->cregs[12];
     env->cregs[12] = old_cr12;
 
-    if (env->cregs[0] & CR0_ASF) {
-        exc = linkage_real_read(env,
-                                (env->cregs[5] & ASTE_ORIGIN) + 24,
-                                &ltd, sizeof(ltd));
-        if (exc) {
-            tcg_s390_program_interrupt(env, exc, GETPC());
-        }
-        ltd = be32_to_cpu(ltd);
-    } else {
-        ltd = env->cregs[5];
+    exc = linkage_real_read(env, (env->cregs[5] & ASTE_ORIGIN) + 24,
+                            &ltd, sizeof(ltd));
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
     }
+    ltd = be32_to_cpu(ltd);
     if (!(ltd & LINKAGE_SUBSYSTEM)) {
         tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
     }
@@ -667,8 +662,8 @@ static int linkage_access_prepare(CPUS390XState *env,
         uint32_t chunk;
 
         g_assert(nr_pages < LINKAGE_ACCESS_MAX_PAGES);
-        exc = mmu_translate(env, addr, rw, PSW_ASC_HOME,
-                            &raddr, &flags, &tec, NULL);
+        exc = mmu_translate_with_key(env, addr, rw, PSW_ASC_HOME, -1,
+                                     &raddr, &flags, &tec, NULL);
         if (exc) {
             env->tlb_fill_exc = exc;
             env->tlb_fill_tec = tec;
@@ -1201,7 +1196,7 @@ void HELPER(pr)(CPUS390XState *env)
 
     env->cregs[15] = preceding_desc_addr & ~0x7ULL;
     env->cregs[12] = new_cr12;
-    tlb_flush(env_cpu(env));
+    HELPER(flush_ars)(env, 2, 14);
     s390_cpu_set_psw(env, new_mask, new_addr);
     linkage_record_per_branch(env, new_addr);
     if (space_switch &&
@@ -1262,7 +1257,7 @@ void HELPER(ereg)(CPUS390XState *env, uint32_t r1, uint32_t r2,
         }
         reg = (reg + 1) & 15;
     }
-    tlb_flush(env_cpu(env));
+    HELPER(flush_ars)(env, r1, r2);
 }
 
 uint32_t HELPER(esta)(CPUS390XState *env, uint32_t r1, uint32_t r2)
@@ -1573,9 +1568,6 @@ uint64_t HELPER(bsa)(CPUS390XState *env, uint32_t r1, uint32_t r2,
     uint64_t new_cr12;
     int exc;
 
-    if (!(env->cregs[0] & CR0_ASF)) {
-        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
-    }
     exc = linkage_real_read(env, duct_origin + 20,
                             &duct_pkrp_raw, sizeof(duct_pkrp_raw));
     if (!exc) {
@@ -1735,8 +1727,7 @@ uint64_t HELPER(bsg)(CPUS390XState *env, uint32_t r1, uint32_t r2,
                  (env->cregs[0] & CR0_ASN_LX_REUSE);
     int exc;
 
-    if (!(env->psw.mask & PSW_MASK_DAT) ||
-        !(env->cregs[0] & CR0_ASF)) {
+    if (!(env->psw.mask & PSW_MASK_DAT)) {
         tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
     }
     exc = linkage_trace_bsg(env, alet, target_spec);

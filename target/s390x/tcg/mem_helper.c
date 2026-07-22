@@ -72,6 +72,19 @@ static inline bool psw_key_valid(CPUS390XState *env, uint8_t psw_key)
     return true;
 }
 
+#ifndef CONFIG_USER_ONLY
+void HELPER(spka)(CPUS390XState *env, uint64_t addr)
+{
+    uint8_t key = (addr >> 4) & 0xf;
+
+    if (!psw_key_valid(env, key)) {
+        tcg_s390_program_interrupt(env, PGM_PRIVILEGED, GETPC());
+    }
+    env->psw.mask = deposit64(env->psw.mask, PSW_SHIFT_KEY, 4, key);
+    tlb_flush(env_cpu(env));
+}
+#endif
+
 static bool is_destructive_overlap(CPUS390XState *env, uint64_t dest,
                                    uint64_t src, uint32_t len)
 {
@@ -588,7 +601,16 @@ static void do_helper_mvc_idx(CPUS390XState *env, uint32_t l, uint64_t dest,
     access_prepare(&desta, env, dest, l, MMU_DATA_STORE, dest_idx, ra);
     if (dest == src + 1 && dest_idx == src_idx) {
         access_memset(env, &desta, access_get_byte(env, &srca, 0, ra), ra);
-    } else if (dest_idx != src_idx || !is_destructive_overlap(env, dest, src, l)) {
+    /*
+     * Distinct MMU indexes do not imply distinct storage.  In AR mode, for
+     * example, two different base-register ARs can both select the primary
+     * address space (or the same access-list entry).  We can therefore use
+     * memmove only when the indexes are equal and the virtual addresses show
+     * that the overlap is non-destructive.  Otherwise preserve the
+     * architected left-to-right, byte-at-a-time semantics.
+     */
+    } else if (dest_idx == src_idx &&
+               !is_destructive_overlap(env, dest, src, l)) {
         access_memmove(env, &desta, &srca, ra);
     } else {
         set_helper_retaddr(ra);
@@ -1247,7 +1269,21 @@ void HELPER(lam)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3,
             break;
         }
     }
-    tlb_flush(env_cpu(env));
+    HELPER(flush_ars)(env, r1, r3);
+}
+
+void HELPER(flush_ars)(CPUS390XState *env, uint32_t r1, uint32_t r3)
+{
+    MMUIdxMap idxmap = 0;
+
+    for (;;) {
+        idxmap |= (MMUIdxMap)1 << MMU_ACCREG_IDX(r1);
+        if (r1 == r3) {
+            break;
+        }
+        r1 = (r1 + 1) & 15;
+    }
+    tlb_flush_by_mmuidx(env_cpu(env), idxmap);
 }
 
 /* store access registers r1 to r3 in memory at a2 */
@@ -2938,6 +2974,66 @@ static void set_storage_key(CPUS390XState *env, uint64_t addr, uint8_t key)
     tlb_flush_all_cpus_synced(env_cpu(env));
 }
 
+static uint8_t get_storage_key(CPUS390XState *env, uint64_t addr)
+{
+    S390SKeysState *ss = get_skeys_device(env);
+    uint8_t key = 0;
+
+    s390_skeys_get(ss, addr / TARGET_PAGE_SIZE, 1, &key);
+    return key;
+}
+
+/* insert virtual storage key */
+uint64_t HELPER(ivsk)(CPUS390XState *env, uint64_t addr, uint32_t arn)
+{
+    uint64_t asc = (env->psw.mask & PSW_MASK_ASC) | arn;
+    uint64_t tec;
+    hwaddr abs;
+    uint8_t key;
+    int flags;
+    int exc;
+
+    addr = wrap_address(env, addr);
+    exc = mmu_translate(env, addr, MMU_DATA_LOAD, asc, &abs, &flags, &tec,
+                        NULL);
+    if (exc) {
+        env->tlb_fill_exc = exc;
+        env->tlb_fill_tec = tec;
+        env->tlb_fill_arn = arn;
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
+
+    key = get_storage_key(env, abs);
+    return key & 0xf8;
+}
+
+#define SSKE_MR 0x4
+#define SSKE_MC 0x2
+#define SSKE_MB 0x1
+
+/*
+ * Return whether Conditional-SSKE permits the key update to be bypassed.
+ * Replacing the complete key when an unmasked R/C bit differs is one of the
+ * architecturally permitted results (CC 1 rather than CC 2).
+ */
+static bool conditional_skey_bypass(uint8_t old_key, uint8_t new_key,
+                                    uint32_t mask)
+{
+    if ((old_key & 0xf8) != (new_key & 0xf8)) {
+        return false;
+    }
+    if ((mask & (SSKE_MR | SSKE_MC)) == (SSKE_MR | SSKE_MC)) {
+        return true;
+    }
+    if (!(mask & SSKE_MR) && ((old_key ^ new_key) & SK_R)) {
+        return false;
+    }
+    if (!(mask & SSKE_MC) && ((old_key ^ new_key) & SK_C)) {
+        return false;
+    }
+    return true;
+}
+
 /*
  * Update the address portion of a register after an interruptible
  * multi-block storage-key operation.  Bits 52-63 (the low 12 bits) are
@@ -2963,12 +3059,16 @@ static void set_storage_key_address(CPUS390XState *env, uint32_t reg,
 }
 
 /* set storage key extended */
-void HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2, uint32_t m3)
+uint32_t HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                      uint32_t m3)
 {
     uint64_t addr = wrap_address(env, env->regs[r2]) & TARGET_PAGE_MASK;
     uint64_t pages = 1;
     uint8_t key = env->regs[r1] & 0xfe;
-    bool multiple = s390_has_feat(S390_FEAT_EDAT) && (m3 & 1);
+    bool conditional = s390_has_feat(S390_FEAT_CONDITIONAL_SSKE) &&
+                       (m3 & (SSKE_MR | SSKE_MC));
+    bool multiple = s390_has_feat(S390_FEAT_EDAT) && (m3 & SSKE_MB);
+
 
     if (multiple) {
         pages = (0x100000 - (addr & 0xfffff)) / TARGET_PAGE_SIZE;
@@ -2980,12 +3080,28 @@ void HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2, uint32_t m3)
         if (!mmu_absolute_addr_valid(addr, false)) {
             tcg_s390_program_interrupt(env, PGM_ADDRESSING, GETPC());
         }
-        set_storage_key(env, addr, key);
+        if (conditional) {
+            uint8_t old_key = get_storage_key(env, addr);
+
+            env->regs[r1] = deposit64(env->regs[r1], 8, 8, old_key & 0xfe);
+            if (conditional_skey_bypass(old_key, key, m3)) {
+                env->cc_op = 0;
+            } else {
+                set_storage_key(env, addr, key);
+                env->cc_op = 1;
+            }
+        } else {
+            set_storage_key(env, addr, key);
+        }
         if (multiple) {
             addr = wrap_address(env, addr + TARGET_PAGE_SIZE);
             set_storage_key_address(env, r2, addr);
         }
     }
+    if (multiple && conditional) {
+        env->cc_op = 3;
+    }
+    return env->cc_op;
 }
 
 #define PFMF_FMFI_SK       0x00020000
@@ -2995,6 +3111,8 @@ void HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2, uint32_t m3)
 #define PFMF_FSC_2G        0x00002000
 #define PFMF_RESERVED      0xfffc0101
 #define PFMF_NQ            0x00000800
+#define PFMF_MR            0x00000400
+#define PFMF_MC            0x00000200
 
 static bool pfmf_low_address(uint64_t addr)
 {
@@ -3066,7 +3184,13 @@ void HELPER(pfmf)(CPUS390XState *env, uint32_t r1, uint32_t r2)
             pfmf_access_exception(env, addr, PGM_ADDRESSING);
         }
         if (set_key) {
-            set_storage_key(env, addr, key);
+            uint32_t mask = (control >> 8) & (SSKE_MR | SSKE_MC);
+
+            if (!s390_has_feat(S390_FEAT_CONDITIONAL_SSKE) || !mask ||
+                !conditional_skey_bypass(get_storage_key(env, addr), key,
+                                         mask)) {
+                set_storage_key(env, addr, key);
+            }
         }
         if (multiple) {
             addr = wrap_address(env, addr + TARGET_PAGE_SIZE);
@@ -3074,6 +3198,7 @@ void HELPER(pfmf)(CPUS390XState *env, uint32_t r1, uint32_t r2)
             set_storage_key_address(env, r2, addr);
         }
     }
+
 }
 
 /* reset reference bit extended */
@@ -3197,6 +3322,162 @@ uint32_t HELPER(mvcp)(CPUS390XState *env, uint64_t l, uint64_t a1, uint64_t a2,
     return cc;
 }
 
+static void check_move_key_authority(CPUS390XState *env, uint64_t key,
+                                     uintptr_t ra)
+{
+    if (!psw_key_valid(env, (key >> 4) & 0xf)) {
+        s390_program_interrupt(env, PGM_PRIVILEGED, ra);
+    }
+}
+
+static uint64_t move_mmu_idx_to_asc(int mmu_idx)
+{
+    if (mmu_idx >= MMU_ACCREG_IDX_BASE) {
+        return PSW_ASC_ACCREG | (mmu_idx - MMU_ACCREG_IDX_BASE);
+    }
+    switch (mmu_idx) {
+    case MMU_PRIMARY_IDX:
+        return PSW_ASC_PRIMARY;
+    case MMU_SECONDARY_IDX:
+        return PSW_ASC_SECONDARY;
+    case MMU_HOME_IDX:
+        return PSW_ASC_HOME;
+    case MMU_REAL_IDX:
+        /* The ASC is ignored while DAT is disabled. */
+        return PSW_ASC_PRIMARY;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+typedef struct KeyedMoveAccess {
+    uint64_t addr;
+    uint16_t len;
+    uint16_t size1;
+    hwaddr page1;
+    hwaddr page2;
+} KeyedMoveAccess;
+
+static void prepare_keyed_move_access(CPUS390XState *env,
+                                      KeyedMoveAccess *access,
+                                      uint64_t addr, uint16_t len,
+                                      MMUAccessType access_type, int mmu_idx,
+                                      uint8_t access_key, uintptr_t ra)
+{
+    uint64_t asc = move_mmu_idx_to_asc(mmu_idx);
+    uint64_t tec;
+    int flags, exc;
+
+    addr = wrap_address(env, addr);
+    access->addr = addr;
+    access->len = len;
+    access->size1 = MIN(len, -(addr | TARGET_PAGE_MASK));
+
+    exc = mmu_translate_with_key(env, addr, access_type, asc, access_key,
+                                 &access->page1, &flags, &tec, NULL);
+    if (!exc && access->size1 != len) {
+        uint64_t addr2 = wrap_address(env, addr + access->size1);
+
+        exc = mmu_translate_with_key(env, addr2, access_type, asc, access_key,
+                                     &access->page2, &flags, &tec, NULL);
+    }
+    if (exc) {
+        env->tlb_fill_exc = exc;
+        env->tlb_fill_tec = tec;
+        env->tlb_fill_arn = mmu_idx >= MMU_ACCREG_IDX_BASE ?
+                            mmu_idx - MMU_ACCREG_IDX_BASE : 0;
+        tcg_s390_program_interrupt(env, exc, ra);
+    }
+}
+
+static hwaddr keyed_move_abs(const KeyedMoveAccess *access, uint16_t offset)
+{
+    if (offset < access->size1) {
+        return access->page1 | ((access->addr + offset) & ~TARGET_PAGE_MASK);
+    }
+    return access->page2 |
+           ((access->addr + offset) & ~TARGET_PAGE_MASK);
+}
+
+static void keyed_move(CPUS390XState *env, uint64_t dest, int dest_idx,
+                       uint8_t dest_key, uint64_t src, int src_idx,
+                       uint8_t src_key, uint16_t len, uintptr_t ra)
+{
+    AddressSpace *as = env_cpu(env)->as;
+    KeyedMoveAccess srca, desta;
+
+    prepare_keyed_move_access(env, &srca, src, len, MMU_DATA_LOAD, src_idx,
+                              src_key, ra);
+    prepare_keyed_move_access(env, &desta, dest, len, MMU_DATA_STORE, dest_idx,
+                              dest_key, ra);
+
+    set_helper_retaddr(ra);
+    for (uint16_t i = 0; i < len; i++) {
+        MemTxResult result;
+        uint8_t byte;
+
+        byte = address_space_ldub(as, keyed_move_abs(&srca, i),
+                                  MEMTXATTRS_UNSPECIFIED, &result);
+        if (result != MEMTX_OK) {
+            tcg_s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        }
+        address_space_stb(as, keyed_move_abs(&desta, i), byte,
+                          MEMTXATTRS_UNSPECIFIED, &result);
+        if (result != MEMTX_OK) {
+            tcg_s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        }
+    }
+    clear_helper_retaddr();
+}
+
+uint32_t HELPER(mvck)(CPUS390XState *env, uint64_t l, uint64_t a1, uint64_t a2,
+                      uint64_t key, uint32_t mmu_idxs)
+{
+    uintptr_t ra = GETPC();
+    uint32_t cc = 0;
+    uint8_t psw_key = (env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY;
+
+    check_move_key_authority(env, key, ra);
+    l = wrap_length32(env, l);
+    if (l > 256) {
+        l = 256;
+        cc = 3;
+    }
+    if (l) {
+        keyed_move(env, a1, mmu_idx1(mmu_idxs), psw_key << 4,
+                   a2, mmu_idx2(mmu_idxs), key & 0xf0, l, ra);
+    }
+    return cc;
+}
+
+static void do_fixed_keyed_move(CPUS390XState *env, uint64_t l, uint64_t a1,
+                                uint64_t a2, uint64_t key,
+                                uint32_t mmu_idxs, bool source_key,
+                                uintptr_t ra)
+{
+    uint8_t psw_key = (env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY;
+    uint64_t len = (l & 0xff) + 1;
+
+    /* Retained explicitly for key-controlled MMU protection support. */
+    check_move_key_authority(env, key, ra);
+    keyed_move(env, a1, mmu_idx1(mmu_idxs),
+               source_key ? psw_key << 4 : key & 0xf0,
+               a2, mmu_idx2(mmu_idxs),
+               source_key ? key & 0xf0 : psw_key << 4, len, ra);
+}
+
+void HELPER(mvcdk)(CPUS390XState *env, uint64_t l, uint64_t a1, uint64_t a2,
+                   uint64_t key, uint32_t mmu_idxs)
+{
+    do_fixed_keyed_move(env, l, a1, a2, key, mmu_idxs, false, GETPC());
+}
+
+void HELPER(mvcsk)(CPUS390XState *env, uint64_t l, uint64_t a1, uint64_t a2,
+                   uint64_t key, uint32_t mmu_idxs)
+{
+    do_fixed_keyed_move(env, l, a1, a2, key, mmu_idxs, true, GETPC());
+}
+
 void HELPER(idte)(CPUS390XState *env, uint64_t r1, uint64_t r2, uint32_t m4)
 {
     CPUState *cs = env_cpu(env);
@@ -3302,9 +3583,9 @@ void HELPER(purge)(CPUS390XState *env)
 
 /* load real address */
 uint64_t HELPER(lra)(CPUS390XState *env, uint64_t r1, uint64_t addr,
-                     uint32_t is_long)
+                     uint32_t is_long, uint32_t arn)
 {
-    uint64_t asc = env->psw.mask & PSW_MASK_ASC;
+    uint64_t asc = (env->psw.mask & PSW_MASK_ASC) | arn;
     uint64_t ret, tec;
     int flags, exc, cc, lra_cc;
 
