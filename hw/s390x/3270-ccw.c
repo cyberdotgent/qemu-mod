@@ -18,6 +18,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/3270-ccw.h"
 
+#define TERMINAL3270_AUTO_DEVNO 0x0700
+
 /* Handle READ ccw commands from guest */
 static int handle_payload_3270_read(EmulatedCcw3270Device *dev, CCW1 *ccw)
 {
@@ -141,7 +143,7 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     SubchDev *sch;
     Error *err = NULL;
 
-    sch = css_create_sch(cdev->devno, errp);
+    sch = css_create_sch_at(cdev->devno, TERMINAL3270_AUTO_DEVNO, errp);
     if (!sch) {
         return;
     }

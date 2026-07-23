@@ -87,6 +87,21 @@ static void test_dev3590_shortcut(void)
     unlink(path);
 }
 
+static void test_auto_devnos(void)
+{
+    g_autofree char *dev_id0 = NULL;
+    g_autofree char *dev_id1 = NULL;
+    QTestState *qts;
+
+    qts = qtest_init(
+        "-nodefaults -dev3590 id=tape0 -dev3590 id=tape1");
+    dev_id0 = qom_get_string(qts, "/machine/peripheral/tape0", "dev_id");
+    dev_id1 = qom_get_string(qts, "/machine/peripheral/tape1", "dev_id");
+    g_assert_cmpstr(dev_id0, ==, "fe.0.0580");
+    g_assert_cmpstr(dev_id1, ==, "fe.0.0581");
+    qtest_quit(qts);
+}
+
 static void test_runtime_media_change(void)
 {
     g_autofree char *path = create_aws_image();
@@ -176,6 +191,7 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/3590-ccw/dev3590-shortcut", test_dev3590_shortcut);
+    qtest_add_func("/3590-ccw/auto-devnos", test_auto_devnos);
     qtest_add_func("/3590-ccw/runtime-media-change",
                    test_runtime_media_change);
     qtest_add_func("/3590-ccw/identity-whitelist",

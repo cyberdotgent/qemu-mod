@@ -308,6 +308,16 @@ extern const PropertyInfo css_devid_ro_propinfo;
  */
 SubchDev *css_create_sch(CssDevId bus_id, Error **errp);
 
+/**
+ * Create a subchannel, preferring device numbers at or above @devno_start.
+ *
+ * An explicit @bus_id is handled exactly like css_create_sch(). For an
+ * automatically assigned @bus_id, allocation starts at @devno_start and
+ * wraps after the highest device number.
+ */
+SubchDev *css_create_sch_at(CssDevId bus_id, uint16_t devno_start,
+                            Error **errp);
+
 /** Turn on css migration */
 void css_register_vmstate(void);
 

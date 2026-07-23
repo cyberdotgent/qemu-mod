@@ -20,6 +20,7 @@
 #include "trace.h"
 
 #define TAPE3590_CHPID_TYPE       0x1b
+#define TAPE3590_AUTO_DEVNO       0x0580
 
 #define TAPE_CMD_WRITE            0x01
 #define TAPE_CMD_READ_IPL         0x02
@@ -550,7 +551,7 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
     }
     blk_set_dev_ops(tape->blk, &tape3590_block_ops, tape);
     tape->record = g_malloc(AWS_TAPE_MAX_RECORD);
-    sch = css_create_sch(cdev->devno, errp);
+    sch = css_create_sch_at(cdev->devno, TAPE3590_AUTO_DEVNO, errp);
     if (!sch) {
         goto fail_record;
     }

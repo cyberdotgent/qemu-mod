@@ -2355,6 +2355,7 @@ static bool css_find_free_subch_for_devno(uint8_t cssid, uint8_t ssid,
  */
 static bool css_find_free_subch_and_devno(uint8_t cssid, uint8_t *ssid,
                                           uint16_t *devno, uint16_t *schid,
+                                          int devno_start,
                                           Error **errp)
 {
     uint32_t free_schid, free_devno;
@@ -2365,7 +2366,9 @@ static bool css_find_free_subch_and_devno(uint8_t cssid, uint8_t *ssid,
         if (free_schid > MAX_SCHID) {
             continue;
         }
-        free_devno = css_find_free_devno(cssid, *ssid, free_schid);
+        free_devno = css_find_free_devno(cssid, *ssid,
+                                         devno_start < 0 ?
+                                         free_schid : devno_start);
         if (free_devno > MAX_DEVNO) {
             continue;
         }
@@ -2693,7 +2696,8 @@ const PropertyInfo css_devid_ro_propinfo = {
     .get = get_css_devid,
 };
 
-SubchDev *css_create_sch(CssDevId bus_id, Error **errp)
+static SubchDev *css_create_sch_internal(CssDevId bus_id, int devno_start,
+                                         Error **errp)
 {
     uint16_t schid = 0;
     SubchDev *sch;
@@ -2715,6 +2719,7 @@ SubchDev *css_create_sch(CssDevId bus_id, Error **errp)
 
             if   (css_find_free_subch_and_devno(bus_id.cssid, &bus_id.ssid,
                                                 &bus_id.devid, &schid,
+                                                devno_start,
                                                 NULL)) {
                 break;
             }
@@ -2733,6 +2738,17 @@ SubchDev *css_create_sch(CssDevId bus_id, Error **errp)
     sch->schid = schid;
     css_subch_assign(sch->cssid, sch->ssid, schid, sch->devno, sch);
     return sch;
+}
+
+SubchDev *css_create_sch(CssDevId bus_id, Error **errp)
+{
+    return css_create_sch_internal(bus_id, -1, errp);
+}
+
+SubchDev *css_create_sch_at(CssDevId bus_id, uint16_t devno_start,
+                            Error **errp)
+{
+    return css_create_sch_internal(bus_id, devno_start, errp);
 }
 
 static int css_sch_get_chpids(SubchDev *sch, CssDevId *dev_id)

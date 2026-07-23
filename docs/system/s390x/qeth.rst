@@ -7,7 +7,8 @@ QEMU network backend.
 
 The adapter occupies three consecutive CCW device numbers.  ``devno`` selects
 the first (read) device; the write and QDIO data devices use the next two
-numbers.  For example::
+numbers.  If ``devno`` is omitted, automatic allocation begins at ``0400``.
+For example::
 
   -netdev user,id=qnet \
   -device qeth-ccw,netdev=qnet,devno=fe.0.0600,mac=52:54:00:12:34:60

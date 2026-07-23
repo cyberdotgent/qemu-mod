@@ -42,14 +42,18 @@ static void test_configuration(void)
 
 static void test_auto_configuration(void)
 {
-    g_autofree char *dev_id = NULL;
+    g_autofree char *dev_id0 = NULL;
+    g_autofree char *dev_id1 = NULL;
     QTestState *qts;
 
     qts = qtest_init(
-        "-nodefaults -netdev user,id=net0 "
-        "-device qeth-ccw,id=qeth0,netdev=net0");
-    dev_id = qom_get_string(qts, "/machine/peripheral/qeth0", "dev_id");
-    g_assert_cmpstr(dev_id, ==, "fe.0.0000");
+        "-nodefaults -netdev user,id=net0 -netdev user,id=net1 "
+        "-device qeth-ccw,id=qeth0,netdev=net0 "
+        "-device qeth-ccw,id=qeth1,netdev=net1");
+    dev_id0 = qom_get_string(qts, "/machine/peripheral/qeth0", "dev_id");
+    dev_id1 = qom_get_string(qts, "/machine/peripheral/qeth1", "dev_id");
+    g_assert_cmpstr(dev_id0, ==, "fe.0.0400");
+    g_assert_cmpstr(dev_id1, ==, "fe.0.0403");
     qtest_quit(qts);
 }
 

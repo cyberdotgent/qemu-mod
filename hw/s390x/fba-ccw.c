@@ -22,6 +22,7 @@
 #include "system/block-backend-io.h"
 
 #define FBA_BLOCK_SIZE             512
+#define FBA_AUTO_DEVNO             0x0200
 #define FBA_CU_TYPE                0x6310
 #define FBA_CU_MODEL               0x01
 #define FBA_DEV_TYPE               0x9336
@@ -545,7 +546,7 @@ static void fba_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    sch = css_create_sch(cdev->devno, errp);
+    sch = css_create_sch_at(cdev->devno, FBA_AUTO_DEVNO, errp);
     if (!sch) {
         return;
     }

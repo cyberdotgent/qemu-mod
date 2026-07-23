@@ -11,6 +11,8 @@ The concise command line is::
 
   -dev3590 file=install.aws,devno=580
 
+If ``devno`` is omitted, automatic allocation begins at ``0580``.
+
 This creates a read-only raw backend by default.  ``readonly=off`` allows the
 backend to be opened for writing.  An existing block node can instead be
 attached with ``drive=NODE``.  Three- and four-digit hexadecimal device

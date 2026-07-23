@@ -25,6 +25,7 @@
 #define QETH_DEV_TYPE            0x1732
 #define QETH_DEV_MODEL           0x01
 #define QETH_CHPID_TYPE          0x11
+#define QETH_AUTO_DEVNO          0x0400
 
 #define QETH_CMD_WRITE           0x01
 #define QETH_CMD_READ            0x02
@@ -602,7 +603,9 @@ static void qeth_realize(DeviceState *dev, Error **errp)
         if (id.valid) {
             id.devid = base_devno + i;
         }
-        s->peer[i] = css_create_sch(id, &local_err);
+        s->peer[i] = i == 0 ?
+            css_create_sch_at(id, QETH_AUTO_DEVNO, &local_err) :
+            css_create_sch(id, &local_err);
         if (!s->peer[i]) {
             goto fail;
         }

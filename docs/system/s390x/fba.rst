@@ -16,6 +16,8 @@ The equivalent shorthand for an image file is::
 
   -dev9336 file=sysres.raw,devno=200
 
+If ``devno`` is omitted, automatic allocation begins at ``0200``.
+
 ``-dev9336`` accepts either ``file=PATH`` or ``drive=NODE``.  For ``file``,
 ``format=FORMAT`` (``raw`` by default) and ``readonly=on`` are also accepted.
 ``blocks=N`` can expose a capacity smaller than the backend, and ``id=ID``

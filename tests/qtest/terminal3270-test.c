@@ -254,6 +254,21 @@ static void test_dev3270_shortcut(void)
     qtest_quit(qts);
 }
 
+static void test_auto_devnos(void)
+{
+    g_autofree char *devid0 = NULL;
+    g_autofree char *devid1 = NULL;
+    QTestState *qts;
+
+    qts = qtest_init(
+        "-nodefaults -dev3270 port=0 -dev3270 port=0");
+    devid0 = qom_get_string(qts, "/machine/peripheral/dev3270-0", "dev_id");
+    devid1 = qom_get_string(qts, "/machine/peripheral/dev3270-1", "dev_id");
+    g_assert_cmpstr(devid0, ==, "fe.0.0700");
+    g_assert_cmpstr(devid1, ==, "fe.0.0701");
+    qtest_quit(qts);
+}
+
 /*
  * A CSS has only 256 CHPIDs, one of which is reserved for virtio-ccw. If each
  * terminal consumed a separate channel path, the last device here would fail
@@ -495,6 +510,7 @@ int main(int argc, char **argv)
     qtest_add_func("/terminal3270/multiple", test_multiple_terminals);
     qtest_add_func("/terminal3270/dev3270-shortcut",
                    test_dev3270_shortcut);
+    qtest_add_func("/terminal3270/auto-devnos", test_auto_devnos);
     qtest_add_func("/terminal3270/shared-chpid",
                    test_many_terminals_share_chpid);
     qtest_add_func("/terminal3270/tn3270-negotiation-records",

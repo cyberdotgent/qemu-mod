@@ -72,10 +72,31 @@ static void test_dev9336_shortcut(void)
     unlink(path1);
 }
 
+static void test_auto_devnos(void)
+{
+    g_autofree char *path0 = create_image();
+    g_autofree char *path1 = create_image();
+    g_autofree char *dev_id0 = NULL;
+    g_autofree char *dev_id1 = NULL;
+    QTestState *qts;
+
+    qts = qtest_initf(
+        "-nodefaults -dev9336 file=%s,id=disk0 -dev9336 file=%s,id=disk1",
+        path0, path1);
+    dev_id0 = qom_get_string(qts, "/machine/peripheral/disk0", "dev_id");
+    dev_id1 = qom_get_string(qts, "/machine/peripheral/disk1", "dev_id");
+    g_assert_cmpstr(dev_id0, ==, "fe.0.0200");
+    g_assert_cmpstr(dev_id1, ==, "fe.0.0201");
+    qtest_quit(qts);
+    unlink(path0);
+    unlink(path1);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/fba-ccw/full-configuration", test_full_configuration);
     qtest_add_func("/fba-ccw/dev9336-shortcut", test_dev9336_shortcut);
+    qtest_add_func("/fba-ccw/auto-devnos", test_auto_devnos);
     return g_test_run();
 }

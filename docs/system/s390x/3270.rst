@@ -27,6 +27,8 @@ Example configuration
 
    -dev3270 port=2300,devno=fe.0.000a
 
+If ``devno`` is omitted, automatic allocation begins at ``0700``.
+
   ``-dev3270`` listens on the loopback interface. It can be repeated to create
   additional devices on different ports::
 
