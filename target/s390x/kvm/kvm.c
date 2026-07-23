@@ -1212,8 +1212,7 @@ static int handle_b2(S390CPU *cpu, struct kvm_run *run, uint8_t ipa1)
         ioinst_handle_sal(cpu, env->regs[1], RA_IGNORED);
         break;
     case PRIV_B2_SIGA:
-        /* Not provided, set CC = 3 for subchannel not operational */
-        setcc(cpu, 3);
+        ioinst_handle_siga(cpu, RA_IGNORED);
         break;
     case PRIV_B2_SCLP_CALL:
         kvm_sclp_service_call(cpu, run, ipbh0);

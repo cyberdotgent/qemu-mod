@@ -359,6 +359,7 @@ void ioinst_handle_stsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
                          uintptr_t ra);
 int ioinst_handle_tsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb, uintptr_t ra);
 void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra);
+void ioinst_handle_siga(S390CPU *cpu, uintptr_t ra);
 void ioinst_handle_schm(S390CPU *cpu, uint64_t reg1, uint64_t reg2,
                         uint32_t ipb, uintptr_t ra);
 void ioinst_handle_rsch(S390CPU *cpu, uint64_t reg1, uintptr_t ra);

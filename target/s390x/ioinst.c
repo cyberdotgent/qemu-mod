@@ -59,6 +59,34 @@ int ioinst_disassemble_sch_ident(uint32_t value, int *m, int *cssid, int *ssid,
     return 0;
 }
 
+void ioinst_handle_siga(S390CPU *cpu, uintptr_t ra)
+{
+    CPUS390XState *env = &cpu->env;
+    uint64_t ident = env->regs[1];
+    int cssid, ssid, schid, m;
+    SubchDev *sch;
+    uint8_t function = env->regs[0] & 0xff;
+    int cc;
+
+    if (function & 0x78) {
+        s390_program_interrupt(env, PGM_OPERAND, ra);
+        return;
+    }
+    if (ioinst_disassemble_sch_ident(ident, &m, &cssid, &ssid, &schid)) {
+        s390_program_interrupt(env, PGM_OPERAND, ra);
+        return;
+    }
+    sch = css_find_subch(m, cssid, ssid, schid);
+    if (!sch || !css_subch_visible(sch) || !sch->qdio_ops ||
+        !sch->qdio_ops->siga) {
+        setcc(cpu, 3);
+        return;
+    }
+    cc = sch->qdio_ops->siga(sch, function, env->regs[2] & 0xffffffff,
+                             env->regs[3] & 0xffffffff, env->regs[3]);
+    setcc(cpu, cc);
+}
+
 void ioinst_handle_xsch(S390CPU *cpu, uint64_t reg1, uintptr_t ra)
 {
     int cssid, ssid, schid, m;
@@ -314,6 +342,10 @@ void ioinst_handle_stsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
             cc = 0;
         }
     }
+    trace_ioinst_stsch(cssid, ssid, schid, cc,
+                       sch ? sch->curr_status.pmcw.flags : 0,
+                       sch ? sch->curr_status.pmcw.devno : 0,
+                       sch ? sch->curr_status.pmcw.chars : 0);
     if (cc != 3) {
         if (s390_is_pv()) {
             s390_cpu_pv_mem_write(cpu, addr, &schib, sizeof(schib));
@@ -404,6 +436,7 @@ typedef struct ChscResp {
 #define CHSC_SCSC 0x0010
 #define CHSC_SDA  0x0031
 #define CHSC_SEI  0x000e
+#define CHSC_SSQD 0x0024
 
 #define CHSC_SCPD_0_M 0x20000000
 #define CHSC_SCPD_0_C 0x10000000
@@ -671,6 +704,51 @@ static void ioinst_handle_chsc_unimplemented(ChscResp *res)
     res->param = 0;
 }
 
+static void ioinst_handle_chsc_ssqd(ChscReq *req, ChscResp *res)
+{
+    uint32_t param0 = be32_to_cpu(req->param0);
+    uint32_t param1 = be32_to_cpu(req->param1);
+    uint16_t ssidfmt = param0 >> 16;
+    uint16_t first = param0;
+    uint16_t last = param1;
+    uint8_t ssid = (ssidfmt & 0x30) >> 4;
+    uint8_t *desc = (uint8_t *)res->data;
+    unsigned int count;
+    uint16_t schid;
+
+    if ((ssidfmt & ~0x003f) || (ssidfmt & 0x000f) || last < first) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+    count = (unsigned int)last - first + 1;
+    if (CHSC_MIN_RESP_LEN + count * 32 > TARGET_PAGE_SIZE - 16) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    for (schid = first; ; schid++) {
+        SubchDev *sch = css_find_subch(0, 0, ssid, schid);
+
+        memset(desc, 0, 32);
+        stw_be_p(desc + 2, schid);
+        if (sch && css_subch_visible(sch) && sch->qdio_ops &&
+            sch->qdio_ops->ssqd) {
+            sch->qdio_ops->ssqd(sch, desc);
+        }
+        desc += 32;
+        if (schid == last) {
+            break;
+        }
+    }
+    res->len = cpu_to_be16(CHSC_MIN_RESP_LEN + count * 32);
+    res->code = cpu_to_be16(0x0001);
+    res->param = 0;
+}
+
 void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
 {
     ChscReq *req;
@@ -726,6 +804,9 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
         break;
     case CHSC_SEI:
         ioinst_handle_chsc_sei(req, res);
+        break;
+    case CHSC_SSQD:
+        ioinst_handle_chsc_ssqd(req, res);
         break;
     default:
         ioinst_handle_chsc_unimplemented(res);

@@ -595,6 +595,23 @@ void css_inject_io_interrupt(SubchDev *sch)
                       isc << 27);
 }
 
+bool css_inject_qdio_pci(SubchDev *sch)
+{
+    if (!(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||
+        !sch->ccw_async_pending ||
+        (sch->curr_status.scsw.ctrl & SCSW_STCTL_STATUS_PEND)) {
+        return false;
+    }
+
+    sch->curr_status.scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;
+    sch->curr_status.scsw.ctrl |= SCSW_STCTL_INTERMEDIATE |
+                                  SCSW_STCTL_STATUS_PEND;
+    sch->curr_status.scsw.cstat = SCSW_CSTAT_PCI;
+    sch->curr_status.scsw.dstat = 0;
+    css_inject_io_interrupt(sch);
+    return true;
+}
+
 bool css_generate_unsolicited_io_interrupt(SubchDev *sch, uint8_t dstat)
 {
     if (!(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||

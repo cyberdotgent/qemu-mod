@@ -107,7 +107,13 @@ QEMU_BUILD_BUG_MSG(sizeof(PMCW) != 28, "size of PMCW is wrong");
 #define PMCW_FLAGS_MASK_MP 0x0004
 #define PMCW_FLAGS_MASK_TF 0x0002
 #define PMCW_FLAGS_MASK_DNV 0x0001
-#define PMCW_FLAGS_MASK_INVALID 0xc300
+/*
+ * The Q bit is reported by STSCH for QDIO-capable subchannels and is
+ * preserved by operating systems in the SCHIB supplied to MSCH.  It is not
+ * a reserved bit; MSCH ignores it because css_do_msch() only applies the
+ * program-modifiable fields.
+ */
+#define PMCW_FLAGS_MASK_INVALID 0x4300
 
 #define PMCW_CHARS_MASK_ST 0x00e00000
 #define PMCW_CHARS_MASK_MBFC 0x00000004

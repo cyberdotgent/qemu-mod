@@ -35,6 +35,10 @@ s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files(
 s390x_ss.add(when: 'CONFIG_TERMINAL3270', if_true: files('3270-ccw.c'))
 s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files('fba-ccw.c'))
 s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files(
+  'qdio.c',
+  'qeth-ccw.c',
+))
+s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files(
   '3590-ccw.c',
   'tape-aws.c',
 ))

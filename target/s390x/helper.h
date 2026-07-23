@@ -417,6 +417,7 @@ DEF_HELPER_3(stsch, void, env, i64, i64)
 DEF_HELPER_2(tpi, i32, env, i64)
 DEF_HELPER_3(tsch, void, env, i64, i64)
 DEF_HELPER_2(chsc, void, env, i64)
+DEF_HELPER_1(siga, void, env)
 
 DEF_HELPER_2(clp, void, env, i32)
 DEF_HELPER_3(pcilg, void, env, i32, i32)

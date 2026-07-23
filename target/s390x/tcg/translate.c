@@ -4760,8 +4760,8 @@ static DisasJumpType op_schm(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_siga(DisasContext *s, DisasOps *o)
 {
-    /* From KVM code: Not provided, set CC = 3 for subchannel not operational */
-    gen_op_movi_cc(s, 3);
+    gen_helper_siga(tcg_env);
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 

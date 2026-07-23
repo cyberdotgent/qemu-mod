@@ -286,6 +286,7 @@ qtests_s390x = \
   (config_all_devices.has_key('CONFIG_TERMINAL3270') ? ['terminal3270-test'] : []) + \
   ['3590-ccw-test'] + \
   ['fba-ccw-test'] + \
+  ['qeth-ccw-test'] + \
   ['boot-serial-test',
    's390x-ipl-test',
    'drive_del-test',

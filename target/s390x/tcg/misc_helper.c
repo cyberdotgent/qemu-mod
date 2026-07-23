@@ -514,6 +514,15 @@ void HELPER(schm)(CPUS390XState *env, uint64_t r1, uint64_t r2, uint64_t inst)
     bql_unlock();
 }
 
+void HELPER(siga)(CPUS390XState *env)
+{
+    S390CPU *cpu = env_archcpu(env);
+
+    bql_lock();
+    ioinst_handle_siga(cpu, GETPC());
+    bql_unlock();
+}
+
 void HELPER(ssch)(CPUS390XState *env, uint64_t r1, uint64_t inst)
 {
     S390CPU *cpu = env_archcpu(env);

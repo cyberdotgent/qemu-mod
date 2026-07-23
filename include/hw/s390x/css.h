@@ -117,6 +117,12 @@ typedef enum IOInstEnding {
 } IOInstEnding;
 
 typedef struct SubchDev SubchDev;
+typedef struct S390QdioOps {
+    int (*siga)(SubchDev *sch, uint8_t function, uint32_t output_mask,
+                uint32_t input_mask, uint64_t aob);
+    void (*ssqd)(SubchDev *sch, void *descriptor);
+} S390QdioOps;
+
 struct SubchDev {
     /* channel-subsystem related things: */
     SCHIB curr_status;           /* Needs alignment and thus must come first */
@@ -149,6 +155,7 @@ struct SubchDev {
     void *driver_data;
     ESW esw;
     bool ccw_async_pending;
+    const S390QdioOps *qdio_ops;
 };
 
 /* A virtual device owns the current CCW and will complete it asynchronously. */
@@ -217,6 +224,7 @@ uint16_t css_build_subchannel_id(SubchDev *sch);
 void copy_scsw_to_guest(SCSW *dest, const SCSW *src);
 void copy_esw_to_guest(ESW *dest, const ESW *src);
 void css_inject_io_interrupt(SubchDev *sch);
+bool css_inject_qdio_pci(SubchDev *sch);
 bool css_generate_unsolicited_io_interrupt(SubchDev *sch, uint8_t dstat);
 void css_reset(void);
 void css_reset_sch(SubchDev *sch);
