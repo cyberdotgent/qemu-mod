@@ -18,10 +18,6 @@
 #include "system/block-backend-io.h"
 #include "trace.h"
 
-#define TAPE3590_CU_TYPE          0x3590
-#define TAPE3590_CU_MODEL         0x11
-#define TAPE3590_DEV_TYPE         0x3590
-#define TAPE3590_DEV_MODEL        0x60
 #define TAPE3590_CHPID_TYPE       0x1b
 
 #define TAPE_CMD_READ_IPL         0x02
@@ -48,15 +44,58 @@
 #define TAPE_SENSE_EQUIPMENT      0x10
 #define TAPE_SENSE_DATA_CHECK     0x08
 
+typedef struct TapeIdentity {
+    const char *name;
+    uint16_t cu_type;
+    uint8_t cu_model;
+    uint16_t dev_type;
+    uint8_t dev_model;
+    uint8_t mdr;
+    uint8_t obr;
+} TapeIdentity;
+
+/*
+ * Hercules tapedev.c DevInitTab and tapeccws.c TapeDevtypeList define
+ * these supported tape identities and model pairings.
+ */
+static const TapeIdentity tape_identities[] = {
+    { "3410", 0x3115, 0x01, 0x3410, 0x01 },
+    { "3411", 0x3115, 0x01, 0x3411, 0x01 },
+    { "3420", 0x3803, 0x02, 0x3420, 0x06 },
+    { "3422", 0x3422, 0x01, 0x3422, 0x01 },
+    { "3430", 0x3422, 0x01, 0x3430, 0x01 },
+    { "3480", 0x3480, 0x31, 0x3480, 0x31, 0x41, 0x80 },
+    { "3490", 0x3490, 0x50, 0x3490, 0x50, 0x42, 0x81 },
+    { "3590", 0x3590, 0x11, 0x3590, 0x60, 0x46, 0x83 },
+    { "8809", 0x8809, 0x01, 0x8809, 0x01 },
+    { "9347", 0x9347, 0x01, 0x9347, 0x01 },
+    { "9348", 0x9348, 0x01, 0x9348, 0x01 },
+};
+
 struct Tape3590CcwDevice {
     CcwDevice parent_obj;
     BlockBackend *blk;
+    char *ident;
+    const TapeIdentity *identity;
     AwsTape medium;
     uint8_t *record;
     uint32_t record_length;
     uint32_t record_offset;
     bool tray_open;
 };
+
+static const TapeIdentity *tape3590_find_identity(const char *name)
+{
+    size_t i;
+
+    name = name ?: "3590";
+    for (i = 0; i < ARRAY_SIZE(tape_identities); i++) {
+        if (!strcmp(name, tape_identities[i].name)) {
+            return &tape_identities[i];
+        }
+    }
+    return NULL;
+}
 
 static void tape3590_cancel(SubchDev *sch)
 {
@@ -313,21 +352,25 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         return tape3590_copy_response(tape, &ccw, buf, 32);
     case TAPE_CMD_SENSE_ID:
         buf[0] = 0xff;
-        stw_be_p(buf + 1, TAPE3590_CU_TYPE);
-        buf[3] = TAPE3590_CU_MODEL;
-        stw_be_p(buf + 4, TAPE3590_DEV_TYPE);
-        buf[6] = TAPE3590_DEV_MODEL;
+        stw_be_p(buf + 1, tape->identity->cu_type);
+        buf[3] = tape->identity->cu_model;
+        stw_be_p(buf + 4, tape->identity->dev_type);
+        buf[6] = tape->identity->dev_model;
         return tape3590_copy_response(tape, &ccw, buf, 7);
     case TAPE_CMD_RDC:
-        stw_be_p(buf, TAPE3590_CU_TYPE);
-        buf[2] = TAPE3590_CU_MODEL;
-        stw_be_p(buf + 3, TAPE3590_DEV_TYPE);
-        buf[5] = TAPE3590_DEV_MODEL;
+        stw_be_p(buf, tape->identity->cu_type);
+        buf[2] = tape->identity->cu_model;
+        stw_be_p(buf + 3, tape->identity->dev_type);
+        buf[5] = tape->identity->dev_model;
         stl_be_p(buf + 6, 0x01805fe8); /* NTP, block-id, SIC, NOP, LWP */
         stl_be_p(buf + 12, 0x00800400); /* read-forward, medium-sense */
-        buf[24] = 0x35; buf[25] = 0x90; buf[26] = 0x11;
-        buf[27] = 0x35; buf[28] = 0x90; buf[29] = 0x60;
-        buf[40] = 0x46; buf[41] = 0x83; buf[42] = 0x80;
+        stw_be_p(buf + 24, tape->identity->cu_type);
+        buf[26] = tape->identity->cu_model;
+        stw_be_p(buf + 27, tape->identity->dev_type);
+        buf[29] = tape->identity->dev_model;
+        buf[40] = tape->identity->mdr;
+        buf[41] = tape->identity->obr;
+        buf[42] = tape->identity->dev_type == 0x3590 ? 0x80 : 0x00;
         stl_be_p(buf + 43, AWS_TAPE_MAX_RECORD);
         stl_be_p(buf + 47, AWS_TAPE_MAX_RECORD);
         return tape3590_copy_response(tape, &ccw, buf, sizeof(buf));
@@ -373,6 +416,14 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
     uint64_t perm = BLK_PERM_CONSISTENT_READ;
     Error *local_err = NULL;
 
+    tape->identity = tape3590_find_identity(tape->ident);
+    if (!tape->identity) {
+        error_setg(errp, "Invalid 3590 identity '%s'; expected one of "
+                   "3410, 3411, 3420, 3422, 3430, 3480, 3490, 3590, "
+                   "8809, 9347, 9348", tape->ident);
+        return;
+    }
+
     if (!tape->blk) {
         int ret;
 
@@ -411,10 +462,10 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
         goto fail_sch;
     }
     sch->id.reserved = 0xff;
-    sch->id.cu_type = TAPE3590_CU_TYPE;
-    sch->id.cu_model = TAPE3590_CU_MODEL;
-    sch->id.dev_type = TAPE3590_DEV_TYPE;
-    sch->id.dev_model = TAPE3590_DEV_MODEL;
+    sch->id.cu_type = tape->identity->cu_type;
+    sch->id.cu_model = tape->identity->cu_model;
+    sch->id.dev_type = tape->identity->dev_type;
+    sch->id.dev_model = tape->identity->dev_model;
     css_sch_build_virtual_schib(sch, chpid, TAPE3590_CHPID_TYPE);
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = tape3590_ccw_cb;
@@ -448,6 +499,7 @@ static const VMStateDescription vmstate_tape3590 = {
 
 static const Property tape3590_properties[] = {
     DEFINE_PROP_DRIVE("drive", Tape3590CcwDevice, blk),
+    DEFINE_PROP_STRING("ident", Tape3590CcwDevice, ident),
     DEFINE_PROP_CCW_LOADPARM("loadparm", CcwDevice, loadparm),
 };
 

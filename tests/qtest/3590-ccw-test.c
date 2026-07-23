@@ -145,11 +145,40 @@ static void test_runtime_media_change(void)
     unlink(bad_path);
 }
 
+static void test_identity_whitelist(void)
+{
+    static const char * const identities[] = {
+        "3410", "3411", "3420", "3422", "3430", "3480",
+        "3490", "3590", "8809", "9347", "9348",
+    };
+    g_autoptr(GString) args = g_string_new("-nodefaults -S");
+    QTestState *qts;
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(identities); i++) {
+        g_string_append_printf(args,
+            " -dev3590 id=tape%zu,devno=%03zx,ident=%s",
+            i, 0x580 + i, identities[i]);
+    }
+    qts = qtest_init(args->str);
+
+    for (i = 0; i < ARRAY_SIZE(identities); i++) {
+        g_autofree char *path =
+            g_strdup_printf("/machine/peripheral/tape%zu", i);
+        g_autofree char *ident = qom_get_string(qts, path, "ident");
+
+        g_assert_cmpstr(ident, ==, identities[i]);
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/3590-ccw/dev3590-shortcut", test_dev3590_shortcut);
     qtest_add_func("/3590-ccw/runtime-media-change",
                    test_runtime_media_change);
+    qtest_add_func("/3590-ccw/identity-whitelist",
+                   test_identity_whitelist);
     return g_test_run();
 }

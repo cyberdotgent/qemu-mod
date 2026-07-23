@@ -18,6 +18,20 @@ instead be attached with ``drive=NODE``.  Three- and four-digit hexadecimal
 device numbers are accepted, so ``580`` and ``0580`` both select
 ``fe.0.0580``.
 
+Some guests select a tape driver from the reported hardware identity.  The
+optional ``ident`` parameter changes that compatibility identity while
+retaining the AWS-backed 3590 command engine.  For example, Linux guests that
+require a 3490 identity can use::
+
+  -dev3590 file=tape.aws,devno=580,ident=3490
+
+The accepted identities are the Hercules tape-device whitelist: ``3410``,
+``3411``, ``3420``, ``3422``, ``3430``, ``3480``, ``3490``, ``3590``,
+``8809``, ``9347``, and ``9348``.  The default is ``3590``.  The selected
+profile controls the subchannel identity, Sense ID response, and identity
+fields in Read Device Characteristics.  It does not change record limits or
+enable the historical command set of the named drive.
+
 The implemented commands cover Read IPL, NOP, Sense, Read Forward, Rewind,
 Read Previous, Rewind Unload, Read Block ID, forward and backward block/file
 spacing, Locate, Read Media Characteristics, Read Device Characteristics,

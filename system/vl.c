@@ -584,6 +584,7 @@ static QemuOptsList qemu_dev3590_opts = {
         { .name = "file", .type = QEMU_OPT_STRING },
         { .name = "drive", .type = QEMU_OPT_STRING },
         { .name = "devno", .type = QEMU_OPT_STRING },
+        { .name = "ident", .type = QEMU_OPT_STRING },
         { .name = "readonly", .type = QEMU_OPT_BOOL },
         { .name = "id", .type = QEMU_OPT_STRING },
         { /* end of list */ }
@@ -1557,7 +1558,7 @@ static bool dev3590_add(const char *optarg, Error **errp)
     QemuOpts *opts = NULL;
     QemuOpts *drive_opts = NULL;
     QemuOpts *device_opts = NULL;
-    const char *file, *drive, *devno, *id;
+    const char *file, *drive, *devno, *ident, *id;
     unsigned int short_devno;
     int consumed;
 
@@ -1568,6 +1569,7 @@ static bool dev3590_add(const char *optarg, Error **errp)
     file = qemu_opt_get(opts, "file");
     drive = qemu_opt_get(opts, "drive");
     devno = qemu_opt_get(opts, "devno");
+    ident = qemu_opt_get(opts, "ident");
     id = qemu_opts_id(opts);
     if (file && drive) {
         error_setg(errp, "'file' and 'drive' are mutually exclusive");
@@ -1599,7 +1601,8 @@ static bool dev3590_add(const char *optarg, Error **errp)
                                    generated_device_id, 1, errp);
     if (!device_opts ||
         !qemu_opt_set(device_opts, "driver", "3590-ccw", errp) ||
-        (drive && !qemu_opt_set(device_opts, "drive", drive, errp))) {
+        (drive && !qemu_opt_set(device_opts, "drive", drive, errp)) ||
+        (ident && !qemu_opt_set(device_opts, "ident", ident, errp))) {
         goto fail;
     }
     if (devno) {
