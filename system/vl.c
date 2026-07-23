@@ -577,6 +577,20 @@ static QemuOptsList qemu_dev9336_opts = {
     },
 };
 
+static QemuOptsList qemu_dev3390_opts = {
+    .name = "dev3390",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3390_opts.head),
+    .desc = {
+        { .name = "file", .type = QEMU_OPT_STRING },
+        { .name = "drive", .type = QEMU_OPT_STRING },
+        { .name = "devno", .type = QEMU_OPT_STRING },
+        { .name = "format", .type = QEMU_OPT_STRING },
+        { .name = "readonly", .type = QEMU_OPT_BOOL },
+        { .name = "id", .type = QEMU_OPT_STRING },
+        { /* end of list */ }
+    },
+};
+
 static QemuOptsList qemu_dev3590_opts = {
     .name = "dev3590",
     .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3590_opts.head),
@@ -1603,6 +1617,84 @@ static bool dev3590_add(const char *optarg, Error **errp)
         !qemu_opt_set(device_opts, "driver", "3590-ccw", errp) ||
         (drive && !qemu_opt_set(device_opts, "drive", drive, errp)) ||
         (ident && !qemu_opt_set(device_opts, "ident", ident, errp))) {
+        goto fail;
+    }
+    if (devno) {
+        if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&
+            !devno[consumed] && short_devno <= UINT16_MAX) {
+            normalized_devno = g_strdup_printf("fe.0.%04x", short_devno);
+            devno = normalized_devno;
+        }
+        if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
+    }
+    index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(drive_opts);
+    qemu_opts_del(opts);
+    return false;
+}
+
+static bool dev3390_add(const char *optarg, Error **errp)
+{
+    static unsigned int index;
+    g_autofree char *generated_drive_id = NULL;
+    g_autofree char *generated_device_id = NULL;
+    g_autofree char *normalized_devno = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *drive_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    const char *file, *drive, *format, *devno, *id;
+    unsigned int short_devno;
+    int consumed;
+
+    opts = qemu_opts_parse(&qemu_dev3390_opts, optarg, false, errp);
+    if (!opts) {
+        return false;
+    }
+    file = qemu_opt_get(opts, "file");
+    drive = qemu_opt_get(opts, "drive");
+    format = qemu_opt_get(opts, "format");
+    devno = qemu_opt_get(opts, "devno");
+    id = qemu_opts_id(opts);
+    if (!!file == !!drive) {
+        error_setg(errp, "Exactly one of 'file' and 'drive' is required");
+        goto fail;
+    }
+    if (drive && (format || qemu_opt_get(opts, "readonly"))) {
+        error_setg(errp, "'format' and 'readonly' are valid only with 'file'");
+        goto fail;
+    }
+
+    generated_device_id = id ? g_strdup(id) :
+                               g_strdup_printf("dev3390-%u", index);
+    if (file) {
+        generated_drive_id = id ? g_strdup_printf("%s-drive", id) :
+                                  g_strdup_printf("dev3390-drive%u", index);
+        drive = generated_drive_id;
+        drive_opts = qemu_opts_create(qemu_find_opts("drive"), drive, 1,
+                                      errp);
+        if (!drive_opts ||
+            !qemu_opt_set(drive_opts, "if", "none", errp) ||
+            !qemu_opt_set(drive_opts, "file", file, errp) ||
+            !qemu_opt_set(drive_opts, "format", format ?: "raw", errp) ||
+            !qemu_opt_set_bool(drive_opts, "read-only",
+                               qemu_opt_get_bool(opts, "readonly", false),
+                               errp)) {
+            goto fail;
+        }
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"),
+                                   generated_device_id, 1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "eckd-ccw", errp) ||
+        !qemu_opt_set(device_opts, "drive", drive, errp)) {
         goto fail;
     }
     if (devno) {
@@ -3677,6 +3769,15 @@ void qemu_init(int argc, char **argv)
                 Error *err = NULL;
 
                 if (!dev9336_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
+            case QEMU_OPTION_dev3390: {
+                Error *err = NULL;
+
+                if (!dev3390_add(optarg, &err)) {
                     error_report_err(err);
                     exit(1);
                 }

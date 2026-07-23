@@ -1191,6 +1191,23 @@ SRST
     be repeated for multiple tape drives.
 ERST
 
+DEF("dev3390", HAS_ARG, QEMU_OPTION_dev3390,
+    "-dev3390 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,id=id]\n"
+    "-dev3390 drive=node[,devno=ccw-address][,id=id]\n"
+    "                add an emulated 2107/3390 ECKD disk\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3390 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,id=id]``
+  \
+``-dev3390 drive=node[,devno=ccw-address][,id=id]``
+    Add an emulated IBM 3390 ECKD disk on a 2107 control unit. The guest byte
+    stream must be an uncompressed ``CKD_P370`` or ``CKD_P064`` image; the
+    outer block backend may be raw or qcow2. With ``file``, ``format`` defaults
+    to ``raw``. Alternatively, ``drive`` attaches an existing block node or
+    ``-drive`` backend. A three- or four-digit hexadecimal ``devno`` such as
+    ``200`` or ``0200`` means ``fe.0.0200``. The option can be repeated.
+ERST
+
 DEF("device", HAS_ARG, QEMU_OPTION_device,
     "-device driver[,prop=value[,...]]\n"
     "                add device (based on driver)\n"

@@ -12,6 +12,7 @@
 #define DASD_IPL_H
 
 int dasd_ipl(SubChannelId schid, uint16_t cutype);
+int eckd_ipl(SubChannelId schid, uint16_t cutype);
 int fba_ipl(SubChannelId schid, uint16_t cutype);
 int tape_3590_ipl(SubChannelId schid, uint16_t cutype);
 

@@ -25,6 +25,14 @@
 #include "hw/s390x/s390-ccw.h"
 #include "exec/cpu-common.h"
 
+/*
+ * A 3390-54 contains 982,800 tracks.  VSE uses TIC loops for sequential
+ * multitrack catalog searches, so the historical 255-TIC loop guard rejected
+ * valid channel programs.  Keep a finite malformed-guest guard, but permit a
+ * complete maximum-size 3390 scan.
+ */
+#define CSS_MAX_TICS_PER_CHANNEL_PROGRAM (1U << 20)
+
 typedef struct CrwContainer {
     CRW crw;
     QTAILQ_ENTRY(CrwContainer) sibling;
@@ -1030,6 +1038,8 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
 
     /* Translate everything to format-1 ccws - the information is the same. */
     ccw = copy_ccw_from_guest(ccw_addr, sch->ccw_fmt_1);
+    trace_css_ccw(sch->devno, ccw_addr, ccw.cmd_code, ccw.cda, ccw.count,
+                  ccw.flags);
     data_chained = sch->last_cmd_valid &&
                    (sch->last_cmd.flags & CCW_FLAG_DC);
 
@@ -1146,7 +1156,7 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
             break;
         }
         /* Limit the number of TICs in a given channel program */
-        if (sch->ccw_tic_cnt == 255) {
+        if (sch->ccw_tic_cnt == CSS_MAX_TICS_PER_CHANNEL_PROGRAM) {
             ret = -EINVAL;
             break;
         }
@@ -1175,6 +1185,15 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
     if (ret == 0) {
         if (ccw.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) {
             sch->channel_prog += 8;
+            /*
+             * Device End with Status Modifier advances the channel-program
+             * address by one additional CCW.  Search/TIC channel programs
+             * rely on this to skip the TIC after a successful comparison.
+             */
+            if (sch->curr_status.scsw.dstat & SCSW_DSTAT_STAT_MOD) {
+                sch->channel_prog += 8;
+                sch->curr_status.scsw.dstat &= ~SCSW_DSTAT_STAT_MOD;
+            }
             ret = -EAGAIN;
         }
     }
@@ -1280,6 +1299,7 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
             break;
         default:
             /* error, generate channel program check */
+            trace_css_ccw_error(sch->devno, sch->channel_prog, ret);
             schib->scsw.ctrl &= ~SCSW_ACTL_START_PEND;
             schib->scsw.cstat = SCSW_CSTAT_PROG_CHECK;
             schib->scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;

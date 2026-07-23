@@ -40,6 +40,8 @@ s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files(
 ))
 s390x_ss.add(when: 'CONFIG_S390_CCW_VIRTIO', if_true: files(
   '3590-ccw.c',
+  'ckd-image.c',
+  'eckd-ccw.c',
   'tape-aws.c',
 ))
 s390x_ss.add(when: 'CONFIG_VFIO', if_true: files('s390-pci-vfio.c'))

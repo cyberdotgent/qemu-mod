@@ -373,6 +373,7 @@ uint16_t cu_type(SubChannelId schid);
 int basic_sense(SubChannelId schid, uint16_t cutype, void *sense_data,
                  uint16_t data_size);
 int do_cio(SubChannelId schid, uint16_t cutype, uint32_t ccw_addr, int fmt);
+int do_cio_raw(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb);
 int do_cio_32bit_ida(SubChannelId schid, uint16_t cutype,
                      uint32_t ccw_addr, int fmt);
 

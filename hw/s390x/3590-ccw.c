@@ -13,6 +13,7 @@
 #include "hw/s390x/tape-aws.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "system/block-backend.h"
 #include "system/block-backend-global-state.h"
@@ -43,6 +44,7 @@
 #define TAPE_CMD_RDC              0x64
 #define TAPE_CMD_MEDIUM_SENSE     0xc2
 #define TAPE_CMD_WRITE_IMMEDIATE  0xc3
+#define TAPE_CMD_ASSIGN           0xb7
 #define TAPE_CMD_MODE_SET         0xdb
 #define TAPE_CMD_SENSE_ID         0xe4
 
@@ -52,10 +54,13 @@
 #define TAPE_SENSE_DATA_CHECK     0x08
 #define TAPE_SENSE_DEFERRED_CHECK 0x02
 
+#define TAPE_ERA_READ_DATA_CHECK  0x23
 #define TAPE_ERA_WRITE_DATA_CHECK 0x25
 #define TAPE_ERA_COMMAND_REJECT   0x27
 #define TAPE_ERA_WRITE_PROTECTED  0x30
+#define TAPE_ERA_TAPE_VOID        0x31
 #define TAPE_ERA_PHYSICAL_EOT     0x38
+#define TAPE_ERA_BACKWARD_AT_BOT  0x39
 #define TAPE_ERA_VOLUME_FENCED    0x47
 
 typedef struct TapeIdentity {
@@ -97,6 +102,7 @@ struct Tape3590CcwDevice {
     uint32_t record_offset;
     bool tray_open;
     bool write_immediate;
+    uint8_t partition_id[11];
 };
 
 static const TapeIdentity *tape3590_find_identity(const char *name)
@@ -185,6 +191,40 @@ static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
     return tape3590_unit_check_era(tape, sense, 0);
 }
 
+static int tape3590_read_result(Tape3590CcwDevice *tape,
+                                AwsTapeResult result)
+{
+    switch (result) {
+    case AWS_TAPE_EOT:
+        /*
+         * Hercules' AWS backend reports a header read at physical EOF as
+         * EMPTYTAPE.  For a 3590 that is data check, permanent-error/OBR
+         * logging in sense byte 2, and ERA 31 (tape void).
+         */
+        {
+            int rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                              TAPE_ERA_TAPE_VOID);
+
+            CCW_DEVICE(tape)->sch->sense_data[2] = 0x10;
+            return rc;
+        }
+    case AWS_TAPE_BOT:
+        return tape3590_unit_check_era(tape, 0,
+                                       TAPE_ERA_BACKWARD_AT_BOT);
+    case AWS_TAPE_IO_ERROR:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
+                                       TAPE_ERA_PHYSICAL_EOT);
+    default:
+        {
+            int rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                              TAPE_ERA_READ_DATA_CHECK);
+
+            CCW_DEVICE(tape)->sch->sense_data[2] = 0x10;
+            return rc;
+        }
+    }
+}
+
 static int tape3590_unit_exception(Tape3590CcwDevice *tape)
 {
     SubchDev *sch = CCW_DEVICE(tape)->sch;
@@ -230,6 +270,30 @@ static int tape3590_copy_response(Tape3590CcwDevice *tape, const CCW1 *ccw,
     return ret;
 }
 
+static void tape3590_unsolicited_sense(Tape3590CcwDevice *tape, uint8_t *buf)
+{
+    uint16_t devno = CCW_DEVICE(tape)->sch->devno;
+
+    /*
+     * Hyperion's 3480-family format-20 drive/CU information, with the
+     * 3590 software-recovery byte added by build_sense_3590().
+     */
+    buf[1] = 0x40; /* online */
+    if (!blk_is_writable(tape->blk)) {
+        buf[1] |= 0x02; /* file protected */
+    }
+    if (tape->medium.block_id == 0) {
+        buf[1] |= 0x08; /* beginning of tape */
+    }
+    buf[2] = 0x20; /* reporting channel A, no log/recovery required */
+    buf[7] = 0x20; /* format-20 drive and CU information */
+    buf[25] = 0x06; /* IDRC installed and upgraded buffer */
+    buf[27] = 0xec; /* 3490-compatible model code plus serial marker */
+    buf[28] = devno >> 12;
+    buf[29] = devno >> 4;
+    buf[30] = (devno & 0x0f) | ((devno & 0x0f) << 4);
+}
+
 static int tape3590_read(Tape3590CcwDevice *tape, const CCW1 *ccw,
                          bool previous)
 {
@@ -255,9 +319,7 @@ static int tape3590_read(Tape3590CcwDevice *tape, const CCW1 *ccw,
             return tape3590_unit_exception(tape);
         }
         if (result != AWS_TAPE_OK) {
-            return tape3590_unit_check(tape,
-                    result == AWS_TAPE_IO_ERROR ? TAPE_SENSE_EQUIPMENT :
-                                                 TAPE_SENSE_DATA_CHECK);
+            return tape3590_read_result(tape, result);
         }
         tape->record_length = record_length;
         tape->record_offset = 0;
@@ -302,7 +364,7 @@ static int tape3590_space(Tape3590CcwDevice *tape, bool forward,
             }
         }
         if (result != AWS_TAPE_OK && result != AWS_TAPE_MARK) {
-            return tape3590_unit_check(tape, TAPE_SENSE_DATA_CHECK);
+            return tape3590_read_result(tape, result);
         }
     } while (to_mark && result != AWS_TAPE_MARK);
     return 0;
@@ -358,7 +420,7 @@ static int tape3590_write(Tape3590CcwDevice *tape, const CCW1 *ccw)
 static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     Tape3590CcwDevice *tape = sch->driver_data;
-    uint8_t buf[64] = { 0 };
+    uint8_t buf[256] = { 0 };
     uint32_t block_id;
     AwsTapeResult result;
 
@@ -437,7 +499,11 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         return result == AWS_TAPE_OK ? 0 :
                tape3590_unit_check(tape, TAPE_SENSE_DATA_CHECK);
     case TAPE_CMD_SENSE:
-        memcpy(buf, sch->sense_data, 32);
+        if (buffer_is_zero(sch->sense_data, 32)) {
+            tape3590_unsolicited_sense(tape, buf);
+        } else {
+            memcpy(buf, sch->sense_data, 32);
+        }
         memset(sch->sense_data, 0, sizeof(sch->sense_data));
         return tape3590_copy_response(tape, &ccw, buf, 32);
     case TAPE_CMD_SENSE_ID:
@@ -452,8 +518,14 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         buf[2] = tape->identity->cu_model;
         stw_be_p(buf + 3, tape->identity->dev_type);
         buf[5] = tape->identity->dev_model;
-        stl_be_p(buf + 6, 0x01805fe8); /* NTP, block-id, SIC, NOP, LWP */
-        stl_be_p(buf + 12, 0x00800400); /* read-forward, medium-sense */
+        /*
+         * Match the A50/B1A feature words defined by the 3590 hardware
+         * profile: NTP, 32-bit block IDs, SIC, channel-path NOP, logical
+         * write protect, ACL and IDR; Read Forward, two-block DCE data and
+         * Medium Sense in the second word.
+         */
+        stl_be_p(buf + 6, 0x01004ec0);
+        stl_be_p(buf + 12, 0x00900400);
         stw_be_p(buf + 24, tape->identity->cu_type);
         buf[26] = tape->identity->cu_model;
         stw_be_p(buf + 27, tape->identity->dev_type);
@@ -463,16 +535,32 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         buf[42] = tape->identity->dev_type == 0x3590 ? 0x80 : 0x00;
         stl_be_p(buf + 43, AWS_TAPE_MAX_RECORD);
         stl_be_p(buf + 47, AWS_TAPE_MAX_RECORD);
-        return tape3590_copy_response(tape, &ccw, buf, sizeof(buf));
+        return tape3590_copy_response(tape, &ccw, buf, 64);
     case TAPE_CMD_READ_MED_CHAR:
         return tape3590_copy_response(tape, &ccw, buf, sizeof(buf));
     case TAPE_CMD_MEDIUM_SENSE:
         buf[0] = 0x01;
-        return tape3590_copy_response(tape, &ccw, buf, sizeof(buf));
+        return tape3590_copy_response(tape, &ccw, buf, 128);
     case TAPE_CMD_WRITE_IMMEDIATE:
         tape->write_immediate = true;
         sch->curr_status.scsw.count = ccw.count;
         return tape3590_write_result(tape, aws_tape_sync(&tape->medium));
+    case TAPE_CMD_ASSIGN:
+        if (ccw.count < sizeof(tape->partition_id) ||
+            ccw_dstream_read_buf(&sch->cds, buf,
+                                 sizeof(tape->partition_id))) {
+            return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
+        }
+        if (!buffer_is_zero(buf, sizeof(tape->partition_id)) &&
+            memcmp(buf, tape->partition_id, sizeof(tape->partition_id))) {
+            return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
+        }
+        if (!buffer_is_zero(buf, sizeof(tape->partition_id))) {
+            memcpy(tape->partition_id, buf, sizeof(tape->partition_id));
+        }
+        sch->curr_status.scsw.count =
+            ccw_dstream_residual_count(&sch->cds);
+        return 0;
     case TAPE_CMD_MODE_SET:
         if (!ccw.count || ccw_dstream_read_buf(&sch->cds, buf, 1)) {
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);

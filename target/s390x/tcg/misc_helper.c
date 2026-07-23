@@ -148,6 +148,19 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
         bql_unlock();
         r = 0;
         break;
+    case 0x31c:
+        /*
+         * CZAM removable-media notification.  The z/VSE recovery loader
+         * issues subfunction zero after its tape image has been placed in
+         * storage.  There is no action for QEMU to take: the s390-ccw
+         * firmware has already performed that service.
+         */
+        if (env->regs[r3] != 0) {
+            r = -1;
+            break;
+        }
+        r = 0;
+        break;
     case 0x288:
         /* time bomb (watchdog) */
         r = handle_diag_288(env, r1, r3);
