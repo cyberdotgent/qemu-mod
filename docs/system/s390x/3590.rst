@@ -12,11 +12,9 @@ The concise command line is::
   -dev3590 file=install.aws,devno=580
 
 This creates a read-only raw backend by default.  ``readonly=off`` allows the
-backend to be opened for writing, although the emulated drive currently
-implements read and positioning commands only.  An existing block node can
-instead be attached with ``drive=NODE``.  Three- and four-digit hexadecimal
-device numbers are accepted, so ``580`` and ``0580`` both select
-``fe.0.0580``.
+backend to be opened for writing.  An existing block node can instead be
+attached with ``drive=NODE``.  Three- and four-digit hexadecimal device
+numbers are accepted, so ``580`` and ``0580`` both select ``fe.0.0580``.
 
 Some guests select a tape driver from the reported hardware identity.  The
 optional ``ident`` parameter changes that compatibility identity while
@@ -32,11 +30,20 @@ profile controls the subchannel identity, Sense ID response, and identity
 fields in Read Device Characteristics.  It does not change record limits or
 enable the historical command set of the named drive.
 
-The implemented commands cover Read IPL, NOP, Sense, Read Forward, Rewind,
-Read Previous, Rewind Unload, Read Block ID, forward and backward block/file
-spacing, Locate, Read Media Characteristics, Read Device Characteristics,
-Medium Sense, Mode Set, and Sense ID.  The maximum logical record size is
-256 KiB.
+The implemented commands cover Write, Write Tape Mark, Synchronize, Erase
+Gap, Read IPL, NOP, Sense, Read Forward, Rewind, Read Previous, Rewind
+Unload, Read Block ID, forward and backward block/file spacing, Locate, Read
+Media Characteristics, Read Device Characteristics, Medium Sense, Mode Set,
+Set Tape-Write Immediate, and Sense ID.  The maximum logical record size is
+256 KiB.  As in Hercules, data chaining is rejected for Write, so a
+guest-written record is limited to the 65535-byte CCW count.
+
+Writing at the current logical position replaces that point and truncates the
+old tail, including when writing a tape mark.  QEMU emits Hercules-compatible
+six-byte AWS headers and splits records into chunks when necessary.  A failed
+write, truncate, or flush fences the mounted volume so later modifying
+commands fail predictably instead of continuing from an uncertain position.
+Unload and remount clears that fence after the image has been revalidated.
 
 Runtime media changes
 ---------------------

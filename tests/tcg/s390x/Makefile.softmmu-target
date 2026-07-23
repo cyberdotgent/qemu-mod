@@ -76,6 +76,22 @@ run-fba-tic: QEMU_OPTS := -action panic=exit-failure -nographic \
 	-blockdev driver=null-co$(COMMA)node-name=fba$(COMMA)size=1048576 \
 	-device fba-ccw$(COMMA)drive=fba$(COMMA)devno=fe.0.0200 -kernel
 
+tape-write: $(S390X_MULTIARCH_RUNTIME_OBJS)
+tape-write: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+tape-write: CFLAGS += $(MINILIB_INC) -I$(SRC_PATH)/pc-bios/s390-ccw
+tape-write: tape-write.o
+tape-write-protect: $(S390X_MULTIARCH_RUNTIME_OBJS)
+tape-write-protect: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+tape-write-protect: CFLAGS += $(MINILIB_INC) -I$(SRC_PATH)/pc-bios/s390-ccw
+tape-write-protect: tape-write-protect.o
+tape-write-protect.o: tape-write.c
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -DTAPE_WRITE_PROTECT_TEST \
+	  -march=z13 -m64 -c $< -o $@
+TESTS += tape-write tape-write-protect
+run-tape-write: tape-write tape-write-protect
+	$(call run-test, $<, $(PYTHON) $(S390X_SRC)/tape-write.py \
+	  $(QEMU) tape-write tape-write-protect)
+
 terminal3215: $(S390X_MULTIARCH_RUNTIME_OBJS)
 terminal3215: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
 terminal3215: CFLAGS += $(MINILIB_INC) -I$(SRC_PATH)/pc-bios/s390-ccw

@@ -15,11 +15,13 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "system/block-backend.h"
+#include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "trace.h"
 
 #define TAPE3590_CHPID_TYPE       0x1b
 
+#define TAPE_CMD_WRITE            0x01
 #define TAPE_CMD_READ_IPL         0x02
 #define TAPE_CMD_NOP              0x03
 #define TAPE_CMD_SENSE            0x04
@@ -27,15 +29,19 @@
 #define TAPE_CMD_REWIND           0x07
 #define TAPE_CMD_READ_PREVIOUS    0x0a
 #define TAPE_CMD_REWIND_UNLOAD    0x0f
+#define TAPE_CMD_ERASE_GAP        0x17
+#define TAPE_CMD_WRITE_MARK       0x1f
 #define TAPE_CMD_READ_BLOCK_ID    0x22
 #define TAPE_CMD_BACKSPACE_BLOCK  0x27
 #define TAPE_CMD_BACKSPACE_FILE   0x2f
 #define TAPE_CMD_FSPACE_BLOCK     0x37
 #define TAPE_CMD_FSPACE_FILE      0x3f
+#define TAPE_CMD_SYNCHRONIZE      0x43
 #define TAPE_CMD_LOCATE           0x4f
 #define TAPE_CMD_READ_MED_CHAR    0x62
 #define TAPE_CMD_RDC              0x64
 #define TAPE_CMD_MEDIUM_SENSE     0xc2
+#define TAPE_CMD_WRITE_IMMEDIATE  0xc3
 #define TAPE_CMD_MODE_SET         0xdb
 #define TAPE_CMD_SENSE_ID         0xe4
 
@@ -43,6 +49,13 @@
 #define TAPE_SENSE_INTERVENTION   0x40
 #define TAPE_SENSE_EQUIPMENT      0x10
 #define TAPE_SENSE_DATA_CHECK     0x08
+#define TAPE_SENSE_DEFERRED_CHECK 0x02
+
+#define TAPE_ERA_WRITE_DATA_CHECK 0x25
+#define TAPE_ERA_COMMAND_REJECT   0x27
+#define TAPE_ERA_WRITE_PROTECTED  0x30
+#define TAPE_ERA_PHYSICAL_EOT     0x38
+#define TAPE_ERA_VOLUME_FENCED    0x47
 
 typedef struct TapeIdentity {
     const char *name;
@@ -82,6 +95,7 @@ struct Tape3590CcwDevice {
     uint32_t record_length;
     uint32_t record_offset;
     bool tray_open;
+    bool write_immediate;
 };
 
 static const TapeIdentity *tape3590_find_identity(const char *name)
@@ -102,6 +116,7 @@ static void tape3590_cancel(SubchDev *sch)
     Tape3590CcwDevice *tape = sch->driver_data;
 
     tape->record_length = tape->record_offset = 0;
+    tape->write_immediate = false;
 }
 
 static void tape3590_change_media(void *opaque, bool load, Error **errp)
@@ -144,13 +159,15 @@ static const BlockDevOps tape3590_block_ops = {
     .is_tray_open = tape3590_is_tray_open,
 };
 
-static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
+static int tape3590_unit_check_era(Tape3590CcwDevice *tape, uint8_t sense,
+                                   uint8_t era)
 {
     SubchDev *sch = CCW_DEVICE(tape)->sch;
     SCHIB *schib = &sch->curr_status;
 
     memset(sch->sense_data, 0, sizeof(sch->sense_data));
     sch->sense_data[0] = sense;
+    sch->sense_data[3] = era;
     schib->scsw.dstat = SCSW_DSTAT_CHANNEL_END |
                         SCSW_DSTAT_DEVICE_END |
                         SCSW_DSTAT_UNIT_CHECK;
@@ -160,6 +177,11 @@ static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
                         SCSW_STCTL_ALERT | SCSW_STCTL_STATUS_PEND;
     schib->scsw.cpa = sch->channel_prog + 8;
     return -EIO;
+}
+
+static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
+{
+    return tape3590_unit_check_era(tape, sense, 0);
 }
 
 static int tape3590_unit_exception(Tape3590CcwDevice *tape)
@@ -271,13 +293,11 @@ static int tape3590_space(Tape3590CcwDevice *tape, bool forward,
         } else {
             result = aws_tape_backspace(&tape->medium);
             if (result == AWS_TAPE_OK && to_mark) {
-                int64_t position = tape->medium.offset;
-                uint32_t block_id = tape->medium.block_id;
+                AwsTape position = tape->medium;
 
                 result = aws_tape_read(&tape->medium, tape->record,
                                        AWS_TAPE_MAX_RECORD, &length);
-                tape->medium.offset = position;
-                tape->medium.block_id = block_id;
+                tape->medium = position;
             }
         }
         if (result != AWS_TAPE_OK && result != AWS_TAPE_MARK) {
@@ -287,6 +307,53 @@ static int tape3590_space(Tape3590CcwDevice *tape, bool forward,
     return 0;
 }
 
+static int tape3590_write_result(Tape3590CcwDevice *tape,
+                                 AwsTapeResult result)
+{
+    switch (result) {
+    case AWS_TAPE_OK:
+        return 0;
+    case AWS_TAPE_WRITE_PROTECTED:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                       TAPE_ERA_WRITE_PROTECTED);
+    case AWS_TAPE_NO_SPACE:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
+                                       TAPE_ERA_PHYSICAL_EOT);
+    case AWS_TAPE_FENCED:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT |
+                                       TAPE_SENSE_DEFERRED_CHECK,
+                                       TAPE_ERA_VOLUME_FENCED);
+    default:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                       TAPE_ERA_WRITE_DATA_CHECK);
+    }
+}
+
+static int tape3590_write(Tape3590CcwDevice *tape, const CCW1 *ccw)
+{
+    SubchDev *sch = CCW_DEVICE(tape)->sch;
+    AwsTapeResult result;
+
+    /*
+     * Hercules rejects data chaining for writes.  Besides matching that
+     * behavior, keeping a record within one CCW makes overwrite-and-truncate
+     * failure handling unambiguous.
+     */
+    if ((ccw->flags & CCW_FLAG_DC) || !ccw->count) {
+        return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                       TAPE_ERA_COMMAND_REJECT);
+    }
+    if (ccw_dstream_read_buf(&sch->cds, tape->record, ccw->count)) {
+        return -EFAULT;
+    }
+    sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
+    result = aws_tape_write(&tape->medium, tape->record, ccw->count);
+    if (result == AWS_TAPE_OK && tape->write_immediate) {
+        result = aws_tape_sync(&tape->medium);
+    }
+    return tape3590_write_result(tape, result);
+}
+
 static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     Tape3590CcwDevice *tape = sch->driver_data;
@@ -294,6 +361,9 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     uint32_t block_id;
     AwsTapeResult result;
 
+    if (!sch->last_cmd_valid) {
+        tape->write_immediate = false;
+    }
     trace_tape3590_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count,
                        ccw.flags, tape->medium.block_id);
 
@@ -303,6 +373,8 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     }
 
     switch (ccw.cmd_code) {
+    case TAPE_CMD_WRITE:
+        return tape3590_write(tape, &ccw);
     case TAPE_CMD_READ_IPL:
         return tape3590_read(tape, &ccw, false);
     case TAPE_CMD_READ_FORWARD:
@@ -321,6 +393,20 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         tape->tray_open = true;
         sch->curr_status.scsw.count = ccw.count;
         return 0;
+    case TAPE_CMD_ERASE_GAP:
+        sch->curr_status.scsw.count = ccw.count;
+        result = aws_tape_erase_gap(&tape->medium);
+        if (result == AWS_TAPE_OK && tape->write_immediate) {
+            result = aws_tape_sync(&tape->medium);
+        }
+        return tape3590_write_result(tape, result);
+    case TAPE_CMD_WRITE_MARK:
+        sch->curr_status.scsw.count = ccw.count;
+        result = aws_tape_write_mark(&tape->medium);
+        if (result == AWS_TAPE_OK && tape->write_immediate) {
+            result = aws_tape_sync(&tape->medium);
+        }
+        return tape3590_write_result(tape, result);
     case TAPE_CMD_BACKSPACE_BLOCK:
         sch->curr_status.scsw.count = ccw.count;
         return tape3590_space(tape, false, false);
@@ -333,6 +419,9 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     case TAPE_CMD_FSPACE_FILE:
         sch->curr_status.scsw.count = ccw.count;
         return tape3590_space(tape, true, true);
+    case TAPE_CMD_SYNCHRONIZE:
+        sch->curr_status.scsw.count = ccw.count;
+        return tape3590_write_result(tape, aws_tape_sync(&tape->medium));
     case TAPE_CMD_READ_BLOCK_ID:
         stl_be_p(buf, tape->medium.block_id);
         stl_be_p(buf + 4, tape->medium.block_id);
@@ -379,9 +468,16 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     case TAPE_CMD_MEDIUM_SENSE:
         buf[0] = 0x01;
         return tape3590_copy_response(tape, &ccw, buf, sizeof(buf));
+    case TAPE_CMD_WRITE_IMMEDIATE:
+        tape->write_immediate = true;
+        sch->curr_status.scsw.count = ccw.count;
+        return tape3590_write_result(tape, aws_tape_sync(&tape->medium));
     case TAPE_CMD_MODE_SET:
         if (!ccw.count || ccw_dstream_read_buf(&sch->cds, buf, 1)) {
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
+        }
+        if (buf[0] & 0x20) {
+            tape->write_immediate = true;
         }
         sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
         return 0;
@@ -401,6 +497,7 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
      * end of CCW IPL must preserve the position following the IPL records.
      */
     tape->record_length = tape->record_offset = 0;
+    tape->write_immediate = false;
     if (tc->parent_phases.hold) {
         tc->parent_phases.hold(obj, type);
     }
@@ -437,6 +534,9 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
             return;
         }
         blk_unref(tape->blk);
+    }
+    if (blk_supports_write_perm(tape->blk)) {
+        perm |= BLK_PERM_WRITE | BLK_PERM_RESIZE;
     }
     if (blk_set_perm(tape->blk, perm, BLK_PERM_ALL, errp) < 0) {
         return;

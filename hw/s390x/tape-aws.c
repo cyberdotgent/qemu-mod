@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 
 #include "hw/s390x/tape-aws.h"
+#include "block/block-common.h"
 #include "qemu/bswap.h"
 #include "system/block-backend.h"
 #include "system/block-backend-io.h"
@@ -22,6 +23,7 @@
 #define AWS_FLAG_END_RECORD 0x20
 #define AWS_KNOWN_FLAGS (AWS_FLAG_NEW_RECORD | AWS_FLAG_TAPE_MARK | \
                          AWS_FLAG_END_RECORD)
+#define AWS_MAX_CHUNK UINT16_MAX
 
 typedef struct QEMU_PACKED AwsHeader {
     uint16_t length;
@@ -67,6 +69,7 @@ void aws_tape_init(AwsTape *tape, BlockBackend *blk, Error **errp)
     }
     tape->blk = blk;
     tape->length = length;
+    tape->fenced = false;
 
     while (cursor < tape->length) {
         AwsHeader header;
@@ -115,6 +118,7 @@ void aws_tape_rewind(AwsTape *tape)
 {
     tape->offset = 0;
     tape->block_id = 0;
+    tape->previous_length = 0;
 }
 
 AwsTapeResult aws_tape_read(AwsTape *tape, uint8_t *buf, size_t capacity,
@@ -138,6 +142,7 @@ AwsTapeResult aws_tape_read(AwsTape *tape, uint8_t *buf, size_t capacity,
             }
             tape->offset = cursor + AWS_HEADER_SIZE;
             tape->block_id++;
+            tape->previous_length = 0;
             return AWS_TAPE_MARK;
         }
         if (first != !!(header.flags1 & AWS_FLAG_NEW_RECORD)) {
@@ -162,6 +167,7 @@ AwsTapeResult aws_tape_read(AwsTape *tape, uint8_t *buf, size_t capacity,
         if (header.flags1 & AWS_FLAG_END_RECORD) {
             tape->offset = cursor;
             tape->block_id++;
+            tape->previous_length = header.length;
             *length = total;
             return AWS_TAPE_OK;
         }
@@ -234,8 +240,15 @@ AwsTapeResult aws_tape_backspace(AwsTape *tape)
     AwsTapeResult result = aws_previous_offset(tape, &previous);
 
     if (result == AWS_TAPE_OK) {
+        AwsHeader header;
+
+        result = aws_read_header(tape, previous, &header);
+        if (result != AWS_TAPE_OK) {
+            return result;
+        }
         tape->offset = previous;
         tape->block_id--;
+        tape->previous_length = header.previous_length;
     }
     return result;
 }
@@ -252,6 +265,134 @@ AwsTapeResult aws_tape_locate(AwsTape *tape, uint32_t block_id)
         if (result != AWS_TAPE_OK && result != AWS_TAPE_MARK) {
             return result;
         }
+    }
+    return AWS_TAPE_OK;
+}
+
+static AwsTapeResult aws_tape_commit(AwsTape *tape, const uint8_t *data,
+                                     size_t length, uint16_t final_length)
+{
+    int64_t new_end = tape->offset + length;
+    Error *local_err = NULL;
+    int ret;
+
+    if (tape->fenced) {
+        return AWS_TAPE_FENCED;
+    }
+    if (!blk_is_writable(tape->blk)) {
+        return AWS_TAPE_WRITE_PROTECTED;
+    }
+
+    /*
+     * Block backends reject writes beyond their current length.  Extend
+     * before writing, but defer shrinking an overwritten tail until after
+     * the complete serialized record is safely present.
+     */
+    if (new_end > tape->length) {
+        ret = blk_truncate(tape->blk, new_end, false, PREALLOC_MODE_OFF, 0,
+                           &local_err);
+        if (ret < 0) {
+            error_free(local_err);
+            tape->fenced = true;
+            return ret == -ENOSPC ? AWS_TAPE_NO_SPACE : AWS_TAPE_IO_ERROR;
+        }
+    }
+    ret = blk_pwrite(tape->blk, tape->offset, length, data, 0);
+    if (ret < 0) {
+        tape->fenced = true;
+        return ret == -ENOSPC ? AWS_TAPE_NO_SPACE : AWS_TAPE_IO_ERROR;
+    }
+    if (new_end < tape->length) {
+        ret = blk_truncate(tape->blk, new_end, false, PREALLOC_MODE_OFF, 0,
+                           &local_err);
+        if (ret < 0) {
+            error_free(local_err);
+            tape->fenced = true;
+            return ret == -ENOSPC ? AWS_TAPE_NO_SPACE : AWS_TAPE_IO_ERROR;
+        }
+    }
+
+    tape->offset = new_end;
+    tape->length = new_end;
+    tape->block_id++;
+    tape->previous_length = final_length;
+    return AWS_TAPE_OK;
+}
+
+AwsTapeResult aws_tape_write(AwsTape *tape, const uint8_t *buf, size_t length)
+{
+    size_t chunks;
+    size_t serialized_length;
+    g_autofree uint8_t *serialized = NULL;
+    size_t input_offset = 0;
+    size_t output_offset = 0;
+    uint16_t previous_length = tape->previous_length;
+    size_t i;
+
+    if (!length || length > AWS_TAPE_MAX_RECORD) {
+        return AWS_TAPE_TOO_LARGE;
+    }
+
+    chunks = DIV_ROUND_UP(length, AWS_MAX_CHUNK);
+    serialized_length = length + chunks * AWS_HEADER_SIZE;
+    serialized = g_malloc(serialized_length);
+    for (i = 0; i < chunks; i++) {
+        size_t chunk_length = MIN(length - input_offset,
+                                  (size_t)AWS_MAX_CHUNK);
+        AwsHeader header = {
+            .length = cpu_to_le16(chunk_length),
+            .previous_length = cpu_to_le16(previous_length),
+            .flags1 = (i == 0 ? AWS_FLAG_NEW_RECORD : 0) |
+                      (i + 1 == chunks ? AWS_FLAG_END_RECORD : 0),
+        };
+
+        memcpy(serialized + output_offset, &header, sizeof(header));
+        memcpy(serialized + output_offset + sizeof(header),
+               buf + input_offset, chunk_length);
+        output_offset += sizeof(header) + chunk_length;
+        input_offset += chunk_length;
+        previous_length = chunk_length;
+    }
+
+    return aws_tape_commit(tape, serialized, serialized_length,
+                           previous_length);
+}
+
+AwsTapeResult aws_tape_write_mark(AwsTape *tape)
+{
+    AwsHeader header = {
+        .previous_length = cpu_to_le16(tape->previous_length),
+        .flags1 = AWS_FLAG_TAPE_MARK,
+    };
+
+    return aws_tape_commit(tape, (uint8_t *)&header, sizeof(header), 0);
+}
+
+AwsTapeResult aws_tape_erase_gap(AwsTape *tape)
+{
+    if (tape->fenced) {
+        return AWS_TAPE_FENCED;
+    }
+    if (!blk_is_writable(tape->blk)) {
+        return AWS_TAPE_WRITE_PROTECTED;
+    }
+    return AWS_TAPE_OK;
+}
+
+AwsTapeResult aws_tape_sync(AwsTape *tape)
+{
+    int ret;
+
+    if (tape->fenced) {
+        return AWS_TAPE_FENCED;
+    }
+    if (!blk_is_writable(tape->blk)) {
+        return AWS_TAPE_WRITE_PROTECTED;
+    }
+    ret = blk_flush(tape->blk);
+    if (ret < 0) {
+        tape->fenced = true;
+        return ret == -ENOSPC ? AWS_TAPE_NO_SPACE : AWS_TAPE_IO_ERROR;
     }
     return AWS_TAPE_OK;
 }
