@@ -293,11 +293,14 @@ bool handle_diag_204(CPUS390XState *env, uint64_t r1, uint64_t r3,
 
     switch (subcode) {
     case DIAG204_SUBCODE_RSI:
-        bql_lock();
-        size = ROUND_UP(sizeof(Diag204XHeader) + sizeof(Diag204XPartition) +
-                        diag204_cpu_count() * sizeof(Diag204XCPU),
-                        TARGET_PAGE_SIZE);
-        bql_unlock();
+        {
+            BQL_LOCK_GUARD();
+
+            size = ROUND_UP(sizeof(Diag204XHeader) +
+                            sizeof(Diag204XPartition) +
+                            diag204_cpu_count() * sizeof(Diag204XCPU),
+                            TARGET_PAGE_SIZE);
+        }
         env->regs[(r3 + 1) & 15] =
             deposit64(env->regs[(r3 + 1) & 15], 0, 32,
                       size / TARGET_PAGE_SIZE);
@@ -309,9 +312,11 @@ bool handle_diag_204(CPUS390XState *env, uint64_t r1, uint64_t r3,
             s390_program_interrupt(env, PGM_SPECIFICATION, ra);
             return false;
         }
-        bql_lock();
-        data = diag204_build_simple(&size);
-        bql_unlock();
+        {
+            BQL_LOCK_GUARD();
+
+            data = diag204_build_simple(&size);
+        }
         if (!data) {
             diag204_set_return(env, r3, DIAG204_RC_UNSUPPORTED);
             return true;
@@ -336,9 +341,11 @@ bool handle_diag_204(CPUS390XState *env, uint64_t r1, uint64_t r3,
             s390_program_interrupt(env, PGM_SPECIFICATION, ra);
             return false;
         }
-        bql_lock();
-        data = diag204_build_extended(&size);
-        bql_unlock();
+        {
+            BQL_LOCK_GUARD();
+
+            data = diag204_build_extended(&size);
+        }
         if (pages < size / TARGET_PAGE_SIZE) {
             g_free(data);
             diag204_set_return(env, r3, DIAG204_RC_UNSUPPORTED);
