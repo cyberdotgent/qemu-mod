@@ -687,6 +687,7 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
     uint32_t required;
     uint32_t length;
     uint32_t padding;
+    bool overlength = false;
     g_autofree uint8_t *discard = NULL;
     int ret;
 
@@ -699,11 +700,24 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
         if (ccw->count < 8) {
             return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
         }
-        if (eckd_read_guest(eckd, data, ccw->count)) {
+        /*
+         * The count field describes the physical record length.  As in
+         * Hercules, transfer no more than that length and leave any excess
+         * CCW count as residual data instead of reporting a device data
+         * check.  VSE uses such an overlength Write CKD while initializing
+         * fresh volumes.
+         */
+        if (eckd_read_guest(eckd, data, 8)) {
             return -EFAULT;
         }
         eckd->write_expected = 8 + data[5] + lduw_be_p(data + 6);
-        eckd->write_used = ccw->count;
+        length = MIN((uint32_t)ccw->count, eckd->write_expected);
+        if (length > 8 &&
+            eckd_read_guest(eckd, data + 8, length - 8)) {
+            return -EFAULT;
+        }
+        eckd->write_used = length;
+        overlength = ccw->count > eckd->write_expected;
     } else {
         trace_eckd_write_chain(sch->devno, true, eckd->write_expected,
                                eckd->write_used, ccw->count, ccw->flags);
@@ -744,6 +758,9 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
         return 0;
     }
     eckd->write_active = false;
+    if (overlength && !(ccw->flags & CCW_FLAG_SLI)) {
+        sch->curr_status.scsw.cstat |= SCSW_CSTAT_INCORR_LEN;
+    }
     if (eckd->write_used < required) {
         /*
          * A short Write CKD is valid: the unwritten key/data portion is
