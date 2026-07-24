@@ -18,7 +18,7 @@
 #include "system/block-backend.h"
 #include "trace.h"
 
-#define ECKD_AUTO_DEVNO 0x0200
+#define ECKD_AUTO_DEVNO 0x0300
 #define ECKD_CU_TYPE 0x2107
 #define ECKD_CU_MODEL 0xe8
 #define ECKD_DEV_TYPE 0x3390

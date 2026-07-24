@@ -87,8 +87,8 @@ static void test_automatic_addresses(void)
 
     dev_id0 = qom_get_string(qts, "/machine/peripheral/dasd0", "dev_id");
     dev_id1 = qom_get_string(qts, "/machine/peripheral/dasd1", "dev_id");
-    g_assert_cmpstr(dev_id0, ==, "fe.0.0200");
-    g_assert_cmpstr(dev_id1, ==, "fe.0.0201");
+    g_assert_cmpstr(dev_id0, ==, "fe.0.0300");
+    g_assert_cmpstr(dev_id1, ==, "fe.0.0301");
     qtest_quit(qts);
     unlink(path0);
     unlink(path1);
