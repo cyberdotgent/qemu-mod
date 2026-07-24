@@ -2393,7 +2393,7 @@ bool kvm_s390_get_host_cpu_model(S390CPUModel *model, Error **errp)
     }
     model->cpu_id = cpuid_id(prop.cpuid);
     model->cpu_id_format = cpuid_format(prop.cpuid);
-    model->cpu_ver = 0xff;
+    model->cpu_ver = s390_get_kvm_cpu_version();
 
     /* get supported cpu features indicated via STFL(E) */
     s390_add_from_feat_block(model->features, S390_FEAT_TYPE_STFL,

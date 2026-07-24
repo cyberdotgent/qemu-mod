@@ -1013,6 +1013,11 @@ static const TypeInfo ccw_machine_info = {
 
 static void ccw_machine_11_1_instance_options(MachineState *machine)
 {
+    /*
+     * A CPU version of 0xff marks a z/VM virtual CPU.  KVM guests are not
+     * running under z/VM, so expose the value used by current real hardware.
+     */
+    s390_set_kvm_cpu_version(0);
 }
 
 static void ccw_machine_11_1_class_options(MachineClass *mc)
@@ -1023,6 +1028,8 @@ DEFINE_CCW_MACHINE_AS_LATEST(11, 1);
 static void ccw_machine_11_0_instance_options(MachineState *machine)
 {
     ccw_machine_11_1_instance_options(machine);
+    /* Preserve the CPU identification exposed by older machine types. */
+    s390_set_kvm_cpu_version(0xff);
 }
 
 static void ccw_machine_11_0_class_options(MachineClass *mc)
