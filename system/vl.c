@@ -1320,11 +1320,14 @@ static bool dev3270_add(const char *optarg, Error **errp)
     static unsigned int index;
     g_autofree char *chardev_id = NULL;
     g_autofree char *device_id = NULL;
+    g_autofree char *normalized_devno = NULL;
     g_autofree char *port_str = NULL;
     QemuOpts *opts = NULL;
     QemuOpts *chardev_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *devno;
+    unsigned int short_devno;
+    int consumed;
     uint64_t port;
 
     opts = qemu_opts_parse(&qemu_dev3270_opts, optarg, false, errp);
@@ -1372,8 +1375,15 @@ static bool dev3270_add(const char *optarg, Error **errp)
     }
 
     devno = qemu_opt_get(opts, "devno");
-    if (devno && !qemu_opt_set(device_opts, "devno", devno, errp)) {
-        goto fail;
+    if (devno) {
+        if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&
+            !devno[consumed] && short_devno <= UINT16_MAX) {
+            normalized_devno = g_strdup_printf("fe.0.%04x", short_devno);
+            devno = normalized_devno;
+        }
+        if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
     }
 
     index++;

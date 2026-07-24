@@ -236,8 +236,8 @@ static void test_dev3270_shortcut(void)
 
     qts = qtest_init(
         "-nodefaults "
-        "-dev3270 port=0,devno=fe.0.000a "
-        "-dev3270 port=0,devno=fe.0.000b");
+        "-dev3270 port=0,devno=300 "
+        "-dev3270 port=0,devno=0301");
 
     chardev0 = qom_get_string(qts, "/machine/peripheral/dev3270-0",
                               "chardev");
@@ -248,8 +248,8 @@ static void test_dev3270_shortcut(void)
 
     g_assert_cmpstr(chardev0, ==, "dev3270-chardev0");
     g_assert_cmpstr(chardev1, ==, "dev3270-chardev1");
-    g_assert_cmpstr(devid0, ==, "fe.0.000a");
-    g_assert_cmpstr(devid1, ==, "fe.0.000b");
+    g_assert_cmpstr(devid0, ==, "fe.0.0300");
+    g_assert_cmpstr(devid1, ==, "fe.0.0301");
 
     qtest_quit(qts);
 }
