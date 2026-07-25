@@ -235,7 +235,7 @@ static void terminal_record_free(TN3270Record *record)
     g_free(record);
 }
 
-static void terminal_clear_records(Terminal3270 *t)
+static void terminal_clear_queued_records(Terminal3270 *t)
 {
     TN3270Record *record;
 
@@ -243,13 +243,18 @@ static void terminal_clear_records(Terminal3270 *t)
         QTAILQ_REMOVE(&t->records, record, next);
         terminal_record_free(record);
     }
+    t->queued_bytes = 0;
+    t->queued_records = 0;
+    t->attention_pending = false;
+}
+
+static void terminal_clear_records(Terminal3270 *t)
+{
+    terminal_clear_queued_records(t);
     terminal_record_free(t->current_record);
     t->current_record = NULL;
     t->current_offset = 0;
     t->current_start_pos = 0;
-    t->queued_bytes = 0;
-    t->queued_records = 0;
-    t->attention_pending = false;
 }
 
 static void terminal_set_unit_check(Terminal3270 *t, uint8_t sense)
@@ -486,12 +491,22 @@ static void terminal_complete_pending_read(Terminal3270 *t)
 static void terminal_finish_record(Terminal3270 *t)
 {
     TN3270Record *record;
-    bool was_empty;
 
     if (!t->ready) {
         t->record_len = 0;
         return;
     }
+
+    /*
+     * A non-SNA 3270 has one pending input buffer, not a FIFO of AIDs.
+     * If the host restores the keyboard without reading an earlier AID, the
+     * next complete input replaces it and raises a fresh attention.  This
+     * also matches Hyperion's readpending handling.
+     */
+    if (!t->read_pending) {
+        terminal_clear_queued_records(t);
+    }
+
     if (t->queued_records == TN3270_MAX_QUEUED_RECORDS ||
         t->queued_bytes + t->record_len > TN3270_MAX_QUEUED_BYTES) {
         t->record_len = 0;
@@ -504,7 +519,6 @@ static void terminal_finish_record(Terminal3270 *t)
     memcpy(record->data, t->record_buf, t->record_len);
     t->record_len = 0;
 
-    was_empty = QTAILQ_EMPTY(&t->records);
     QTAILQ_INSERT_TAIL(&t->records, record, next);
     t->queued_records++;
     t->queued_bytes += record->len;
@@ -513,7 +527,7 @@ static void terminal_finish_record(Terminal3270 *t)
 
     if (t->read_pending) {
         terminal_complete_pending_read(t);
-    } else if (was_empty) {
+    } else {
         t->attention_pending = true;
         terminal_try_attention(t);
     }

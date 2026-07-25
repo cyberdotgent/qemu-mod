@@ -326,10 +326,14 @@ static void test_tn3270_negotiation_and_records(void)
     g_assert_true(qtest_qom_get_bool(qts, TERMINAL_PATH,
                                      "extended-attributes"));
 
-    /* Both EOR-delimited records arrive in one host write; doubled IAC is data. */
+    /*
+     * Both EOR-delimited records arrive in one host write; doubled IAC is
+     * data.  A 3270 has one unread input buffer, so the second AID replaces
+     * the first rather than being queued behind it.
+     */
     g_assert_cmpint(send(fd, records, sizeof(records), 0), ==,
                     sizeof(records));
-    wait_for_int(qts, "queued-records", 2);
+    wait_for_int(qts, "queued-records", 1);
 
     close(fd);
     wait_for_bool(qts, "connected", false);
@@ -387,7 +391,7 @@ static void test_migration_reconnect(void)
     unlink(path);
 }
 
-static void test_negotiation_retry_refusal_and_queue_limit(void)
+static void test_negotiation_retry_refusal_and_record_replacement(void)
 {
     static const uint8_t bad_type[] = {
         TN_IAC, 0xfa, 0x18, 0x00, 'A', 'N', 'S', 'I', TN_IAC, 0xf0,
@@ -425,8 +429,10 @@ static void test_negotiation_retry_refusal_and_queue_limit(void)
         }
         g_assert_cmpint(ret, ==, sizeof(one_record));
     }
-    wait_for_bool(qts, "connected", false);
+    wait_for_int(qts, "queued-records", 1);
+    wait_for_bool(qts, "connected", true);
     close(fd);
+    wait_for_bool(qts, "connected", false);
 
     /* A new session must not inherit an incomplete parser or full queue. */
     fd = connect_terminal(port);
@@ -518,7 +524,7 @@ int main(int argc, char **argv)
     qtest_add_func("/terminal3270/migration-reconnect",
                    test_migration_reconnect);
     qtest_add_func("/terminal3270/protocol-edge-cases",
-                   test_negotiation_retry_refusal_and_queue_limit);
+                   test_negotiation_retry_refusal_and_record_replacement);
     qtest_add_func("/terminal3270/models", test_terminal_models);
 
     return g_test_run();

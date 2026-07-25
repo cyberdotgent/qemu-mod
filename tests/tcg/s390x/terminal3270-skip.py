@@ -122,6 +122,14 @@ def main():
                         f"expected READ MODIFIED, received {request.hex()}"
                     )
                 terminal.sendall(bytes((0x7D, 0x40, 0x40, IAC, EOR)))
+
+                request = recv_record(terminal)
+                if request != bytes((0xF6,)):
+                    raise RuntimeError(
+                        f"expected second READ MODIFIED, "
+                        f"received {request.hex()}"
+                    )
+                terminal.sendall(bytes((0x7D, 0x40, 0x40, IAC, EOR)))
                 return proc.wait(timeout=10)
         finally:
             if proc.poll() is None:

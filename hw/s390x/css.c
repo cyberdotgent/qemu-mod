@@ -1183,7 +1183,14 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
         sch->last_cmd_valid = true;
     }
     if (ret == 0) {
-        if (ccw.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) {
+        /*
+         * Channel status other than PCI terminates command or data
+         * chaining.  In particular, when a device ends a short transfer
+         * with incorrect length, the residual count and CPA must describe
+         * that CCW rather than a later continuation.
+         */
+        if ((ccw.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) &&
+            !(sch->curr_status.scsw.cstat & ~SCSW_CSTAT_PCI)) {
             sch->channel_prog += 8;
             /*
              * Device End with Status Modifier advances the channel-program
@@ -1219,7 +1226,8 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
                               SCSW_ACTL_DEVICE_ACTIVE);
         ret = completion_ret;
         if (ret == 0 &&
-            (sch->last_cmd.flags & (CCW_FLAG_CC | CCW_FLAG_DC))) {
+            (sch->last_cmd.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) &&
+            !(schib->scsw.cstat & ~SCSW_CSTAT_PCI)) {
             sch->channel_prog += 8;
             ret = -EAGAIN;
         }

@@ -14,7 +14,8 @@
 
 LowCore *lowcore;
 
-static Ccw1 ccw __attribute__((aligned(8)));
+static Ccw1 ccw[2] __attribute__((aligned(8)));
+static uint8_t input[0x103];
 
 static uint32_t addr32(const void *p)
 {
@@ -28,7 +29,7 @@ int main(void)
         .fmt = 1,
         .pfch = 1,
         .lpm = 0xff,
-        .cpa = addr32(&ccw),
+        .cpa = addr32(ccw),
     };
     Schib schib;
     Irb irb = { 0 };
@@ -45,7 +46,7 @@ int main(void)
      * SKIP makes the data address immaterial.  VSE uses this exact form to
      * drain a 3270 input record after attention.
      */
-    ccw = (Ccw1) {
+    ccw[0] = (Ccw1) {
         .cmd_code = TERM3270_CMD_READ_MODIFIED,
         .flags = CCW_FLAG_SKIP,
         .count = 0x7fff,
@@ -62,6 +63,40 @@ int main(void)
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
         irb.scsw.count != 0x7fff - INPUT_RECORD_SIZE) {
         return 5;
+    }
+
+    /*
+     * Incorrect length terminates data chaining.  VSE depends on the CPA
+     * and residual identifying this first, short Read Modified CCW; running
+     * the following drain CCW instead makes the input appear malformed.
+     */
+    ccw[0] = (Ccw1) {
+        .cmd_code = TERM3270_CMD_READ_MODIFIED,
+        .flags = CCW_FLAG_DC,
+        .count = sizeof(input),
+        .cda = addr32(input),
+    };
+    ccw[1] = (Ccw1) {
+        .cmd_code = TERM3270_CMD_READ_MODIFIED,
+        .flags = CCW_FLAG_SKIP,
+        .count = 0x7fff,
+        .cda = 0,
+    };
+    memset(input, 0, sizeof(input));
+    if (ssch(schid, &orb)) {
+        return 6;
+    }
+    consume_io_int();
+    memset(&irb, 0, sizeof(irb));
+    if (tsch(schid, &irb)) {
+        return 7;
+    }
+    if (irb.scsw.cstat != SCSW_CSTAT_BADLEN ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count != sizeof(input) - INPUT_RECORD_SIZE ||
+        irb.scsw.cpa != addr32(&ccw[1]) ||
+        input[0] != 0x7d || input[1] != 0x40 || input[2] != 0x40) {
+        return 8;
     }
     return 0;
 }
