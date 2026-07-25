@@ -126,9 +126,8 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp)
     image->heads = le32_to_cpu(header.heads);
     image->track_size = le32_to_cpu(header.track_size);
     if (header.device_type != 0x90 || image->heads != CKD_3390_HEADS ||
-        image->track_size != CKD_3390_TRACK_SIZE ||
-        header.file_sequence || le16_to_cpu(header.high_cylinder)) {
-        error_setg(errp, "unsupported CKD geometry or multi-file image");
+        image->track_size != CKD_3390_TRACK_SIZE) {
+        error_setg(errp, "unsupported CKD geometry");
         return false;
     }
 
@@ -142,6 +141,18 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp)
     if (!image->cylinders || image->cylinders > CKD_3390_MAX_CYLINDERS) {
         error_setg(errp, "CKD cylinder count %u is outside 1..%u",
                    image->cylinders, CKD_3390_MAX_CYLINDERS);
+        return false;
+    }
+
+    /*
+     * Hercules also accepts old single-file images whose header contains a
+     * nonzero file sequence and a one-origin cylinder count in high_cylinder.
+     * A real multi-file member uses the zero-origin number of its last
+     * cylinder instead, so it cannot satisfy this size-derived check.
+     */
+    if ((header.file_sequence || le16_to_cpu(header.high_cylinder)) &&
+        le16_to_cpu(header.high_cylinder) != image->cylinders) {
+        error_setg(errp, "multi-file CKD images are unsupported");
         return false;
     }
 

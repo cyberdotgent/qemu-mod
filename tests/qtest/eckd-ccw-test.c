@@ -14,7 +14,8 @@
 #define CKD_TRACK_SIZE 56832
 #define CKD_HEADS 15
 
-static char *create_ckd64_image(void)
+static char *create_ckd_image(const char *identifier, uint8_t file_sequence,
+                              uint16_t high_cylinder)
 {
     uint8_t header[CKD_HEADER_SIZE] = { 0 };
     uint8_t track[13] = { 0 };
@@ -23,10 +24,12 @@ static char *create_ckd64_image(void)
     unsigned int head;
 
     g_assert_cmpint(fd, >=, 0);
-    memcpy(header, "CKD_P064", 8);
+    memcpy(header, identifier, 8);
     stl_le_p(header + 8, CKD_HEADS);
     stl_le_p(header + 12, CKD_TRACK_SIZE);
     header[16] = 0x90;
+    header[17] = file_sequence;
+    stw_le_p(header + 18, high_cylinder);
     memcpy(header + 20, "123456789012", 12);
     g_assert_cmpint(write(fd, header, sizeof(header)), ==, sizeof(header));
 
@@ -43,6 +46,11 @@ static char *create_ckd64_image(void)
                              CKD_HEADS * CKD_TRACK_SIZE), ==, 0);
     close(fd);
     return path;
+}
+
+static char *create_ckd64_image(void)
+{
+    return create_ckd_image("CKD_P064", 0, 0);
 }
 
 static char *qom_get_string(QTestState *qts, const char *path,
@@ -94,10 +102,22 @@ static void test_automatic_addresses(void)
     unlink(path1);
 }
 
+static void test_legacy_single_file_header(void)
+{
+    g_autofree char *path = create_ckd_image("CKD_P370", 4, 1);
+    QTestState *qts = qtest_initf(
+        "-nodefaults -dev3390 file=%s,devno=200,id=dasd0 -S", path);
+
+    qtest_quit(qts);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/eckd-ccw/dev3390-shortcut", test_dev3390_shortcut);
     qtest_add_func("/eckd-ccw/automatic-addresses", test_automatic_addresses);
+    qtest_add_func("/eckd-ccw/legacy-single-file-header",
+                   test_legacy_single_file_header);
     return g_test_run();
 }
