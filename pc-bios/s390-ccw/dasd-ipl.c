@@ -271,7 +271,7 @@ int eckd_ipl(SubChannelId schid, uint16_t cutype)
         return -EIO;
     }
     disable_prefixing();
-    jump_to_low_kernel();
+    jump_to_low_kernel_esa();
     return -1;
 }
 
@@ -315,7 +315,7 @@ int fba_ipl(SubChannelId schid, uint16_t cutype)
      * SIGP Set Architecture Mode; forcing the addressing-mode bits here
      * changes the architected IPL state underneath it.
      */
-    jump_to_low_kernel();
+    jump_to_low_kernel_esa();
     return -1;
 }
 
@@ -346,6 +346,6 @@ int tape_3590_ipl(SubChannelId schid, uint16_t cutype)
         return -EIO;
     }
     disable_prefixing();
-    jump_to_low_kernel();
+    jump_to_low_kernel_esa();
     return -1;
 }

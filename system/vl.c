@@ -524,6 +524,21 @@ static QemuOptsList qemu_dev3270_opts = {
         },{
             .name = "devno",
             .type = QEMU_OPT_STRING,
+        },{
+            .name = "chpid",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "control-unit-type",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "control-unit-model",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "device-type",
+            .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "device-model",
+            .type = QEMU_OPT_NUMBER,
         },
         { /* end of list */ }
     },
@@ -1329,6 +1344,8 @@ static bool dev3270_add(const char *optarg, Error **errp)
     unsigned int short_devno;
     int consumed;
     uint64_t port;
+    uint64_t chpid;
+    uint64_t value;
 
     opts = qemu_opts_parse(&qemu_dev3270_opts, optarg, false, errp);
     if (!opts) {
@@ -1382,6 +1399,62 @@ static bool dev3270_add(const char *optarg, Error **errp)
             devno = normalized_devno;
         }
         if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "chpid")) {
+        chpid = qemu_opt_get_number(opts, "chpid", 0);
+        if (chpid > UINT8_MAX) {
+            error_setg(errp, "Parameter 'chpid' must be between 0 and 255");
+            goto fail;
+        }
+        if (!qemu_opt_set_number(device_opts, "chpid", chpid, errp)) {
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "control-unit-type")) {
+        value = qemu_opt_get_number(opts, "control-unit-type", 0);
+        if (value > UINT16_MAX ||
+            !qemu_opt_set_number(device_opts, "control-unit-type", value,
+                                 errp)) {
+            if (value > UINT16_MAX) {
+                error_setg(errp,
+                           "Parameter 'control-unit-type' must fit in 16 bits");
+            }
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "control-unit-model")) {
+        value = qemu_opt_get_number(opts, "control-unit-model", 0);
+        if (value > UINT8_MAX ||
+            !qemu_opt_set_number(device_opts, "control-unit-model", value,
+                                 errp)) {
+            if (value > UINT8_MAX) {
+                error_setg(errp,
+                           "Parameter 'control-unit-model' must fit in 8 bits");
+            }
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "device-type")) {
+        value = qemu_opt_get_number(opts, "device-type", 0);
+        if (value > UINT16_MAX ||
+            !qemu_opt_set_number(device_opts, "device-type", value, errp)) {
+            if (value > UINT16_MAX) {
+                error_setg(errp,
+                           "Parameter 'device-type' must fit in 16 bits");
+            }
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "device-model")) {
+        value = qemu_opt_get_number(opts, "device-model", 0);
+        if (value > UINT8_MAX ||
+            !qemu_opt_set_number(device_opts, "device-model", value, errp)) {
+            if (value > UINT8_MAX) {
+                error_setg(errp,
+                           "Parameter 'device-model' must fit in 8 bits");
+            }
             goto fail;
         }
     }

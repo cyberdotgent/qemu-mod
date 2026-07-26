@@ -542,19 +542,58 @@ static int handle_sigp_single_dst(S390CPU *cpu, S390CPU *dst_cpu, uint8_t order,
 static int sigp_set_architecture(S390CPU *cpu, uint32_t param,
                                  uint64_t *status_reg)
 {
-    if ((param & 0xff) == 1) {
-        /*
-         * CZAM starts in z/Arch mode, so a request to enter the mode has
-         * already achieved its architected result.
-         */
-        return SIGP_CC_ORDER_CODE_ACCEPTED;
+    CPUState *cs;
+    uint8_t mode = param & 0xff;
+    bool esa_mode = cpu->env.esa_mode;
+
+    if (!tcg_enabled()) {
+        if (mode == 1) {
+            return SIGP_CC_ORDER_CODE_ACCEPTED;
+        }
+        *status_reg = (*status_reg & 0xffffffff00000000ULL) |
+                      SIGP_STAT_INVALID_PARAMETER;
+        return SIGP_CC_STATUS_STORED;
     }
 
-    *status_reg &= 0xffffffff00000000ULL;
+    CPU_FOREACH(cs) {
+        S390CPU *other = S390_CPU(cs);
 
-    /* Reject set arch order, with czam we're always in z/Arch mode. */
-    *status_reg |= SIGP_STAT_INVALID_PARAMETER;
-    return SIGP_CC_STATUS_STORED;
+        if (other != cpu &&
+            s390_cpu_get_state(other) != S390_CPU_STATE_STOPPED) {
+            *status_reg = (*status_reg & 0xffffffff00000000ULL) |
+                          SIGP_STAT_INCORRECT_STATE;
+            return SIGP_CC_STATUS_STORED;
+        }
+    }
+
+    if ((mode == 0 && esa_mode) || ((mode == 1 || mode == 2) && !esa_mode) ||
+        mode > 2) {
+        *status_reg = (*status_reg & 0xffffffff00000000ULL) |
+                      SIGP_STAT_INVALID_PARAMETER;
+        return SIGP_CC_STATUS_STORED;
+    }
+
+    CPU_FOREACH(cs) {
+        S390CPU *target = S390_CPU(cs);
+        CPUS390XState *env = &target->env;
+
+        if (mode == 0) {
+            env->captured_z_psw = env->psw;
+            env->esa_mode = true;
+        } else {
+            env->esa_mode = false;
+            if (mode == 2) {
+                env->psw = env->captured_z_psw;
+            } else {
+                env->psw.mask &= ~PSW_MASK_64;
+                env->psw.addr &= PSW_MASK_SHORT_ADDR;
+            }
+        }
+        env->psa &= 0x7ffff000;
+        tlb_flush(cs);
+    }
+
+    return SIGP_CC_ORDER_CODE_ACCEPTED;
 }
 
 S390CPU *s390_cpu_addr2state(uint16_t cpu_addr)

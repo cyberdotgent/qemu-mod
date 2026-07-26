@@ -1121,14 +1121,19 @@ SRST
 ERST
 
 DEF("dev3270", HAS_ARG, QEMU_OPTION_dev3270,
-    "-dev3270 port=port[,devno=ccw-address]\n"
+    "-dev3270 port=port[,devno=ccw-address][,chpid=id][,device-type=type][,device-model=model]\n"
     "                add a 3270 terminal listening on the loopback interface\n",
     QEMU_ARCH_S390X)
 SRST
-``-dev3270 port=port[,devno=ccw-address]``
+``-dev3270 port=port[,devno=ccw-address][,chpid=id][,device-type=type][,device-model=model]``
     Add a 3270 terminal backed by a TN3270 socket server listening on the
     loopback interface. The server does not wait for a client when QEMU starts.
     If ``devno`` is omitted, QEMU assigns an available CCW device number.
+    If ``chpid`` is omitted, QEMU assigns or reuses a virtual channel path.
+    ``device-type`` and ``device-model`` select the Sense ID presented to the
+    guest; they default to 3278 model 2. ``control-unit-type`` and
+    ``control-unit-model`` can likewise override the default 3274 model 1D
+    identity.
 
     This option is equivalent to creating a socket chardev with
     ``server=on,wait=off,tn3270=on`` and attaching an ``x-terminal3270`` device

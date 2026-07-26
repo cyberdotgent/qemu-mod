@@ -618,7 +618,7 @@ static void qeth_realize(DeviceState *dev, Error **errp)
         }
     }
     cdev->sch = s->peer[0];
-    chpid = css_find_virtual_chpid(s->peer[0]->cssid, QETH_CHPID_TYPE);
+    chpid = base_devno >> 8;
     if (chpid > MAX_CHPID) {
         error_setg(&local_err, "No available CHPID for qeth-ccw");
         goto fail;

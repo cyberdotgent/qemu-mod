@@ -108,6 +108,11 @@ static void terminal3215_status_cleared(SubchDev *sch)
     terminal3215_try_attention(TERMINAL_3215(sch->driver_data));
 }
 
+static void terminal3215_enabled(SubchDev *sch)
+{
+    terminal3215_try_attention(TERMINAL_3215(sch->driver_data));
+}
+
 static void terminal3215_pop_record(Terminal3215 *t)
 {
     g_assert(t->record_count);
@@ -446,6 +451,7 @@ static void terminal3215_realize(DeviceState *dev, Error **errp)
     sch->ccw_cb = terminal3215_ccw_cb;
     sch->ccw_cb_first = true;
     sch->cancel_cb = terminal3215_cancel;
+    sch->enable_cb = terminal3215_enabled;
     sch->disable_cb = terminal3215_cancel;
     sch->irb_cb = build_irb_virtual;
     sch->status_clear_cb = terminal3215_status_cleared;
@@ -473,6 +479,7 @@ static void terminal3215_unrealize(DeviceState *dev)
     Terminal3215 *t = TERMINAL_3215(dev);
 
     if (CCW_DEVICE(t)->sch) {
+        CCW_DEVICE(t)->sch->enable_cb = NULL;
         CCW_DEVICE(t)->sch->status_clear_cb = NULL;
     }
     qemu_chr_fe_deinit(&t->chr, false);

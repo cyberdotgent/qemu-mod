@@ -1616,7 +1616,11 @@ IOInstEnding css_do_msch(SubchDev *sch, const SCHIB *orig_schib)
             (PMCW_CHARS_MASK_MBFC | PMCW_CHARS_MASK_CSENSE);
     schib->mba = schib_copy.mba;
 
-    /* Has the channel been disabled? */
+    /* Has the channel been enabled or disabled? */
+    if (sch->enable_cb && (oldflags & PMCW_FLAGS_MASK_ENA) == 0 &&
+        (schib->pmcw.flags & PMCW_FLAGS_MASK_ENA) != 0) {
+        sch->enable_cb(sch);
+    }
     if (sch->disable_cb && (oldflags & PMCW_FLAGS_MASK_ENA) != 0
         && (schib->pmcw.flags & PMCW_FLAGS_MASK_ENA) == 0) {
         sch->disable_cb(sch);
@@ -2041,7 +2045,7 @@ int css_collect_chp_desc(int m, uint8_t cssid, uint8_t f_chpid, uint8_t l_chpid,
     int i, desc_size;
     uint32_t words[8];
     uint32_t chpid_type_word;
-    uint32_t max_chpids, chpid_count = 0;
+    uint32_t max_chpids;
     CssImage *css;
 
     if (!m && !cssid) {
@@ -2064,31 +2068,29 @@ int css_collect_chp_desc(int m, uint8_t cssid, uint8_t f_chpid, uint8_t l_chpid,
 
     desc_size = 0;
     for (i = f_chpid; i <= l_chpid; i++) {
+        /*
+         * Store Channel-Path Description is a range operation.  Its
+         * response contains one descriptor for every requested CHPID, not a
+         * compact list of installed paths.  In particular, the CHPID field
+         * remains meaningful in an invalid descriptor.  Guests such as
+         * z/OS use the positional correspondence while constructing their
+         * channel-path tables.
+         */
+        if (desc_size / (rfmt ? 32 : 8) == max_chpids) {
+            break;
+        }
+        chpid_type_word = i;
         if (css->chpids[i].in_use) {
-            /* Limit number of CHPIDs sent back */
-            if (chpid_count == max_chpids) {
-                break;
-            }
-
-            chpid_count++;
-            chpid_type_word = 0x80000000 | (css->chpids[i].type << 8) | i;
-            if (rfmt == 0) {
-                words[0] = cpu_to_be32(chpid_type_word);
-                words[1] = 0;
-                memcpy(buf + desc_size, words, 8);
-                desc_size += 8;
-            } else if (rfmt == 1) {
-                words[0] = cpu_to_be32(chpid_type_word);
-                words[1] = 0;
-                words[2] = 0;
-                words[3] = 0;
-                words[4] = 0;
-                words[5] = 0;
-                words[6] = 0;
-                words[7] = 0;
-                memcpy(buf + desc_size, words, 32);
-                desc_size += 32;
-            }
+            chpid_type_word |= 0x80000000 | (css->chpids[i].type << 8);
+        }
+        memset(words, 0, sizeof(words));
+        words[0] = cpu_to_be32(chpid_type_word);
+        if (rfmt == 0) {
+            memcpy(buf + desc_size, words, 8);
+            desc_size += 8;
+        } else {
+            memcpy(buf + desc_size, words, 32);
+            desc_size += 32;
         }
     }
     return desc_size;
@@ -2263,6 +2265,7 @@ void css_sch_build_virtual_schib(SubchDev *sch, uint8_t chpid, uint8_t type)
     schib->pmcw.flags |= PMCW_FLAGS_MASK_DNV;
     schib->pmcw.devno = sch->devno;
     /* single path */
+    schib->pmcw.lpm = 0x80;
     schib->pmcw.pim = 0x80;
     schib->pmcw.pom = 0xff;
     schib->pmcw.pam = 0x80;

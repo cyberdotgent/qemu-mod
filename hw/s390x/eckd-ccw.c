@@ -22,7 +22,7 @@
 #define ECKD_CU_TYPE 0x2107
 #define ECKD_CU_MODEL 0xe8
 #define ECKD_DEV_TYPE 0x3390
-#define ECKD_CHPID_TYPE 0x1b
+#define ECKD_CHPID_TYPE 0x1f
 #define ECKD_TRACK_SIZE 56832
 #define ECKD_MAX_RECORD_SIZE (8 + UINT8_MAX + UINT16_MAX)
 
@@ -51,9 +51,11 @@
 #define CMD_LOCATE 0x47
 #define CMD_SEARCH_KEY_HIGH 0x49
 #define CMD_LOCATE_EXT 0x4b
+#define CMD_SEARCH_ID_HIGH 0x51
 #define CMD_SNSS 0x54
 #define CMD_SEARCH_KEY_EQ_HIGH 0x69
 #define CMD_DEFINE_EXTENT 0x63
+#define CMD_SEARCH_ID_EQ_HIGH 0x71
 #define CMD_RDC 0x64
 #define CMD_WRITE_MT 0x85
 #define CMD_READ_MT 0x86
@@ -99,12 +101,13 @@ struct EckdCcwDevice {
 
     uint16_t cylinder;
     uint16_t head;
-    uint8_t record;
+    uint16_t record;
     uint8_t locate_count;
     uint8_t locate_operation;
     uint16_t locate_length;
     bool positioned;
     bool search_match;
+    bool search_count_advance;
     unsigned int search_index;
     bool search_index_seen;
     bool reserved;
@@ -112,7 +115,8 @@ struct EckdCcwDevice {
     uint8_t pgid[11];
     uint8_t psf_order;
     uint8_t psf_suborder;
-    bool rssd_prepared;
+    uint16_t rssd_length;
+    uint8_t rssd_data[512];
 
     uint8_t *format_track;
     uint32_t format_used;
@@ -196,6 +200,22 @@ static int eckd_unit_check(EckdCcwDevice *eckd, uint8_t sense0,
     return -EIO;
 }
 
+static int eckd_unit_exception(EckdCcwDevice *eckd)
+{
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+    SCHIB *schib = &sch->curr_status;
+
+    schib->scsw.dstat = SCSW_DSTAT_CHANNEL_END |
+                        SCSW_DSTAT_DEVICE_END |
+                        SCSW_DSTAT_UNIT_EXCEP;
+    schib->scsw.ctrl &= ~SCSW_ACTL_START_PEND;
+    schib->scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;
+    schib->scsw.ctrl |= SCSW_STCTL_PRIMARY | SCSW_STCTL_SECONDARY |
+                        SCSW_STCTL_STATUS_PEND;
+    schib->scsw.cpa = sch->channel_prog + 8;
+    return -EIO;
+}
+
 static void eckd_set_length_status(EckdCcwDevice *eckd, const CCW1 *ccw,
                                    uint32_t transferred, uint32_t available)
 {
@@ -272,6 +292,7 @@ static int eckd_position(EckdCcwDevice *eckd, uint16_t cylinder,
     eckd->head = head;
     eckd->record = record;
     eckd->positioned = true;
+    eckd->search_count_advance = false;
     eckd->search_index = 0;
     eckd->search_index_seen = false;
     return 0;
@@ -289,23 +310,60 @@ static int eckd_next_track(EckdCcwDevice *eckd)
     return eckd_position(eckd, cylinder, head, 0);
 }
 
+static const CkdImageRecord *eckd_first_data_record(const CkdImage *image)
+{
+    unsigned int i;
+
+    for (i = 0; i < image->record_count; i++) {
+        if (image->records[i].number != 0) {
+            return &image->records[i];
+        }
+    }
+    return NULL;
+}
+
+static const CkdImageRecord *eckd_next_record(const CkdImage *image,
+                                               const CkdImageRecord *record)
+{
+    unsigned int i = record - image->records + 1;
+
+    for (; i < image->record_count; i++) {
+        if (image->records[i].number != 0) {
+            return &image->records[i];
+        }
+    }
+    return NULL;
+}
+
 static const CkdImageRecord *eckd_current_record(EckdCcwDevice *eckd,
                                                  bool multitrack)
 {
     const CkdImageRecord *record;
 
-    record = ckd_image_find_record(&eckd->image, eckd->record);
-    if (!record && multitrack) {
+    record = eckd->record <= UINT8_MAX ?
+             ckd_image_find_record(&eckd->image, eckd->record) : NULL;
+    while (!record && multitrack) {
         /*
          * Outside a Locate Record domain, multitrack operation terminates
          * at the cylinder boundary.  VSE's VTOC search distinguishes this
          * End-of-Cylinder indication from No-Record-Found.
+         *
+         * A CKD track need not contain any user records.  Multitrack read
+         * commands skip such tracks and continue looking for record 1,
+         * just as a real count-field scan (and Hercules ckd_read_count())
+         * does.  Trying only the immediately following track incorrectly
+         * reported No Record Found when z/OS crossed a run of empty tracks.
          */
         if (!eckd->locate_count && eckd->head + 1 >= eckd->image.heads) {
             eckd_unit_check(eckd, 0, SENSE1_END_CYLINDER);
-        } else if (eckd_next_track(eckd) == 0) {
-            eckd->record = 1;
-            record = ckd_image_find_record(&eckd->image, eckd->record);
+            break;
+        }
+        if (eckd_next_track(eckd)) {
+            break;
+        }
+        record = eckd_first_data_record(&eckd->image);
+        if (record) {
+            eckd->record = record->number;
         }
     }
     return record;
@@ -321,9 +379,18 @@ static int eckd_no_record(EckdCcwDevice *eckd)
     return eckd_unit_check(eckd, 0, SENSE1_NO_RECORD);
 }
 
-static void eckd_advance_record(EckdCcwDevice *eckd)
+static void eckd_advance_record(EckdCcwDevice *eckd,
+                                const CkdImageRecord *record)
 {
-    eckd->record++;
+    const CkdImageRecord *next = eckd_next_record(&eckd->image, record);
+
+    /*
+     * Record identifiers are labels, not a physical ordinal.  Advance to the
+     * next count field in track order; CKD tracks commonly leave gaps in the
+     * record numbers.  A value that cannot name a real record makes the next
+     * multitrack operation advance to the following track.
+     */
+    eckd->record = next ? next->number : UINT8_MAX + 1;
     if (eckd->locate_count) {
         eckd->locate_count--;
     }
@@ -429,6 +496,89 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
     buf[241] = 0x80;
     buf[242] = 0x80;
     buf[243] = cdev->sch->devno;
+}
+
+static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
+                                           const uint8_t *buf,
+                                           uint32_t length)
+{
+    uint8_t *data = eckd->rssd_data;
+    char node_id[27];
+
+    eckd->rssd_length = 0;
+    eckd->psf_order = buf[0];
+    eckd->psf_suborder = length > 6 ? buf[6] : 0;
+
+    switch (eckd->psf_order) {
+    case 0x18: /* Prepare for Read Subsystem Data */
+        if (length < 12 || buf[1]) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        switch (eckd->psf_suborder) {
+        case 0x00: /* Storage path status */
+            memset(data, 0, 16);
+            data[0] = 0xc0; /* storage path valid and attached */
+            data[1] = 0x80; /* one logical path configured */
+            eckd->rssd_length = 16;
+            break;
+        case 0x01: /* Subsystem statistics */
+            if (buf[7] != 0x00 && buf[7] != 0xff) {
+                return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+            }
+            eckd->rssd_length = buf[8] ? 192 : 96;
+            memset(data, 0, eckd->rssd_length);
+            data[1] = CCW_DEVICE(eckd)->sch->devno;
+            break;
+        case 0x03: /* Read attention message: no message pending */
+            memset(data, 0, 9);
+            data[1] = 9;
+            memcpy(data + 4, buf + 8, 4);
+            eckd->rssd_length = 9;
+            break;
+        case 0x0e: /* Unit address configuration */
+            memset(data, 0, sizeof(eckd->rssd_data));
+            eckd->rssd_length = sizeof(eckd->rssd_data);
+            break;
+        case 0x1c: /* Query host access */
+            memset(data, 0, 52);
+            data[17] = 0x20;
+            data[19] = 0x01;
+            eckd->rssd_length = 52;
+            break;
+        case 0x41: /* Feature codes */
+            memset(data, 0, 256);
+            eckd->rssd_length = 256;
+            break;
+        default:
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        return 0;
+    case 0xb0: /* Set Interface Identifier */
+        if (length < 4 || (buf[1] & 0xfe)) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        /*
+         * Return the subsystem node descriptor and qualifier records.
+         * This is the same architected compatibility response used by
+         * Hercules for an emulated 2107.
+         */
+        memset(data, 0, 96);
+        stl_be_p(data, 0x00000100);
+        snprintf(node_id, sizeof(node_id), "00%04X   HRCZZ000000000001",
+                 ECKD_CU_TYPE);
+        ebcdic_put(data + 4, node_id, 26);
+        stl_be_p(data + 40, 0x41010000);
+        stl_be_p(data + 44, 0x41010001);
+        stl_be_p(data + 48, 0x41010010);
+        stl_be_p(data + 52, 0x41010011);
+        eckd->rssd_length = (buf[1] & 0x01) ? 32 : 96;
+        return 0;
+    case 0x1b: /* Set Special Intercept Condition */
+    case 0x1d: /* Set Subsystem Characteristics */
+        return 0;
+    default:
+        return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+    }
 }
 
 static int eckd_define_extent(EckdCcwDevice *eckd, const CCW1 *ccw,
@@ -546,9 +696,24 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
         return -EFAULT;
     }
     if (advance) {
-        eckd_advance_record(eckd);
+        eckd_advance_record(eckd, record);
     } else if (eckd->locate_count) {
         eckd->locate_count--;
+    }
+    eckd->search_count_advance = false;
+    /*
+     * A data transfer from a CKD record whose data length is zero completes
+     * with Channel End, Device End and Unit Exception.  In particular,
+     * z/OS uses Read Count followed by Read Data while scanning a VTOC and
+     * relies on Unit Exception to distinguish an empty record from a
+     * successful short transfer.  Returning only CE+DE leaves the full
+     * residual count with normal status and makes IOS retry indefinitely.
+     *
+     * Hercules applies this rule to Read IPL, Read Data, Read Key and Data,
+     * and the count/key/data variants after consuming the record.
+     */
+    if (!record->data_length) {
+        return eckd_unit_exception(eckd);
     }
     return 0;
 }
@@ -602,7 +767,7 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
         eckd->fenced = true;
         return eckd_unit_check(eckd, SENSE_EQUIPMENT_CHECK, 0);
     }
-    eckd_advance_record(eckd);
+    eckd_advance_record(eckd, record);
     return 0;
 }
 
@@ -824,7 +989,6 @@ static int eckd_read_track(EckdCcwDevice *eckd, const CCW1 *ccw)
 static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     EckdCcwDevice *eckd = sch->driver_data;
-    g_autofree uint8_t *response = NULL;
     uint8_t buf[256] = { 0 };
     uint32_t length;
     int ret;
@@ -840,6 +1004,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd->locate_operation = 0;
         eckd->format_active = false;
         eckd->search_match = false;
+        eckd->search_count_advance = false;
         eckd->search_index = 0;
         eckd->search_index_seen = false;
         eckd->write_active = false;
@@ -905,21 +1070,36 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         }
         return 0;
     case CMD_SEARCH_ID_EQ:
+    case CMD_SEARCH_ID_HIGH:
+    case CMD_SEARCH_ID_EQ_HIGH:
+    case CMD_SEARCH_ID_EQ | 0x80:
+    case CMD_SEARCH_ID_HIGH | 0x80:
+    case CMD_SEARCH_ID_EQ_HIGH | 0x80:
         if (ccw.count < 5 || eckd_read_guest(eckd, buf, 5)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
         /*
          * Search ID compares the next physical count field, rather than
          * looking up the requested record directly.  A TIC loop therefore
-         * walks the track.  After the first index crossing it searches the
-         * track once more; a second crossing reports no-record-found.
+         * walks the track.  A non-multitrack search crosses the index once
+         * and searches the same track again; the second crossing reports
+         * no-record-found.  A multitrack search (the high bit in B1/D1/F1)
+         * advances to the next track at the index, as Hercules does in
+         * ckd_read_count().
          */
         if (eckd->search_index >= eckd->image.record_count) {
-            if (eckd->search_index_seen) {
-                return eckd_unit_check(eckd, 0, SENSE1_NO_RECORD);
+            if (ccw.cmd_code & 0x80) {
+                ret = eckd_next_track(eckd);
+                if (ret) {
+                    return ret;
+                }
+            } else {
+                if (eckd->search_index_seen) {
+                    return eckd_unit_check(eckd, 0, SENSE1_NO_RECORD);
+                }
+                eckd->search_index_seen = true;
+                eckd->search_index = 0;
             }
-            eckd->search_index_seen = true;
-            eckd->search_index = 0;
         }
         if (!eckd->image.record_count) {
             return eckd_unit_check(eckd, 0, SENSE1_NO_RECORD);
@@ -928,10 +1108,15 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
             const CkdImageRecord *record =
                 &eckd->image.records[eckd->search_index++];
 
+            int comparison =
+                memcmp(eckd->image.track + record->header_offset, buf, 5);
+            uint8_t operation = ccw.cmd_code & 0x7f;
+
             eckd->search_match =
-                lduw_be_p(buf) == record->cylinder &&
-                lduw_be_p(buf + 2) == record->head &&
-                buf[4] == record->number;
+                (operation == CMD_SEARCH_ID_EQ && comparison == 0) ||
+                (operation == CMD_SEARCH_ID_HIGH && comparison > 0) ||
+                (operation == CMD_SEARCH_ID_EQ_HIGH && comparison >= 0);
+            eckd->search_count_advance = eckd->search_match;
             eckd->record = record->number;
             trace_eckd_search_id(sch->devno, lduw_be_p(buf),
                                  lduw_be_p(buf + 2), buf[4],
@@ -950,11 +1135,32 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     case CMD_SEARCH_KEY_EQ_HIGH | 0x80: {
         bool multitrack = ccw.cmd_code & 0x80;
         uint8_t operation = ccw.cmd_code & 0x7f;
-        const CkdImageRecord *record =
-            eckd_current_record(eckd, multitrack);
+        const CkdImageRecord *record;
         uint32_t compare_length;
         int comparison;
 
+        /*
+         * A non-multitrack SEARCH KEY scans through index and gets one more
+         * revolution of the current track.  Only the second index crossing
+         * reports no-record-found.  This matters for the canonical
+         * READ COUNT / SEARCH KEY / TIC loop: the final READ COUNT leaves
+         * orientation at index, and the following search starts the second
+         * revolution rather than failing immediately.
+         *
+         * Hercules models the same rule with ckdxmark in ckd_read_count().
+         */
+        if (!multitrack && eckd->record > UINT8_MAX) {
+            if (eckd->search_index_seen) {
+                return eckd_unit_check(eckd, 0, SENSE1_NO_RECORD);
+            }
+            eckd->search_index_seen = true;
+            record = eckd_first_data_record(&eckd->image);
+            if (record) {
+                eckd->record = record->number;
+            }
+        } else {
+            record = eckd_current_record(eckd, multitrack);
+        }
         if (!record) {
             return eckd_no_record(eckd);
         }
@@ -979,7 +1185,21 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
                               eckd->head, record->number, comparison,
                               eckd->search_match);
         if (eckd->search_match) {
+            eckd->search_count_advance = true;
             sch->curr_status.scsw.dstat |= SCSW_DSTAT_STAT_MOD;
+        } else {
+            eckd->search_count_advance = false;
+            const CkdImageRecord *next =
+                eckd_next_record(&eckd->image, record);
+
+            /*
+             * SEARCH KEY consumes the key field it compares.  A chained TIC
+             * therefore continues with the next count/key field; retaining
+             * the current record here makes a valid search loop examine the
+             * same key forever.  Keep the matching record selected so a
+             * following READ DATA operates on it.
+             */
+            eckd->record = next ? next->number : UINT8_MAX + 1;
         }
         return 0;
     }
@@ -1012,11 +1232,37 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         const CkdImageRecord *record;
 
         /*
-         * Locate Record leaves the device oriented to the search argument.
-         * Read Count transfers the following count field.
+         * A Read Count leaves the device count-oriented to the record whose
+         * count field it returned.  Search Key and Read Data must therefore
+         * still see that same record.  A subsequent Read Count advances to
+         * the next count field first.
+         *
+         * search_count_advance represents that count/key orientation.
+         * Data-transfer commands clear it after consuming the record, and a
+         * failed Search Key has already selected the following record.
          */
-        eckd->record++;
-        record = ckd_image_find_record(&eckd->image, eckd->record);
+        record = eckd->record <= UINT8_MAX ?
+                 ckd_image_find_record(&eckd->image, eckd->record) : NULL;
+        if (eckd->search_count_advance && record) {
+            eckd_advance_record(eckd, record);
+            record = eckd->record <= UINT8_MAX ?
+                     ckd_image_find_record(&eckd->image, eckd->record) : NULL;
+        }
+        eckd->search_count_advance = false;
+        if (!record && !multitrack && !eckd->search_index_seen) {
+            /*
+             * Reaching index during a non-multitrack count scan starts one
+             * more revolution of the current track.  No-record-found is
+             * reported only on the second index crossing without an
+             * intervening command that resets the index marker.  Hercules
+             * models this with ckdxmark in ckd_read_count().
+             */
+            eckd->search_index_seen = true;
+            record = eckd_first_data_record(&eckd->image);
+            if (record) {
+                eckd->record = record->number;
+            }
+        }
         while (!record && multitrack) {
             /*
              * Read Count requires a user-data count field.  As on Hercules,
@@ -1028,16 +1274,16 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
             if (ret) {
                 return ret;
             }
-            eckd->record = 1;
-            record = ckd_image_find_record(&eckd->image, eckd->record);
+            record = eckd_first_data_record(&eckd->image);
+            if (record) {
+                eckd->record = record->number;
+            }
         }
         if (!record) {
             return eckd_no_record(eckd);
         }
         memcpy(buf, eckd->image.track + record->header_offset, 8);
-        if (eckd->locate_count) {
-            eckd->locate_count--;
-        }
+        eckd->search_count_advance = true;
         return eckd_copy_response(eckd, &ccw, buf, 8);
     }
     case CMD_DIAG_READ_HA:
@@ -1164,17 +1410,15 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         if (length < 2 || eckd_read_guest(eckd, buf, length)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
-        eckd->psf_order = buf[0];
-        eckd->psf_suborder = length > 6 ? buf[6] : 0;
-        eckd->rssd_prepared = eckd->psf_order == 0x18;
-        return 0;
+        return eckd_perform_subsystem_function(eckd, buf, length);
     case CMD_RSSD:
-        if (!eckd->rssd_prepared) {
+        if (!eckd->rssd_length) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
-        eckd->rssd_prepared = false;
-        response = g_malloc0(ccw.count);
-        return eckd_copy_response(eckd, &ccw, response, ccw.count);
+        ret = eckd_copy_response(eckd, &ccw, eckd->rssd_data,
+                                 eckd->rssd_length);
+        eckd->rssd_length = 0;
+        return ret;
     default:
         return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
     }
@@ -1228,7 +1472,7 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     }
     sch->driver_data = eckd;
     cdev->sch = sch;
-    chpid = css_find_virtual_chpid(sch->cssid, ECKD_CHPID_TYPE);
+    chpid = sch->devno >> 8;
     if (chpid > MAX_CHPID) {
         error_setg(&local_err, "No available CHPID for eckd-ccw");
         goto fail_sch;

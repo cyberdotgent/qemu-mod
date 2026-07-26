@@ -18,8 +18,8 @@
 #include "hw/s390x/ccw-device.h"
 #include "qom/object.h"
 
-#define EMULATED_CCW_3270_CU_TYPE 0x3270
-#define EMULATED_CCW_3270_CHPID_TYPE 0x1a
+#define EMULATED_CCW_3270_CU_TYPE 0x3274
+#define EMULATED_CCW_3270_CHPID_TYPE 0x1f
 #define EMULATED_CCW_3270_CU_MODEL 0x1d
 #define EMULATED_CCW_3270_DEV_TYPE 0x3278
 #define EMULATED_CCW_3270_DEV_MODEL 0x02
@@ -70,6 +70,11 @@ OBJECT_DECLARE_TYPE(EmulatedCcw3270Device, EmulatedCcw3270Class, EMULATED_CCW_32
 
 struct EmulatedCcw3270Device {
     CcwDevice parent_obj;
+    uint16_t chpid;
+    uint16_t cu_type;
+    uint16_t dev_type;
+    uint8_t cu_model;
+    uint8_t dev_model;
 };
 
 struct EmulatedCcw3270Class {

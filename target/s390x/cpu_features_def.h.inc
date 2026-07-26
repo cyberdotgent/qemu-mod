@@ -78,6 +78,7 @@ DEF_FEAT(TIME_SLICE_INSTRUMENTATION, "tsi", STFL, 60, "Time-slice Instrumentatio
 DEF_FEAT(MISC_INSTRUCTION_EXT3, "minste3", STFL, 61, "Miscellaneous-Instruction-Extensions Facility 3")
 DEF_FEAT(RUNTIME_INSTRUMENTATION, "ri", STFL, 64, "CPU runtime-instrumentation facility")
 DEF_FEAT(AP_QUEUE_INTERRUPT_CONTROL, "apqi", STFL, 65, "AP-Queue interruption facility")
+DEF_FEAT(RESET_REFERENCE_BITS_MULT, "rrbm", STFL, 66, "Reset-reference-bits-multiple facility")
 DEF_FEAT(ZPCI, "zpci", STFL, 69, "z/PCI facility")
 DEF_FEAT(ADAPTER_EVENT_NOTIFICATION, "aen", STFL, 71, "General-purpose-adapter-event-notification facility")
 DEF_FEAT(ADAPTER_INT_SUPPRESSION, "ais", STFL, 72, "General-purpose-adapter-interruption-suppression facility")

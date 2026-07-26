@@ -19,6 +19,20 @@
 #include "hw/s390x/3270-ccw.h"
 
 #define TERMINAL3270_AUTO_DEVNO 0x0700
+#define TERMINAL3270_AUTO_CHPID 0xffff
+
+static const Property emulated_ccw_3270_properties[] = {
+    DEFINE_PROP_UINT16("chpid", EmulatedCcw3270Device, chpid,
+                       TERMINAL3270_AUTO_CHPID),
+    DEFINE_PROP_UINT16("control-unit-type", EmulatedCcw3270Device, cu_type,
+                       EMULATED_CCW_3270_CU_TYPE),
+    DEFINE_PROP_UINT8("control-unit-model", EmulatedCcw3270Device, cu_model,
+                      EMULATED_CCW_3270_CU_MODEL),
+    DEFINE_PROP_UINT16("device-type", EmulatedCcw3270Device, dev_type,
+                       EMULATED_CCW_3270_DEV_TYPE),
+    DEFINE_PROP_UINT8("device-model", EmulatedCcw3270Device, dev_model,
+                      EMULATED_CCW_3270_DEV_MODEL),
+};
 
 /* Handle READ ccw commands from guest */
 static int handle_payload_3270_read(EmulatedCcw3270Device *dev, CCW1 *ccw)
@@ -155,8 +169,11 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     sch->driver_data = dev;
     cdev->sch = sch;
     /* All emulated 3270 devices in a CSS share their virtual channel path. */
-    chpid = css_find_virtual_chpid(sch->cssid,
-                                   EMULATED_CCW_3270_CHPID_TYPE);
+    chpid = dev->chpid;
+    if (chpid == TERMINAL3270_AUTO_CHPID) {
+        chpid = css_find_virtual_chpid(sch->cssid,
+                                       EMULATED_CCW_3270_CHPID_TYPE);
+    }
 
     if (chpid > MAX_CHPID) {
         error_setg(&err, "No available chpid to use.");
@@ -164,10 +181,10 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     }
 
     sch->id.reserved = 0xff;
-    sch->id.cu_type = EMULATED_CCW_3270_CU_TYPE;
-    sch->id.cu_model = EMULATED_CCW_3270_CU_MODEL;
-    sch->id.dev_type = EMULATED_CCW_3270_DEV_TYPE;
-    sch->id.dev_model = EMULATED_CCW_3270_DEV_MODEL;
+    sch->id.cu_type = dev->cu_type;
+    sch->id.cu_model = dev->cu_model;
+    sch->id.dev_type = dev->dev_type;
+    sch->id.dev_model = dev->dev_model;
     css_sch_build_virtual_schib(sch, (uint8_t)chpid,
                                 EMULATED_CCW_3270_CHPID_TYPE);
     sch->do_subchannel_work = do_subchannel_work_virtual;
@@ -202,6 +219,7 @@ static void emulated_ccw_3270_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = emulated_ccw_3270_realize;
     dc->hotpluggable = false;
+    device_class_set_props(dc, emulated_ccw_3270_properties);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 

@@ -13,12 +13,55 @@
     .globl _start
 _start:
     lctlg %c0,%c7,initial_crs
+    lctlg %c13,%c13,initial_cr13
     lctlg %c14,%c14,initial_cr14
     lpswe dat_psw
 
 start_dat:
-    /* In z/Architecture ASF is enabled regardless of the ESA/390 CR0 bit. */
+    /*
+     * IAC's mode number uses AR * 2 + SPACE, not the physical ordering
+     * of the two ASC bits in the PSW.  Verify all four SAC/IAC round trips.
+     */
+    sac 0
+    iac %r4
+    ipm %r5
+    nilf %r4,0xf00
+    ltgr %r4,%r4
+    jne failure
+    srlg %r5,%r5,28
+    ltgr %r5,%r5
+    jne failure
+
+    sac 0x100
+    iac %r4
+    ipm %r5
+    nilf %r4,0xf00
+    cghi %r4,0x100
+    jne failure
+    srlg %r5,%r5,28
+    cghi %r5,1
+    jne failure
+
     sac 0x200
+    iac %r4
+    ipm %r5
+    nilf %r4,0xf00
+    cghi %r4,0x200
+    jne failure
+    srlg %r5,%r5,28
+    cghi %r5,2
+    jne failure
+
+    sac 0x300
+    iac %r4
+    ipm %r5
+    nilf %r4,0xf00
+    cghi %r4,0x300
+    jne failure
+    srlg %r5,%r5,28
+    cghi %r5,3
+    jne failure
+
     sac 0
 
     /* EPAR/ESAR replace the low word and preserve the high word. */
@@ -148,6 +191,8 @@ initial_crs:
     .quad 0x20                     /* CR7: real-space ASCE */
 initial_cr14:
     .quad 0x0000000000080004       /* ASN translation + AFT origin */
+initial_cr13:
+    .quad 0x20                     /* CR13: real-space ASCE */
 dat_psw:
     .quad DAT_PRIMARY_64,start_dat
 success_psw:

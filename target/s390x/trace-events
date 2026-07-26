@@ -3,9 +3,11 @@
 # ioinst.c
 ioinst(const char *insn) "IOINST: %s"
 ioinst_sch_id(const char *insn, int cssid, int ssid, int schid) "IOINST: %s (%x.%x.%04x)"
+ioinst_ssch(uint16_t devno, uint64_t psw_addr) "IOINST: SSCH devno=0x%04x psw=0x%" PRIx64
 ioinst_stsch(int cssid, int ssid, int schid, int cc, uint16_t flags, uint16_t devno, uint32_t chars) "IOINST: stsch (%x.%x.%04x) cc=%d flags=0x%04x devno=0x%04x chars=0x%08x"
+ioinst_stcps(uint64_t addr, uint32_t active0) "IOINST: stcps addr=0x%" PRIx64 " active[0..3]=0x%08x"
 ioinst_chp_id(const char *insn, int cssid, int chpid) "IOINST: %s (%x.%02x)"
-ioinst_chsc_cmd(uint16_t cmd, uint16_t len) "IOINST: chsc command 0x%04x, len 0x%04x"
+ioinst_chsc_cmd(uint16_t cmd, uint16_t len, uint32_t param0, uint32_t param1) "IOINST: chsc command 0x%04x, len 0x%04x, param0 0x%08x, param1 0x%08x"
 
 # cpu-system.c
 cpu_set_state(int cpu_index, uint8_t state) "setting cpu %d state to %" PRIu8

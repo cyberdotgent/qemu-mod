@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "system/address-spaces.h"
 #include "cpu.h"
 #include "s390x-internal.h"
@@ -58,19 +59,16 @@
 #define ASTE_AUTH_LENGTH   0x0000fff0U
 
 static void trigger_access_exception(CPUS390XState *env, uint32_t type,
-                                     uint64_t tec)
+                                     uint64_t tec, uint8_t arn)
 {
     S390CPU *cpu = env_archcpu(env);
 
     if (kvm_enabled()) {
         kvm_s390_access_exception(cpu, type, tec);
     } else {
-        CPUState *cs = env_cpu(env);
-        if (type != PGM_ADDRESSING) {
-            address_space_stq_be(cs->as,
-                                 env->psa + offsetof(LowCore, trans_exc_code),
-                                 tec, MEMTXATTRS_UNSPECIFIED, NULL);
-        }
+        env->tlb_fill_exc = type;
+        env->tlb_fill_tec = tec;
+        env->tlb_fill_arn = arn;
         trigger_pgm_exception(env, type);
     }
 }
@@ -705,12 +703,16 @@ int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
  * to absolute addresses. This function is used for TCG and old KVM without
  * the MEMOP interface.
  */
-static int translate_pages(S390CPU *cpu, vaddr addr, int nr_pages,
+static int translate_pages(S390CPU *cpu, vaddr addr, uint8_t ar, int nr_pages,
                            hwaddr *pages, bool is_write, uint64_t *tec)
 {
     uint64_t asc = cpu->env.psw.mask & PSW_MASK_ASC;
     CPUS390XState *env = &cpu->env;
     int ret, i, pflags;
+
+    if (asc == PSW_ASC_ACCREG) {
+        asc |= ar;
+    }
 
     for (i = 0; i < nr_pages; i++) {
         ret = mmu_translate(env, addr, is_write, asc, &pages[i], &pflags, tec,
@@ -757,6 +759,8 @@ int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
                          int len, bool is_write)
 {
     const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    uint8_t arn = (cpu->env.psw.mask & PSW_MASK_ASC) == PSW_ASC_ACCREG ?
+                  ar : 0;
     int currlen, nr_pages, i;
     hwaddr *pages;
     uint64_t tec;
@@ -773,7 +777,7 @@ int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
                + 1;
     pages = g_malloc(nr_pages * sizeof(*pages));
 
-    ret = translate_pages(cpu, laddr, nr_pages, pages, is_write, &tec);
+    ret = translate_pages(cpu, laddr, ar, nr_pages, pages, is_write, &tec);
     if (ret == 0 && hostbuf != NULL) {
         AddressSpace *as = CPU(cpu)->as;
 
@@ -794,7 +798,7 @@ int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
         }
     }
     if (ret) {
-        trigger_access_exception(&cpu->env, ret, tec);
+        trigger_access_exception(&cpu->env, ret, tec, arn);
     }
 
     g_free(pages);

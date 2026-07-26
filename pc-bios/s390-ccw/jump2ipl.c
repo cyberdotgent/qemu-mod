@@ -16,6 +16,7 @@
 #define RESET_PSW ((uint64_t)&jump_to_IPL_addr | RESET_PSW_MASK)
 
 static uint64_t *reset_psw = 0, save_psw, ipl_continue;
+static bool ipl_esa_mode;
 
 void write_reset_psw(uint64_t psw)
 {
@@ -24,12 +25,44 @@ void write_reset_psw(uint64_t psw)
 
 static void jump_to_IPL_addr(void)
 {
-    __attribute__((noreturn)) void (*ipl)(void) = (void *)ipl_continue;
+    /*
+     * DIAG 308 load-normal reset disables all subchannels.  A real IPL
+     * operation enables the IPL subchannel, and loaded programs rely on that
+     * architectural state.
+     */
+    enable_ipl_subchannel();
 
     /* Restore reset PSW */
     write_reset_psw(save_psw);
 
-    ipl();
+    if (ipl_esa_mode) {
+        register unsigned long r1 asm("1") = 0;
+        register unsigned long r3 asm("3") = 0;
+
+        /*
+         * A classic Read IPL operation enters its medium-supplied PSW in
+         * ESA/390 architecture mode.  CZAM itself runs in z/Architecture,
+         * so make the architected transition at the last possible point,
+         * after the load-normal reset and before entering guest code.
+         */
+        asm volatile("sigp %0,%1,0x12"
+                     : "+d" (r1)
+                     : "d" (r3)
+                     : "cc", "memory");
+    }
+
+    if (ipl_continue) {
+        __attribute__((noreturn)) void (*ipl)(void) = (void *)ipl_continue;
+
+        ipl();
+    }
+
+    /*
+     * A zero continuation means that the medium supplied an IPL PSW at
+     * absolute zero.  It has just been restored above.
+     */
+    asm volatile("lpsw 0" : : : "memory");
+    __builtin_unreachable();
     /* should not return */
 }
 
@@ -56,15 +89,11 @@ int jump_to_IPL_code(uint64_t address)
      * content of non-BIOS memory after we loaded the guest, so we
      * save the original content and restore it in jump_to_IPL_2.
      */
-    if (address) {
-        save_psw = *reset_psw;
-        write_reset_psw(RESET_PSW);
-        ipl_continue = address;
-    }
-    debug_print_int("set IPL addr to", address ?: *reset_psw & PSW_MASK_SHORT_ADDR);
-
-    /* Ensure the guest output starts fresh */
-    printf("\n");
+    save_psw = *reset_psw;
+    write_reset_psw(RESET_PSW);
+    ipl_continue = address;
+    debug_print_int("set IPL addr to",
+                    address ?: save_psw & PSW_MASK_SHORT_ADDR);
 
     /*
      * HACK ALERT.
@@ -102,4 +131,10 @@ void jump_to_low_kernel(void)
 
     /* No other option left, so use the Linux kernel start address */
     jump_to_IPL_code(KERN_IMAGE_START);
+}
+
+void jump_to_low_kernel_esa(void)
+{
+    ipl_esa_mode = true;
+    jump_to_low_kernel();
 }

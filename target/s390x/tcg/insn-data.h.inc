@@ -493,8 +493,8 @@
     D(0xc408, LGRL,    RIL_b, GIE, 0, ri2, r1, 0, ld64, 0, MO_ALIGN)
     D(0xc40c, LGFRL,   RIL_b, GIE, 0, ri2, r1, 0, ld32s, 0, MO_ALIGN)
 /* LOAD ADDRESS */
-    C(0x4100, LA,      RX_a,  Z,   0, a2, 0, r1, mov2, 0)
-    C(0xe371, LAY,     RXY_a, LD,  0, a2, 0, r1, mov2, 0)
+    C(0x4100, LA,      RX_a,  Z,   0, a2, 0, r1_la, mov2, 0)
+    C(0xe371, LAY,     RXY_a, LD,  0, a2, 0, r1_la, mov2, 0)
 /* LOAD ADDRESS EXTENDED */
     C(0x5100, LAE,     RX_a,  Z,   0, a2, 0, r1, mov2e, 0)
     C(0xe375, LAEY,    RXY_a, GIE, 0, a2, 0, r1, mov2e, 0)
@@ -1049,6 +1049,16 @@
     F(0xed11, TCDB,    RXE,   Z,   f1, a2, 0, 0, tcdb, 0, IF_BFP)
     F(0xed12, TCXB,    RXE,   Z,   x1, a2, 0, 0, tcxb, 0, IF_BFP)
 
+/* CONVERT BETWEEN ZONED DECIMAL AND DECIMAL FLOATING POINT */
+    F(0xeda8, CZDT,    RSL_b, DFPZ, 0, 0, 0, 0, czdt, 0, IF_DFP)
+    F(0xeda9, CZXT,    RSL_b, DFPZ, 0, 0, 0, 0, czxt, 0, IF_DFP)
+    F(0xedaa, CDZT,    RSL_b, DFPZ, 0, 0, 0, 0, cdzt, 0, IF_DFP)
+    F(0xedab, CXZT,    RSL_b, DFPZ, 0, 0, 0, 0, cxzt, 0, IF_DFP)
+    F(0xedac, CPDT,    RSL_b, DFPP, 0, 0, 0, 0, cpdt, 0, IF_DFP)
+    F(0xedad, CPXT,    RSL_b, DFPP, 0, 0, 0, 0, cpxt, 0, IF_DFP)
+    F(0xedae, CDPT,    RSL_b, DFPP, 0, 0, 0, 0, cdpt, 0, IF_DFP)
+    F(0xedaf, CXPT,    RSL_b, DFPP, 0, 0, 0, 0, cxpt, 0, IF_DFP)
+
 /* TEST DECIMAL */
     C(0xebc0, TP,      RSL,   E2,  la1, 0, 0, 0, tp, 0)
 
@@ -1068,6 +1078,10 @@
     C(0xd000, TRTR,    SS_a,  ETF3, la1, a2, 0, 0, trtr, 0)
 /* TRANSLATE EXTENDED */
     C(0xb2a5, TRE,     RRE,   Z,   0, r2, r1_P, 0, tre, 0)
+/* TRANSLATE AND TEST EXTENDED */
+    D(0xb9bf, TRTE,    RRF_c, PARSE, 0, 0, 0, 0, trte, 0, 0)
+/* TRANSLATE AND TEST REVERSE EXTENDED */
+    D(0xb9bd, TRTRE,   RRF_c, PARSE, 0, 0, 0, 0, trte, 0, 1)
 
 /* TRANSLATE ONE TO ONE */
     C(0xb993, TROO,    RRF_c, E2,  0, 0, 0, 0, trXX, 0)
@@ -1428,10 +1442,27 @@
 /* EXTRACT PRIMARY/SECONDARY ASN */
     D(0xb226, EPAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 4)
     D(0xb227, ESAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 3)
+/* EXTRACT AND SET EXTENDED AUTHORITY */
+    F(0xb99d, ESEA,    RRE,   Z,   0, 0, 0, 0, esea, 0, IF_PRIV)
 /* SET SECONDARY ASN */
     C(0xb225, SSAR,    RRE,   Z,   0, 0, 0, 0, ssar, 0)
 /* PROGRAM TRANSFER */
     C(0xb228, PT,      RRE,   Z,   0, 0, 0, 0, pt, 0)
+/* PROCESS QUEUE AUXILIARY PROCESSOR */
+    F(0xb2af, PQAP,    RRE,   Z,   0, 0, 0, 0, pqap, 0, IF_PRIV)
+/* SET VECTOR SUMMARY */
+    F(0xb265, SVS,     RRE,   Z,   r1p1, 0, 0, 0, svs, 0, IF_PRIV)
+/*
+ * The B264 firmware instruction submits a request to a coupling facility.
+ * TCG supports its operand-free local-serialization form.
+ */
+    C(0xb264, CFS,     RRE,   Z,   0, 0, 0, 0, cfs, 0)
+/* TRANSACTION BEGIN CONSTRAINED */
+    F(0xe561, TBEGINC, SIL, CTE,   0, 0, 0, 0, tbeginc, 0, 0)
+/* TRANSACTION END */
+    F(0xb2f8, TEND,      S,  TE,   0, 0, 0, 0, tend, 0, 0)
+/* PERFORM FLOATING-POINT OPERATION */
+    C(0x010a, PFPO,    E,     PFPO, 0, 0, 0, 0, pfpo, 0)
 /* PROGRAM RETURN */
     C(0x0101, PR,      E,     Z,   0, 0, 0, 0, pr, 0)
 /* PROGRAM CALL */
@@ -1454,8 +1485,13 @@
     C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
 /* INSERT STORAGE KEY EXTENDED */
     F(0xb229, ISKE,    RRE,   Z,   0, r2_o, new, r1_8, iske, 0, IF_PRIV)
+/* INSERT REFERENCE BITS MULTIPLE */
+    F(0xb9ac, IRBM,    RRE,   IRBM, 0, r2_o, new, r1, irbm, 0, IF_PRIV)
 /* INSERT VIRTUAL STORAGE KEY */
     F(0xb223, IVSK,    RRE,   Z,   0, r2_o, new, r1_8, ivsk, 0, 0)
+/* LOAD ADDRESS SPACE PARAMETERS */
+    F(0xe500, LASP,    SSE,   Z,   la1, a2, 0, 0, lasp, 0, IF_PRIV)
+    F(0xe502, STRAG,   SSE,   Z,   la1, a2, 0, 0, strag, 0, IF_PRIV)
 /* INVALIDATE DAT TABLE ENTRY */
     F(0xb98e, IPDE,    RRF_b, Z,   r1_o, r2_o, 0, 0, idte, 0, IF_PRIV)
 /* BRANCH AND STACK */
@@ -1495,6 +1531,8 @@
     F(0xb9af, PFMF,    RRE,   EDAT, 0, 0, 0, 0, pfmf, 0, IF_PRIV)
 /* RESET REFERENCE BIT EXTENDED */
     F(0xb22a, RRBE,    RRE,   Z,   0, r2_o, 0, 0, rrbe, 0, IF_PRIV)
+/* RESET REFERENCE BITS MULTIPLE */
+    F(0xb9ae, RRBM,    RRE,   RRBM, 0, r2_o, new, r1, rrbm, 0, IF_PRIV)
 /* SERVICE CALL LOGICAL PROCESSOR (PV hypercall) */
     F(0xb220, SERVC,   RRE,   Z,   r1_o, r2_o, 0, 0, servc, 0, IF_PRIV | IF_IO)
 /* SET ADDRESS SPACE CONTROL */
@@ -1546,6 +1584,8 @@
     F(0xb22c, TB,      RRE,   Z,   0, r2_o, 0, 0, testblock, 0, IF_PRIV)
 /* TEST PROTECTION */
     C(0xe501, TPROT,   SSE,   Z,   la1, a2, 0, 0, tprot, 0)
+/* TRACE */
+    F(0x9900, TRACE,   RS_a,  Z,   0, a2, 0, 0, trace, 0, IF_PRIV)
 
 /* CCW I/O Instructions */
     F(0xb276, XSCH,    S,     Z,   0, 0, 0, 0, xsch, 0, IF_PRIV | IF_IO)

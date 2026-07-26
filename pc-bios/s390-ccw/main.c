@@ -50,9 +50,33 @@ void write_subsystem_identification(void)
     lowcore->io_int_parm = 0;
 }
 
+/*
+ * A load-normal reset disables all subchannels.  The architectural IPL
+ * operation leaves the selected IPL subchannel enabled, so restore that
+ * state after the reset and before entering the loaded program.
+ */
+void enable_ipl_subchannel(void)
+{
+    if (cutype == CU_TYPE_VIRTIO && virtio_get_device_type() == VIRTIO_ID_NET) {
+        enable_subchannel(net_schid);
+    } else {
+        enable_subchannel(blk_schid);
+    }
+}
+
 void write_iplb_location(void)
 {
-    if (virtio_is_supported(virtio_get_device()) &&
+    /*
+     * Do not call virtio_is_supported() here.  That function issues a
+     * SENSE ID CCW, but this runs after the IPL channel program has loaded
+     * the guest lowcore.  Waiting for that I/O installs the firmware's
+     * interruption PSW over the guest's new-I/O PSW.
+     *
+     * find_boot_device() has already established both the control-unit type
+     * and, for virtio devices, the device type.  Use that cached result so
+     * the handoff remains free of channel I/O.
+     */
+    if (cutype == CU_TYPE_VIRTIO &&
         virtio_get_device_type() != VIRTIO_ID_NET) {
         lowcore->ptr_iplb = ptr2u32(&iplb);
     }

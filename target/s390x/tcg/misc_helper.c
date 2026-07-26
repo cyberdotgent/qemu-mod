@@ -56,6 +56,126 @@
 #define HELPER_LOG(x...)
 #endif
 
+uint64_t HELPER(ecag)(uint64_t address)
+{
+    unsigned int ai = extract64(address, 4, 4);
+    unsigned int li = extract64(address, 1, 3);
+
+    /* Address bits 40-55 are reserved. */
+    if (address & 0xffff00) {
+        return -1;
+    }
+
+    switch (ai) {
+    case 0:
+        /*
+         * Topology summary: cache level 0 is private to this CPU and
+         * cache levels 1-7 are not implemented.
+         */
+        return 0x0400000000000000ULL;
+    case 1:
+        /* Cache-line size for the implemented level 0 cache. */
+        return li == 0 ? 256 : -1;
+    case 2:
+        /* Fictitious 512 KiB total size for the level 0 cache. */
+        return li == 0 ? 256 * 2048 : -1;
+    default:
+        return -1;
+    }
+}
+
+uint32_t HELPER(pfpo)(CPUS390XState *env)
+{
+    uint32_t control = env->regs[0];
+    bool test = control & 0x80000000;
+    unsigned int operation_type = extract32(control, 24, 7);
+    unsigned int rounding_method = extract32(control, 0, 4);
+
+    /*
+     * PFPO permits a machine to implement a subset of the conversion
+     * operations.  TCG currently implements the test-operation interface
+     * and reports every conversion operation as unsupported.
+     */
+    if (operation_type != 1 ||
+        (rounding_method >= 2 && rounding_method <= 7)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+
+    env->regs[1] = deposit64(env->regs[1], 0, 32, 0);
+    if (test) {
+        return 3;
+    }
+
+    tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+}
+
+uint32_t HELPER(svs)(CPUS390XState *env, uint32_t r1)
+{
+    /*
+     * SVS manages the coupling-facility list-notification summary state.
+     * QEMU does not provide list-notification vectors, so the only global
+     * summary state it can expose is the inactive state.  Setting or
+     * resetting that state therefore completes immediately.
+     */
+    switch ((uint32_t)env->regs[1]) {
+    case 1:                         /* set global summary */
+        return 0;
+    case 3:                         /* reset global summary */
+        env->regs[r1 + 1] = 0;      /* no active local summaries */
+        return 0;
+    default:
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+}
+
+/*
+ * In a one-vCPU TCG machine a constrained transaction cannot conflict with
+ * another CPU.  Keep asynchronous interruptions pending until TEND, making
+ * the permitted constrained instruction sequence indivisible.  Stores can
+ * therefore be made directly: the architecturally guaranteed completion of
+ * a constrained transaction means that no rollback path is needed in this
+ * execution mode.
+ */
+uint32_t HELPER(tbeginc)(CPUS390XState *env, uint32_t b1, uint32_t i2)
+{
+    if (!(env->cregs[0] & CR0_TRANSACTIONAL_EXE)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if (b1 != 0) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+    if (env->tx_depth != 0) {
+        /*
+         * A constrained transaction cannot be nested in another
+         * constrained transaction.  The full abort diagnostic is not
+         * reachable in the uniprocessor completion path.
+         */
+        env->tx_depth = 0;
+        env->tx_constrained = false;
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+
+    env->tx_depth = 1;
+    env->tx_constrained = true;
+    return 0;
+}
+
+uint32_t HELPER(tend)(CPUS390XState *env)
+{
+    if (!(env->cregs[0] & CR0_TRANSACTIONAL_EXE)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if (env->tx_depth == 0) {
+        return 2;
+    }
+
+    env->tx_depth--;
+    if (env->tx_depth == 0) {
+        env->tx_constrained = false;
+    }
+    return 0;
+}
+
 /* Raise an exception statically from a TB.  */
 void HELPER(exception)(CPUS390XState *env, uint32_t excp)
 {
@@ -106,13 +226,31 @@ uint64_t HELPER(stck)(CPUS390XState *env)
 /* SCLP service call */
 uint32_t HELPER(servc)(CPUS390XState *env, uint64_t r1, uint64_t r2)
 {
+    /*
+     * SERVC operands are the low 32 bits of the selected general registers.
+     * In particular, ESA/390 callers are free to retain unrelated values in
+     * the high halves.  Passing the full 64-bit SCCB register to the memory
+     * layer turns those values into a spurious addressing exception.
+     */
+    uint32_t sccb = r1;
+    uint32_t code = r2;
+
     bql_lock();
-    int r = sclp_service_call(env_archcpu(env), r1, r2);
+    int r = sclp_service_call(env_archcpu(env), sccb, code);
     bql_unlock();
     if (r < 0) {
         tcg_s390_program_interrupt(env, -r, GETPC());
     }
     return r;
+}
+
+void HELPER(esea)(CPUS390XState *env, uint32_t r1)
+{
+    uint16_t new_eax = extract64(env->regs[r1], 0, 16);
+    uint16_t old_eax = extract64(env->cregs[8], 16, 16);
+
+    env->regs[r1] = deposit64(env->regs[r1], 16, 16, old_eax);
+    env->cregs[8] = deposit64(env->cregs[8], 16, 16, new_eax);
 }
 
 void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
@@ -131,6 +269,13 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
 #endif /* CONFIG_S390_CCW_VIRTIO */
     case 0x44:
         /* yield */
+        r = 0;
+        break;
+    case 0x80:
+        /* MSSF service-processor call */
+        bql_lock();
+        handle_diag_080(env, r1, r3, GETPC());
+        bql_unlock();
         r = 0;
         break;
     case 0x204:
@@ -541,6 +686,15 @@ void HELPER(ssch)(CPUS390XState *env, uint64_t r1, uint64_t inst)
     S390CPU *cpu = env_archcpu(env);
     bql_lock();
     ioinst_handle_ssch(cpu, r1, inst >> 16, GETPC());
+    bql_unlock();
+}
+
+void HELPER(stcps)(CPUS390XState *env, uint64_t inst)
+{
+    S390CPU *cpu = env_archcpu(env);
+
+    bql_lock();
+    ioinst_handle_stcps(cpu, inst >> 16, GETPC());
     bql_unlock();
 }
 

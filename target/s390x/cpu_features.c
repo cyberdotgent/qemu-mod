@@ -79,6 +79,28 @@ void s390_fill_feat_block(const S390FeatBitmap features, S390FeatType type,
         break;
     case S390_FEAT_TYPE_SCLP_CONF_CHAR:
         if (test_bit(S390_FEAT_ZARCH, features)) {
+            /*
+             * Baseline configuration characteristics implemented by QEMU.
+             * These predate STFLE and are reported in the original six-byte
+             * SCLP configuration-characteristics field.
+             */
+            set_be_bit(2, data);  /* Suppression on protection */
+            set_be_bit(4, data);  /* Store-channel-subsystem characteristics */
+            set_be_bit(5, data);  /* MVPG for all guests */
+            set_be_bit(22, data); /* Called-space identification */
+            set_be_bit(23, data); /* Checksum instruction */
+            set_be_bit(24, data); /* Resume program */
+            set_be_bit(25, data); /* Perform locked operation */
+            set_be_bit(27, data); /* Immediate and relative instructions */
+            set_be_bit(28, data); /* Compare and move extended */
+            set_be_bit(29, data); /* Branch and set authority */
+            set_be_bit(30, data); /* Extended floating point */
+            set_be_bit(31, data); /* Extended logical computation */
+            set_be_bit(32, data); /* Extended TOD clock */
+            set_be_bit(33, data); /* Extended translation facility 1 */
+            set_be_bit(34, data); /* Load reversed */
+            set_be_bit(35, data); /* Extended translation facility 2 */
+            set_be_bit(36, data); /* Store system information */
             set_be_bit(47, data); /* ESAME mode is installed. */
         }
         break;

@@ -14,8 +14,11 @@
 #include "exec/target_page.h"
 #include "exec/cputlb.h"
 #include "system/memory.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/helper-retaddr.h"
+#include "hw/s390x/tod.h"
+#include "qapi/error.h"
 
 #ifndef CONFIG_USER_ONLY
 
@@ -119,6 +122,59 @@ static int linkage_trace_store(CPUS390XState *env, const void *data,
     env->cregs[12] = (env->cregs[12] & ~CR12_TRACE_ENTRY_MASK) |
                      ((raddr + len) & CR12_TRACE_ENTRY_MASK);
     return 0;
+}
+
+void HELPER(trace)(CPUS390XState *env, uint32_t r1, uint32_t r3,
+                   uint64_t address, uint32_t mmu_idx)
+{
+    uint8_t entry[76] = { 0 };
+    S390TODState *td;
+    S390TODClass *tdc;
+    S390TOD tod;
+    uint32_t operand;
+    unsigned int n;
+    unsigned int i;
+    int exc;
+
+    if (address & 3) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+    if (!(env->cregs[12] & CR12_EXPLICIT_TRACE)) {
+        return;
+    }
+
+    operand = cpu_ldl_be_mmuidx_ra(env, address, mmu_idx, GETPC());
+    if (operand & 0x80000000) {
+        return;
+    }
+
+    n = (r3 - r1) & 15;
+    /*
+     * TRACE reserves enough room for its maximum-size entry before it
+     * forms the variable-size register list.  The trace-table exception
+     * therefore depends on the 76-byte maximum, not on the shorter entry
+     * that may ultimately be committed.
+     */
+    if (((env->cregs[12] & CR12_TRACE_ENTRY_MASK) & TARGET_PAGE_MASK) !=
+        (((env->cregs[12] & CR12_TRACE_ENTRY_MASK) + sizeof(entry) - 1) &
+         TARGET_PAGE_MASK)) {
+        tcg_s390_program_interrupt(env, PGM_TRACE_TABLE, GETPC());
+    }
+
+    td = s390_get_todstate();
+    tdc = S390_TOD_GET_CLASS(td);
+    tdc->get(td, &tod, &error_abort);
+    stq_be_p(entry, ((uint64_t)(0x70 | n) << 56) |
+                    (tod.low & 0x0000ffffffffffffULL));
+    stl_be_p(entry + 8, operand);
+    for (i = 0; i <= n; i++) {
+        stl_be_p(entry + 12 + i * 4, env->regs[(r1 + i) & 15]);
+    }
+
+    exc = linkage_trace_store(env, entry, 12 + (n + 1) * 4);
+    if (exc) {
+        tcg_s390_program_interrupt(env, exc, GETPC());
+    }
 }
 
 static int linkage_real_write(CPUS390XState *env, uint64_t raddr,
@@ -252,6 +308,159 @@ void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
     env->cregs[7] = new_sasce;
     env->cregs[12] = new_cr12;
     tlb_flush(env_cpu(env));
+}
+
+uint32_t HELPER(lasp)(CPUS390XState *env, uint64_t addr, uint64_t function,
+                      uint32_t mmu_idx)
+{
+    uintptr_t ra = GETPC();
+    uint64_t first;
+    uint64_t second = 0;
+    uint64_t new_pasce = env->cregs[1];
+    uint64_t new_sasce = env->cregs[7];
+    uint32_t new_pasteo = env->cregs[5];
+    uint32_t new_pastein = 0;
+    uint32_t new_sastein = 0;
+    uint32_t designated_pastein = 0;
+    uint32_t designated_sastein = 0;
+    uint16_t designated_pkm;
+    uint16_t designated_sasn;
+    uint16_t designated_ax;
+    uint16_t designated_pasn;
+    uint16_t new_ax;
+    uint16_t current_pasn = env->cregs[4];
+    bool force_translation = function & 4;
+    bool use_designated_ax = function & 2;
+    bool suppress_sasn_authorization = function & 1;
+    bool reuse = s390_has_feat(S390_FEAT_ASN_LX_REUSE) &&
+                 (env->cregs[0] & CR0_ASN_LX_REUSE);
+    S390ASTE paste;
+    S390ASTE saste;
+    int exc;
+
+    if (!(env->cregs[14] & CR14_ASN_TRANSLATION)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, ra);
+    }
+    if (addr & 7) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+
+    first = cpu_ldq_be_mmuidx_ra(env, addr, mmu_idx, ra);
+    if (reuse) {
+        second = cpu_ldq_be_mmuidx_ra(env, addr + 8, mmu_idx, ra);
+        designated_sastein = first >> 32;
+        designated_pkm = first >> 16;
+        designated_sasn = first;
+        designated_pastein = second >> 32;
+        designated_ax = second >> 16;
+        designated_pasn = second;
+    } else {
+        designated_pkm = first >> 48;
+        designated_sasn = first >> 32;
+        designated_ax = first >> 16;
+        designated_pasn = first;
+    }
+
+    if (force_translation || designated_pasn != current_pasn) {
+        exc = asn_translate(env, designated_pasn, &paste);
+        if (exc == PGM_AFX_TRANS || exc == PGM_ASX_TRANS) {
+            return 1;
+        }
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, ra);
+        }
+        if (reuse && designated_pastein != paste.words[11]) {
+            return 1;
+        }
+
+        new_pasce = aste_asce(&paste);
+        new_pasteo = paste.origin;
+        new_ax = paste.words[1] >> 16;
+        if (reuse) {
+            new_pastein = designated_pastein;
+        }
+
+        exc = subspace_replace(env, new_pasce, paste.origin, &new_pasce);
+        if (exc == PGM_ASTE_VALID || exc == PGM_ASTE_SEQ) {
+            return 1;
+        }
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, ra);
+        }
+        if ((env->cregs[1] | new_pasce) & ASCE_SPACE_SWITCH_EVENT) {
+            return 3;
+        }
+    } else {
+        new_ax = extract64(env->cregs[4], 16, 16);
+        if (reuse) {
+            new_pastein = env->cregs[4] >> 32;
+        }
+    }
+
+    if (use_designated_ax) {
+        new_ax = designated_ax;
+    }
+
+    if (designated_sasn == designated_pasn) {
+        new_sasce = new_pasce;
+        if (reuse) {
+            new_sastein = new_pastein;
+        }
+    } else if (!force_translation && suppress_sasn_authorization &&
+               designated_sasn == (uint16_t)env->cregs[3]) {
+        new_sasce = env->cregs[7];
+        if (reuse) {
+            new_sastein = env->cregs[3] >> 32;
+        }
+    } else {
+        exc = asn_translate(env, designated_sasn, &saste);
+        if (exc == PGM_AFX_TRANS || exc == PGM_ASX_TRANS) {
+            return 2;
+        }
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, ra);
+        }
+        if (reuse && designated_sastein != saste.words[11]) {
+            return 2;
+        }
+
+        new_sasce = aste_asce(&saste);
+        if (reuse) {
+            new_sastein = designated_sastein;
+        }
+        exc = subspace_replace(env, new_sasce, saste.origin, &new_sasce);
+        if (exc == PGM_ASTE_VALID || exc == PGM_ASTE_SEQ) {
+            return 2;
+        }
+        if (exc) {
+            tcg_s390_program_interrupt(env, exc, ra);
+        }
+
+        if (!suppress_sasn_authorization) {
+            exc = aste_authorize_secondary(env, &saste, new_ax,
+                                           designated_sasn);
+            if (exc == PGM_SEC_AUTH) {
+                return 2;
+            }
+            if (exc) {
+                tcg_s390_program_interrupt(env, exc, ra);
+            }
+        }
+    }
+
+    env->cregs[1] = new_pasce;
+    env->cregs[3] = deposit64(env->cregs[3], 16, 16, designated_pkm);
+    env->cregs[3] = deposit64(env->cregs[3], 0, 16, designated_sasn);
+    env->cregs[4] = deposit64(env->cregs[4], 16, 16, new_ax);
+    env->cregs[4] = deposit64(env->cregs[4], 0, 16, designated_pasn);
+    env->cregs[5] = deposit64(env->cregs[5], 0, 32, new_pasteo);
+    env->cregs[7] = new_sasce;
+    if (reuse) {
+        env->cregs[3] = deposit64(env->cregs[3], 32, 32, new_sastein);
+        env->cregs[4] = deposit64(env->cregs[4], 32, 32, new_pastein);
+    }
+    tlb_flush(env_cpu(env));
+    return 0;
 }
 
 uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,

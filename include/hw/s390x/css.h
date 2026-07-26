@@ -147,6 +147,7 @@ struct SubchDev {
     int (*ccw_cb) (SubchDev *, CCW1);
     bool ccw_cb_first;
     void (*cancel_cb)(SubchDev *);
+    void (*enable_cb)(SubchDev *);
     void (*disable_cb)(SubchDev *);
     IOInstEnding (*do_subchannel_work) (SubchDev *);
     void (*irb_cb)(SubchDev *, IRB *);

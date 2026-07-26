@@ -41,6 +41,22 @@ int main(void)
     if (msch_err(schid, &schib)) {
         return 2;
     }
+    /*
+     * An already connected display reports unsolicited Device End when the
+     * subchannel becomes enabled.  Consume that readiness status before
+     * starting the channel program.  Older machine versions may have no
+     * status pending here, which is also valid for this data-transfer test.
+     */
+    {
+        int cc = tsch(schid, &irb);
+
+        if (cc != 1 &&
+            (cc || irb.scsw.cstat ||
+             irb.scsw.dstat != SCSW_DSTAT_DEVEND)) {
+            return 3;
+        }
+        irb = (Irb) { 0 };
+    }
 
     /*
      * SKIP makes the data address immaterial.  VSE uses this exact form to
@@ -53,16 +69,16 @@ int main(void)
         .cda = 0,
     };
     if (ssch(schid, &orb)) {
-        return 3;
+        return 4;
     }
     consume_io_int();
     if (tsch(schid, &irb)) {
-        return 4;
+        return 5;
     }
     if (irb.scsw.cstat != SCSW_CSTAT_BADLEN ||
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
         irb.scsw.count != 0x7fff - INPUT_RECORD_SIZE) {
-        return 5;
+        return 6;
     }
 
     /*
@@ -84,19 +100,19 @@ int main(void)
     };
     memset(input, 0, sizeof(input));
     if (ssch(schid, &orb)) {
-        return 6;
+        return 7;
     }
     consume_io_int();
     memset(&irb, 0, sizeof(irb));
     if (tsch(schid, &irb)) {
-        return 7;
+        return 8;
     }
     if (irb.scsw.cstat != SCSW_CSTAT_BADLEN ||
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
         irb.scsw.count != sizeof(input) - INPUT_RECORD_SIZE ||
         irb.scsw.cpa != addr32(&ccw[1]) ||
         input[0] != 0x7d || input[1] != 0x40 || input[2] != 0x40) {
-        return 8;
+        return 9;
     }
     return 0;
 }

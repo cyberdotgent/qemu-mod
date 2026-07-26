@@ -237,7 +237,9 @@ static void test_dev3270_shortcut(void)
     qts = qtest_init(
         "-nodefaults "
         "-dev3270 port=0,devno=300 "
-        "-dev3270 port=0,devno=0301");
+        "-dev3270 port=0,devno=0301,"
+        "control-unit-type=0x3274,control-unit-model=0x1d,"
+        "device-type=0x3279,device-model=1");
 
     chardev0 = qom_get_string(qts, "/machine/peripheral/dev3270-0",
                               "chardev");
@@ -250,6 +252,14 @@ static void test_dev3270_shortcut(void)
     g_assert_cmpstr(chardev1, ==, "dev3270-chardev1");
     g_assert_cmpstr(devid0, ==, "fe.0.0300");
     g_assert_cmpstr(devid1, ==, "fe.0.0301");
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/dev3270-1",
+                               "control-unit-type"), ==, 0x3274);
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/dev3270-1",
+                               "control-unit-model"), ==, 0x1d);
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/dev3270-1",
+                               "device-type"), ==, 0x3279);
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/dev3270-1",
+                               "device-model"), ==, 1);
 
     qtest_quit(qts);
 }

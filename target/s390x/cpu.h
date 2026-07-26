@@ -63,10 +63,14 @@ typedef struct CPUArchState {
     uint32_t fpc;          /* floating-point control register */
     uint32_t cc_op;
     bool bpbc;             /* branch prediction blocking */
+    uint8_t tx_depth;      /* transactional-execution nesting depth */
+    bool tx_constrained;   /* current transaction is constrained */
 
     float_status fpu_status; /* passed to softfloat lib */
 
     PSW psw;
+    PSW captured_z_psw;
+    bool esa_mode;
 
     S390CrashReason crash_reason;
 
@@ -363,6 +367,7 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 #define CR0_FETCH_PROT_OVERRIDE 0x0000000002000000ULL
 #define CR0_STORE_PROT_OVERRIDE 0x0000000001000000ULL
 #define CR0_ASN_LX_REUSE        0x0000000000080000ULL
+#define CR0_TRANSACTIONAL_EXE   0x0080000000000000ULL
 #define CR0_ASF                 0x0000000000010000ULL
 #define CR0_EDAT                0x0000000000800000ULL
 #define CR0_AFP                 0x0000000000040000ULL

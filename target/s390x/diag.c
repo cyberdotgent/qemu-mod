@@ -16,7 +16,9 @@
 #include "cpu.h"
 #include "s390x-internal.h"
 #include "hw/core/boards.h"
+#include "hw/s390x/css.h"
 #include "hw/s390x/ebcdic.h"
+#include "hw/s390x/sclp.h"
 #include "hw/watchdog/wdt_diag288.h"
 #include "system/cpus.h"
 #include "hw/s390x/ipl.h"
@@ -41,6 +43,18 @@
 #define DIAG204_SHARED_WEIGHT  100
 #define DIAG204_X_WEIGHT       1000
 #define DIAG204_DED_WEIGHT     0xffff
+
+#define MSSF_READ_CONFIG_INFO  0x00020001
+#define MSSF_READ_CHP_STATUS   0x00030001
+#define MSSF_CONFIG_MIN_LEN    64
+#define MSSF_CHP_STATUS_LEN    (8 + 32 + 32 + 32 + 152)
+#define MSSF_RESP_REASON       6
+#define MSSF_RESP_CODE         7
+#define MSSF_REASON_COMPLETE   0x00
+#define MSSF_RESPONSE_COMPLETE 0x10
+#define MSSF_REASON_BAD_LENGTH 0x01
+#define MSSF_RESPONSE_REJECT   0xf0
+#define MSSF_REASON_UNASSIGNED 0x06
 
 typedef struct QEMU_PACKED Diag204Header {
     uint8_t partitions;
@@ -126,6 +140,152 @@ QEMU_BUILD_BUG_ON(sizeof(Diag204CPU) != 24);
 QEMU_BUILD_BUG_ON(sizeof(Diag204XHeader) != 64);
 QEMU_BUILD_BUG_ON(sizeof(Diag204XPartition) != 96);
 QEMU_BUILD_BUG_ON(sizeof(Diag204XCPU) != 96);
+
+bool handle_diag_080(CPUS390XState *env, uint64_t r1, uint64_t r3,
+                     uintptr_t ra)
+{
+    S390CPU *cpu = env_archcpu(env);
+    AddressSpace *as = cpu_get_address_space(CPU(cpu), 0);
+    MachineState *machine = MACHINE(qdev_get_machine());
+    uint64_t addr = mmu_real2abs(env, (uint32_t)env->regs[r1]);
+    uint32_t command = env->regs[r3];
+    uint8_t header[8];
+    g_autofree uint8_t *spccb = NULL;
+    uint16_t length;
+    MemTxResult tx_result;
+    unsigned int ssid;
+    unsigned int schid;
+
+    if (addr & 7) {
+        s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+        return false;
+    }
+    if (!address_space_access_valid(as, addr, sizeof(header), false,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        return false;
+    }
+    tx_result = address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED,
+                                   header, sizeof(header));
+    if (tx_result != MEMTX_OK) {
+        s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        return false;
+    }
+    length = lduw_be_p(header);
+    if (length < sizeof(header) ||
+        !address_space_access_valid(as, addr, length, true,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        return false;
+    }
+    spccb = g_malloc(length);
+    tx_result = address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED,
+                                   spccb, length);
+    if (tx_result != MEMTX_OK) {
+        s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        return false;
+    }
+
+    if (addr & 0x7ff) {
+        spccb[MSSF_RESP_REASON] = MSSF_REASON_BAD_LENGTH;
+        spccb[MSSF_RESP_CODE] = 0;
+    } else {
+        switch (command) {
+        case MSSF_READ_CONFIG_INFO:
+            if (length < MAX(MSSF_CONFIG_MIN_LEN,
+                             32 + machine->smp.max_cpus * 2)) {
+                spccb[MSSF_RESP_REASON] = MSSF_REASON_BAD_LENGTH;
+                spccb[MSSF_RESP_CODE] = MSSF_RESPONSE_REJECT;
+                break;
+            }
+            /*
+             * This legacy format has one-byte increment-count and
+             * increment-size fields.  Pick an exact power-of-two increment
+             * large enough to represent contemporary storage sizes.
+             */
+            {
+                uint64_t memory_mb = machine->ram_size / MiB;
+                uint64_t increment_mb = 1;
+                uint64_t cpu_count = machine->smp.max_cpus;
+                unsigned int i;
+
+                while (DIV_ROUND_UP(memory_mb, increment_mb) > UINT8_MAX) {
+                    increment_mb <<= 1;
+                }
+                memset(spccb + 8, 0, 24 + cpu_count * 2);
+                spccb[8] = DIV_ROUND_UP(memory_mb, increment_mb);
+                spccb[9] = increment_mb;
+                spccb[10] = 0x04;
+                spccb[11] = 0x01;
+                stw_be_p(spccb + 16, cpu_count);
+                stw_be_p(spccb + 18, 32);
+                stw_be_p(spccb + 20, 0);
+                stw_be_p(spccb + 22, 32 + cpu_count * 2);
+                s390_ipl_convert_loadparm(
+                    (char *)S390_CCW_MACHINE(machine)->loadparm, spccb + 24);
+                for (i = 0; i < cpu_count; i++) {
+                    spccb[32 + i * 2] = i;
+                }
+            }
+            spccb[MSSF_RESP_REASON] = MSSF_REASON_COMPLETE;
+            spccb[MSSF_RESP_CODE] = MSSF_RESPONSE_COMPLETE;
+            break;
+        case MSSF_READ_CHP_STATUS:
+            if (length < MSSF_CHP_STATUS_LEN) {
+                spccb[MSSF_RESP_REASON] = MSSF_REASON_BAD_LENGTH;
+                spccb[MSSF_RESP_CODE] = MSSF_RESPONSE_REJECT;
+                break;
+            }
+            memset(spccb + 8, 0, MSSF_CHP_STATUS_LEN - 8);
+            for (ssid = 0; ssid <= MAX_SSID; ssid++) {
+                for (schid = 0; schid <= MAX_SCHID; schid++) {
+                    SubchDev *sch = css_find_subch(1, 0, ssid, schid);
+                    SCHIB status;
+                    unsigned int path;
+
+                    if (!sch || !css_subch_visible(sch)) {
+                        continue;
+                    }
+                    memcpy(&status, &sch->curr_status, sizeof(status));
+                    if (!(status.pmcw.flags & PMCW_FLAGS_MASK_DNV)) {
+                        continue;
+                    }
+                    for (path = 0;
+                         path < ARRAY_SIZE(status.pmcw.chpid); path++) {
+                        uint8_t bit = 0x80 >> path;
+                        uint8_t chpid;
+
+                        if (!(status.pmcw.pim & bit)) {
+                            continue;
+                        }
+                        chpid = status.pmcw.chpid[path];
+                        bit = 0x80 >> (chpid % 8);
+                        spccb[8 + chpid / 8] |= bit;
+                        spccb[40 + chpid / 8] |= bit;
+                        spccb[72 + chpid / 8] |= bit;
+                    }
+                }
+            }
+            spccb[MSSF_RESP_REASON] = MSSF_REASON_COMPLETE;
+            spccb[MSSF_RESP_CODE] = MSSF_RESPONSE_COMPLETE;
+            break;
+        default:
+            spccb[MSSF_RESP_REASON] = MSSF_REASON_UNASSIGNED;
+            spccb[MSSF_RESP_CODE] = MSSF_RESPONSE_REJECT;
+            break;
+        }
+    }
+
+    tx_result = address_space_write(as, addr, MEMTXATTRS_UNSPECIFIED,
+                                    spccb, length);
+    if (tx_result != MEMTX_OK) {
+        s390_program_interrupt(env, PGM_ADDRESSING, ra);
+        return false;
+    }
+    setcc(cpu, 0);
+    sclp_service_interrupt(addr);
+    return true;
+}
 
 static uint8_t diag204_cpu_count(void)
 {

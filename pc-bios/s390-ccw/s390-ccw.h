@@ -52,6 +52,7 @@ void consume_io_int(void);
 
 /* main.c */
 void write_subsystem_identification(void);
+void enable_ipl_subchannel(void);
 void write_iplb_location(void);
 unsigned int get_loadparm_index(void);
 void main(void);
@@ -73,6 +74,7 @@ void zipl_load(void);
 void write_reset_psw(uint64_t psw);
 int jump_to_IPL_code(uint64_t address);
 void jump_to_low_kernel(void);
+void jump_to_low_kernel_esa(void);
 
 /* menu.c */
 void menu_set_parms(uint8_t boot_menu_flag, uint32_t boot_menu_timeout);

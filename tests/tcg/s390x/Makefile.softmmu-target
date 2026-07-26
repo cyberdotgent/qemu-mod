@@ -23,6 +23,7 @@ ASM_TESTS =                                                                    \
     bakr                                                                       \
     bassm                                                                      \
     cksm                                                                       \
+    dfp-convert                                                                \
     clm                                                                        \
     exrl-ssm-early                                                             \
     icm                                                                        \
@@ -36,12 +37,19 @@ ASM_TESTS =                                                                    \
     mc                                                                         \
     pc                                                                         \
     pc-ss                                                                      \
+    pfpo                                                                       \
+    pqap                                                                       \
     per                                                                        \
     precise-smc-softmmu                                                        \
     sckc                                                                       \
     ssm-early                                                                  \
     stosm-early                                                                \
     stpq                                                                       \
+    strag                                                                      \
+    svs                                                                        \
+    trace                                                                      \
+    trte                                                                       \
+    xc-teid                                                                    \
     unaligned-lowcore
 
 include $(S390X_SRC)/pgm-specification.mak
@@ -51,9 +59,13 @@ ASM_TESTS += $(PGM_SPECIFICATION_TESTS)
 
 $(ASM_TESTS): LDFLAGS += -Wl,-T$(LINK_SCRIPT) -Wl,--build-id=none
 $(ASM_TESTS): $(LINK_SCRIPT)
+dfp-convert: dfp-convert.o
+strag: strag.o
+svs: svs.o
+xc-teid: xc-teid.o
 TESTS += $(ASM_TESTS)
 
-MULTIARCH_TESTS += mvc-smc diag204 decimal edat hfp plo
+MULTIARCH_TESTS += mvc-smc diag204 decimal edat hfp la plo
 S390X_MULTIARCH_RUNTIME_OBJS = head64.o console.o $(MINILIB_OBJS)
 $(MULTIARCH_TESTS): $(S390X_MULTIARCH_RUNTIME_OBJS)
 $(MULTIARCH_TESTS): LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
@@ -63,6 +75,7 @@ diag204: diag204.o
 decimal: decimal.o
 edat: edat.o
 hfp: hfp.o
+la: la.o
 plo: plo.o
 fba-tic: $(S390X_MULTIARCH_RUNTIME_OBJS)
 fba-tic: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
@@ -75,6 +88,25 @@ run-fba-tic: QEMU_OPTS := -action panic=exit-failure -nographic \
 	-serial chardev:output $(EXTFLAGS) -nodefaults \
 	-blockdev driver=null-co$(COMMA)node-name=fba$(COMMA)size=1048576 \
 	-device fba-ccw$(COMMA)drive=fba$(COMMA)devno=fe.0.0200 -kernel
+
+sclp-chp: $(S390X_MULTIARCH_RUNTIME_OBJS)
+sclp-chp: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+sclp-chp: CFLAGS += -I$(SRC_PATH)/pc-bios/s390-ccw
+sclp-chp: sclp-chp.o
+TESTS += sclp-chp
+run-sclp-chp: QEMU_OPTS := -action panic=exit-failure -nographic \
+	-serial chardev:output $(EXTFLAGS) -nodefaults \
+	-blockdev driver=null-co$(COMMA)node-name=fba$(COMMA)size=1048576 \
+	-device fba-ccw$(COMMA)drive=fba$(COMMA)devno=fe.0.0200 -kernel
+
+eckd-zero-data: $(S390X_MULTIARCH_RUNTIME_OBJS)
+eckd-zero-data: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+eckd-zero-data: CFLAGS += $(MINILIB_INC) -I$(SRC_PATH)/pc-bios/s390-ccw
+eckd-zero-data: eckd-zero-data.o
+TESTS += eckd-zero-data
+run-eckd-zero-data: eckd-zero-data
+	$(call run-test, $<, $(PYTHON) $(S390X_SRC)/eckd-zero-data.py \
+	  $(QEMU) $<)
 
 tape-write: $(S390X_MULTIARCH_RUNTIME_OBJS)
 tape-write: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)

@@ -23,6 +23,7 @@
 /* SCLP command codes */
 #define SCLP_CMDW_READ_SCP_INFO                 0x00020001
 #define SCLP_CMDW_READ_SCP_INFO_FORCED          0x00120001
+#define SCLP_CMDW_READ_CHP_INFO                 0x00030001
 #define SCLP_READ_STORAGE_ELEMENT_INFO          0x00040001
 #define SCLP_ATTACH_STORAGE_ELEMENT             0x00080001
 #define SCLP_ASSIGN_STORAGE                     0x000D0001
@@ -38,6 +39,8 @@
 #define MAX_STORAGE_INCREMENTS                  1020
 
 /* CPU hotplug SCLP codes */
+#define SCLP_HAS_CHP_INFO                       0x8000000000000000ULL
+#define SCLP_HAS_CHP_SUBSYSTEM_COMMAND          0x4000000000000000ULL
 #define SCLP_HAS_CPU_INFO                       0x0800000000000000ULL
 #define SCLP_HAS_LOADPARM                       0x0004000000000000ULL
 #define SCLP_HAS_READ_WRITE_EVENT               0x0000004000000000ULL
@@ -97,6 +100,13 @@ typedef struct SCCBHeader {
     uint8_t control_mask[3];
     uint16_t response_code;
 } QEMU_PACKED SCCBHeader;
+
+typedef struct ReadChpInfo {
+    SCCBHeader h;
+    uint8_t installed[32];
+    uint8_t standby[32];
+    uint8_t online[32];
+} QEMU_PACKED ReadChpInfo;
 
 #define SCCB_DATA_LEN (SCCB_SIZE - sizeof(SCCBHeader))
 #define SCCB_CPU_FEATURE_LEN 6

@@ -103,6 +103,7 @@ struct Terminal3270 {
     uint16_t current_start_pos;
     uint32_t queued_bytes;
     uint16_t queued_records;
+    bool device_end_pending;
     bool attention_pending;
 
     uint8_t record_buf[TN3270_MAX_RECORD_SIZE];
@@ -180,6 +181,7 @@ static inline CcwDataStream *terminal_cds(Terminal3270 *t)
 
 static bool terminal_send_record(Terminal3270 *t,
                                  const uint8_t *buf, size_t len);
+static void terminal_try_unsolicited_status(Terminal3270 *t);
 
 static void terminal_banner_line(GByteArray *record, Terminal3270 *t,
                                  unsigned int row, const char *text)
@@ -342,7 +344,8 @@ static void terminal_signal_ready(Terminal3270 *t)
     if (t->queued_records) {
         t->attention_pending = true;
     }
-    css_generate_unsolicited_io_interrupt(sch, SCSW_DSTAT_DEVICE_END);
+    t->device_end_pending = true;
+    terminal_try_unsolicited_status(t);
 }
 
 static void terminal_maybe_ready(Terminal3270 *t)
@@ -448,10 +451,24 @@ static bool terminal_append_record_byte(Terminal3270 *t, uint8_t byte)
     return true;
 }
 
-static void terminal_try_attention(Terminal3270 *t)
+static void terminal_try_unsolicited_status(Terminal3270 *t)
 {
     SubchDev *sch = terminal_sch(t);
 
+    /*
+     * A TN3270 client can finish negotiation before the guest enables the
+     * subchannel.  css_generate_unsolicited_io_interrupt() then refuses the
+     * status, so retain it and retry from the enable/status-clear callbacks.
+     * Device End reports that the display became available and must precede
+     * any Attention raised by an input record from that display.
+     */
+    if (t->device_end_pending) {
+        if (css_generate_unsolicited_io_interrupt(sch,
+                                                  SCSW_DSTAT_DEVICE_END)) {
+            t->device_end_pending = false;
+        }
+        return;
+    }
     if (!t->attention_pending) {
         return;
     }
@@ -462,7 +479,12 @@ static void terminal_try_attention(Terminal3270 *t)
 
 static void terminal_status_cleared(SubchDev *sch)
 {
-    terminal_try_attention(TERMINAL_3270(sch->driver_data));
+    terminal_try_unsolicited_status(TERMINAL_3270(sch->driver_data));
+}
+
+static void terminal_enabled(SubchDev *sch)
+{
+    terminal_try_unsolicited_status(TERMINAL_3270(sch->driver_data));
 }
 
 static int terminal_transfer_record(Terminal3270 *t, CCW1 *ccw);
@@ -529,7 +551,7 @@ static void terminal_finish_record(Terminal3270 *t)
         terminal_complete_pending_read(t);
     } else {
         t->attention_pending = true;
-        terminal_try_attention(t);
+        terminal_try_unsolicited_status(t);
     }
 }
 
@@ -686,8 +708,8 @@ static void chr_event(void *opaque, QEMUChrEvent event)
             terminal_set_unit_check(t, SENSE_DATA_CHECK);
             css_virtual_ccw_complete(sch, -EIO);
         } else if (!preserving) {
-            css_generate_unsolicited_io_interrupt(sch,
-                                                  SCSW_DSTAT_DEVICE_END);
+            t->device_end_pending = true;
+            terminal_try_unsolicited_status(t);
         }
         break;
     case CHR_EVENT_BREAK:
@@ -701,6 +723,7 @@ static void terminal_init(EmulatedCcw3270Device *dev, Error **errp)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
 
+    terminal_sch(t)->enable_cb = terminal_enabled;
     terminal_sch(t)->status_clear_cb = terminal_status_cleared;
     qemu_chr_fe_set_handlers(&t->chr, terminal_can_read,
                              terminal_read, chr_event, NULL, t, NULL, true);
@@ -1220,12 +1243,12 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     SubchDev *sch = terminal_sch(t);
     uint8_t sense_id[] = {
         0xff,
-        EMULATED_CCW_3270_CU_TYPE >> 8,
-        EMULATED_CCW_3270_CU_TYPE & 0xff,
-        EMULATED_CCW_3270_CU_MODEL,
-        EMULATED_CCW_3270_DEV_TYPE >> 8,
-        EMULATED_CCW_3270_DEV_TYPE & 0xff,
-        EMULATED_CCW_3270_DEV_MODEL,
+        dev->cu_type >> 8,
+        dev->cu_type,
+        dev->cu_model,
+        dev->dev_type >> 8,
+        dev->dev_type,
+        dev->dev_model,
     };
     uint8_t *data;
     uint32_t available;
@@ -1525,6 +1548,7 @@ static void terminal_unrealize(DeviceState *dev)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
 
+    terminal_sch(t)->enable_cb = NULL;
     terminal_sch(t)->status_clear_cb = NULL;
     migration_remove_notifier(&t->migration_notifier);
     qemu_chr_fe_deinit(&t->chr, false);
