@@ -23,6 +23,7 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
+#include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-loop.h"
 #include "s390x-internal.h"
@@ -182,6 +183,23 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         g_assert_not_reached();
     }
 
+    if (!excp && access_type == MMU_DATA_STORE && env->tx_depth) {
+        excp = s390_tx_track_page(env, raddr);
+        if (excp) {
+            tec = vaddr & TARGET_PAGE_MASK;
+        }
+    }
+    if (!excp && env->tx_depth && access_type != MMU_DATA_STORE) {
+        /*
+         * The s390 TLB is unified, so an instruction or load fill can make
+         * the same page writable.  Keep such entries read-only while a
+         * transaction is active; the first store then faults back through
+         * this function and snapshots the page before installing write
+         * access.
+         */
+        prot &= ~PAGE_WRITE;
+    }
+
     if (!excp) {
         qemu_log_mask(CPU_LOG_MMU,
                       "%s: set tlb %" PRIx64 " -> %" PRIx64 " (%x)\n",
@@ -222,14 +240,21 @@ static void do_program_interrupt(CPUS390XState *env)
     uint64_t mask, addr;
     LowCore *lowcore;
     int ilen = env->int_pgm_ilen;
+    int code;
     bool set_trans_exc_code = false;
     bool advance = false;
 
-    assert(((env->int_pgm_code == PGM_SPECIFICATION ||
-             env->int_pgm_code == PGM_SPACE_SWITCH) && ilen == 0) ||
+    if (env->tx_depth) {
+        s390_tx_abort(env);
+        env->int_pgm_code |= PGM_TXF_EVENT;
+    }
+    code = env->int_pgm_code & 0xff;
+
+    assert(((code == PGM_SPECIFICATION ||
+             code == PGM_SPACE_SWITCH) && ilen == 0) ||
            ilen == 2 || ilen == 4 || ilen == 6);
 
-    switch (env->int_pgm_code) {
+    switch (code) {
     case PGM_PER:
         /* advance already handled */
         break;
@@ -239,7 +264,7 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_REG_THIRD_TRANS:
     case PGM_SEGMENT_TRANS:
     case PGM_PAGE_TRANS:
-        assert(env->int_pgm_code == env->tlb_fill_exc);
+        assert(code == env->tlb_fill_exc);
         set_trans_exc_code = true;
         break;
     case PGM_SPACE_SWITCH:
@@ -265,7 +290,7 @@ static void do_program_interrupt(CPUS390XState *env)
         advance = true;
         break;
     case PGM_PROTECTION:
-        assert(env->int_pgm_code == env->tlb_fill_exc);
+        assert(code == env->tlb_fill_exc);
         set_trans_exc_code = true;
         advance = true;
         break;
@@ -294,7 +319,7 @@ static void do_program_interrupt(CPUS390XState *env)
     }
 
     /* advance the PSW if our exception is not nullifying */
-    if (advance) {
+    if (advance && !(env->int_pgm_code & PGM_TXF_EVENT)) {
         env->psw.addr += ilen;
     }
 
@@ -304,7 +329,7 @@ static void do_program_interrupt(CPUS390XState *env)
                   env->psw.addr);
     lowcore = cpu_map_lowcore(env);
 
-    switch (env->int_pgm_code) {
+    switch (code) {
     case PGM_ASCE_TYPE:
     case PGM_REG_FIRST_TRANS:
     case PGM_REG_SEC_TRANS:
@@ -423,12 +448,18 @@ static void do_ext_interrupt(CPUS390XState *env)
                (env->cregs[0] & CR0_CKC_SC)) {
         lowcore->ext_int_code = cpu_to_be16(EXT_CLOCK_COMP);
         lowcore->cpu_addr = 0;
-        env->pending_int &= ~INTERRUPT_EXT_CLOCK_COMPARATOR;
+        /*
+         * The clock-comparator condition remains pending while the TOD
+         * clock exceeds the comparator.  SCKC clears or reschedules it.
+         */
     } else if ((env->pending_int & INTERRUPT_EXT_CPU_TIMER) &&
                (env->cregs[0] & CR0_CPU_TIMER_SC)) {
         lowcore->ext_int_code = cpu_to_be16(EXT_CPU_TIMER);
         lowcore->cpu_addr = 0;
-        env->pending_int &= ~INTERRUPT_EXT_CPU_TIMER;
+        /*
+         * The CPU-timer condition remains pending while the timer is
+         * negative.  SPT clears or reschedules it.
+         */
     } else if (qemu_s390_flic_has_service(flic) &&
                (env->cregs[0] & CR0_SERVICE_SC)) {
         uint32_t param;

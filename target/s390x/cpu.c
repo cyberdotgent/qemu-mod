@@ -162,6 +162,9 @@ static void s390_cpu_reset_hold(Object *obj, ResetType type)
     if (scc->parent_phases.hold) {
         scc->parent_phases.hold(obj, type);
     }
+#ifndef CONFIG_USER_ONLY
+    s390_tx_reset(env);
+#endif
     cpu->env.sigp_order = 0;
     s390_cpu_set_state(S390_CPU_STATE_STOPPED, cpu);
 

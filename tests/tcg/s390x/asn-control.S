@@ -107,6 +107,50 @@ start_dat:
     lghi %r1,0x1234
     ssar %r1
 
+    /* The instance-extract forms copy both ASTEIN and ASN. */
+    llihf %r6,0xa5a5a5a5
+    iilf %r6,0xa5a5a5a5
+    epair %r6
+    llihf %r7,0x55667788
+    iilf %r7,0x00001234
+    clgr %r6,%r7
+    jne failure
+    llihf %r6,0xa5a5a5a5
+    iilf %r6,0xa5a5a5a5
+    esair %r6
+    llilf %r7,0x00001234
+    clgr %r6,%r7
+    jne failure
+
+    /*
+     * SSAIR-cp ignores the supplied ASTE instance and copies PASTEIN, even
+     * when ASN-and-LX reuse is installed but disabled.
+     */
+    llihf %r1,0xdeadbeef
+    iilf %r1,0x00001234
+    ssair %r1
+    stctg %c3,%c3,saved_cr3
+    lg %r8,saved_cr3
+    srlg %r8,%r8,32
+    clfi %r8,0x55667788
+    jne failure
+
+    /* SSAIR-ss validates ASTEIN and installs it as the new SASTEIN. */
+    llihf %r1,0x11223344
+    iilf %r1,0x00001240
+    ssair %r1
+    stctg %c3,%c3,saved_cr3
+    lg %r8,saved_cr3
+    srlg %r8,%r8,32
+    clfi %r8,0x11223344
+    jne failure
+    llgf %r8,saved_cr3+4
+    nilf %r8,0xffff
+    cghi %r8,0x1240
+    jne failure
+    lghi %r1,0x1234
+    ssar %r1
+
     /* PT-cp changes PKM/SASN and branches without translating an ASN. */
     llilf %r1,0xffff1234
     larl %r2,after_pt
@@ -116,6 +160,22 @@ after_pt:
     stctg %c3,%c3,saved_cr3
     llgf %r8,saved_cr3+4
     clfi %r8,0xffff1234
+    jne failure
+
+    /*
+     * PTI-cp ignores the supplied instance, branches, and copies the current
+     * primary instance into the secondary state even when reuse is disabled.
+     */
+    llihf %r1,0xdeadbeef
+    iilf %r1,0xffff1234
+    larl %r2,after_pti
+    pti %r1,%r2
+    j failure
+after_pti:
+    stctg %c3,%c3,saved_cr3
+    lg %r8,saved_cr3
+    srlg %r8,%r8,32
+    clfi %r8,0x55667788
     jne failure
 
     /* BSG with ALET zero selects the base ASTE and saves the return. */
@@ -169,6 +229,23 @@ after_pt_ss:
     larl %r9,destination_aste
     clgr %r8,%r9
     jne failure
+
+    /* PTI-ss validates and installs the supplied primary ASTE instance. */
+    llihf %r1,0x99aabbcc
+    iilf %r1,0xffff1244
+    larl %r2,after_pti_ss
+    pti %r1,%r2
+    j failure
+after_pti_ss:
+    stctg %c3,%c4,saved_cr3
+    lg %r8,saved_cr3
+    srlg %r8,%r8,32
+    clfi %r8,0x99aabbcc
+    jne failure
+    lg %r8,saved_cr3+8
+    srlg %r8,%r8,32
+    clfi %r8,0x99aabbcc
+    jne failure
     lpswe success_psw
 
 reduced:
@@ -185,7 +262,7 @@ initial_crs:
     .quad 0x20                     /* CR1: real-space ASCE */
     .quad duct                     /* CR2: DUCT origin */
     .quad 0x00000000ffff1234       /* CR3: PKM, SASN */
-    .quad 0x0000000000001234       /* CR4: AX, PASN */
+    .quad 0x5566778800001234       /* CR4: PASTEIN, AX, PASN */
     .quad base_aste                /* CR5: primary ASTE origin */
     .quad 0                        /* CR6 */
     .quad 0x20                     /* CR7: real-space ASCE */
@@ -223,6 +300,7 @@ duct:
 
     .org 0x4124
     .long destination_aste         /* ASN 1240 first-table entry */
+    .long destination_aste2        /* ASN 1244 first-table entry */
 
     .org 0x4200
     .align 64
@@ -237,10 +315,21 @@ destination_aste:
     .space 16
 
     .org 0x4300
+destination_aste2:
+    .long authority_table          /* authority-table origin */
+    .long 0                        /* AX zero, authority length zero */
+    .quad 0x20                     /* real-space ASCE */
+    .space 8
+    .long 0x80000000               /* subsystem-linkage control */
+    .space 16
+    .long 0x99aabbcc               /* ASTE instance */
+    .space 16
+
+    .org 0x4400
 authority_table:
     .byte 0xc0                     /* primary + secondary for AX 0 */
 
-    .org 0x4400
+    .org 0x4500
 access_list:
     .space 16
     .long 0                        /* valid, deliberately wrong ALESN */

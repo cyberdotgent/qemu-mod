@@ -140,7 +140,6 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
     read_info->entries_cpu = cpu_to_be16(cpu_count);
     read_info->offset_cpu = cpu_to_be16(offset_cpu);
     read_info->highest_cpu = cpu_to_be16(machine->smp.max_cpus - 1);
-
     read_info->ibc_val = cpu_to_be32(s390_get_ibc_val());
 
     /* Configuration Characteristic (Extension) */
@@ -262,10 +261,8 @@ static void sclp_read_cpu_info(SCLPDevice *sclp, SCCB *sccb)
     cpu_info->nr_standby = cpu_to_be16(0);
 
     /* The standby offset is 16-byte for each CPU */
-    cpu_info->offset_standby = cpu_to_be16(cpu_info->offset_configured
-        + cpu_info->nr_configured*sizeof(CPUEntry));
-
-
+    cpu_info->offset_standby = cpu_to_be16(offsetof(ReadCpuInfo, entries) +
+                                           cpu_count * sizeof(CPUEntry));
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }
 

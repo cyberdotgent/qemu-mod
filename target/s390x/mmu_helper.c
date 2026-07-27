@@ -33,6 +33,7 @@
 #endif
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
+#include "exec/cputlb.h"
 #include "hw/core/hw-error.h"
 #include "hw/s390x/storage-keys.h"
 #include "hw/core/boards.h"
@@ -232,7 +233,8 @@ int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
             return exc;
         }
     }
-    *fetch_only = (ale[0] & ALE_FETCH_ONLY) && rw == MMU_DATA_STORE;
+    *fetch_only = (ale[0] & ALE_FETCH_ONLY) &&
+                  (rw == MMU_DATA_STORE || rw == MMU_S390_TPROT);
 
     *asce = (uint64_t)aste[2] << 32 | aste[3];
     if (aste_origin) {
@@ -688,6 +690,74 @@ int mmu_translate_with_key(CPUS390XState *env, vaddr vaddr, int rw,
     return 0;
 }
 
+int s390_tprot(CPUS390XState *env, vaddr addr, uint64_t asc,
+               uint8_t access_key, uint64_t *tec)
+{
+    static S390SKeysClass *skeyclass;
+    static S390SKeysState *ss;
+    uint64_t asc_mode = asc & PSW_MASK_ASC;
+    uint64_t asce = 0;
+    hwaddr raddr;
+    uint8_t skey = 0;
+    bool private = false;
+    bool fetch_only = false;
+    int flags;
+    int exc;
+
+    exc = mmu_translate_with_key(env, addr, MMU_S390_TPROT, asc, -1,
+                                 &raddr, &flags, tec, NULL);
+    if (exc) {
+        return -exc;
+    }
+
+    if (env->psw.mask & PSW_MASK_DAT) {
+        switch (asc_mode) {
+        case PSW_ASC_PRIMARY:
+            asce = env->cregs[1];
+            break;
+        case PSW_ASC_SECONDARY:
+            asce = env->cregs[7];
+            break;
+        case PSW_ASC_HOME:
+            asce = env->cregs[13];
+            break;
+        case PSW_ASC_ACCREG:
+            exc = mmu_translate_arn(env, asc & 0xf, MMU_S390_TPROT,
+                                    &asce, &fetch_only);
+            if (exc) {
+                return -exc;
+            }
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        private = asce & ASCE_PRIVATE_SPACE;
+    }
+
+    raddr = mmu_real2abs(env, raddr);
+    if (!mmu_absolute_addr_valid(raddr, false)) {
+        return -PGM_ADDRESSING;
+    }
+
+    if (!ss) {
+        ss = s390_get_skeys_device();
+        skeyclass = S390_SKEYS_GET_CLASS(ss);
+    }
+    if (skeyclass->skeys_are_enabled(ss)) {
+        s390_skeys_get(ss, raddr / TARGET_PAGE_SIZE, 1, &skey);
+    }
+
+    if (skey_fetch_protected(env, addr, private, skey, access_key)) {
+        return 2;
+    }
+    if (fetch_only || !(flags & PAGE_WRITE) ||
+        (is_low_address(addr) && lowprot_enabled(env, asce)) ||
+        skey_store_protected(env, skey, access_key)) {
+        return 1;
+    }
+    return 0;
+}
+
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
                   hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc)
 {
@@ -805,6 +875,99 @@ int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
     return ret;
 }
 
+static void s390_tx_discard_pages(CPUS390XState *env)
+{
+    for (unsigned int i = 0; i < env->tx_page_count; i++) {
+        g_free(env->tx_page_data[i]);
+        env->tx_page_data[i] = NULL;
+        env->tx_pages[i] = 0;
+    }
+    env->tx_page_count = 0;
+}
+
+void s390_tx_reset(CPUS390XState *env)
+{
+    s390_tx_discard_pages(env);
+    env->tx_depth = 0;
+    env->tx_constrained = false;
+    env->tx_gprmask = 0;
+    env->tx_start_addr = 0;
+}
+
+void s390_tx_begin(CPUS390XState *env, uint64_t start_addr, uint8_t gprmask)
+{
+    s390_tx_reset(env);
+    memcpy(env->tx_saved_regs, env->regs, sizeof(env->tx_saved_regs));
+    env->tx_start_addr = start_addr;
+    env->tx_gprmask = gprmask;
+    env->tx_depth = 1;
+    env->tx_constrained = true;
+
+    /*
+     * Every transactional store must fault through s390_cpu_tlb_fill() at
+     * least once so that the original page can be retained for rollback.
+     */
+    tlb_flush(env_cpu(env));
+}
+
+int s390_tx_track_page(CPUS390XState *env, hwaddr page)
+{
+    AddressSpace *as = env_cpu(env)->as;
+    uint8_t *copy;
+
+    page &= TARGET_PAGE_MASK;
+    for (unsigned int i = 0; i < env->tx_page_count; i++) {
+        if (env->tx_pages[i] == page) {
+            return 0;
+        }
+    }
+    if (env->tx_page_count == S390_TX_MAX_PAGES) {
+        return PGM_TRANSACTION_CONSTRAINT;
+    }
+
+    copy = g_malloc(TARGET_PAGE_SIZE);
+    if (address_space_read(as, page, MEMTXATTRS_UNSPECIFIED, copy,
+                           TARGET_PAGE_SIZE) != MEMTX_OK) {
+        g_free(copy);
+        return PGM_ADDRESSING;
+    }
+    env->tx_pages[env->tx_page_count] = page;
+    env->tx_page_data[env->tx_page_count] = copy;
+    env->tx_page_count++;
+    return 0;
+}
+
+void s390_tx_commit(CPUS390XState *env)
+{
+    s390_tx_discard_pages(env);
+    env->tx_depth = 0;
+    env->tx_constrained = false;
+    env->tx_gprmask = 0;
+    env->tx_start_addr = 0;
+    tlb_flush(env_cpu(env));
+}
+
+void s390_tx_abort(CPUS390XState *env)
+{
+    AddressSpace *as = env_cpu(env)->as;
+    uint8_t mask = env->tx_gprmask;
+    uint64_t start_addr = env->tx_start_addr;
+
+    for (unsigned int i = 0; i < env->tx_page_count; i++) {
+        address_space_write(as, env->tx_pages[i], MEMTXATTRS_UNSPECIFIED,
+                            env->tx_page_data[i], TARGET_PAGE_SIZE);
+    }
+    for (unsigned int i = 0; i < 16; i += 2, mask <<= 1) {
+        if (mask & 0x80) {
+            env->regs[i] = env->tx_saved_regs[i];
+            env->regs[i + 1] = env->tx_saved_regs[i + 1];
+        }
+    }
+    s390_tx_reset(env);
+    env->psw.addr = start_addr;
+    tlb_flush(env_cpu(env));
+}
+
 void s390_cpu_virt_mem_handle_exc(S390CPU *cpu, uintptr_t ra)
 {
     /* KVM will handle the interrupt automatically, TCG has to exit the TB */
@@ -823,8 +986,9 @@ void s390_cpu_virt_mem_handle_exc(S390CPU *cpu, uintptr_t ra)
  * @param flags  the PAGE_READ/WRITE/EXEC flags are stored to this pointer
  * @return       0 = success, != 0, the exception to raise
  */
-int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
-                       hwaddr *addr, int *flags, uint64_t *tec)
+int mmu_translate_real_with_key(CPUS390XState *env, hwaddr raddr, int rw,
+                                int access_key, hwaddr *addr, int *flags,
+                                uint64_t *tec)
 {
     const bool lowprot_enabled = env->cregs[0] & CR0_LOWPROT;
 
@@ -847,10 +1011,18 @@ int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
         return PGM_ADDRESSING;
     }
 
-    if (mmu_handle_skey(env, raddr, false, *addr, rw,
-                        ((env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY) << 4,
-                        flags)) {
+    if (mmu_handle_skey(env, raddr, false, *addr, rw, access_key, flags)) {
         return PGM_PROTECTION;
     }
     return 0;
+}
+
+int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
+                       hwaddr *addr, int *flags, uint64_t *tec)
+{
+    int access_key =
+        ((env->psw.mask & PSW_MASK_KEY) >> PSW_SHIFT_KEY) << 4;
+
+    return mmu_translate_real_with_key(env, raddr, rw, access_key,
+                                       addr, flags, tec);
 }

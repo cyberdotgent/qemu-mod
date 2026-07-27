@@ -393,13 +393,24 @@ bool mmu_absolute_addr_valid(hwaddr addr, bool is_write);
 /* Special access mode only valid for mmu_translate() */
 #define MMU_S390_LRA        -1
 #define MMU_S390_STRAG      -2
+#define MMU_S390_TPROT      -3
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
                   hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc);
 int mmu_translate_with_key(CPUS390XState *env, vaddr vaddr, int rw,
                            uint64_t asc, int access_key, hwaddr *raddr,
                            int *flags, uint64_t *tec, int *lra_cc);
+int mmu_translate_real_with_key(CPUS390XState *env, hwaddr raddr, int rw,
+                                int access_key, hwaddr *addr, int *flags,
+                                uint64_t *tec);
 int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
                        hwaddr *addr, int *flags, uint64_t *tec);
+int s390_tprot(CPUS390XState *env, vaddr addr, uint64_t asc, uint8_t access_key,
+               uint64_t *tec);
+void s390_tx_begin(CPUS390XState *env, uint64_t start_addr, uint8_t gprmask);
+void s390_tx_commit(CPUS390XState *env);
+void s390_tx_abort(CPUS390XState *env);
+void s390_tx_reset(CPUS390XState *env);
+int s390_tx_track_page(CPUS390XState *env, hwaddr page);
 int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
                             int rw, bool special_art, uint64_t *asce,
                             bool *fetch_only, uint32_t *aste_origin,

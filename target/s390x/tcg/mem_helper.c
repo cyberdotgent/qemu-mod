@@ -1257,19 +1257,24 @@ void HELPER(lam)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3,
                  uint32_t mmu_idx)
 {
     uintptr_t ra = GETPC();
-    int i;
+    uint32_t values[16];
+    uint32_t count = ((r3 - r1) & 15) + 1;
+    uint32_t i;
 
     if (a2 & 0x3) {
         tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
     }
 
-    for (i = r1;; i = (i + 1) % 16) {
-        env->aregs[i] = cpu_ldl_be_mmuidx_ra(env, a2, mmu_idx, ra);
+    /*
+     * LAM is nullifying.  Preflight the complete operand before changing
+     * any access register, in particular when the list crosses a page.
+     */
+    for (i = 0; i < count; i++) {
+        values[i] = cpu_ldl_be_mmuidx_ra(env, a2, mmu_idx, ra);
         a2 += 4;
-
-        if (i == r3) {
-            break;
-        }
+    }
+    for (i = 0; i < count; i++) {
+        env->aregs[(r1 + i) & 15] = values[i];
     }
     HELPER(flush_ars)(env, r1, r3);
 }
@@ -2431,24 +2436,36 @@ uint32_t HELPER(tp)(CPUS390XState *env, uint64_t dest, uint32_t destlen)
     return cc;
 }
 
-static uint32_t do_helper_tr(CPUS390XState *env, uint32_t len, uint64_t array,
-                             uint64_t trans, uintptr_t ra)
+static uint32_t do_helper_tr_idx(CPUS390XState *env, uint32_t len,
+                                 uint64_t array, uint64_t trans,
+                                 int array_idx, int trans_idx, uintptr_t ra)
 {
     uint32_t i;
 
     for (i = 0; i <= len; i++) {
-        uint8_t byte = cpu_ldub_data_ra(env, array + i, ra);
-        uint8_t new_byte = cpu_ldub_data_ra(env, trans + byte, ra);
-        cpu_stb_data_ra(env, array + i, new_byte, ra);
+        uint8_t byte = cpu_ldub_mmuidx_ra(env, array + i, array_idx, ra);
+        uint8_t new_byte =
+            cpu_ldub_mmuidx_ra(env, trans + byte, trans_idx, ra);
+
+        cpu_stb_mmuidx_ra(env, array + i, new_byte, array_idx, ra);
     }
 
     return env->cc_op;
 }
 
-void HELPER(tr)(CPUS390XState *env, uint32_t len, uint64_t array,
-                uint64_t trans)
+static uint32_t do_helper_tr(CPUS390XState *env, uint32_t len, uint64_t array,
+                             uint64_t trans, uintptr_t ra)
 {
-    do_helper_tr(env, len, array, trans, GETPC());
+    int idx = s390x_env_mmu_index(env, false);
+
+    return do_helper_tr_idx(env, len, array, trans, idx, idx, ra);
+}
+
+void HELPER(tr)(CPUS390XState *env, uint32_t len, uint64_t array,
+                uint64_t trans, uint32_t mmu_idxs)
+{
+    do_helper_tr_idx(env, len, array, trans, mmu_idx1(mmu_idxs),
+                     mmu_idx2(mmu_idxs), GETPC());
 }
 
 Int128 HELPER(tre)(CPUS390XState *env, uint64_t array,
@@ -2565,15 +2582,18 @@ uint32_t HELPER(trte)(CPUS390XState *env, uint32_t r1, uint32_t r2,
     return function ? 1 : 0;
 }
 
-static inline uint32_t do_helper_trt(CPUS390XState *env, int len,
-                                     uint64_t array, uint64_t trans,
-                                     int inc, uintptr_t ra)
+static inline uint32_t do_helper_trt_idx(CPUS390XState *env, int len,
+                                         uint64_t array, uint64_t trans,
+                                         int inc, int array_idx, int trans_idx,
+                                         uintptr_t ra)
 {
     int i;
 
     for (i = 0; i <= len; i++) {
-        uint8_t byte = cpu_ldub_data_ra(env, array + i * inc, ra);
-        uint8_t sbyte = cpu_ldub_data_ra(env, trans + byte, ra);
+        uint8_t byte =
+            cpu_ldub_mmuidx_ra(env, array + i * inc, array_idx, ra);
+        uint8_t sbyte =
+            cpu_ldub_mmuidx_ra(env, trans + byte, trans_idx, ra);
 
         if (sbyte != 0) {
             set_address(env, 1, array + i * inc);
@@ -2585,6 +2605,15 @@ static inline uint32_t do_helper_trt(CPUS390XState *env, int len,
     return 0;
 }
 
+static inline uint32_t do_helper_trt(CPUS390XState *env, int len,
+                                     uint64_t array, uint64_t trans,
+                                     int inc, uintptr_t ra)
+{
+    int idx = s390x_env_mmu_index(env, false);
+
+    return do_helper_trt_idx(env, len, array, trans, inc, idx, idx, ra);
+}
+
 static uint32_t do_helper_trt_fwd(CPUS390XState *env, uint32_t len,
                                   uint64_t array, uint64_t trans,
                                   uintptr_t ra)
@@ -2593,9 +2622,10 @@ static uint32_t do_helper_trt_fwd(CPUS390XState *env, uint32_t len,
 }
 
 uint32_t HELPER(trt)(CPUS390XState *env, uint32_t len, uint64_t array,
-                     uint64_t trans)
+                     uint64_t trans, uint32_t mmu_idxs)
 {
-    return do_helper_trt(env, len, array, trans, 1, GETPC());
+    return do_helper_trt_idx(env, len, array, trans, 1,
+                             mmu_idx1(mmu_idxs), mmu_idx2(mmu_idxs), GETPC());
 }
 
 static uint32_t do_helper_trt_bkwd(CPUS390XState *env, uint32_t len,
@@ -2606,9 +2636,10 @@ static uint32_t do_helper_trt_bkwd(CPUS390XState *env, uint32_t len,
 }
 
 uint32_t HELPER(trtr)(CPUS390XState *env, uint32_t len, uint64_t array,
-                      uint64_t trans)
+                      uint64_t trans, uint32_t mmu_idxs)
 {
-    return do_helper_trt(env, len, array, trans, -1, GETPC());
+    return do_helper_trt_idx(env, len, array, trans, -1,
+                             mmu_idx1(mmu_idxs), mmu_idx2(mmu_idxs), GETPC());
 }
 
 /* Translate one/two to one/two */
@@ -2830,6 +2861,8 @@ uint32_t HELPER(csst_parallel)(CPUS390XState *env, uint32_t r3, uint64_t a1,
 void HELPER(lctlg)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3)
 {
     uintptr_t ra = GETPC();
+    uint64_t values[16];
+    uint32_t count = ((r3 - r1) & 15) + 1;
     bool PERchanged = false;
     uint64_t src = a2;
     uint32_t i;
@@ -2838,23 +2871,28 @@ void HELPER(lctlg)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3)
         tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
     }
 
-    for (i = r1;; i = (i + 1) % 16) {
-        uint64_t val = cpu_ldq_be_data_ra(env, src, ra);
-        if (env->cregs[i] != val && i >= 9 && i <= 11) {
+    /* LCTLG is nullifying: fetch the entire operand before changing CRs. */
+    for (i = 0; i < count; i++) {
+        values[i] = cpu_ldq_be_data_ra(env, src, ra);
+        src += sizeof(uint64_t);
+    }
+    src = a2;
+    for (i = 0; i < count; i++) {
+        uint32_t cr = (r1 + i) & 15;
+        uint64_t val = values[i];
+
+        if (env->cregs[cr] != val && cr >= 9 && cr <= 11) {
             PERchanged = true;
         }
-        if (i == 0 && !(env->cregs[i] & CR0_CKC_SC) && (val & CR0_CKC_SC)) {
+        if (cr == 0 && !(env->cregs[cr] & CR0_CKC_SC) &&
+            (val & CR0_CKC_SC)) {
             BQL_LOCK_GUARD();
             tcg_s390_tod_updated(env_cpu(env), RUN_ON_CPU_NULL);
         }
-        env->cregs[i] = val;
+        env->cregs[cr] = val;
         HELPER_LOG("load ctl %d from 0x%" PRIx64 " == 0x%" PRIx64 "\n",
-                   i, src, val);
+                   cr, src, val);
         src += sizeof(uint64_t);
-
-        if (i == r3) {
-            break;
-        }
     }
 
     if (PERchanged && env->psw.mask & PSW_MASK_PER) {
@@ -2867,6 +2905,8 @@ void HELPER(lctlg)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3)
 void HELPER(lctl)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3)
 {
     uintptr_t ra = GETPC();
+    uint32_t values[16];
+    uint32_t count = ((r3 - r1) & 15) + 1;
     bool PERchanged = false;
     uint64_t src = a2;
     uint32_t i;
@@ -2875,23 +2915,29 @@ void HELPER(lctl)(CPUS390XState *env, uint32_t r1, uint64_t a2, uint32_t r3)
         tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
     }
 
-    for (i = r1;; i = (i + 1) % 16) {
-        uint32_t val = cpu_ldl_be_data_ra(env, src, ra);
-        uint64_t val64 = deposit64(env->cregs[i], 0, 32, val);
-        if ((uint32_t)env->cregs[i] != val && i >= 9 && i <= 11) {
+    /* LCTL is nullifying: fetch the entire operand before changing CRs. */
+    for (i = 0; i < count; i++) {
+        values[i] = cpu_ldl_be_data_ra(env, src, ra);
+        src += sizeof(uint32_t);
+    }
+    src = a2;
+    for (i = 0; i < count; i++) {
+        uint32_t cr = (r1 + i) & 15;
+        uint32_t val = values[i];
+        uint64_t val64 = deposit64(env->cregs[cr], 0, 32, val);
+
+        if ((uint32_t)env->cregs[cr] != val && cr >= 9 && cr <= 11) {
             PERchanged = true;
         }
-        if (i == 0 && !(env->cregs[i] & CR0_CKC_SC) && (val64 & CR0_CKC_SC)) {
+        if (cr == 0 && !(env->cregs[cr] & CR0_CKC_SC) &&
+            (val64 & CR0_CKC_SC)) {
             BQL_LOCK_GUARD();
             tcg_s390_tod_updated(env_cpu(env), RUN_ON_CPU_NULL);
         }
-        env->cregs[i] = val64;
-        HELPER_LOG("load ctl %d from 0x%" PRIx64 " == 0x%x\n", i, src, val);
+        env->cregs[cr] = val64;
+        HELPER_LOG("load ctl %d from 0x%" PRIx64 " == 0x%x\n",
+                   cr, src, val);
         src += sizeof(uint32_t);
-
-        if (i == r3) {
-            break;
-        }
     }
 
     if (PERchanged && env->psw.mask & PSW_MASK_PER) {
@@ -2955,44 +3001,32 @@ uint32_t HELPER(testblock)(CPUS390XState *env, uint64_t real_addr)
     return 0;
 }
 
-uint32_t HELPER(tprot)(CPUS390XState *env, uint64_t a1, uint64_t a2)
+uint32_t HELPER(tprot)(CPUS390XState *env, uint64_t a1, uint64_t a2,
+                       uint32_t arn)
 {
-    S390CPU *cpu = env_archcpu(env);
-    CPUState *cs = env_cpu(env);
+    uint64_t asc = env->psw.mask & PSW_MASK_ASC;
+    uint64_t tec = 0;
+    int result;
 
-    /*
-     * TODO: we currently don't handle all access protection types
-     * (including access-list and key-controlled) as well as AR mode.
-     */
-    if (!s390_cpu_virt_mem_check_write(cpu, a1, 0, 1)) {
-        /* Fetching permitted; storing permitted */
-        return 0;
+    if (asc == PSW_ASC_ACCREG) {
+        asc |= arn;
+    }
+    result = s390_tprot(env, a1, asc, a2 & 0xf0, &tec);
+    if (result >= 0) {
+        return result;
     }
 
-    if (env->int_pgm_code == PGM_PROTECTION) {
-        /* retry if reading is possible */
-        cs->exception_index = -1;
-        if (!s390_cpu_virt_mem_check_read(cpu, a1, 0, 1)) {
-            /* Fetching permitted; storing not permitted */
-            return 1;
-        }
-    }
-
-    switch (env->int_pgm_code) {
-    case PGM_PROTECTION:
-        /* Fetching not permitted; storing not permitted */
-        cs->exception_index = -1;
-        return 2;
+    result = -result;
+    switch (result) {
     case PGM_ADDRESSING:
     case PGM_TRANS_SPEC:
-        /* exceptions forwarded to the guest */
-        s390_cpu_virt_mem_handle_exc(cpu, GETPC());
-        return 0;
+        env->tlb_fill_exc = result;
+        env->tlb_fill_tec = tec;
+        env->tlb_fill_arn = arn;
+        tcg_s390_program_interrupt(env, result, GETPC());
+    default:
+        return 3;
     }
-
-    /* Translation not available */
-    cs->exception_index = -1;
-    return 3;
 }
 
 /* insert storage key extended */
@@ -3195,7 +3229,6 @@ uint32_t HELPER(sske)(CPUS390XState *env, uint32_t r1, uint32_t r2,
     bool conditional = s390_has_feat(S390_FEAT_CONDITIONAL_SSKE) &&
                        (m3 & (SSKE_MR | SSKE_MC));
     bool multiple = s390_has_feat(S390_FEAT_EDAT) && (m3 & SSKE_MB);
-
 
     if (multiple) {
         pages = (0x100000 - (addr & 0xfffff)) / TARGET_PAGE_SIZE;
@@ -3661,7 +3694,6 @@ void HELPER(ipte)(CPUS390XState *env, uint64_t pto, uint64_t vaddr,
 {
     CPUState *cs = env_cpu(env);
     const uintptr_t ra = GETPC();
-    uint64_t page = vaddr & TARGET_PAGE_MASK;
     uint64_t pte_addr, pte;
 
     /* Compute the page table entry address */
@@ -3673,26 +3705,17 @@ void HELPER(ipte)(CPUS390XState *env, uint64_t pto, uint64_t vaddr,
     pte |= PAGE_ENTRY_I;
     cpu_stq_be_mmuidx_ra(env, pte_addr, pte, MMU_REAL_IDX, ra);
 
-    /* XXX we exploit the fact that Linux passes the exact virtual
-       address here - it's not obliged to! */
+    /*
+     * IPTE invalidates cached translations by the page-frame real address
+     * in the PTE, not by operand 2.  Operand 2 supplies only the page-table
+     * index, so it need not be an exact virtual address.  QEMU cannot flush
+     * every virtual alias of a physical page selectively; flush the complete
+     * TLB instead.
+     */
     if (m4 & 1) {
-        if (vaddr & ~VADDR_PAGE_TX_MASK) {
-            tlb_flush_page(cs, page);
-            /* XXX 31-bit hack */
-            tlb_flush_page(cs, page ^ 0x80000000);
-        } else {
-            /* looks like we don't have a valid virtual address */
-            tlb_flush(cs);
-        }
+        tlb_flush(cs);
     } else {
-        if (vaddr & ~VADDR_PAGE_TX_MASK) {
-            tlb_flush_page_all_cpus_synced(cs, page);
-            /* XXX 31-bit hack */
-            tlb_flush_page_all_cpus_synced(cs, page ^ 0x80000000);
-        } else {
-            /* looks like we don't have a valid virtual address */
-            tlb_flush_all_cpus_synced(cs);
-        }
+        tlb_flush_all_cpus_synced(cs);
     }
 }
 

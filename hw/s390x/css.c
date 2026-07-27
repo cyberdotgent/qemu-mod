@@ -1094,6 +1094,14 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
 
     /* Look at the command. */
     ccw_dstream_init(&sch->cds, &ccw, &(sch->orb));
+    /*
+     * Residual count starts at the CCW count before the device sees the
+     * command.  Device handlers reduce it as bytes are transferred.  This is
+     * also the architecturally meaningful residual when a device presents
+     * initial status (for example, Unit Check with Intervention Required)
+     * without transferring data.
+     */
+    sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
     if (sch->ccw_cb_first && ccw.cmd_code != CCW_CMD_TIC) {
         ret = sch->ccw_cb ? sch->ccw_cb(sch, ccw) : -ENOSYS;
     } else {

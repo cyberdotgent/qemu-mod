@@ -37,6 +37,7 @@
 #define MMU_USER_IDX 0
 
 #define S390_MAX_CPUS 248
+#define S390_TX_MAX_PAGES 8
 
 typedef struct PSW {
     uint64_t mask;
@@ -65,6 +66,12 @@ typedef struct CPUArchState {
     bool bpbc;             /* branch prediction blocking */
     uint8_t tx_depth;      /* transactional-execution nesting depth */
     bool tx_constrained;   /* current transaction is constrained */
+    uint8_t tx_gprmask;    /* even/odd GPR-pair restoration mask */
+    uint8_t tx_page_count;
+    uint64_t tx_start_addr;
+    uint64_t tx_saved_regs[16];
+    hwaddr tx_pages[S390_TX_MAX_PAGES];
+    uint8_t *tx_page_data[S390_TX_MAX_PAGES];
 
     float_status fpu_status; /* passed to softfloat lib */
 
@@ -225,6 +232,7 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_SPECIAL_OP                  0x0013
 #define PGM_OPERAND                     0x0015
 #define PGM_TRACE_TABLE                 0x0016
+#define PGM_TRANSACTION_CONSTRAINT      0x0018
 #define PGM_VECTOR_PROCESSING           0x001b
 #define PGM_SPACE_SWITCH                0x001c
 #define PGM_HFP_SQRT                    0x001d
@@ -256,6 +264,7 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_REG_THIRD_TRANS             0x003b
 #define PGM_MONITOR                     0x0040
 #define PGM_PER                         0x0080
+#define PGM_TXF_EVENT                   0x0200
 #define PGM_CRYPTO                      0x0119
 
 /* External Interrupts */

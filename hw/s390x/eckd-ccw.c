@@ -31,6 +31,7 @@
 #define CMD_SEEK 0x07
 #define CMD_DIAG_WRITE_HA 0x09
 #define CMD_DIAG_READ_HA 0x0a
+#define CMD_SEEK_CYLINDER 0x0b
 #define CMD_WRITE_KD 0x0d
 #define CMD_READ_KD 0x0e
 #define CMD_ERASE 0x11
@@ -39,6 +40,7 @@
 #define CMD_READ_R0 0x16
 #define CMD_WRITE_HA 0x19
 #define CMD_READ_HA 0x1a
+#define CMD_SEEK_HEAD 0x1b
 #define CMD_SET_FILE_MASK 0x1f
 #define CMD_READ_SECTOR 0x22
 #define CMD_SET_SECTOR 0x23
@@ -128,6 +130,13 @@ struct EckdCcwDevice {
     uint32_t write_expected;
     uint32_t write_used;
     bool write_active;
+
+    uint8_t read_command;
+    uint8_t read_record;
+    uint32_t read_length;
+    uint32_t read_used;
+    bool read_advance;
+    bool read_active;
 };
 
 static uint8_t eckd_model(uint32_t cylinders)
@@ -630,12 +639,17 @@ static int eckd_locate(EckdCcwDevice *eckd, const CCW1 *ccw,
     }
     /*
      * Count orientation leaves the device at the selected count field.
-     * Data orientation has already passed that record, so the next
-     * data/key-data command operates on its successor.  Hyperion models
-     * this with ckdorient/ckdcurrec; keeping the adjustment here preserves
-     * the simpler "next record to transfer" representation used below.
+     * A following Read Data therefore consumes the selected record, while a
+     * following Read Count must advance to the next count field first.
+     * Data orientation has already passed the selected record, so the next
+     * data/key-data command operates on its successor.  Hyperion models all
+     * of this with ckdorient/ckdcurrec; retain the equivalent distinction in
+     * search_count_advance instead of treating both cases as merely a record
+     * number.
      */
-    if ((buf[0] & 0xc0) == 0x80) {
+    if ((buf[0] & 0xc0) == 0x00) {
+        eckd->search_count_advance = true;
+    } else if ((buf[0] & 0xc0) == 0x80) {
         eckd->record++;
     }
     return 0;
@@ -668,11 +682,23 @@ static int eckd_prefix(EckdCcwDevice *eckd, const CCW1 *ccw,
 static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
                             uint8_t command, bool advance)
 {
-    bool multitrack = command & 0x80;
-    const CkdImageRecord *record = eckd_current_record(eckd, multitrack);
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+    bool continuation = eckd->read_active && sch->last_cmd_valid &&
+                        (sch->last_cmd.flags & CCW_FLAG_DC);
+    const CkdImageRecord *record;
     const uint8_t *data;
+    uint32_t transferred;
     uint32_t length;
 
+    if (continuation) {
+        command = eckd->read_command;
+        advance = eckd->read_advance;
+        record = ckd_image_find_record(&eckd->image, eckd->read_record);
+    } else {
+        eckd->read_active = false;
+        eckd->read_used = 0;
+        record = eckd_current_record(eckd, command & 0x80);
+    }
     if (!record) {
         return eckd_no_record(eckd);
     }
@@ -690,11 +716,33 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
         length = 8 + record->key_length + record->data_length;
         break;
     }
+    if (!continuation) {
+        eckd->read_command = command;
+        eckd->read_record = record->number;
+        eckd->read_length = length;
+        eckd->read_advance = advance;
+    } else {
+        if (eckd->read_used > length) {
+            eckd->read_active = false;
+            return eckd_unit_check(eckd, SENSE_DATA_CHECK, 0);
+        }
+        data += eckd->read_used;
+        length -= eckd->read_used;
+    }
     trace_eckd_read(CCW_DEVICE(eckd)->sch->devno, command, eckd->cylinder,
                     eckd->head, record->number, length, ccw->count);
     if (eckd_copy_response(eckd, ccw, data, length)) {
+        eckd->read_active = false;
         return -EFAULT;
     }
+    transferred = MIN((uint32_t)ccw->count, length);
+    eckd->read_used += transferred;
+    if ((ccw->flags & CCW_FLAG_DC) &&
+        eckd->read_used < eckd->read_length) {
+        eckd->read_active = true;
+        return 0;
+    }
+    eckd->read_active = false;
     if (advance) {
         eckd_advance_record(eckd, record);
     } else if (eckd->locate_count) {
@@ -861,6 +909,7 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
     }
     if (!continuation) {
         eckd->write_active = false;
+        eckd->read_active = false;
         eckd->write_used = 0;
         if (ccw->count < 8) {
             return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
@@ -923,6 +972,7 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
         return 0;
     }
     eckd->write_active = false;
+    eckd->read_active = false;
     if (overlength && !(ccw->flags & CCW_FLAG_SLI)) {
         sch->curr_status.scsw.cstat |= SCSW_CSTAT_INCORR_LEN;
     }
@@ -1008,6 +1058,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd->search_index = 0;
         eckd->search_index_seen = false;
         eckd->write_active = false;
+        eckd->read_active = false;
     }
     trace_eckd_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count, ccw.flags,
                    eckd->cylinder, eckd->head, eckd->record);
@@ -1054,10 +1105,28 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         return eckd_copy_response(eckd, &ccw, buf,
                                   MIN((uint32_t)ccw.count, 64u));
     case CMD_SEEK:
+    case CMD_SEEK_CYLINDER:
         if (ccw.count < 6 || eckd_read_guest(eckd, buf, 6)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
+        if (lduw_be_p(buf) != 0) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
         return eckd_position(eckd, lduw_be_p(buf + 2),
+                             lduw_be_p(buf + 4), 0);
+    case CMD_SEEK_HEAD:
+        /*
+         * Seek Head has the same BBCCHH operand as Seek, but retains the
+         * current cylinder.  z/OS uses it while locating paging data sets;
+         * rejecting it boxes an otherwise valid paging volume.
+         */
+        if (ccw.count < 6 || eckd_read_guest(eckd, buf, 6)) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        if (lduw_be_p(buf) != 0) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        return eckd_position(eckd, eckd->cylinder,
                              lduw_be_p(buf + 4), 0);
     case CMD_SEARCH_HA_EQ:
         if (ccw.count < 4 || eckd_read_guest(eckd, buf, 4)) {
@@ -1437,6 +1506,7 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->reserved = false;
     eckd->format_active = false;
     eckd->write_active = false;
+    eckd->read_active = false;
     if (ec->parent_phases.hold) {
         ec->parent_phases.hold(obj, type);
     }

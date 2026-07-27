@@ -956,8 +956,8 @@
     C(0xe32f, STRVG,   RXY_a, Z,   la2, r1_o, new, m1_64, rev64, 0)
 
 /* STORE CLOCK */
-    F(0xb205, STCK,    S,     Z,   la2, 0, new, m1_64, stck, 0, IF_IO)
-    F(0xb27c, STCKF,   S,     SCF, la2, 0, new, m1_64, stck, 0, IF_IO)
+    F(0xb205, STCK,    S,     Z,   la2, 0, new, m1_64_ser, stck, 0, IF_IO)
+    F(0xb27c, STCKF,   S,     SCF, la2, 0, new, m1_64, stckf, 0, IF_IO)
 /* STORE CLOCK EXTENDED */
     F(0xb278, STCKE,   S,     Z,   0, a2, 0, 0, stcke, 0, IF_IO)
 
@@ -1442,12 +1442,21 @@
 /* EXTRACT PRIMARY/SECONDARY ASN */
     D(0xb226, EPAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 4)
     D(0xb227, ESAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 3)
+/* EXTRACT PRIMARY/SECONDARY ASN AND INSTANCE */
+    D(0xb99a, EPAIR,   RRE,   ASNLXR, 0, 0, 0, 0,
+      extract_asn_instance, 0, 4)
+    D(0xb99b, ESAIR,   RRE,   ASNLXR, 0, 0, 0, 0,
+      extract_asn_instance, 0, 3)
 /* EXTRACT AND SET EXTENDED AUTHORITY */
     F(0xb99d, ESEA,    RRE,   Z,   0, 0, 0, 0, esea, 0, IF_PRIV)
 /* SET SECONDARY ASN */
     C(0xb225, SSAR,    RRE,   Z,   0, 0, 0, 0, ssar, 0)
+/* SET SECONDARY ASN WITH INSTANCE */
+    C(0xb99f, SSAIR,   RRE,   ASNLXR, 0, 0, 0, 0, ssair, 0)
 /* PROGRAM TRANSFER */
     C(0xb228, PT,      RRE,   Z,   0, 0, 0, 0, pt, 0)
+/* PROGRAM TRANSFER WITH INSTANCE */
+    C(0xb99e, PTI,     RRE,   ASNLXR, 0, 0, 0, 0, pti, 0)
 /* PROCESS QUEUE AUXILIARY PROCESSOR */
     F(0xb2af, PQAP,    RRE,   Z,   0, 0, 0, 0, pqap, 0, IF_PRIV)
 /* SET VECTOR SUMMARY */
@@ -1463,6 +1472,9 @@
     F(0xb2f8, TEND,      S,  TE,   0, 0, 0, 0, tend, 0, 0)
 /* PERFORM FLOATING-POINT OPERATION */
     C(0x010a, PFPO,    E,     PFPO, 0, 0, 0, 0, pfpo, 0)
+/* PERFORM TIMING FACILITY FUNCTION */
+    F(0x0104, PTFF,    E,     TODS,
+      0, 0, 0, 0, ptff, 0, IF_IO)
 /* PROGRAM RETURN */
     C(0x0101, PR,      E,     Z,   0, 0, 0, 0, pr, 0)
 /* PROGRAM CALL */
@@ -1585,7 +1597,7 @@
 /* TEST PROTECTION */
     C(0xe501, TPROT,   SSE,   Z,   la1, a2, 0, 0, tprot, 0)
 /* TRACE */
-    F(0x9900, TRACE,   RS_a,  Z,   0, a2, 0, 0, trace, 0, IF_PRIV)
+    F(0x9900, TRACE,   RS_a,  Z,   0, a2, 0, 0, trace, 0, IF_PRIV | IF_IO)
 
 /* CCW I/O Instructions */
     F(0xb276, XSCH,    S,     Z,   0, 0, 0, 0, xsch, 0, IF_PRIV | IF_IO)

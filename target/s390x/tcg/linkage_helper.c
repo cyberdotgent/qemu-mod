@@ -36,6 +36,7 @@
 #define ASTE_ATL 0x0000fff0U
 #define ASTE_ORIGIN 0x7fffffc0U
 #define ASTE_REUSABLE 0x00000001U
+#define ASTE_CONTROLLED 0x00000002U
 #define LINKAGE_SUBSYSTEM 0x80000000U
 #define ASTE_BASE_SPACE 0x00000001U
 #define DUCT_REDUCED_AUTHORITY 0x00000008U
@@ -84,7 +85,8 @@ static int aste_authorize_secondary(CPUS390XState *env,
                                     uint16_t asn);
 static int linkage_real_read(CPUS390XState *env, uint64_t raddr,
                              void *buf, uint16_t len);
-static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn);
+static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn,
+                              bool instance);
 static int linkage_trace_pt(CPUS390XState *env, uint16_t pasn, uint64_t r2);
 static int linkage_trace_bsg(CPUS390XState *env, uint32_t alet,
                              uint64_t target);
@@ -103,15 +105,19 @@ static int linkage_trace_store(CPUS390XState *env, const void *data,
     int flags;
     int exc;
 
-    exc = mmu_translate_real(env, raddr, MMU_DATA_STORE,
-                             &abs, &flags, &tec);
+    /*
+     * Trace-table stores are not subject to key-controlled protection.
+     * Low-address protection still applies.
+     */
+    exc = mmu_translate_real_with_key(env, raddr, MMU_DATA_STORE, -1,
+                                      &abs, &flags, &tec);
     if (exc) {
         env->tlb_fill_exc = exc;
         env->tlb_fill_tec = tec;
         return exc;
     }
     if ((raddr & TARGET_PAGE_MASK) !=
-        ((raddr + len - 1) & TARGET_PAGE_MASK)) {
+        ((raddr + len) & TARGET_PAGE_MASK)) {
         return PGM_TRACE_TABLE;
     }
     if (address_space_write(env_cpu(env)->as,
@@ -156,7 +162,7 @@ void HELPER(trace)(CPUS390XState *env, uint32_t r1, uint32_t r3,
      * that may ultimately be committed.
      */
     if (((env->cregs[12] & CR12_TRACE_ENTRY_MASK) & TARGET_PAGE_MASK) !=
-        (((env->cregs[12] & CR12_TRACE_ENTRY_MASK) + sizeof(entry) - 1) &
+        (((env->cregs[12] & CR12_TRACE_ENTRY_MASK) + sizeof(entry)) &
          TARGET_PAGE_MASK)) {
         tcg_s390_program_interrupt(env, PGM_TRACE_TABLE, GETPC());
     }
@@ -191,8 +197,8 @@ static int linkage_real_write(CPUS390XState *env, uint64_t raddr,
         int exc;
         uint32_t chunk;
 
-        exc = mmu_translate_real(env, raddr, MMU_DATA_STORE,
-                                 &abs, &flags, &tec);
+        exc = mmu_translate_real_with_key(env, raddr, MMU_DATA_STORE, -1,
+                                          &abs, &flags, &tec);
         if (exc) {
             env->tlb_fill_exc = exc;
             env->tlb_fill_tec = tec;
@@ -252,7 +258,20 @@ void HELPER(extract_asn)(CPUS390XState *env, uint32_t r1, uint32_t cr)
                               (uint16_t)env->cregs[cr]);
 }
 
-void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
+void HELPER(extract_asn_instance)(CPUS390XState *env, uint32_t r1,
+                                  uint32_t cr)
+{
+    if (!(env->psw.mask & PSW_MASK_DAT)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if ((env->psw.mask & PSW_MASK_PSTATE) &&
+        !(env->cregs[0] & CR0_EXT_AUTH)) {
+        tcg_s390_program_interrupt(env, PGM_PRIVILEGED, GETPC());
+    }
+    env->regs[r1] = env->cregs[cr] & 0xffffffff0000ffffULL;
+}
+
+static void set_secondary_asn(CPUS390XState *env, uint32_t r1, bool instance)
 {
     uint16_t sasn = env->regs[r1];
     uint16_t pasn = env->cregs[4];
@@ -270,7 +289,7 @@ void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
         tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
     }
 
-    exc = linkage_trace_ssar(env, sasn);
+    exc = linkage_trace_ssar(env, sasn, instance);
     if (exc) {
         tcg_s390_program_interrupt(env, exc, GETPC());
     }
@@ -285,8 +304,16 @@ void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
         if (exc) {
             tcg_s390_program_interrupt(env, exc, GETPC());
         }
-        if (reuse && (aste.words[1] & ASTE_REUSABLE)) {
+        if (!instance && reuse && (aste.words[1] & ASTE_REUSABLE)) {
             tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        if (instance && (env->psw.mask & PSW_MASK_PSTATE) &&
+            (aste.words[1] & ASTE_CONTROLLED)) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        if (instance && (uint32_t)(env->regs[r1] >> 32) != aste.words[11]) {
+            linkage_set_exception_access_id(env, 0x10);
+            tcg_s390_program_interrupt(env, PGM_ASTE_INSTANCE, GETPC());
         }
         exc = aste_authorize_secondary(env, &aste, env->cregs[4] >> 16,
                                        sasn);
@@ -302,12 +329,22 @@ void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
     }
 
     env->cregs[3] = deposit64(env->cregs[3], 0, 16, sasn);
-    if (reuse) {
+    if (instance || reuse) {
         env->cregs[3] = deposit64(env->cregs[3], 32, 32, new_sastein);
     }
     env->cregs[7] = new_sasce;
     env->cregs[12] = new_cr12;
     tlb_flush(env_cpu(env));
+}
+
+void HELPER(ssar)(CPUS390XState *env, uint32_t r1)
+{
+    set_secondary_asn(env, r1, false);
+}
+
+void HELPER(ssair)(CPUS390XState *env, uint32_t r1)
+{
+    set_secondary_asn(env, r1, true);
 }
 
 uint32_t HELPER(lasp)(CPUS390XState *env, uint64_t addr, uint64_t function,
@@ -463,8 +500,9 @@ uint32_t HELPER(lasp)(CPUS390XState *env, uint64_t addr, uint64_t function,
     return 0;
 }
 
-uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
-                    uint64_t next_pc)
+static uint64_t program_transfer(CPUS390XState *env, uint32_t r1,
+                                 uint32_t r2, uint64_t next_pc,
+                                 bool instance)
 {
     uint16_t pkm = env->regs[r1] >> 16;
     uint16_t pasn = env->regs[r1];
@@ -533,8 +571,16 @@ uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
         if (exc) {
             tcg_s390_program_interrupt(env, exc, GETPC());
         }
-        if (reuse && (aste.words[1] & ASTE_REUSABLE)) {
+        if (!instance && reuse && (aste.words[1] & ASTE_REUSABLE)) {
             tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        if (instance && (env->psw.mask & PSW_MASK_PSTATE) &&
+            (aste.words[1] & ASTE_CONTROLLED)) {
+            tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+        }
+        if (instance && (uint32_t)(env->regs[r1] >> 32) != aste.words[11]) {
+            linkage_set_exception_access_id(env, 0x20);
+            tcg_s390_program_interrupt(env, PGM_ASTE_INSTANCE, GETPC());
         }
         exc = aste_authorize_primary(env, &aste, env->cregs[4] >> 16,
                                      pasn);
@@ -554,14 +600,14 @@ uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
     if (space_switch) {
         env->cregs[4] = deposit64(env->cregs[4], 0, 32,
                                   (aste.words[1] & ASTE_AX) | pasn);
-        if (reuse) {
+        if (instance || reuse) {
             env->cregs[4] = deposit64(env->cregs[4], 32, 32,
                                       aste.words[11]);
         }
         env->cregs[5] = deposit64(env->cregs[5], 0, 32, aste.origin);
         env->cregs[1] = new_pasce;
     }
-    if (reuse) {
+    if (instance || reuse) {
         env->cregs[3] = deposit64(env->cregs[3], 32, 32,
                                   env->cregs[4] >> 32);
     }
@@ -580,6 +626,18 @@ uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
         linkage_completed_exception(env, PGM_SPACE_SWITCH, target, 4);
     }
     return target;
+}
+
+uint64_t HELPER(pt)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                    uint64_t next_pc)
+{
+    return program_transfer(env, r1, r2, next_pc, false);
+}
+
+uint64_t HELPER(pti)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                     uint64_t next_pc)
+{
+    return program_transfer(env, r1, r2, next_pc, true);
 }
 
 static int linkage_trace_pc(CPUS390XState *env, uint32_t pc_number,
@@ -742,9 +800,10 @@ static int linkage_trace_mode(CPUS390XState *env, uint64_t next_addr)
     return linkage_trace_store(env, entry, 12);
 }
 
-static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn)
+static int linkage_trace_ssar(CPUS390XState *env, uint16_t sasn,
+                              bool instance)
 {
-    uint8_t entry[4] = { 0x10, 0 };
+    uint8_t entry[4] = { 0x10, instance };
 
     if (!(env->cregs[12] & CR12_ASN_TRACE)) {
         return 0;
@@ -1259,6 +1318,7 @@ void HELPER(pr)(CPUS390XState *env)
     uint64_t old_cr12 = env->cregs[12];
     uint64_t new_cr12 = old_cr12;
     uint16_t old_pasn = env->cregs[4];
+    uint16_t old_eax = env->cregs[8] >> 16;
     bool space_switch = false;
     bool reuse = s390_has_feat(S390_FEAT_ASN_LX_REUSE) &&
                  (env->cregs[0] & CR0_ASN_LX_REUSE);
@@ -1405,7 +1465,16 @@ void HELPER(pr)(CPUS390XState *env)
 
     env->cregs[15] = preceding_desc_addr & ~0x7ULL;
     env->cregs[12] = new_cr12;
-    HELPER(flush_ars)(env, 2, 14);
+    /*
+     * PR restores AR2-AR14.  Restoring a different EAX also changes the
+     * authorization of private ALEs selected by the otherwise unchanged
+     * AR1 and AR15, so discard every access-register translation then.
+     */
+    if ((uint16_t)(env->cregs[8] >> 16) != old_eax) {
+        HELPER(flush_ars)(env, 0, 15);
+    } else {
+        HELPER(flush_ars)(env, 2, 14);
+    }
     s390_cpu_set_psw(env, new_mask, new_addr);
     linkage_record_per_branch(env, new_addr);
     if (space_switch &&
@@ -1603,8 +1672,8 @@ static int linkage_real_read(CPUS390XState *env, uint64_t raddr,
         int exc;
         uint32_t chunk;
 
-        exc = mmu_translate_real(env, raddr, MMU_DATA_LOAD,
-                                 &abs, &flags, &tec);
+        exc = mmu_translate_real_with_key(env, raddr, MMU_DATA_LOAD, -1,
+                                          &abs, &flags, &tec);
         if (exc) {
             env->tlb_fill_exc = exc;
             env->tlb_fill_tec = tec;
@@ -2207,6 +2276,7 @@ uint64_t HELPER(pc)(CPUS390XState *env, uint64_t pc_number, uint64_t next_pc)
     uint64_t new_cr12 = 0;
     uint64_t old_pasce = env->cregs[1];
     uint16_t old_pasn = env->cregs[4];
+    uint16_t old_eax = env->cregs[8] >> 16;
     uint64_t new_mask = old_mask;
     uint64_t q0;
     uint64_t entry_parameter;
@@ -2400,6 +2470,15 @@ uint64_t HELPER(pc)(CPUS390XState *env, uint64_t pc_number, uint64_t next_pc)
     env->psw.mask = new_mask;
     if (new_cr12 != old_cr12) {
         env->cregs[12] = new_cr12;
+    }
+    /*
+     * A stacking PC may install the ETE's EAX without switching primary
+     * address spaces.  EAX participates in private-ALE authorization, so
+     * cached AR translations authorized with the old value are no longer
+     * usable.
+     */
+    if ((uint16_t)(env->cregs[8] >> 16) != old_eax) {
+        HELPER(flush_ars)(env, 0, 15);
     }
     linkage_record_per_branch(env, target);
     if (asn &&

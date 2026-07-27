@@ -53,6 +53,15 @@ static int cpu_pre_save(void *opaque)
     }
 
     if (tcg_enabled()) {
+        /*
+         * Transaction snapshots contain host pointers and are deliberately
+         * not migration state.  Restart an in-flight constrained transaction
+         * at TBEGINC so the migrated architectural state is nontransactional
+         * and guest memory contains no uncommitted writes.
+         */
+        if (cpu->env.tx_depth) {
+            s390_tx_abort(&cpu->env);
+        }
         tcg_s390_tod_updated(CPU(cpu), RUN_ON_CPU_NULL);
     }
 

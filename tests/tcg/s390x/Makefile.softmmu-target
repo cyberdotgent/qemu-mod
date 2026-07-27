@@ -23,10 +23,13 @@ ASM_TESTS =                                                                    \
     bakr                                                                       \
     bassm                                                                      \
     cksm                                                                       \
+    cpu-timer                                                                  \
+    csp-purge                                                                  \
     dfp-convert                                                                \
     clm                                                                        \
     exrl-ssm-early                                                             \
     icm                                                                        \
+    ipte-alias                                                                 \
     ipk                                                                        \
     keyed-move                                                                 \
     storage-key                                                                \
@@ -39,6 +42,7 @@ ASM_TESTS =                                                                    \
     pc-ss                                                                      \
     pfpo                                                                       \
     pqap                                                                       \
+    ptff                                                                       \
     per                                                                        \
     precise-smc-softmmu                                                        \
     sckc                                                                       \
@@ -48,6 +52,9 @@ ASM_TESTS =                                                                    \
     strag                                                                      \
     svs                                                                        \
     trace                                                                      \
+    tod-clock                                                                  \
+    tprot-key                                                                  \
+    transaction-constrained                                                    \
     trte                                                                       \
     xc-teid                                                                    \
     unaligned-lowcore
@@ -60,6 +67,12 @@ ASM_TESTS += $(PGM_SPECIFICATION_TESTS)
 $(ASM_TESTS): LDFLAGS += -Wl,-T$(LINK_SCRIPT) -Wl,--build-id=none
 $(ASM_TESTS): $(LINK_SCRIPT)
 dfp-convert: dfp-convert.o
+cpu-timer: cpu-timer.o
+ptff: ptff.o
+tod-clock: tod-clock.o
+tprot-key: tprot-key.o
+transaction-constrained: transaction-constrained.o
+run-ptff: EXTFLAGS += -cpu max
 strag: strag.o
 svs: svs.o
 xc-teid: xc-teid.o
@@ -98,6 +111,12 @@ run-sclp-chp: QEMU_OPTS := -action panic=exit-failure -nographic \
 	-serial chardev:output $(EXTFLAGS) -nodefaults \
 	-blockdev driver=null-co$(COMMA)node-name=fba$(COMMA)size=1048576 \
 	-device fba-ccw$(COMMA)drive=fba$(COMMA)devno=fe.0.0200 -kernel
+
+sclp-cpu: $(S390X_MULTIARCH_RUNTIME_OBJS)
+sclp-cpu: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+sclp-cpu: CFLAGS += -I$(SRC_PATH)/pc-bios/s390-ccw
+sclp-cpu: sclp-cpu.o
+TESTS += sclp-cpu
 
 eckd-zero-data: $(S390X_MULTIARCH_RUNTIME_OBJS)
 eckd-zero-data: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
@@ -151,6 +170,15 @@ terminal3270-skip: terminal3270-skip.o
 TESTS += terminal3270-skip
 run-terminal3270-skip: terminal3270-skip
 	$(call run-test, $<, $(PYTHON) $(S390X_SRC)/terminal3270-skip.py \
+	  $(QEMU) $<)
+
+terminal3270-residual: $(S390X_MULTIARCH_RUNTIME_OBJS)
+terminal3270-residual: LDFLAGS += $(S390X_MULTIARCH_RUNTIME_OBJS)
+terminal3270-residual: CFLAGS += -I$(SRC_PATH)/pc-bios/s390-ccw
+terminal3270-residual: terminal3270-residual.o
+TESTS += terminal3270-residual
+run-terminal3270-residual: terminal3270-residual
+	$(call run-test, $<, $(PYTHON) $(S390X_SRC)/terminal3270-residual.py \
 	  $(QEMU) $<)
 
 # s390x clears the BSS section so we need to account for that

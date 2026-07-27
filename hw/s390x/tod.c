@@ -116,6 +116,20 @@ static void s390_tod_realize(DeviceState *dev, Error **errp)
     register_savevm_live("todclock", 0, 1, &savevm_tod, td);
 }
 
+static void s390_tod_init(Object *obj)
+{
+    S390TODState *td = S390_TOD(obj);
+
+    qemu_mutex_init(&td->unique_lock);
+}
+
+static void s390_tod_finalize(Object *obj)
+{
+    S390TODState *td = S390_TOD(obj);
+
+    qemu_mutex_destroy(&td->unique_lock);
+}
+
 static void s390_tod_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -132,6 +146,8 @@ static const TypeInfo s390_tod_info = {
     .name = TYPE_S390_TOD,
     .parent = TYPE_DEVICE,
     .instance_size = sizeof(S390TODState),
+    .instance_init = s390_tod_init,
+    .instance_finalize = s390_tod_finalize,
     .class_init = s390_tod_class_init,
     .class_size = sizeof(S390TODClass),
     .abstract = true,

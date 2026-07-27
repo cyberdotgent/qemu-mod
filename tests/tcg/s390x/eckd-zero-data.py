@@ -10,26 +10,48 @@ import tempfile
 
 
 HEADS = 15
+CYLINDERS = 2
 TRACK_SIZE = 56832
 HEADER_SIZE = 512
 
 
 def create_image(path):
-    image = bytearray(HEADER_SIZE + HEADS * TRACK_SIZE)
+    image = bytearray(HEADER_SIZE + CYLINDERS * HEADS * TRACK_SIZE)
     image[0:8] = b"CKD_P064"
     struct.pack_into("<II", image, 8, HEADS, TRACK_SIZE)
     image[16] = 0x90
     image[20:32] = b"123456789012"
 
-    for head in range(HEADS):
-        offset = HEADER_SIZE + head * TRACK_SIZE
-        struct.pack_into(">BHH", image, offset, 0, 0, head)
-        end = offset + 5
-        if head == 0:
-            # CCHHR 0000/0000/00, key length 0, data length 0.
-            image[end:end + 8] = bytes(8)
-            end += 8
-        image[end:end + 8] = bytes((0xff,)) * 8
+    for cylinder in range(CYLINDERS):
+        for head in range(HEADS):
+            offset = HEADER_SIZE + (cylinder * HEADS + head) * TRACK_SIZE
+            struct.pack_into(">BHH", image, offset, 0, cylinder, head)
+            end = offset + 5
+            if cylinder == 0 and head == 0:
+                # CCHHR 0000/0000/00, key length 0, data length 0.
+                image[end:end + 8] = bytes(8)
+                end += 8
+                # The next count field contains a normal four-byte record.
+                struct.pack_into(">HHBBH", image, end, 0, 0, 1, 0, 4)
+                end += 8
+                image[end:end + 4] = b"good"
+                end += 4
+            elif cylinder == 0 and head == 2:
+                struct.pack_into(">HHBBH", image, end, 0, 2, 0, 0, 4)
+                end += 8
+                image[end:end + 4] = b"head"
+                end += 4
+            elif cylinder == 1 and head == 2:
+                struct.pack_into(">HHBBH", image, end, 1, 2, 0, 0, 3)
+                end += 8
+                image[end:end + 3] = b"cyl"
+                end += 3
+            elif cylinder == 1 and head == 3:
+                struct.pack_into(">HHBBH", image, end, 1, 3, 0, 0, 100)
+                end += 8
+                image[end:end + 100] = bytes(range(100))
+                end += 100
+            image[end:end + 8] = bytes((0xff,)) * 8
     path.write_bytes(image)
 
 
