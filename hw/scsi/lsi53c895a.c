@@ -625,6 +625,7 @@ static void lsi_bad_selection(LSIState *s, uint32_t id)
 static void lsi_do_dma(LSIState *s, int out)
 {
     uint32_t count;
+    uint32_t dma_len;
     dma_addr_t addr;
     SCSIDevice *dev;
     SCSIRequest *req;
@@ -644,6 +645,8 @@ static void lsi_do_dma(LSIState *s, int out)
     count = s->dbc;
     if (count > p->dma_len)
         count = p->dma_len;
+
+    dma_len = p->dma_len;
 
     addr = s->dnad;
     /* both 40 and Table Indirect 64-bit DMAs store upper bits in dnad64 */
@@ -670,6 +673,27 @@ static void lsi_do_dma(LSIState *s, int out)
     if (p->orphan) {
         scsi_req_unref(req);
         return;
+    }
+
+    /*
+     * The transfer above can re-enter this device through its own MMIO BAR.
+     * Do not apply a pre-transfer snapshot to a different current request,
+     * and re-calculate against residual state consumed by a nested DMA frame.
+     * It's not clear if there is a reachable call sequence that swaps out the
+     * current request in practice, so the first check might just be
+     * defense-in-depth.
+     */
+    if (p != s->current) {
+        scsi_req_unref(req);
+        return;
+    }
+    if (dma_len > p->dma_len) {
+        if (p->dma_len == 0) {
+            /* the nested frame already continued the request */
+            scsi_req_unref(req);
+            return;
+        }
+        count -= MIN(count, dma_len - p->dma_len);
     }
     scsi_req_unref(req);
 
