@@ -81,6 +81,7 @@ int main(int argc, char **argv)
     const char *keyfile = NULL;
     int verbose = false;
     bool skip_zero = false;
+    bool no_cache = false;
 
     error_init(argv[0]);
 
@@ -93,6 +94,7 @@ int main(int argc, char **argv)
             {"repository", required_argument, 0, 'r'},
             {"ns", required_argument, 0, 'n'},
             {"keyfile", required_argument, 0, 'k'},
+            {"no-cache", no_argument, 0, 'N'},
             {0, 0, 0, 0}
         };
         int c = getopt_long(argc, argv, "hvf:r:k:", long_options, NULL);
@@ -123,6 +125,9 @@ int main(int argc, char **argv)
                 break;
             case 'S':
                 skip_zero = true;
+                break;
+            case 'N':
+                no_cache = true;
                 break;
             case 'h':
                 help();
@@ -198,6 +203,12 @@ int main(int argc, char **argv)
     }
     Error *local_err = NULL;
     int flags = BDRV_O_RDWR;
+    if (no_cache) {
+        flags |= BDRV_O_NOCACHE;
+        if (verbose) {
+            fprintf(stderr, "skip host page cache for restore of '%s'\n", target);
+        }
+    }
     BlockBackend *blk = blk_new_open(target, NULL, options, flags, &local_err);
     if (!blk) {
         fprintf(stderr, "%s\n", error_get_pretty(local_err));
