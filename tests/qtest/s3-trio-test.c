@@ -776,6 +776,145 @@ static void test_law_base(void)
     s3_test_fini(&t);
 }
 
+/* ---- hardware cursor --------------------------------------------------- */
+
+/*
+ * Write a 64x64 cursor image at 1K page `page`.  Each row is four groups
+ * of (AND word, XOR word), big endian.  Group g of every row uses
+ * and_pat[g]/xor_pat[g].
+ */
+static void write_cursor(S3Test *t, int page, const uint16_t *and_pat,
+                         const uint16_t *xor_pat)
+{
+    uint8_t img[1024];
+    int row, g;
+
+    for (row = 0; row < 64; row++) {
+        for (g = 0; g < 4; g++) {
+            uint8_t *p = img + row * 16 + g * 4;
+            p[0] = and_pat[g] >> 8;
+            p[1] = and_pat[g] & 0xff;
+            p[2] = xor_pat[g] >> 8;
+            p[3] = xor_pat[g] & 0xff;
+        }
+    }
+    qtest_bufwrite(t->qts, t->lfb + page * 1024, img, sizeof(img));
+}
+
+static void cursor_colors(S3Test *t, uint32_t fg, uint32_t bg)
+{
+    (void)crtc_r(t, 0x45);              /* reset the colour stack index */
+    crtc_w(t, 0x4a, fg & 0xff);
+    crtc_w(t, 0x4a, (fg >> 8) & 0xff);
+    crtc_w(t, 0x4a, (fg >> 16) & 0xff);
+    (void)crtc_r(t, 0x45);
+    crtc_w(t, 0x4b, bg & 0xff);
+    crtc_w(t, 0x4b, (bg >> 8) & 0xff);
+    crtc_w(t, 0x4b, (bg >> 16) & 0xff);
+}
+
+static void cursor_pos(S3Test *t, int x, int y, int xoff, int yoff)
+{
+    crtc_w(t, 0x46, x >> 8);
+    crtc_w(t, 0x47, x & 0xff);
+    crtc_w(t, 0x48, y >> 8);
+    crtc_w(t, 0x49, y & 0xff);
+    crtc_w(t, 0x4e, xoff);
+    crtc_w(t, 0x4f, yoff);
+}
+
+static void test_cursor_8bpp(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640, page = 0x200;
+    /* group 0: fg, group 1: bg, group 2: transparent, group 3: invert */
+    static const uint16_t and_pat[4] = { 0x0000, 0x0000, 0xffff, 0xffff };
+    static const uint16_t xor_pat[4] = { 0xffff, 0x0000, 0x0000, 0xffff };
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    dac_w(&t, 0, 0, 0, 0);
+    dac_w(&t, 1, 255, 0, 0);
+    dac_w(&t, 2, 0, 255, 0);
+    dac_w(&t, 3, 0, 0, 255);
+    clear_fb(&t, pitch * h);
+    /* a blue background block under the "invert" group */
+    fill_rect(&t, pitch, 8, 148, 50, 16, 64, 3);
+    write_cursor(&t, page, and_pat, xor_pat);
+
+    crtc_w(&t, 0x4c, page >> 8);
+    crtc_w(&t, 0x4d, page & 0xff);
+    cursor_colors(&t, 1, 2);
+    cursor_pos(&t, 100, 50, 0, 0);
+    crtc_w(&t, 0x55, 0x00);             /* Windows semantics */
+    crtc_w(&t, 0x45, 0x01);
+
+    screendump(&t, &img);
+    check_pixel(&img, 99, 50, 0, 0, 0);
+    check_pixel(&img, 100, 50, 255, 0, 0);       /* fg */
+    check_pixel(&img, 115, 113, 255, 0, 0);      /* fg, last row */
+    check_pixel(&img, 116, 50, 0, 255, 0);       /* bg */
+    check_pixel(&img, 132, 50, 0, 0, 0);         /* transparent */
+    check_pixel(&img, 148, 50, 255, 255, 0);     /* blue inverted */
+    check_pixel(&img, 148, 49, 0, 0, 0);
+    check_pixel(&img, 100, 114, 0, 0, 0);
+    image_free(&img);
+
+    /* X11 semantics: AND set draws, AND clear is transparent */
+    crtc_w(&t, 0x55, 0x10);
+    screendump(&t, &img);
+    check_pixel(&img, 100, 50, 0, 0, 0);
+    check_pixel(&img, 116, 50, 0, 0, 0);
+    check_pixel(&img, 132, 50, 0, 255, 0);       /* AND=1, XOR=0: bg */
+    check_pixel(&img, 148, 50, 255, 0, 0);       /* AND=1, XOR=1: fg */
+    image_free(&img);
+    crtc_w(&t, 0x55, 0x00);
+
+    /* move it, with X/Y offsets: only 64-yoff rows, starting at x-xoff */
+    cursor_pos(&t, 300, 200, 8, 60);
+    screendump(&t, &img);
+    check_pixel(&img, 100, 50, 0, 0, 0);         /* old position gone */
+    check_pixel(&img, 292, 200, 255, 0, 0);      /* x - xoff */
+    check_pixel(&img, 291, 200, 0, 0, 0);
+    check_pixel(&img, 292, 203, 255, 0, 0);      /* 4 rows visible */
+    check_pixel(&img, 292, 204, 0, 0, 0);
+    image_free(&img);
+
+    /* disable */
+    crtc_w(&t, 0x45, 0x00);
+    screendump(&t, &img);
+    check_pixel(&img, 292, 200, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_cursor_16bpp(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 1280, page = 0x300;
+    static const uint16_t and_pat[4] = { 0x0000, 0x0000, 0xffff, 0xffff };
+    static const uint16_t xor_pat[4] = { 0xffff, 0x0000, 0x0000, 0x0000 };
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 16, pitch);
+    clear_fb(&t, pitch * h);
+    write_cursor(&t, page, and_pat, xor_pat);
+    crtc_w(&t, 0x4c, page >> 8);
+    crtc_w(&t, 0x4d, page & 0xff);
+    cursor_colors(&t, 0xf800, 0x07e0);          /* red on green */
+    cursor_pos(&t, 10, 10, 0, 0);
+    crtc_w(&t, 0x45, 0x01);
+
+    screendump(&t, &img);
+    check_pixel(&img, 10, 10, 255, 0, 0);
+    check_pixel(&img, 26, 73, 0, 255, 0);
+    check_pixel(&img, 42, 10, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
 int main(int argc, char **argv)
 {
     const char *arch = qtest_get_arch();
@@ -800,6 +939,8 @@ int main(int argc, char **argv)
     qtest_add_func("/s3-trio/crtc/start-address", test_start_address);
     qtest_add_func("/s3-trio/crtc/banked-window", test_banked_window);
     qtest_add_func("/s3-trio/crtc/law-base", test_law_base);
+    qtest_add_func("/s3-trio/cursor/8bpp", test_cursor_8bpp);
+    qtest_add_func("/s3-trio/cursor/16bpp", test_cursor_16bpp);
 
     return g_test_run();
 }

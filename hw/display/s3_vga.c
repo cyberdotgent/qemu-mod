@@ -39,6 +39,7 @@
 #include "qemu/log.h"
 #include "system/reset.h"
 #include "qemu/range.h"
+#include "ui/pixel_ops.h"
 
 #define TYPE_S3_TRIO "s3-trio"
 
@@ -176,9 +177,15 @@ typedef struct S3TrioState {
     uint16_t mfc[16]; /* bee8 */
     uint16_t pix_trans; /* e2e8 */
 
-    uint8_t origin_x;
-    uint8_t origin_y;
     uint8_t unlock_pll;
+
+    /* hardware cursor (CR45-CR4F, CR55) */
+    uint32_t hwc_fg_col;
+    uint32_t hwc_bg_col;
+    uint8_t hwc_col_stack_pos;
+    int last_hwc_x;
+    int last_hwc_y;
+    int last_hwc_ysize;
 
     /* extended display start address bits 20-16 (CR31/CR51/CR69) */
     uint8_t ma_ext;
@@ -989,6 +996,161 @@ static const MemoryRegionOps s3_vga_mem_ops = {
     .impl.max_access_size = 1,
 };
 
+/*
+ * Hardware cursor.  The 64x64 two-plane cursor image lives in video memory
+ * at (CR4C:CR4D & 0xfff) * 1024; each row is 16 bytes made of four
+ * 16-pixel groups of a big-endian AND word followed by a big-endian XOR
+ * word.  CR46:CR47 and CR48:CR49 give the screen position, CR4E/CR4F the
+ * offset of the first displayed column/row within the image, CR4A/CR4B
+ * the foreground/background colours through 3-byte stacks and CR55 bit 4
+ * selects X11 semantics instead of the Windows ones.  This follows 86Box's
+ * s3_hwcursor_draw() for the Trio32/Trio64.
+ */
+static bool s3_cursor_enabled(S3TrioState *s)
+{
+    return s->vga.cr[0x45] & 0x01;
+}
+
+static int s3_cursor_x(S3TrioState *s)
+{
+    int x = ((s->vga.cr[0x46] << 8) | s->vga.cr[0x47]) & 0x7ff;
+
+    if (s3_trio_get_bpp(&s->vga) == 32) {
+        x &= ~1;
+    }
+    return x - (s->vga.cr[0x4e] & 0x3f);
+}
+
+static int s3_cursor_y(S3TrioState *s)
+{
+    return ((s->vga.cr[0x48] << 8) | s->vga.cr[0x49]) & 0x7ff;
+}
+
+static int s3_cursor_ysize(S3TrioState *s)
+{
+    return 64 - (s->vga.cr[0x4f] & 0x3f);
+}
+
+static uint32_t s3_cursor_color(S3TrioState *s, uint32_t col)
+{
+    VGACommonState *vga = &s->vga;
+    unsigned r, g, b;
+
+    switch (s3_trio_get_bpp(vga)) {
+    case 8:
+    {
+        const uint8_t *pal = vga->palette + (col & 0xff) * 3;
+        if (vga->dac_8bit) {
+            r = pal[0];
+            g = pal[1];
+            b = pal[2];
+        } else {
+            r = c6_to_8(pal[0]);
+            g = c6_to_8(pal[1]);
+            b = c6_to_8(pal[2]);
+        }
+        break;
+    }
+    case 15:
+        r = ((col >> 10) & 0x1f) * 255 / 31;
+        g = ((col >> 5) & 0x1f) * 255 / 31;
+        b = (col & 0x1f) * 255 / 31;
+        break;
+    case 16:
+        r = ((col >> 11) & 0x1f) * 255 / 31;
+        g = ((col >> 5) & 0x3f) * 255 / 63;
+        b = (col & 0x1f) * 255 / 31;
+        break;
+    default:
+        r = (col >> 16) & 0xff;
+        g = (col >> 8) & 0xff;
+        b = col & 0xff;
+        break;
+    }
+    return rgb_to_pixel32(r, g, b);
+}
+
+static void s3_cursor_invalidate(VGACommonState *vga)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    int x, y, ysize;
+
+    if (s3_cursor_enabled(s)) {
+        x = s3_cursor_x(s);
+        y = s3_cursor_y(s);
+        ysize = s3_cursor_ysize(s);
+    } else {
+        x = y = ysize = 0;
+    }
+    if (x != s->last_hwc_x || y != s->last_hwc_y ||
+        ysize != s->last_hwc_ysize) {
+        if (s->last_hwc_ysize) {
+            vga_invalidate_scanlines(vga, s->last_hwc_y,
+                                     s->last_hwc_y + s->last_hwc_ysize);
+        }
+        s->last_hwc_x = x;
+        s->last_hwc_y = y;
+        s->last_hwc_ysize = ysize;
+        if (ysize) {
+            vga_invalidate_scanlines(vga, y, y + ysize);
+        }
+    }
+}
+
+static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    uint32_t *dst = (uint32_t *)d;
+    uint32_t fg, bg, addr;
+    const uint8_t *src;
+    int x0, y0, row, group, i, width;
+    bool x11 = vga->cr[0x55] & 0x10;
+
+    if (!s3_cursor_enabled(s)) {
+        return;
+    }
+    y0 = s3_cursor_y(s);
+    if (scr_y < y0 || scr_y >= y0 + s3_cursor_ysize(s)) {
+        return;
+    }
+    row = scr_y - y0 + (vga->cr[0x4f] & 0x3f);
+    addr = (((vga->cr[0x4c] << 8) | vga->cr[0x4d]) & 0xfff) * 1024 + row * 16;
+    x0 = s3_cursor_x(s);
+    width = vga->last_scr_width;
+    fg = s3_cursor_color(s, s->hwc_fg_col);
+    bg = s3_cursor_color(s, s->hwc_bg_col);
+
+    for (group = 0; group < 4; group++) {
+        uint16_t and_mask, xor_mask;
+
+        src = vga->vram_ptr + ((addr + group * 4) & vga->vbe_size_mask);
+        and_mask = (src[0] << 8) | src[1];
+        xor_mask = (src[2] << 8) | src[3];
+        for (i = 0; i < 16; i++) {
+            int x = x0 + group * 16 + i;
+            bool a = and_mask & 0x8000;
+            bool b = xor_mask & 0x8000;
+
+            and_mask <<= 1;
+            xor_mask <<= 1;
+            if (x < 0 || x >= width) {
+                continue;
+            }
+            if (x11) {
+                if (a) {
+                    dst[x] = b ? fg : bg;
+                }
+            } else {
+                if (!a) {
+                    dst[x] = b ? fg : bg;
+                } else if (b) {
+                    dst[x] ^= 0xffffff;
+                }
+            }
+        }
+    }
+}
+
 static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
 {
     uint8_t *cr = s->vga.cr;
@@ -1019,10 +1181,9 @@ static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
         return (cr[0x31] & 0xcf) | ((s->ma_ext & 3) << 4);
     case 0x35:
         return (cr[0x35] & 0xf0) | (s->bank & 0xf);
-    case 0x47:
-        return s->origin_x;
-    case 0x49:
-        return s->origin_y;
+    case 0x45: /* reading resets the cursor colour stack index */
+        s->hwc_col_stack_pos = 0;
+        return cr[0x45];
     case 0x51:
         return (cr[0x51] & 0xf0) | ((s->bank >> 2) & 0xc) |
                ((s->ma_ext >> 2) & 3);
@@ -1081,11 +1242,24 @@ static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
         vga_ioport_write(&s->vga, addr, val);
         s3_update_bank(s);
         break;
-    case 0x47:
-        s->origin_x = val;
+    case 0x45:
+        vga_ioport_write(&s->vga, addr, val);
+        /* the cursor is drawn into a shadow surface by the VGA core */
+        s->vga.force_shadow = !!(val & 0x01);
         break;
-    case 0x49:
-        s->origin_y = val;
+    case 0x4a: /* foreground colour stack: 3 bytes, low byte first */
+        if (s->hwc_col_stack_pos < 3) {
+            s->hwc_fg_col = deposit32(s->hwc_fg_col,
+                                      8 * s->hwc_col_stack_pos, 8, val);
+        }
+        s->hwc_col_stack_pos = (s->hwc_col_stack_pos + 1) & 3;
+        break;
+    case 0x4b: /* background colour stack */
+        if (s->hwc_col_stack_pos < 3) {
+            s->hwc_bg_col = deposit32(s->hwc_bg_col,
+                                      8 * s->hwc_col_stack_pos, 8, val);
+        }
+        s->hwc_col_stack_pos = (s->hwc_col_stack_pos + 1) & 3;
         break;
     case 0x51:
         vga_ioport_write(&s->vga, addr, val);
@@ -1284,10 +1458,20 @@ static const MemoryRegionPortio s3_trio_portio_list[] = {
     PORTIO_END_OF_LIST()
 };
 
+static int s3_trio_post_load(void *opaque, int version_id)
+{
+    S3TrioState *s = opaque;
+
+    s->vga.force_shadow = s3_cursor_enabled(s);
+    s3_update_bank(s);
+    return 0;
+}
+
 static VMStateDescription vmstate_s3_trio = {
     .name = TYPE_S3_TRIO,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
+    .post_load = s3_trio_post_load,
     .fields = (VMStateField []) {
         VMSTATE_PCI_DEVICE(dev, S3TrioState),
         VMSTATE_STRUCT(vga, S3TrioState, 0, vmstate_vga_common, VGACommonState),
@@ -1327,6 +1511,9 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT16(pix_trans, S3TrioState),
         VMSTATE_UINT8(ma_ext, S3TrioState),
         VMSTATE_UINT8(bank, S3TrioState),
+        VMSTATE_UINT32(hwc_fg_col, S3TrioState),
+        VMSTATE_UINT32(hwc_bg_col, S3TrioState),
+        VMSTATE_UINT8(hwc_col_stack_pos, S3TrioState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1368,6 +1555,11 @@ static void s3_trio_reset(DeviceState *d)
     s->bank = 0;
     s->advfunc_cntl = 0;
     s->vga.bank_offset = 0;
+    s->hwc_fg_col = 0;
+    s->hwc_bg_col = 0;
+    s->hwc_col_stack_pos = 0;
+    s->last_hwc_x = s->last_hwc_y = s->last_hwc_ysize = 0;
+    s->vga.force_shadow = false;
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
@@ -1408,6 +1600,8 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     s->vga.get_bpp = s3_trio_get_bpp;
     s->vga.get_resolution = s3_trio_get_resolution;
     s->vga.get_params = s3_trio_get_params;
+    s->vga.cursor_invalidate = s3_cursor_invalidate;
+    s->vga.cursor_draw_line = s3_cursor_draw_line;
 
     /*
      * Legacy VGA ports.  Register them through the generic portio API so
