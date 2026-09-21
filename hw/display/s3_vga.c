@@ -22,8 +22,11 @@
  * with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-/* S3 Trio is a very complex graphic card. Only some parts of them have
- * been implemented.
+/*
+ * S3 Trio64 (86C764): VGA core plus the S3 extended CRTC registers,
+ * hardware cursor and the 8514-style 2D graphics engine with its I/O and
+ * memory-mapped register interfaces.  The Trio64V+ streams processor is
+ * not modelled.
  */
 
 #include "qemu/osdep.h"
@@ -43,139 +46,160 @@
 
 #define TYPE_S3_TRIO "s3-trio"
 
+/*
+ * 8514/A-style graphics engine registers.  Ports are xxE8 in I/O space; the
+ * same offsets are used inside the memory-mapped I/O window (0xA0000 +
+ * port) and, for the packed register file, at 0x8100-0x816F.
+ */
 enum {
-    REG_DISP_STAT      = 0x00,
-    REG_H_DISP         = 0x01,
-    REG_H_SYNC_START   = 0x02,
-    REG_H_SYNC_WID     = 0x03,
-    REG_V_TOTAL        = 0x04,
-    REG_V_DISP         = 0x05,
-    REG_V_SYNC_STRT    = 0x06,
-    REG_V_SYNC_WID     = 0x07,
-    REG_DISP_CNTL      = 0x08,
-    REG_H_TOTAL        = 0x09,
-    REG_SUBSYS_STAT    = 0x10, /* read-only */
-    REG_SUBSYS_CNTL    = 0x10, /* write-only */
-    REG_ROM_PAGE_SEL   = 0x11,
-    REG_ADVFUNC_CNTL   = 0x12,
-    REG_CUR_Y          = 0x20,
-    REG_CUR_X          = 0x21,
-    REG_DESTY_AXSTP    = 0x22,
-    REG_DESTX_DIASTP   = 0x23,
-    REG_ERR_TERM       = 0x24,
-    REG_MAJ_AXIS_PCNT  = 0x25,
-    REG_GP_STAT        = 0x26, /* read-only */
-    REG_CMD            = 0x26, /* write-only */
-    REG_SHORT_STROKE   = 0x27,
-    REG_BKGD_COLOR     = 0x28,
-    REG_FRGD_COLOR     = 0x29,
-    REG_WRT_MASK       = 0x2A,
-    REG_RD_MASK        = 0x2B,
-    REG_COLOR_CMP      = 0x2C,
-    REG_BKGD_MIX       = 0x2D,
-    REG_FRGD_MIX       = 0x2E,
-    REG_MULTIFUNC_CNTL = 0x2F,
-    REG_PIX_TRANS      = 0x38,
+    PORT_SUBSYS_STAT    = 0x42e8, /* read: status, write: control */
+    PORT_SETUP_MD       = 0x46e8,
+    PORT_ADVFUNC_CNTL   = 0x4ae8,
+    PORT_CUR_Y          = 0x82e8,
+    PORT_CUR_Y2         = 0x82ea,
+    PORT_CUR_X          = 0x86e8,
+    PORT_CUR_X2         = 0x86ea,
+    PORT_DESTY_AXSTP    = 0x8ae8,
+    PORT_DESTY_AXSTP2   = 0x8aea,
+    PORT_DESTX_DIASTP   = 0x8ee8,
+    PORT_X2             = 0x8eea,
+    PORT_ERR_TERM       = 0x92e8,
+    PORT_ERR_TERM2      = 0x92ea,
+    PORT_MAJ_AXIS_PCNT  = 0x96e8,
+    PORT_MAJ_AXIS_PCNT2 = 0x96ea,
+    PORT_CMD            = 0x9ae8, /* read: GP_STAT */
+    PORT_CMD2           = 0x9aea,
+    PORT_SHORT_STROKE   = 0x9ee8,
+    PORT_BKGD_COLOR     = 0xa2e8,
+    PORT_FRGD_COLOR     = 0xa6e8,
+    PORT_WRT_MASK       = 0xaae8,
+    PORT_RD_MASK        = 0xaee8,
+    PORT_COLOR_CMP      = 0xb2e8,
+    PORT_BKGD_MIX       = 0xb6e8,
+    PORT_FRGD_MIX       = 0xbae8,
+    PORT_MULTIFUNC_CNTL = 0xbee8,
+    PORT_PIX_TRANS      = 0xe2e8,
 };
 
 enum {
     DISP_STAT_SENSE = 0x0001,
 };
 
+/* GP_STAT (read of 0x9AE8) */
 enum {
-    GP_STAT_BUSY = 0x0200,
+    GP_STAT_DATA_AVAIL = 0x0100,
+    GP_STAT_BUSY       = 0x0200,
+    GP_STAT_FIFO_EMPTY = 0x0400,
 };
 
+/* CMD register (0x9AE8) */
 enum {
-    CMD_WRTDATA  = 0x0001,
-    CMD_PLANAR   = 0x0002,
-    CMD_LASTPIX  = 0x0004,
-    CMD_LINETYPE = 0x0008,
-    CMD_DRAW     = 0x0010,
+    CMD_WRTDATA  = 0x0001, /* write data (pixel transfer direction) */
+    CMD_PLANAR   = 0x0002, /* "across the plane": CPU data is a mono mask */
+    CMD_LASTPIX  = 0x0004, /* last pixel off */
+    CMD_LINETYPE = 0x0008, /* 1 = radial (vector) line, 0 = Bresenham */
+    CMD_DRAW     = 0x0010, /* write to video memory */
     CMD_INC_X    = 0x0020,
     CMD_YMAJAXIS = 0x0040,
     CMD_INC_Y    = 0x0080,
-    CMD_PCDATA   = 0x0100,
-    CMD_16BIT    = 0x0200,
-    CMD_BYTSEQ   = 0x1000,
+    CMD_PCDATA   = 0x0100, /* wait for CPU data through PIX_TRANS */
+    CMD_BUS_MASK = 0x0600, /* 0 = 8 bit, 0x200 = 16 bit, 0x400 = 32 bit */
+    CMD_BUS_16   = 0x0200,
+    CMD_BUS_32   = 0x0400,
+    CMD_EXT      = 0x0800, /* Trio64: extended command set (bit 3 of the op) */
+    CMD_BYTSEQ   = 0x1000, /* swap bytes of 16-bit mono transfers */
 };
 
-#define CMD_CMD_MASK 0xE000
+/* command opcode: bits 15-13, extended by bit 11 on the Trio64 */
 enum {
-    CMD_CMD_NOP    = 0x0000,
-    CMD_CMD_LINE   = 0x2000,
-    CMD_CMD_RECT   = 0x4000,
-    CMD_CMD_RECTV1 = 0x6000,
-    CMD_CMD_RECTV2 = 0x8000,
-    CMD_CMD_LINEAF = 0xA000,
-    CMD_CMD_BITBLT = 0xC000,
+    OP_NOP        = 0,  /* short stroke vectors */
+    OP_LINE       = 1,
+    OP_RECT       = 2,
+    OP_POLY_SOLID = 3,
+    OP_BITBLT     = 6,
+    OP_PATBLT     = 7,
+    OP_LINE_2PT   = 9,
+    OP_POLY_PAT   = 11,
 };
 
-#define BKGD_MIX_BSS_MASK 0x0060
+/* MULTIFUNC_CNTL indices */
 enum {
-    BKGD_MIX_BSS_BKGD = 0x0000,
-    BKGD_MIX_BSS_FRGD = 0x0020,
-    BKGD_MIX_BSS_PIX  = 0x0040,
-    BKGD_MIX_BSS_BMP  = 0x0060,
+    MF_MIN_AXIS_PCNT = 0x0,
+    MF_SCISSORS_T    = 0x1,
+    MF_SCISSORS_L    = 0x2,
+    MF_SCISSORS_B    = 0x3,
+    MF_SCISSORS_R    = 0x4,
+    MF_PIX_CNTL      = 0xa,
+    MF_MULT_MISC2    = 0xd,
+    MF_MULT_MISC     = 0xe,
+    MF_READ_SEL      = 0xf,
 };
 
-#define FRGD_MIX_FSS_MASK 0x0060
-enum {
-    FRGD_MIX_FSS_BKGD = 0x0000,
-    FRGD_MIX_FSS_FRGD = 0x0020,
-    FRGD_MIX_FSS_PIX  = 0x0040,
-    FRGD_MIX_FSS_BMP  = 0x0060,
-};
-
-#define PIX_CNTL_MIXSEL_MASK 0x00C0
+/* PIX_CNTL (MULTIFUNC index 0xA) bits 7-6: mix select */
+#define PIX_CNTL_MIXSEL_MASK 0x00c0
 enum {
     PIX_CNTL_MIXSEL_FOREMIX = 0x0000,
-    PIX_CNTL_MIXSEL_PATTERN = 0x0040,
-    PIX_CNTL_MIXSEL_VAR     = 0x0080,
-    PIX_CNTL_MIXSEL_TRANS   = 0x00C0,
+    PIX_CNTL_MIXSEL_CPU     = 0x0080, /* CPU data is a mono mask */
+    PIX_CNTL_MIXSEL_VRAM    = 0x00c0, /* video memory is a mono mask */
+};
+
+/* MULT_MISC (index 0xE) */
+enum {
+    MULT_MISC_HIGH_WORD  = 0x010, /* next colour register byte pair is 31-16 */
+    MULT_MISC_CLIP_OUT   = 0x020, /* draw outside the scissors instead */
+    MULT_MISC_CMP_SENSE  = 0x080, /* 1 = update when equal */
+    MULT_MISC_CMP_ENABLE = 0x100,
+    MULT_MISC_32BIT_REGS = 0x200, /* colour registers written as 32 bits */
+};
+
+/* mix registers: bits 6-5 colour source, bits 3-0 mix (ROP) */
+#define MIX_SRC_MASK 0x60
+enum {
+    MIX_SRC_BKGD   = 0x00,
+    MIX_SRC_FRGD   = 0x20,
+    MIX_SRC_CPU    = 0x40,
+    MIX_SRC_BITMAP = 0x60,
 };
 
 typedef struct S3TrioState {
     PCIDevice dev;
     VGACommonState vga;
-    uint16_t maj_axis, min_axis;
     PortioList portio;
 
     uint32_t dclk;
     uint32_t mclk;
 
-    uint16_t disp_stat; /* 02e8 */
-    uint16_t h_disp; /* 06e8 */
-    uint16_t h_sync_strt; /* 0ae8 */
-    uint16_t h_sync_wid; /* 0ee8 */
-    uint16_t v_total; /* 12e8 */
-    uint16_t v_disp; /* 16e8 */
-    uint16_t v_sync_strt; /* 1ae8 */
-    uint16_t v_sync_wid; /* 1ee8 */
-    uint16_t disp_cntl; /* 22e8 */
-    uint16_t h_total; /* 26e8 */
-    uint16_t subsys_cntl; /* 42e8 (W) */
-    uint16_t subsys_stat; /* 42e8 (R) */
-    uint16_t rom_page_sel; /* 46e8 */
+    uint16_t disp_stat;    /* 02e8 (R) */
+    uint16_t subsys_cntl;  /* 42e8 (W) */
+    uint16_t subsys_stat;  /* 42e8 (R) */
+    uint16_t setup_md;     /* 46e8 */
     uint16_t advfunc_cntl; /* 4ae8 */
-    uint16_t cur_y; /* 82e8 */
-    uint16_t cur_x; /* 86e8 */
-    uint16_t desty_axstep; /* 8ae8 */
-    uint16_t destx_diastp; /* 8ee8 */
-    uint16_t err_term; /* 92e8 */
-    uint16_t maj_axis_pcnt; /* 96e8 */
-    uint16_t gp_stat; /* 9ae8 (R) */
-    uint16_t cmd; /* 9ae8 (W) */
-    uint16_t short_stroke; /* 9ee8 */
-    uint16_t bkgd_color; /* a2e8 */
-    uint16_t frgd_color; /* a6e8 */
-    uint16_t wrt_mask; /* aae8 */
-    uint16_t rd_mask; /* aee8 */
-    uint16_t color_cmp; /* b2e8 */
-    uint16_t bkgd_mix; /* b6e8 */
-    uint16_t frgd_mix; /* bae8 */
-    uint16_t mfc[16]; /* bee8 */
-    uint16_t pix_trans; /* e2e8 */
+
+    /* graphics engine registers */
+    uint16_t cur_x, cur_y, cur_x2, cur_y2;
+    int16_t desty_axstp, desty_axstp2, destx_diastp, x2;
+    int16_t err_term, err_term2;
+    uint16_t maj_axis_pcnt, maj_axis_pcnt2;
+    uint16_t cmd, cmd2;
+    uint16_t short_stroke;
+    uint32_t bkgd_color, frgd_color;
+    uint32_t wrt_mask, rd_mask;
+    uint32_t color_cmp;
+    uint8_t bkgd_mix, frgd_mix;
+    uint16_t multifunc_cntl;
+    uint16_t mfc[16];
+    uint8_t read_sel;
+    uint8_t pix_trans[4];
+
+    /* graphics engine working state */
+    int32_t cx, cy, dx, dy, sx, sy;
+    uint32_t src, dest, pattern;
+    int32_t poly_cx, poly_cy, poly_cx2, poly_cy2, poly_dx1, poly_dx2, poly_x;
+    uint8_t point_1_updated, point_2_updated;
+    uint8_t ssv_state, ssv_len, ssv_dir, ssv_draw;
+    uint32_t dat_buf;
+    uint8_t dat_count;
+    uint8_t busy; /* a CMD_PCDATA command is waiting for CPU data */
 
     uint8_t unlock_pll;
 
@@ -196,352 +220,1597 @@ typedef struct S3TrioState {
 
 OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
 
-/* FIXME: remove forward declarations */
-static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix);
+static bool s3_enhanced_mode(S3TrioState *s);
+static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val);
+static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr);
 
-#define min_axis_pcnt mfc[0]
-#define scissors_t    mfc[1]
-#define scissors_l    mfc[2]
-#define scissors_b    mfc[3]
-#define scissors_r    mfc[4]
-#define mem_cntl      mfc[5]
-#define pattern_l     mfc[8]
-#define pattern_h     mfc[9]
-#define pix_cntl      mfc[10]
-#define color_compare mfc[14]
+/*
+ * ---- Graphics engine ---------------------------------------------------
+ *
+ * The algorithms below follow 86Box's s3_accel_start() and
+ * s3_accel_out_fifo() for the Trio64: the engine draws with a pitch taken
+ * from CR50 (screen width) and CR31 bit 1, a pixel size from CR50 bits 5-4,
+ * a 16-entry mix (ROP) table selected per pixel by a mono mask, a write
+ * mask, an optional colour compare and a scissors rectangle.
+ */
 
-static inline int address_to_reg(uint32_t addr)
+/* pixel size code from CR50 bits 5-4: 0 = 8bpp, 1 = 16bpp, 2 = 24, 3 = 32 */
+static int s3_accel_bpp(S3TrioState *s)
 {
-    assert((addr & 0x3ff) == 0x2e8);
-    return addr >> 10;
+    return (s->vga.cr[0x50] >> 4) & 3;
 }
 
-static inline uint32_t reg_to_address(int reg)
+static int s3_accel_pixel_bytes(S3TrioState *s)
 {
-    return (reg << 10) + 0x2e8;
+    return s3_accel_bpp(s) + 1;
 }
 
-static inline void do_cmd_done(S3TrioState *s)
+/* engine pitch in pixels from CR50 bits 7-6 and 0 (86Box s3_recalctimings) */
+static int s3_accel_width(S3TrioState *s)
 {
-    s->gp_stat &= ~GP_STAT_BUSY;
+    uint8_t *cr = s->vga.cr;
+
+    switch (cr[0x50] & 0xc1) {
+    case 0x00:
+        return (cr[0x31] & 0x02) ? 2048 : 1024;
+    case 0x01:
+        return 1152;
+    case 0x40:
+        return 640;
+    case 0x80:
+        return ((s->advfunc_cntl & 0x04) && !s3_enhanced_mode(s)) ? 1600 : 800;
+    case 0x81:
+        return 1600;
+    case 0xc0:
+        return 1280;
+    default:
+        return 1024;
+    }
 }
 
-static void move_to_next_pixel(S3TrioState *s)
+static uint32_t s3_accel_read_pixel(S3TrioState *s, uint32_t addr)
 {
-    uint16_t maj_axis_pcnt;
-    int dx;
-    int dy;
+    VGACommonState *vga = &s->vga;
+    uint32_t mask = vga->vbe_size_mask;
 
-    switch (s->cmd & CMD_CMD_MASK) {
-    case CMD_CMD_RECT:
-        maj_axis_pcnt = s->maj_axis_pcnt + 1;
-        dx = s->cmd & CMD_INC_X ? 1 : -1;
-        dy = s->cmd & CMD_INC_Y ? 1 : -1;
-        ++s->maj_axis;
-        if (s->maj_axis < maj_axis_pcnt) {
-            s->cur_x += dx;
-        } else if (s->maj_axis == maj_axis_pcnt) {
-            if ((maj_axis_pcnt % 2 == 0) || !(s->cmd & CMD_16BIT)) {
-                s->maj_axis = 0;
-            }
-            s->cur_x -= (s->maj_axis_pcnt) * dx;
-            s->cur_y += dy;
-            s->min_axis++;
-            if (s->min_axis == s->min_axis_pcnt + 1) {
-                do_cmd_done(s);
-            }
-        } else {
-            s->maj_axis = 0;
+    addr &= mask;
+    switch (s3_accel_bpp(s)) {
+    case 0:
+        return vga->vram_ptr[addr];
+    case 1:
+        if (addr + 1 > mask) {
+            return 0;
         }
+        return lduw_le_p(vga->vram_ptr + addr);
+    case 2:
+        if (addr + 3 > mask) {
+            return 0;
+        }
+        return ldl_le_p(vga->vram_ptr + addr) & 0xffffff;
+    default:
+        if (addr + 3 > mask) {
+            return 0;
+        }
+        return ldl_le_p(vga->vram_ptr + addr);
+    }
+}
+
+static void s3_accel_write_pixel(S3TrioState *s, uint32_t addr, uint32_t val)
+{
+    VGACommonState *vga = &s->vga;
+    uint32_t mask = vga->vbe_size_mask;
+
+    addr &= mask;
+    switch (s3_accel_bpp(s)) {
+    case 0:
+        vga->vram_ptr[addr] = val;
+        memory_region_set_dirty(&vga->vram, addr, 1);
         break;
-    case CMD_CMD_LINE:
-        if ((s->cmd & CMD_LINETYPE) == 0) {
-            assert(0);
-        } else {
-            static const int xstep[] = { 1,  1,  0, -1, -1, -1, 0, 1 };
-            static const int ystep[] = { 0, -1, -1, -1,  0,  1, 1, 1 };
-            s->cur_x += xstep[(s->cmd >> 5) & 3];
-            s->cur_y += ystep[(s->cmd >> 5) & 3];
-            if (s->maj_axis_pcnt-- == 0) {
-                do_cmd_done(s);
-            }
+    case 1:
+        if (addr + 1 > mask) {
+            return;
         }
+        stw_le_p(vga->vram_ptr + addr, val);
+        memory_region_set_dirty(&vga->vram, addr, 2);
+        break;
+    case 2:
+        if (addr + 2 > mask) {
+            return;
+        }
+        vga->vram_ptr[addr] = val;
+        vga->vram_ptr[addr + 1] = val >> 8;
+        vga->vram_ptr[addr + 2] = val >> 16;
+        memory_region_set_dirty(&vga->vram, addr, 3);
         break;
     default:
-        assert(0);
+        if (addr + 3 > mask) {
+            return;
+        }
+        stl_le_p(vga->vram_ptr + addr, val);
+        memory_region_set_dirty(&vga->vram, addr, 4);
         break;
     }
 }
 
-static void do_cmd_write_one_pixel(S3TrioState *s, uint8_t value)
+/* the 16 mixes (raster operations) of the S3/8514 mix registers */
+static uint32_t s3_mix(int mix, uint32_t src, uint32_t dst)
 {
-    uint32_t offset;
-    uint8_t* p8;
-    int width, height;
-
-    if (s->color_compare & 0x100) {
-        if ((s->color_compare & 0x80) == 0x80 && s->color_cmp != value) {
-            return;
-        } else if ((s->color_compare & 0x80) == 0x00 && s->color_cmp == value) {
-            return;
-        }
-    }
-
-    s->vga.get_resolution(&s->vga, &width, &height);
-
-    if ((s->maj_axis < s->maj_axis_pcnt) ||
-        (s->maj_axis == s->maj_axis_pcnt && !(s->cmd & CMD_LASTPIX))) {
-        offset = s->cur_y * width + s->cur_x;
-        p8 = s->vga.vram_ptr + offset;
-        p8[0] = value;
-        memory_region_set_dirty(&s->vga.vram, offset, 1);
+    switch (mix & 0xf) {
+    case 0x0: return ~dst;
+    case 0x1: return 0;
+    case 0x2: return ~0;
+    case 0x3: return dst;
+    case 0x4: return ~src;
+    case 0x5: return src ^ dst;
+    case 0x6: return ~(src ^ dst);
+    case 0x7: return src;
+    case 0x8: return ~(src & dst);
+    case 0x9: return ~src | dst;
+    case 0xa: return src | ~dst;
+    case 0xb: return src | dst;
+    case 0xc: return src & dst;
+    case 0xd: return src & ~dst;
+    case 0xe: return ~src & dst;
+    default:  return ~(src | dst);
     }
 }
 
-static void do_cmd_write_pixel(S3TrioState *s, uint16_t value)
+/* engine parameters that are constant for one s3_accel_start() call */
+typedef struct S3AccelCtx {
+    int clip_t, clip_l, clip_b, clip_r;
+    bool vram_mask;         /* PIX_CNTL: video memory supplies the mask */
+    uint32_t mix_mask;      /* MSB of the mono mask for the bus width */
+    uint32_t compare, rd_mask, wrt_mask, frgd_color, bkgd_color;
+    int frgd_sel, bkgd_sel; /* mix register bits 6-5 */
+    int frgd_mix, bkgd_mix; /* mix register bits 3-0 */
+    int x_mul;              /* bytes per pixel */
+    int width;              /* pitch in pixels */
+    uint32_t srcbase, dstbase;
+} S3AccelCtx;
+
+static bool s3_accel_clipped(S3TrioState *s, const S3AccelCtx *c, int x, int y)
 {
-    int i, size;
-    uint16_t color;
+    bool inside = x >= c->clip_l && x <= c->clip_r &&
+                  y >= c->clip_t && y <= c->clip_b;
 
-    if (!(s->gp_stat & GP_STAT_BUSY)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "s3_trio: %s called while GP_STAT_BUSY not set\n",
-                      __func__);
-        return;
+    if (s->mfc[MF_MULT_MISC] & MULT_MISC_CLIP_OUT) {
+        return inside;
     }
+    return !inside;
+}
 
-    if (s->cmd & CMD_PLANAR) {
-        size = (s->cmd & CMD_16BIT) ? 16 : 8;
-        for (i = 0; i < size; i++) {
-            if (value & (1 << (size - i - 1))) {
-                color = get_color_from_mix(s, s->frgd_mix);
-            } else {
-                color = get_color_from_mix(s, s->bkgd_mix);
-            }
-            do_cmd_write_one_pixel(s, color);
-            move_to_next_pixel(s);
+/* colour compare: returns false when the pixel must not be updated */
+static bool s3_accel_compare(S3TrioState *s, const S3AccelCtx *c, uint32_t src)
+{
+    if (!(s->mfc[MF_MULT_MISC] & MULT_MISC_CMP_ENABLE)) {
+        return true;
+    }
+    if (s->mfc[MF_MULT_MISC] & MULT_MISC_CMP_SENSE) {
+        return src == c->compare;
+    }
+    return src != c->compare;
+}
+
+/* source operand for one pixel, from the selected mix register */
+static uint32_t s3_accel_source(S3TrioState *s, const S3AccelCtx *c,
+                                bool fg, uint32_t cpu_dat, uint32_t bmp_addr)
+{
+    switch (fg ? c->frgd_sel : c->bkgd_sel) {
+    case 0:
+        return c->bkgd_color;
+    case 1:
+        return c->frgd_color;
+    case 2:
+        /* only the current pixel takes part in the mix and compare */
+        switch (s3_accel_bpp(s)) {
+        case 0:
+            return cpu_dat & 0xff;
+        case 1:
+            return cpu_dat & 0xffff;
+        case 2:
+            return cpu_dat & 0xffffff;
+        default:
+            return cpu_dat;
         }
+    default:
+        return s3_accel_read_pixel(s, bmp_addr);
+    }
+}
+
+/* mix one pixel into the destination at addr and write it back */
+static void s3_accel_plot(S3TrioState *s, const S3AccelCtx *c, uint32_t addr,
+                          bool fg, uint32_t src, bool write)
+{
+    uint32_t dst, out;
+
+    dst = s3_accel_read_pixel(s, addr);
+    out = s3_mix(fg ? c->frgd_mix : c->bkgd_mix, src, dst);
+    out = (out & c->wrt_mask) | (dst & ~c->wrt_mask);
+    if (write) {
+        s3_accel_write_pixel(s, addr, out);
+    }
+}
+
+static void s3_accel_setup_ctx(S3TrioState *s, S3AccelCtx *c)
+{
+    int bpp = s3_accel_bpp(s);
+
+    c->clip_t = s->mfc[MF_SCISSORS_T] & 0xfff;
+    c->clip_l = s->mfc[MF_SCISSORS_L] & 0xfff;
+    c->clip_b = s->mfc[MF_SCISSORS_B] & 0xfff;
+    c->clip_r = s->mfc[MF_SCISSORS_R] & 0xfff;
+    c->vram_mask = (s->mfc[MF_PIX_CNTL] & PIX_CNTL_MIXSEL_MASK) ==
+                   PIX_CNTL_MIXSEL_VRAM;
+    c->compare = s->color_cmp;
+    c->rd_mask = s->rd_mask;
+    c->wrt_mask = s->wrt_mask;
+    c->frgd_color = s->frgd_color;
+    c->bkgd_color = s->bkgd_color;
+    c->frgd_sel = (s->frgd_mix >> 5) & 3;
+    c->bkgd_sel = (s->bkgd_mix >> 5) & 3;
+    c->frgd_mix = s->frgd_mix & 0xf;
+    c->bkgd_mix = s->bkgd_mix & 0xf;
+    c->x_mul = s3_accel_pixel_bytes(s);
+    c->width = s3_accel_width(s);
+
+    /* source/destination base (MULT_MISC2 / MULT_MISC), in 1MB units */
+    if ((s->mfc[MF_MULT_MISC2] >> 4) & 7) {
+        c->srcbase = 0x100000 * ((s->mfc[MF_MULT_MISC2] >> 4) & 7);
     } else {
-        if (s->cmd & CMD_16BIT) {
-            do_cmd_write_one_pixel(s, value >> 8);
-            move_to_next_pixel(s);
-        }
-        do_cmd_write_one_pixel(s, value & 0xff);
-        move_to_next_pixel(s);
+        c->srcbase = 0x100000 * ((s->mfc[MF_MULT_MISC] >> 2) & 3);
     }
-}
-
-static uint16_t get_current_source_bitmap(S3TrioState *s)
-{
-    qemu_log_mask(LOG_UNIMP,
-                  "s3_trio: unimplemented source operand BMP\n");
-    return 0;
-}
-
-static uint16_t get_current_destination_bitmap(S3TrioState *s)
-{
-    qemu_log_mask(LOG_UNIMP,
-                  "s3_trio: unimplemented destination operand BMP\n");
-    return 0;
-}
-
-static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix)
-{
-    switch (mix & FRGD_MIX_FSS_MASK) {
-    case FRGD_MIX_FSS_BKGD:
-        return s->bkgd_color;
-    case FRGD_MIX_FSS_FRGD:
-        return s->frgd_color;
-    case FRGD_MIX_FSS_PIX:
-        return s->pix_trans;
-    case FRGD_MIX_FSS_BMP:
-        return get_current_source_bitmap(s);
+    if (s->mfc[MF_MULT_MISC2] & 7) {
+        c->dstbase = 0x100000 * (s->mfc[MF_MULT_MISC2] & 7);
+    } else {
+        c->dstbase = 0x100000 * (s->mfc[MF_MULT_MISC] & 3);
+    }
+    switch (bpp) {
+    case 1:
+        c->srcbase >>= 1;
+        c->dstbase >>= 1;
+        break;
+    case 2:
+        c->srcbase /= 3;
+        c->dstbase /= 3;
+        break;
+    case 3:
+        c->srcbase >>= 2;
+        c->dstbase >>= 2;
+        break;
     default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid FSS 0x%x\n",
-                      (s->frgd_mix & FRGD_MIX_FSS_MASK) >> 5);
-        return 0;
+        break;
+    }
+
+    switch (bpp) {
+    case 0:
+        c->rd_mask &= 0xff;
+        c->compare &= 0xff;
+        break;
+    case 1:
+        c->rd_mask &= 0xffff;
+        c->compare &= 0xffff;
+        break;
+    case 2:
+        if (c->wrt_mask == 0xffff) {
+            c->wrt_mask = 0xffffff;
+        }
+        if (c->rd_mask == 0xffff) {
+            c->rd_mask = 0xffffff;
+        }
+        break;
+    default:
+        break;
+    }
+
+    switch (s->cmd & CMD_BUS_MASK) {
+    case 0x000:
+        c->mix_mask = 0x80;
+        break;
+    case CMD_BUS_16:
+        c->mix_mask = 0x8000;
+        break;
+    default:
+        c->mix_mask = 0x80000000;
+        break;
     }
 }
 
-static uint16_t raster_op(S3TrioState *s, uint16_t mix)
+static inline uint32_t s3_pix_addr(const S3AccelCtx *c, uint32_t base,
+                                   int x, int y)
 {
-    uint16_t src = get_color_from_mix(s, mix);
-    uint16_t op = mix & 0x1f;
+    return base + (y * c->width + x) * c->x_mul;
+}
+
+/* the mono mask is consumed MSB first; a 1 is shifted in from the right */
+static inline void s3_next_mix(uint32_t *mix_dat)
+{
+    *mix_dat = (*mix_dat << 1) | 1;
+}
+
+static inline void s3_next_cpu_dat(S3TrioState *s, uint32_t *cpu_dat)
+{
+    if (s3_accel_bpp(s) == 0) {
+        *cpu_dat >>= 8;
+    } else {
+        *cpu_dat >>= 16;
+    }
+}
+
+/* step one pixel in one of the eight radial directions (cmd/ssv bits 7-5) */
+static void s3_step_dir(int dir, int32_t *x, int32_t *y)
+{
+    switch (dir & 0xe0) {
+    case 0x00: (*x)++; break;
+    case 0x20: (*x)++; (*y)--; break;
+    case 0x40: (*y)--; break;
+    case 0x60: (*x)--; (*y)--; break;
+    case 0x80: (*x)--; break;
+    case 0xa0: (*x)--; (*y)++; break;
+    case 0xc0: (*y)++; break;
+    default:   (*x)++; (*y)++; break;
+    }
+}
+
+static void s3_polygon_setup(S3TrioState *s)
+{
+    if (s->point_1_updated) {
+        int start_x = s->poly_cx;
+        int start_y = s->poly_cy;
+        int end_x = s->destx_diastp << 20;
+        int end_y = s->desty_axstp;
+
+        s->poly_dx1 = (end_y - start_y) ? (end_x - start_x) / (end_y - start_y)
+                                        : 0;
+        s->point_1_updated = 0;
+        if (end_y == s->poly_cy) {
+            s->poly_cx = end_x;
+            s->poly_x = end_x >> 20;
+        }
+    }
+    if (s->point_2_updated) {
+        int start_x = s->poly_cx2;
+        int start_y = s->poly_cy2;
+        int end_x = s->x2 << 20;
+        int end_y = s->desty_axstp2;
+
+        s->poly_dx2 = (end_y - start_y) ? (end_x - start_x) / (end_y - start_y)
+                                        : 0;
+        s->point_2_updated = 0;
+        if (end_y == s->poly_cy) {
+            s->poly_cx2 = end_x;
+        }
+    }
+}
+
+static bool s3_cpu_src(S3TrioState *s)
+{
+    /* on the Trio64 CPU data can only be a source */
+    return s->cmd & CMD_PCDATA;
+}
+
+static void s3_accel_done(S3TrioState *s)
+{
+    s->busy = 0;
+}
+
+/*
+ * Run (part of) the current command.  count is the number of pixels or
+ * mask bits provided by this call (-1: run to completion), cpu_input tells
+ * whether this is a PIX_TRANS transfer, mix_dat is the mono mask
+ * (0xffffffff = all foreground) and cpu_dat the CPU colour data.
+ */
+static void s3_accel_start(S3TrioState *s, int count, bool cpu_input,
+                           uint32_t mix_dat, uint32_t cpu_dat)
+{
+    S3AccelCtx ctx, *c = &ctx;
+    int op = s->cmd >> 13;
+    uint32_t src, addr;
+    bool fg;
+
+    if (s->cmd & CMD_EXT) {
+        op |= 0x08;
+    }
+    s3_accel_setup_ctx(s, c);
+
+    if (!cpu_input) {
+        s->dat_count = 0;
+        s->busy = 0;
+        trace_s3_vga_accel_start(op, s->cmd, s->cur_x, s->cur_y,
+                                 s->destx_diastp, s->desty_axstp,
+                                 s->maj_axis_pcnt, s->mfc[MF_MIN_AXIS_PCNT]);
+        trace_s3_vga_accel_regs(s->frgd_mix, s->bkgd_mix, s->mfc[MF_PIX_CNTL],
+                                s->mfc[MF_MULT_MISC], s->color_cmp,
+                                s->wrt_mask, s->frgd_color, s->bkgd_color);
+    } else if (cpu_input && ((s->mfc[MF_PIX_CNTL] & PIX_CNTL_MIXSEL_MASK) !=
+                             PIX_CNTL_MIXSEL_CPU) && !(s->cmd & CMD_PLANAR)) {
+        /* colour data: count was in bytes, convert to pixels */
+        if (s3_accel_bpp(s) == 3 && count == 2) {
+            /* 32bpp pixels arriving as 16-bit halves */
+            if (s->dat_count) {
+                cpu_dat = ((cpu_dat & 0xffff) << 16) | s->dat_buf;
+                count = 4;
+                s->dat_count = 0;
+            } else {
+                s->dat_buf = cpu_dat & 0xffff;
+                s->dat_count = 1;
+                return;
+            }
+        }
+        if (s3_accel_bpp(s) == 1) {
+            count >>= 1;
+        } else if (s3_accel_bpp(s) >= 2) {
+            count >>= 2;
+        }
+    }
+
+#define LOOP_COUNT()  (count != 0 ? (count > 0 ? count-- : 1) : 0)
 
     switch (op) {
-    case 0x00: return ~get_current_destination_bitmap(s);
-    case 0x01: return 0;
-    case 0x02: return 1;
-    case 0x03: return ~get_current_destination_bitmap(s);
-    case 0x04: return ~get_color_from_mix(s, mix);
-    case 0x05: return get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s);
-    case 0x06: return ~(get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s));
-    case 0x07: return get_color_from_mix(s, mix);
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid MIX operation 0x%x\n",
-                      op);
-        return src;
-    }
-}
-
-static uint16_t get_foreground_color(S3TrioState *s)
-{
-    return raster_op(s, s->frgd_mix);
-}
-
-#if 0
-static uint16_t get_background_color(S3TrioState *s)
-{
-    return raster_op(s, s->bkgd_mix);
-}
-#endif
-
-static uint16_t get_color(S3TrioState *s)
-{
-    assert(!(s->cmd & CMD_PCDATA));
-
-    if (s->cmd & CMD_PLANAR) {
-        return 0xffff;
-    }
-
-    switch (s->pix_cntl & PIX_CNTL_MIXSEL_MASK) {
-    case PIX_CNTL_MIXSEL_FOREMIX:
-        return get_foreground_color(s);
-    case PIX_CNTL_MIXSEL_PATTERN:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented mixel PATTERN\n");
-        return 0;
-    case PIX_CNTL_MIXSEL_VAR:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented mixel VAR\n");
-        return 0;
-    case PIX_CNTL_MIXSEL_TRANS:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented mixel TRANS\n");
-        return 0;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid MIXSEL 0x%x\n",
-                      (s->pix_cntl & PIX_CNTL_MIXSEL_MASK) >> 6);
-        return 0;
-    }
-}
-
-static void s3_do_cmd_bitblt(S3TrioState *s)
-{
-    int dx, dy, x, y, srcx, srcy, destx, desty;
-    uint16_t x1 = s->cur_x;
-    uint16_t y1 = s->cur_y;
-    uint16_t x2 = s->destx_diastp;
-    uint16_t y2 = s->desty_axstep;
-    uint16_t width = s->maj_axis_pcnt;
-    uint16_t height = s->min_axis_pcnt;
-    uint8_t *p8_src, *p8_dest;
-    int res_width, res_height;
-
-    s->vga.get_resolution(&s->vga, &res_width, &res_height);
-
-    if (x1 > x2) {
-        dx = 1;
-        srcx = x1;
-        destx = x2;
-    } else {
-        dx = -1;
-        srcx = x1 + width - 1;
-        destx = x2 + width - 1;
-    }
-    if (y1 > y2) {
-        dy = 1;
-        srcy = y1;
-        desty = y2;
-    } else {
-        dy = -1;
-        srcy = y1 + height - 1;
-        desty = y2 + height - 1;
-    }
-    for (y = 0; y < height; y++) {
-        p8_src = s->vga.vram_ptr + (srcy + y * dy) * res_width + srcx;
-        p8_dest = s->vga.vram_ptr + (desty + y * dy) * res_width + destx;
-        for (x = 0; x < width; x++) {
-            *p8_dest = *p8_src;
-            memory_region_set_dirty(&s->vga.vram, p8_dest - s->vga.vram_ptr, 1);
-            p8_src += dx;
-            p8_dest += dx;
+    case OP_NOP: /* short stroke vectors */
+        if (!s->ssv_state) {
+            break;
         }
-    }
-}
-
-static void do_cmd_init(S3TrioState *s)
-{
-    s->gp_stat |= GP_STAT_BUSY;
-    s->maj_axis = 0;
-    s->min_axis = 0;
-}
-
-static void do_cmd(S3TrioState *s)
-{
-    trace_s3_vga_cmd(s->cmd);
-
-    do_cmd_init(s);
-
-    if ((s->cmd & CMD_WRTDATA) == 0) {
-        qemu_log_mask(LOG_UNIMP,
-                      "s3_trio: CMD_WRTDATA=0 not implemented (%04x)\n", s->cmd);
-    }
-
-    switch (s->cmd & CMD_CMD_MASK) {
-    case CMD_CMD_NOP:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_NOP not implemented (%04x)\n",
-                      s->cmd);
+        if (!(s->cmd & CMD_LINETYPE)) {
+            break;
+        }
+        while (LOOP_COUNT()) {
+            if (!s3_accel_clipped(s, c, s->cx & 0xfff, s->cy & 0xfff)) {
+                fg = mix_dat & c->mix_mask;
+                addr = s3_pix_addr(c, 0, s->cx, s->cy);
+                src = s3_accel_source(s, c, fg, cpu_dat, addr);
+                if (s3_accel_compare(s, c, src)) {
+                    s3_accel_plot(s, c, addr, fg, src, s->ssv_draw);
+                }
+            }
+            s3_next_mix(&mix_dat);
+            s3_next_cpu_dat(s, &cpu_dat);
+            if (!s->ssv_len) {
+                s->cur_x = s->cx & 0xfff;
+                s->cur_y = s->cy & 0xfff;
+                break;
+            }
+            s3_step_dir(s->ssv_dir, &s->cx, &s->cy);
+            s->ssv_len--;
+            s->cx &= 0xfff;
+            s->cy &= 0xfff;
+        }
         break;
-    case CMD_CMD_LINE:
-        if ((s->cmd & CMD_LINETYPE) == 0) {
-            trace_s3_vga_cmd_line_bresenham(s->cur_x, s->cur_y,
-                                            s->cmd & CMD_INC_X ? 1 : -1,
-                                            s->cmd & CMD_INC_Y ? 1 : -1,
-                                            s->maj_axis_pcnt,
-                                            s->cmd & CMD_YMAJAXIS ? 'Y' : 'X');
-            qemu_log_mask(LOG_UNIMP,
-                          "s3_trio: CMD_LINE (Bresenham) not implemented (%04x)\n",
-                          s->cmd);
-        } else {
-            trace_s3_vga_cmd_line_vector(s->cur_x, s->cur_y, (s->cmd >> 5) & 3,
-                                         s->maj_axis_pcnt);
-            if (!(s->cmd & CMD_PCDATA)) {
-                while (s->gp_stat & GP_STAT_BUSY) {
-                    do_cmd_write_pixel(s, get_color(s));
+
+    case OP_LINE:
+        if (!cpu_input) {
+            s->cx = s->cur_x & 0xfff;
+            s->cy = s->cur_y & 0xfff;
+            s->sy = s->maj_axis_pcnt;
+            if (s3_cpu_src(s)) {
+                s->busy = 1;
+                return;
+            }
+        }
+        while (LOOP_COUNT() && s->sy >= 0) {
+            bool last = s->sy == 0;
+
+            if (!s3_accel_clipped(s, c, s->cx & 0xfff, s->cy & 0xfff) &&
+                !(last && (s->cmd & CMD_LASTPIX))) {
+                fg = mix_dat & c->mix_mask;
+                addr = s3_pix_addr(c, 0, s->cx, s->cy);
+                src = s3_accel_source(s, c, fg, cpu_dat, addr);
+                if (s3_accel_compare(s, c, src)) {
+                    s3_accel_plot(s, c, addr, fg, src, true);
+                }
+            }
+            s3_next_mix(&mix_dat);
+            s3_next_cpu_dat(s, &cpu_dat);
+            if (last) {
+                s3_accel_done(s);
+                break;
+            }
+            if (s->cmd & CMD_LINETYPE) {
+                /* radial: fixed direction from bits 7-5 */
+                s3_step_dir(s->cmd, &s->cx, &s->cy);
+            } else if (s->cmd & CMD_YMAJAXIS) {
+                /* Bresenham, Y major */
+                s->cy += (s->cmd & CMD_INC_Y) ? 1 : -1;
+                if (s->err_term >= s->maj_axis_pcnt) {
+                    s->err_term = (int16_t)(s->err_term + s->destx_diastp);
+                    s->cx += (s->cmd & CMD_INC_X) ? 1 : -1;
+                } else {
+                    s->err_term = (int16_t)(s->err_term + s->desty_axstp);
+                }
+            } else {
+                /* Bresenham, X major */
+                s->cx += (s->cmd & CMD_INC_X) ? 1 : -1;
+                if (s->err_term >= s->maj_axis_pcnt) {
+                    s->err_term = (int16_t)(s->err_term + s->destx_diastp);
+                    s->cy += (s->cmd & CMD_INC_Y) ? 1 : -1;
+                } else {
+                    s->err_term = (int16_t)(s->err_term + s->desty_axstp);
+                }
+            }
+            s->sy--;
+            s->cx &= 0xfff;
+            s->cy &= 0xfff;
+        }
+        s->cur_x = s->cx & 0xfff;
+        s->cur_y = s->cy & 0xfff;
+        break;
+
+    case OP_RECT:
+        if (!cpu_input) {
+            s->sx = s->maj_axis_pcnt & 0xfff;
+            s->sy = s->mfc[MF_MIN_AXIS_PCNT] & 0xfff;
+            s->cx = s->cur_x & 0xfff;
+            s->cy = s->cur_y & 0xfff;
+            s->dest = s3_pix_addr(c, c->dstbase, 0, s->cy);
+            if (s3_cpu_src(s)) {
+                s->busy = 1;
+                return;
+            }
+        }
+        while (LOOP_COUNT() && s->sy >= 0) {
+            if (!s3_accel_clipped(s, c, s->cx, s->cy)) {
+                fg = mix_dat & c->mix_mask;
+                addr = s->dest + s->cx * c->x_mul;
+                src = s3_accel_source(s, c, fg, cpu_dat, addr);
+                if (s3_accel_compare(s, c, src)) {
+                    s3_accel_plot(s, c, addr, fg, src, s->cmd & CMD_DRAW);
+                }
+            }
+            s3_next_mix(&mix_dat);
+            s3_next_cpu_dat(s, &cpu_dat);
+            s->cx += (s->cmd & CMD_INC_X) ? 1 : -1;
+            s->cx &= 0xfff;
+            s->sx--;
+            if (s->sx < 0) {
+                s->sx = s->maj_axis_pcnt & 0xfff;
+                if (s->cmd & CMD_INC_X) {
+                    s->cx -= s->sx + 1;
+                } else {
+                    s->cx += s->sx + 1;
+                }
+                s->cy += (s->cmd & CMD_INC_Y) ? 1 : -1;
+                s->cy &= 0xfff;
+                s->dest = s3_pix_addr(c, c->dstbase, 0, s->cy);
+                s->sy--;
+                if (s->sy < 0) {
+                    s->cur_x = s->cx;
+                    s->cur_y = s->cy;
+                    s3_accel_done(s);
+                    return;
+                }
+                if (cpu_input) {
+                    /* the rest of the transfer is padding */
+                    return;
                 }
             }
         }
         break;
-    case CMD_CMD_RECT:
-        trace_s3_vga_cmd_rect(s->cur_x, s->cur_y, s->cmd & CMD_INC_X ? 1 : -1,
-                              s->cmd & CMD_INC_Y ? 1 : -1, s->maj_axis_pcnt,
-                              s->min_axis_pcnt);
-        if (!(s->cmd & CMD_PCDATA)) {
-            while (s->gp_stat & GP_STAT_BUSY) {
-                do_cmd_write_pixel(s, get_color(s));
+
+    case OP_POLY_SOLID:
+    case OP_POLY_PAT:
+    {
+        int end_y1, end_y2;
+
+        s3_polygon_setup(s);
+        if ((s->cmd & CMD_PCDATA) && !cpu_input) {
+            s->busy = 1;
+            return;
+        }
+        end_y1 = s->desty_axstp;
+        end_y2 = s->desty_axstp2;
+        while (s->poly_cy < end_y1 && s->poly_cy2 < end_y2) {
+            int y = s->poly_cy;
+            int x_count = abs((s->poly_cx2 >> 20) - s->poly_x) + 1;
+            uint32_t pat_line = c->srcbase + s->pattern +
+                                (y & 7) * c->width * c->x_mul;
+
+            s->dest = s3_pix_addr(c, c->dstbase, 0, y);
+            while (x_count-- && LOOP_COUNT()) {
+                if (!s3_accel_clipped(s, c, s->poly_x & 0xfff, y & 0xfff)) {
+                    uint32_t pat_addr = pat_line + (s->poly_x & 7) * c->x_mul;
+
+                    if (op == OP_POLY_PAT && c->vram_mask) {
+                        mix_dat = (s3_accel_read_pixel(s, pat_addr) &
+                                   c->rd_mask) == c->rd_mask ? c->mix_mask : 0;
+                    }
+                    fg = (op == OP_POLY_SOLID) || (mix_dat & c->mix_mask);
+                    addr = s->dest + s->poly_x * c->x_mul;
+                    src = s3_accel_source(s, c, fg, cpu_dat, pat_addr);
+                    if (op == OP_POLY_PAT && c->vram_mask &&
+                        (fg ? c->frgd_sel : c->bkgd_sel) == 3) {
+                        src = (src & c->rd_mask) == c->rd_mask;
+                    }
+                    if (s3_accel_compare(s, c, src)) {
+                        s3_accel_plot(s, c, addr, fg, src, s->cmd & CMD_DRAW);
+                    }
+                }
+                s3_next_cpu_dat(s, &cpu_dat);
+                if (op == OP_POLY_PAT) {
+                    s3_next_mix(&mix_dat);
+                }
+                if (s->poly_x < (s->poly_cx2 >> 20)) {
+                    s->poly_x++;
+                } else {
+                    s->poly_x--;
+                }
+            }
+            s->poly_cx += s->poly_dx1;
+            s->poly_cx2 += s->poly_dx2;
+            s->poly_x = s->poly_cx >> 20;
+            s->poly_cy++;
+            s->poly_cy2++;
+            if (!count) {
+                break;
+            }
+        }
+        s->cur_x = s->poly_cx & 0xfff;
+        s->cur_y = s->poly_cy & 0xfff;
+        s->cur_x2 = s->poly_cx2 & 0xfff;
+        s->cur_y2 = s->poly_cy2 & 0xfff;
+        if (s->poly_cy >= end_y1 || s->poly_cy2 >= end_y2) {
+            s3_accel_done(s);
+        }
+        break;
+    }
+
+    case OP_BITBLT:
+        if (!cpu_input) {
+            s->sx = s->maj_axis_pcnt & 0xfff;
+            s->sy = s->mfc[MF_MIN_AXIS_PCNT] & 0xfff;
+            s->dx = s->destx_diastp & 0xfff;
+            s->dy = s->desty_axstp & 0xfff;
+            s->cx = s->cur_x & 0xfff;
+            s->cy = s->cur_y & 0xfff;
+            s->src = s3_pix_addr(c, c->srcbase, 0, s->cy);
+            s->dest = s3_pix_addr(c, c->dstbase, 0, s->dy);
+            if (s->cmd & CMD_PCDATA) {
+                s->busy = 1;
+                return;
+            }
+        }
+        while (LOOP_COUNT() && s->sy >= 0) {
+            if (!s3_accel_clipped(s, c, s->dx, s->dy)) {
+                uint32_t src_addr = s->src + s->cx * c->x_mul;
+
+                if (c->vram_mask && (s->cmd & CMD_DRAW)) {
+                    mix_dat = (s3_accel_read_pixel(s, src_addr) & c->rd_mask)
+                              == c->rd_mask ? c->mix_mask : 0;
+                }
+                fg = mix_dat & c->mix_mask;
+                addr = s->dest + s->dx * c->x_mul;
+                src = s3_accel_source(s, c, fg, cpu_dat, src_addr);
+                if ((fg ? c->frgd_sel : c->bkgd_sel) == 3 && c->vram_mask &&
+                    (s->cmd & CMD_DRAW)) {
+                    src = (src & c->rd_mask) == c->rd_mask;
+                }
+                if (s3_accel_compare(s, c, src)) {
+                    s3_accel_plot(s, c, addr, fg, src,
+                                  (s->cmd & CMD_DRAW) || c->vram_mask);
+                }
+            }
+            s3_next_mix(&mix_dat);
+            s3_next_cpu_dat(s, &cpu_dat);
+            if (s->cmd & CMD_INC_X) {
+                s->cx++;
+                s->dx++;
+            } else {
+                s->cx--;
+                s->dx--;
+            }
+            s->dx &= 0xfff;
+            s->sx--;
+            if (s->sx < 0) {
+                int w = (s->maj_axis_pcnt & 0xfff) + 1;
+
+                s->sx = s->maj_axis_pcnt & 0xfff;
+                if (s->cmd & CMD_INC_X) {
+                    s->cx -= w;
+                    s->dx -= w;
+                } else {
+                    s->cx += w;
+                    s->dx += w;
+                }
+                if (s->cmd & CMD_INC_Y) {
+                    s->cy++;
+                    s->dy++;
+                } else {
+                    s->cy--;
+                    s->dy--;
+                }
+                s->src = s3_pix_addr(c, c->srcbase, 0, s->cy);
+                s->dest = s3_pix_addr(c, c->dstbase, 0, s->dy);
+                s->sy--;
+                if (s->sy < 0) {
+                    s->destx_diastp = s->dx;
+                    s->desty_axstp = s->dy;
+                    s3_accel_done(s);
+                    return;
+                }
+                if (cpu_input) {
+                    return;
+                }
             }
         }
         break;
-    case CMD_CMD_RECTV1:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV1 not implemented (%04x)\n",
-                      s->cmd);
+
+    case OP_PATBLT: /* BitBlt with an 8x8 source pattern */
+        if (!cpu_input) {
+            s->sx = s->maj_axis_pcnt & 0xfff;
+            s->sy = s->mfc[MF_MIN_AXIS_PCNT] & 0xfff;
+            s->dx = s->destx_diastp & 0xfff;
+            s->dy = s->desty_axstp & 0xfff;
+            s->cx = s->cur_x & 0xfff;
+            s->cy = s->cur_y & 0xfff;
+            /* align the pattern with the destination */
+            s->pattern = s3_pix_addr(c, 0, s->cx, s->cy);
+            s->dest = s3_pix_addr(c, c->dstbase, 0, s->dy);
+            s->cx = s->dx & 7;
+            s->cy = s->dy & 7;
+            s->src = c->srcbase + s->pattern + s->cy * c->width * c->x_mul;
+            if (s->cmd & CMD_PCDATA) {
+                s->busy = 1;
+                return;
+            }
+        }
+        while (LOOP_COUNT() && s->sy >= 0) {
+            if (!s3_accel_clipped(s, c, s->dx, s->dy)) {
+                uint32_t pat_addr = s->src + s->cx * c->x_mul;
+
+                if (c->vram_mask) {
+                    mix_dat = (s3_accel_read_pixel(s, pat_addr) & c->rd_mask)
+                              == c->rd_mask ? c->mix_mask : 0;
+                }
+                fg = mix_dat & c->mix_mask;
+                addr = s->dest + s->dx * c->x_mul;
+                src = s3_accel_source(s, c, fg, cpu_dat, pat_addr);
+                if ((fg ? c->frgd_sel : c->bkgd_sel) == 3 && c->vram_mask) {
+                    src = (src & c->rd_mask) == c->rd_mask;
+                }
+                if (s3_accel_compare(s, c, src)) {
+                    s3_accel_plot(s, c, addr, fg, src, s->cmd & CMD_DRAW);
+                }
+            }
+            s3_next_mix(&mix_dat);
+            s3_next_cpu_dat(s, &cpu_dat);
+            if (s->cmd & CMD_INC_X) {
+                s->cx = ((s->cx + 1) & 7) | (s->cx & ~7);
+                s->dx++;
+            } else {
+                s->cx = ((s->cx - 1) & 7) | (s->cx & ~7);
+                s->dx--;
+            }
+            s->dx &= 0xfff;
+            s->sx--;
+            if (s->sx < 0) {
+                int w = (s->maj_axis_pcnt & 0xfff) + 1;
+
+                if (s->cmd & CMD_INC_X) {
+                    s->cx = ((s->cx - w) & 7) | (s->cx & ~7);
+                    s->dx -= w;
+                } else {
+                    s->cx = ((s->cx + w) & 7) | (s->cx & ~7);
+                    s->dx += w;
+                }
+                s->sx = s->maj_axis_pcnt & 0xfff;
+                if (s->cmd & CMD_INC_Y) {
+                    s->cy = ((s->cy + 1) & 7) | (s->cy & ~7);
+                    s->dy++;
+                } else {
+                    s->cy = ((s->cy - 1) & 7) | (s->cy & ~7);
+                    s->dy--;
+                }
+                s->src = c->srcbase + s->pattern +
+                         s->cy * c->width * c->x_mul;
+                s->dest = s3_pix_addr(c, c->dstbase, 0, s->dy);
+                s->sy--;
+                if (s->sy < 0) {
+                    s->destx_diastp = s->dx;
+                    s->desty_axstp = s->dy;
+                    s3_accel_done(s);
+                    return;
+                }
+                if (cpu_input) {
+                    return;
+                }
+            }
+        }
         break;
-    case CMD_CMD_RECTV2:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV2 not implemented (%04x)\n",
-                      s->cmd);
-        break;
-    case CMD_CMD_LINEAF:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_LINEAF not implemented (%04x)\n",
-                      s->cmd);
-        break;
-    case CMD_CMD_BITBLT:
-        trace_s3_vga_cmd_bitblt(s->cur_x, s->cur_y, s->destx_diastp, s->desty_axstep,
-                                s->maj_axis_pcnt, s->min_axis_pcnt);
-        s3_do_cmd_bitblt(s);
-        break;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: illegal command %04x\n",
-                      s->cmd);
+
+    case OP_LINE_2PT: /* line from CUR to DEST, foreground colour only */
+    {
+        int error;
+
+        if (!cpu_input) {
+            s->dx = abs(s->destx_diastp - s->cur_x);
+            s->dy = abs(s->desty_axstp - s->cur_y);
+            s->cx = s->cur_x & 0xfff;
+            s->cy = s->cur_y & 0xfff;
+        }
+        if ((s->cmd & CMD_PCDATA) && !cpu_input) {
+            s->busy = 1;
+            return;
+        }
+        if (s->dx > s->dy) {
+            error = s->dx / 2;
+            while (s->cx != s->destx_diastp && LOOP_COUNT()) {
+                if (!s3_accel_clipped(s, c, s->cx & 0xfff, s->cy & 0xfff)) {
+                    addr = s3_pix_addr(c, 0, s->cx, s->cy);
+                    if (s3_accel_compare(s, c, c->frgd_color)) {
+                        s3_accel_plot(s, c, addr, true, c->frgd_color,
+                                      s->cmd & CMD_DRAW);
+                    }
+                }
+                error -= s->dy;
+                if (error < 0) {
+                    error += s->dx;
+                    s->cy += (s->desty_axstp > s->cur_y) ? 1 : -1;
+                    s->cy &= 0xfff;
+                }
+                s->cx += (s->destx_diastp > s->cur_x) ? 1 : -1;
+                s->cx &= 0xfff;
+            }
+        } else {
+            error = s->dy / 2;
+            while (s->cy != s->desty_axstp && LOOP_COUNT()) {
+                if (!s3_accel_clipped(s, c, s->cx & 0xfff, s->cy & 0xfff)) {
+                    addr = s3_pix_addr(c, 0, s->cx, s->cy);
+                    if (s3_accel_compare(s, c, c->frgd_color)) {
+                        s3_accel_plot(s, c, addr, true, c->frgd_color,
+                                      s->cmd & CMD_DRAW);
+                    }
+                }
+                error -= s->dx;
+                if (error < 0) {
+                    error += s->dy;
+                    s->cx += (s->destx_diastp > s->cur_x) ? 1 : -1;
+                    s->cx &= 0xfff;
+                }
+                s->cy += (s->desty_axstp > s->cur_y) ? 1 : -1;
+                s->cy &= 0xfff;
+            }
+        }
+        s->cur_x = s->cx;
+        s->cur_y = s->cy;
+        s3_accel_done(s);
         break;
     }
+
+    default:
+        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented command %d (%04x)\n",
+                      op, s->cmd);
+        s3_accel_done(s);
+        break;
+    }
+#undef LOOP_COUNT
+}
+
+static void s3_short_stroke_start(S3TrioState *s, uint8_t ssv)
+{
+    s->ssv_len = ssv & 0x0f;
+    s->ssv_dir = ssv & 0xe0;
+    s->ssv_draw = !!(ssv & 0x10);
+    if (s3_cpu_src(s)) {
+        s->busy = 1;
+        return;
+    }
+    s3_accel_start(s, -1, false, 0xffffffff, 0);
+}
+
+/*
+ * PIX_TRANS data (86Box s3_accel_out_pixtrans_w/_l and the E2E8 byte
+ * cases).  With the mix select set to "CPU data" (or the "across the
+ * plane" command bit) the data is a mono mask of 8/16/32 bits, the bus
+ * width from CMD bits 10-9; otherwise it is colour data.  CMD bit 12
+ * (BYTSEQ) selects the byte order of 16-bit units: clear means the high
+ * byte is the first pixel (8514/A compatible), set means the low byte is.
+ * 86Box only applies the bit to mono masks because x86 drivers always set
+ * it; the IBM RS/6000 firmware draws colour data with it clear.
+ */
+static uint32_t s3_swap_halfwords(uint32_t val)
+{
+    return ((val & 0xff00ff00) >> 8) | ((val & 0x00ff00ff) << 8);
+}
+
+static void s3_accel_pix_trans(S3TrioState *s, uint32_t val, int bytes)
+{
+    bool mono, swap;
+
+    if (!(s->cmd & CMD_PCDATA)) {
+        return;
+    }
+    trace_s3_vga_accel_pix_trans(val, bytes, s->cmd);
+    mono = ((s->mfc[MF_PIX_CNTL] & PIX_CNTL_MIXSEL_MASK) == PIX_CNTL_MIXSEL_CPU
+            || (s->cmd & CMD_PLANAR)) &&
+           ((s->frgd_mix & MIX_SRC_MASK) != MIX_SRC_CPU ||
+            (s->bkgd_mix & MIX_SRC_MASK) != MIX_SRC_CPU);
+    /* a mono mask is consumed MSB first, colour data low byte first */
+    swap = mono ? !!(s->cmd & CMD_BYTSEQ) : !(s->cmd & CMD_BYTSEQ);
+
+    switch (s->cmd & CMD_BUS_MASK) {
+    case 0x000: /* 8-bit bus: one byte per write, whatever its size */
+        if (bytes >= 2 && swap) {
+            val = s3_swap_halfwords(val);
+        }
+        if (mono) {
+            s3_accel_start(s, 8, true, val & 0xff, 0);
+            if (bytes == 4) {
+                s3_accel_start(s, 8, true, (val >> 16) & 0xff, 0);
+            }
+        } else {
+            s3_accel_start(s, 1, true, 0xffffffff, val);
+            if (bytes == 4) {
+                s3_accel_start(s, 1, true, 0xffffffff, val >> 16);
+            }
+        }
+        break;
+    case CMD_BUS_16:
+        if (bytes < 2) {
+            return;
+        }
+        if (swap) {
+            val = s3_swap_halfwords(val);
+        }
+        if (mono) {
+            s3_accel_start(s, 16, true, val & 0xffff, 0);
+            if (bytes == 4) {
+                s3_accel_start(s, 16, true, val >> 16, 0);
+            }
+        } else {
+            s3_accel_start(s, 2, true, 0xffffffff, val);
+            if (bytes == 4) {
+                s3_accel_start(s, 2, true, 0xffffffff, val >> 16);
+            }
+        }
+        break;
+    default: /* 32-bit bus */
+        if (bytes < 2) {
+            return;
+        }
+        if (bytes == 2) {
+            if (swap) {
+                val = s3_swap_halfwords(val);
+            }
+            if (mono) {
+                s3_accel_start(s, 16, true, val & 0xffff, 0);
+            } else {
+                s3_accel_start(s, 4, true, 0xffffffff,
+                               (val & 0xffff) | (val << 16));
+            }
+        } else {
+            if (swap) {
+                val = bswap32(val);
+            }
+            if (mono) {
+                s3_accel_start(s, 32, true, val, 0);
+            } else {
+                s3_accel_start(s, 4, true, 0xffffffff, val);
+            }
+        }
+        break;
+    }
+}
+
+/*
+ * Write one byte of a 32-bit colour/mask register.  Bytes 0/1 go to the
+ * low word; on the Trio64 MULT_MISC bit 4 redirects them to the high word
+ * and is toggled by every high-byte write unless MULT_MISC bit 9 (32-bit
+ * register access) is set, in which case bytes 2/3 address the high word
+ * directly (86Box s3_accel_out_fifo for chips >= Vision964).
+ */
+static void s3_write_color_byte(S3TrioState *s, uint32_t *reg, int byte,
+                                uint8_t val)
+{
+    uint16_t misc = s->mfc[MF_MULT_MISC];
+    int shift;
+
+    switch (byte) {
+    case 0:
+    case 1:
+        shift = byte * 8;
+        if (s3_accel_bpp(s) == 3 && (misc & MULT_MISC_HIGH_WORD) &&
+            !(misc & MULT_MISC_32BIT_REGS)) {
+            shift += 16;
+        }
+        *reg = deposit32(*reg, shift, 8, val);
+        if (byte == 1 && !(misc & MULT_MISC_32BIT_REGS)) {
+            s->mfc[MF_MULT_MISC] ^= MULT_MISC_HIGH_WORD;
+        }
+        break;
+    default:
+        shift = byte * 8;
+        if (misc & MULT_MISC_32BIT_REGS) {
+            *reg = deposit32(*reg, shift, 8, val);
+        } else if (s3_accel_bpp(s) == 3) {
+            if (!(misc & MULT_MISC_HIGH_WORD)) {
+                shift -= 16;
+            }
+            *reg = deposit32(*reg, shift, 8, val);
+            if (byte == 3) {
+                s->mfc[MF_MULT_MISC] ^= MULT_MISC_HIGH_WORD;
+            }
+        }
+        break;
+    }
+}
+
+static void s3_accel_cmd_written(S3TrioState *s)
+{
+    s->ssv_state = 0;
+    if (s3_accel_bpp(s) == 3 && !(s->mfc[MF_MULT_MISC] & MULT_MISC_32BIT_REGS)) {
+        s->mfc[MF_MULT_MISC] &= ~MULT_MISC_HIGH_WORD;
+    }
+    trace_s3_vga_cmd(s->cmd);
+    s3_accel_start(s, -1, false, 0xffffffff, 0);
+}
+
+static bool s3_accel_enabled(S3TrioState *s)
+{
+    /* CR40 bit 0: enable the 8514-style graphics engine registers */
+    return s->vga.cr[0x40] & 0x01;
+}
+
+/* byte write to a graphics engine register (port address, 86Box layout) */
+static void s3_accel_out_byte(S3TrioState *s, uint16_t port, uint8_t val)
+{
+    int byte = port & 3;
+
+    switch (port) {
+    case PORT_SUBSYS_STAT:
+        s->subsys_stat &= ~val;
+        s->subsys_cntl = (s->subsys_cntl & 0xff00) | val;
+        return;
+    case PORT_SUBSYS_STAT + 1:
+        s->subsys_cntl = (s->subsys_cntl & 0xff) | (val << 8);
+        return;
+    case PORT_SETUP_MD:
+        s->setup_md = (s->setup_md & 0xff00) | val;
+        return;
+    case PORT_SETUP_MD + 1:
+        s->setup_md = (s->setup_md & 0xff) | (val << 8);
+        return;
+    case PORT_ADVFUNC_CNTL:
+        s->advfunc_cntl = val;
+        return;
+    case PORT_ADVFUNC_CNTL + 1:
+        return;
+    default:
+        break;
+    }
+
+    if (!s3_accel_enabled(s)) {
+        return;
+    }
+
+    switch (port) {
+    case PORT_CUR_Y:
+        s->cur_y = (s->cur_y & 0xf00) | val;
+        s->poly_cy = s->cur_y;
+        break;
+    case PORT_CUR_Y + 1:
+        s->cur_y = (s->cur_y & 0xff) | ((val & 0x0f) << 8);
+        s->poly_cy = s->cur_y;
+        break;
+    case PORT_CUR_Y2:
+        s->cur_y2 = (s->cur_y2 & 0xf00) | val;
+        s->poly_cy2 = s->cur_y2;
+        break;
+    case PORT_CUR_Y2 + 1:
+        s->cur_y2 = (s->cur_y2 & 0xff) | ((val & 0x0f) << 8);
+        s->poly_cy2 = s->cur_y2;
+        break;
+    case PORT_CUR_X:
+        s->cur_x = (s->cur_x & 0xf00) | val;
+        s->poly_cx = s->cur_x << 20;
+        s->poly_x = s->poly_cx >> 20;
+        break;
+    case PORT_CUR_X + 1:
+        s->cur_x = (s->cur_x & 0xff) | ((val & 0x0f) << 8);
+        s->poly_cx = s->cur_x << 20;
+        s->poly_x = s->poly_cx >> 20;
+        break;
+    case PORT_CUR_X2:
+        s->cur_x2 = (s->cur_x2 & 0xf00) | val;
+        s->poly_cx2 = s->cur_x2 << 20;
+        break;
+    case PORT_CUR_X2 + 1:
+        s->cur_x2 = (s->cur_x2 & 0xff) | ((val & 0x0f) << 8);
+        s->poly_cx2 = s->cur_x2 << 20;
+        break;
+    case PORT_DESTY_AXSTP:
+        s->desty_axstp = (s->desty_axstp & 0x3f00) | val;
+        s->point_1_updated = 1;
+        break;
+    case PORT_DESTY_AXSTP + 1:
+        s->desty_axstp = (s->desty_axstp & 0xff) | ((val & 0x3f) << 8);
+        if (val & 0x20) {
+            s->desty_axstp |= ~0x3fff;
+        }
+        s->point_1_updated = 1;
+        break;
+    case PORT_DESTY_AXSTP2:
+        s->desty_axstp2 = (s->desty_axstp2 & 0x3f00) | val;
+        s->point_2_updated = 1;
+        break;
+    case PORT_DESTY_AXSTP2 + 1:
+        s->desty_axstp2 = (s->desty_axstp2 & 0xff) | ((val & 0x3f) << 8);
+        if (val & 0x20) {
+            s->desty_axstp2 |= ~0x3fff;
+        }
+        s->point_2_updated = 1;
+        break;
+    case PORT_DESTX_DIASTP:
+        s->destx_diastp = (s->destx_diastp & 0x3f00) | val;
+        s->point_1_updated = 1;
+        break;
+    case PORT_DESTX_DIASTP + 1:
+        s->destx_diastp = (s->destx_diastp & 0xff) | ((val & 0x3f) << 8);
+        if (val & 0x20) {
+            s->destx_diastp |= ~0x3fff;
+        }
+        s->point_1_updated = 1;
+        break;
+    case PORT_X2:
+        s->x2 = (s->x2 & 0xf00) | val;
+        s->point_2_updated = 1;
+        break;
+    case PORT_X2 + 1:
+        s->x2 = (s->x2 & 0xff) | ((val & 0x0f) << 8);
+        s->point_2_updated = 1;
+        break;
+    case PORT_ERR_TERM:
+        s->err_term = (s->err_term & 0x3f00) | val;
+        break;
+    case PORT_ERR_TERM + 1:
+        s->err_term = (s->err_term & 0xff) | ((val & 0x3f) << 8);
+        if (val & 0x20) {
+            s->err_term |= ~0x1fff;
+        }
+        break;
+    case PORT_ERR_TERM2:
+        s->err_term2 = (s->err_term2 & 0x3f00) | val;
+        break;
+    case PORT_ERR_TERM2 + 1:
+        s->err_term2 = (s->err_term2 & 0xff) | ((val & 0x3f) << 8);
+        if (val & 0x20) {
+            s->err_term2 |= ~0x1fff;
+        }
+        break;
+    case PORT_MAJ_AXIS_PCNT:
+        s->maj_axis_pcnt = (s->maj_axis_pcnt & 0xf00) | val;
+        break;
+    case PORT_MAJ_AXIS_PCNT + 1:
+        s->maj_axis_pcnt = (s->maj_axis_pcnt & 0xff) | ((val & 0x0f) << 8);
+        break;
+    case PORT_MAJ_AXIS_PCNT2:
+        s->maj_axis_pcnt2 = (s->maj_axis_pcnt2 & 0xf00) | val;
+        break;
+    case PORT_MAJ_AXIS_PCNT2 + 1:
+        s->maj_axis_pcnt2 = (s->maj_axis_pcnt2 & 0xff) | ((val & 0x0f) << 8);
+        break;
+    case PORT_CMD:
+        s->cmd = (s->cmd & 0xff00) | val;
+        break;
+    case PORT_CMD + 1:
+        s->cmd = (s->cmd & 0xff) | (val << 8);
+        s3_accel_cmd_written(s);
+        break;
+    case PORT_CMD2:
+        s->cmd2 = (s->cmd2 & 0xff00) | val;
+        break;
+    case PORT_CMD2 + 1:
+        s->cmd2 = (s->cmd2 & 0xff) | (val << 8);
+        break;
+    case PORT_SHORT_STROKE:
+        s->short_stroke = (s->short_stroke & 0xff00) | val;
+        break;
+    case PORT_SHORT_STROKE + 1:
+        s->short_stroke = (s->short_stroke & 0xff) | (val << 8);
+        s->ssv_state = 1;
+        s->cx = s->cur_x & 0xfff;
+        s->cy = s->cur_y & 0xfff;
+        if (s->cmd & CMD_BYTSEQ) {
+            s3_short_stroke_start(s, s->short_stroke & 0xff);
+            s3_short_stroke_start(s, s->short_stroke >> 8);
+        } else {
+            s3_short_stroke_start(s, s->short_stroke >> 8);
+            s3_short_stroke_start(s, s->short_stroke & 0xff);
+        }
+        break;
+    case PORT_BKGD_COLOR ... PORT_BKGD_COLOR + 3:
+        s3_write_color_byte(s, &s->bkgd_color, byte, val);
+        break;
+    case PORT_FRGD_COLOR ... PORT_FRGD_COLOR + 3:
+        s3_write_color_byte(s, &s->frgd_color, byte, val);
+        break;
+    case PORT_WRT_MASK ... PORT_WRT_MASK + 3:
+        s3_write_color_byte(s, &s->wrt_mask, byte, val);
+        break;
+    case PORT_RD_MASK ... PORT_RD_MASK + 3:
+        s3_write_color_byte(s, &s->rd_mask, byte, val);
+        break;
+    case PORT_COLOR_CMP ... PORT_COLOR_CMP + 3:
+        s3_write_color_byte(s, &s->color_cmp, byte, val);
+        break;
+    case PORT_BKGD_MIX:
+        s->bkgd_mix = val;
+        break;
+    case PORT_BKGD_MIX + 1:
+        break;
+    case PORT_FRGD_MIX:
+        s->frgd_mix = val;
+        break;
+    case PORT_FRGD_MIX + 1:
+        break;
+    case PORT_MULTIFUNC_CNTL:
+        s->multifunc_cntl = (s->multifunc_cntl & 0xff00) | val;
+        break;
+    case PORT_MULTIFUNC_CNTL + 1:
+        s->multifunc_cntl = (s->multifunc_cntl & 0xff) | (val << 8);
+        if ((val >> 4) == MF_READ_SEL) {
+            s->read_sel = s->multifunc_cntl & 0xf;
+        } else {
+            s->mfc[val >> 4] = s->multifunc_cntl & 0xfff;
+        }
+        trace_s3_vga_accel_multifunc(val >> 4, s->multifunc_cntl & 0xfff);
+        break;
+    case PORT_PIX_TRANS ... PORT_PIX_TRANS + 3:
+        /* byte-wise PIX_TRANS: the bytes of one bus-width unit are collected */
+        s->pix_trans[byte] = val;
+        switch (s->cmd & CMD_BUS_MASK) {
+        case 0x000:
+            if (byte == 0) {
+                s3_accel_pix_trans(s, val, 1);
+            }
+            break;
+        case CMD_BUS_16:
+            if (byte == 1) {
+                s3_accel_pix_trans(s, lduw_le_p(s->pix_trans), 2);
+            }
+            break;
+        default:
+            if (byte == 3) {
+                s3_accel_pix_trans(s, ldl_le_p(s->pix_trans), 4);
+            }
+            break;
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: write to unknown engine "
+                      "register %04x\n", port);
+        break;
+    }
+}
+
+/* access of `size` bytes to the graphics engine registers */
+static void s3_accel_out(S3TrioState *s, uint16_t port, uint32_t val,
+                         unsigned size)
+{
+    int i;
+
+    trace_s3_vga_accel_out(port, val, size);
+    if (size > 1 && (port & ~3) == PORT_PIX_TRANS && s3_accel_enabled(s)) {
+        s3_accel_pix_trans(s, val, size);
+        return;
+    }
+    if (size > 1 && (port & ~1) == PORT_SHORT_STROKE && s3_accel_enabled(s)) {
+        /* the whole register is written before the strokes start */
+        s->short_stroke = val;
+        s3_accel_out_byte(s, PORT_SHORT_STROKE + 1, val >> 8);
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        s3_accel_out_byte(s, port + i, (val >> (8 * i)) & 0xff);
+    }
+}
+
+static uint32_t s3_gp_stat(S3TrioState *s)
+{
+    return s->busy ? GP_STAT_BUSY : GP_STAT_FIFO_EMPTY;
+}
+
+/* MULTIFUNC_CNTL read-back through the read select index */
+static uint16_t s3_multifunc_read(S3TrioState *s)
+{
+    switch (s->read_sel) {
+    case 0x0 ... 0x4:
+        return s->mfc[s->read_sel];
+    case 0x5:
+        return s->mfc[MF_PIX_CNTL];
+    case 0x6:
+        return s->mfc[MF_MULT_MISC];
+    case 0x7:
+        return s->cmd;
+    case 0x8:
+        return s->subsys_cntl;
+    case 0x9:
+        return s->setup_md;
+    case 0xa:
+        return s->mfc[MF_MULT_MISC2];
+    default:
+        return 0xffff;
+    }
+}
+
+static uint32_t s3_accel_in_reg(S3TrioState *s, uint16_t port)
+{
+    switch (port & ~3) {
+    case PORT_SUBSYS_STAT:
+        return s->subsys_stat;
+    case PORT_SETUP_MD:
+        return s->setup_md;
+    case PORT_ADVFUNC_CNTL:
+        return s->advfunc_cntl;
+    case PORT_CUR_Y & ~3:
+        return s->cur_y | (s->cur_y2 << 16);
+    case PORT_CUR_X & ~3:
+        return s->cur_x | (s->cur_x2 << 16);
+    case PORT_DESTY_AXSTP & ~3:
+        return (s->desty_axstp & 0xffff) | (s->desty_axstp2 << 16);
+    case PORT_DESTX_DIASTP & ~3:
+        return (s->destx_diastp & 0xffff) | (s->x2 << 16);
+    case PORT_ERR_TERM & ~3:
+        return (s->err_term & 0xffff) | (s->err_term2 << 16);
+    case PORT_MAJ_AXIS_PCNT & ~3:
+        return s->maj_axis_pcnt | (s->maj_axis_pcnt2 << 16);
+    case PORT_CMD & ~3:
+        return s3_gp_stat(s) | (s->cmd2 << 16);
+    case PORT_SHORT_STROKE:
+        return s->short_stroke;
+    case PORT_BKGD_COLOR:
+        return s->bkgd_color;
+    case PORT_FRGD_COLOR:
+        return s->frgd_color;
+    case PORT_WRT_MASK:
+        return s->wrt_mask;
+    case PORT_RD_MASK:
+        return s->rd_mask;
+    case PORT_COLOR_CMP:
+        return s->color_cmp;
+    case PORT_BKGD_MIX:
+        return s->bkgd_mix;
+    case PORT_FRGD_MIX:
+        return s->frgd_mix;
+    case PORT_MULTIFUNC_CNTL:
+        return s3_multifunc_read(s);
+    case PORT_PIX_TRANS:
+        /* the Trio64 does not read video memory through PIX_TRANS */
+        return 0xffffffff;
+    default:
+        return 0xffffffff;
+    }
+}
+
+static uint32_t s3_accel_in(S3TrioState *s, uint16_t port, unsigned size)
+{
+    uint32_t val = s3_accel_in_reg(s, port);
+
+    val >>= 8 * (port & 3);
+    if (size < 4) {
+        val &= (1u << (8 * size)) - 1;
+    }
+    if ((port & ~1) == PORT_MULTIFUNC_CNTL && (size > 1 || (port & 1))) {
+        /* reading the high byte advances the read select index */
+        s->read_sel = (s->read_sel + 1) & 0xf;
+    }
+    trace_s3_vga_accel_in(port, val, size);
+    return val;
+}
+
+/* I/O port glue */
+static uint32_t s3_trio_accel_readb(void *opaque, uint32_t addr)
+{
+    return s3_accel_in(opaque, addr, 1);
+}
+
+static uint32_t s3_trio_accel_readw(void *opaque, uint32_t addr)
+{
+    return s3_accel_in(opaque, addr, 2);
+}
+
+static uint32_t s3_trio_accel_readl(void *opaque, uint32_t addr)
+{
+    return s3_accel_in(opaque, addr, 4);
+}
+
+static void s3_trio_accel_writeb(void *opaque, uint32_t addr, uint32_t val)
+{
+    s3_accel_out(opaque, addr, val, 1);
+}
+
+static void s3_trio_accel_writew(void *opaque, uint32_t addr, uint32_t val)
+{
+    s3_accel_out(opaque, addr, val, 2);
+}
+
+static void s3_trio_accel_writel(void *opaque, uint32_t addr, uint32_t val)
+{
+    s3_accel_out(opaque, addr, val, 4);
+}
+
+/* 8514-style display status / CRT parameter ports (02E8-26E8) */
+static uint32_t s3_trio_status_readw(void *opaque, uint32_t addr)
+{
+    S3TrioState *s = opaque;
+    uint32_t val = 0;
+
+    if (addr == 0x02e8) {
+        val = s->disp_stat;
+    }
+    trace_s3_vga_io_readw(addr, val);
+    return val;
+}
+
+static void s3_trio_status_writew(void *opaque, uint32_t addr, uint32_t val)
+{
+    trace_s3_vga_io_writew(addr, val);
+}
+
+static uint32_t s3_trio_status_readb(void *opaque, uint32_t addr)
+{
+    return (s3_trio_status_readw(opaque, addr & ~1) >> ((addr & 1) * 8)) & 0xff;
+}
+
+static void s3_trio_status_writeb(void *opaque, uint32_t addr, uint32_t val)
+{
+    trace_s3_vga_io_writeb(addr, val);
+}
+
+/*
+ * Memory-mapped I/O window.  Enabled by CR53 bit 4 (or ADVFUNC_CNTL bit 5)
+ * it replaces the VGA window at 0xA0000: offsets below 0x8000 are the
+ * pixel transfer area, offsets 0x8000-0xFFFF map the engine ports, the
+ * packed register file at 0x8100-0x816F aliases them (86Box
+ * s3_accel_write_fifo), 0x83B0-0x83DF are the VGA ports and 0x8504/0x8505/
+ * 0x850C the subsystem and advanced function control registers.
+ */
+static bool s3_mmio_enabled(S3TrioState *s)
+{
+    return (s->vga.cr[0x53] & 0x10) || (s->advfunc_cntl & 0x20);
+}
+
+static int s3_mmio_packed_port(uint32_t addr)
+{
+    switch (addr & 0xfffe) {
+    case 0x8100: return PORT_CUR_Y;
+    case 0x8102: return PORT_CUR_X;
+    case 0x8104: return PORT_CUR_Y2;
+    case 0x8106: return PORT_CUR_X2;
+    case 0x8108: return PORT_DESTY_AXSTP;
+    case 0x810a: return PORT_DESTX_DIASTP;
+    case 0x810c: return PORT_DESTY_AXSTP2;
+    case 0x810e: return PORT_X2;
+    case 0x8110: return PORT_ERR_TERM;
+    case 0x8112: return PORT_ERR_TERM2;
+    case 0x8118: return PORT_CMD;
+    case 0x811a: return PORT_CMD2;
+    case 0x811c: return PORT_SHORT_STROKE;
+    case 0x8120: return PORT_BKGD_COLOR;
+    case 0x8122: return PORT_BKGD_COLOR + 2;
+    case 0x8124: return PORT_FRGD_COLOR;
+    case 0x8126: return PORT_FRGD_COLOR + 2;
+    case 0x8128: return PORT_WRT_MASK;
+    case 0x812a: return PORT_WRT_MASK + 2;
+    case 0x812c: return PORT_RD_MASK;
+    case 0x812e: return PORT_RD_MASK + 2;
+    case 0x8130: return PORT_COLOR_CMP;
+    case 0x8132: return PORT_COLOR_CMP + 2;
+    case 0x8134: return PORT_BKGD_MIX;
+    case 0x8136: return PORT_FRGD_MIX;
+    case 0x814a: return PORT_MAJ_AXIS_PCNT;
+    case 0x814c: return PORT_MAJ_AXIS_PCNT2;
+    case 0x8154: return PORT_DESTX_DIASTP;
+    case 0x8156: return PORT_MAJ_AXIS_PCNT;
+    default:     return -1;
+    }
+}
+
+/* packed MULTIFUNC registers written directly, 0x8138-0x8148 */
+static int s3_mmio_packed_mfc(uint32_t addr)
+{
+    switch (addr & 0xfffe) {
+    case 0x8138: return MF_SCISSORS_T;
+    case 0x813a: return MF_SCISSORS_L;
+    case 0x813c: return MF_SCISSORS_B;
+    case 0x813e: return MF_SCISSORS_R;
+    case 0x8140: return MF_PIX_CNTL;
+    case 0x8142: return MF_MULT_MISC2;
+    case 0x8144: return MF_MULT_MISC;
+    case 0x8146: return MF_READ_SEL;
+    case 0x8148: return MF_MIN_AXIS_PCNT;
+    default:     return -1;
+    }
+}
+
+static void s3_mmio_write_byte(S3TrioState *s, uint32_t addr, uint8_t val)
+{
+    int port, mfc;
+
+    if (addr >= 0x83b0 && addr <= 0x83df) {
+        s3_trio_vga_ioport_write(s, addr & 0x3ff, val);
+        return;
+    }
+    switch (addr) {
+    case 0x8504:
+        s3_accel_out_byte(s, PORT_SUBSYS_STAT, val);
+        return;
+    case 0x8505:
+        s3_accel_out_byte(s, PORT_SUBSYS_STAT + 1, val);
+        return;
+    case 0x850c:
+        s3_accel_out_byte(s, PORT_ADVFUNC_CNTL, val);
+        return;
+    default:
+        break;
+    }
+    mfc = s3_mmio_packed_mfc(addr);
+    if (mfc >= 0) {
+        if (mfc == MF_READ_SEL) {
+            if (!(addr & 1)) {
+                s->read_sel = val & 0xf;
+            }
+        } else if (addr & 1) {
+            s->mfc[mfc] = (s->mfc[mfc] & 0xff) | ((val & 0x0f) << 8);
+        } else {
+            s->mfc[mfc] = (s->mfc[mfc] & 0xf00) | val;
+        }
+        return;
+    }
+    port = s3_mmio_packed_port(addr);
+    if (port >= 0) {
+        s3_accel_out_byte(s, port | (addr & 1), val);
+        return;
+    }
+    s3_accel_out_byte(s, addr, val);
+}
+
+static void s3_mmio_write(S3TrioState *s, uint32_t addr, uint64_t val,
+                          unsigned size)
+{
+    trace_s3_vga_mmio_write(addr, val, size);
+    if (!s3_accel_enabled(s)) {
+        return;
+    }
+    if (addr < 0x8000) {
+        s3_accel_pix_trans(s, val, size);
+        return;
+    }
+    if (size > 1 && ((addr & 0xfffc) == PORT_PIX_TRANS ||
+                     (addr & 0xfffe) == 0x811c ||
+                     (addr & 0xfffe) == PORT_SHORT_STROKE)) {
+        int port = s3_mmio_packed_port(addr);
+
+        s3_accel_out(s, port >= 0 ? port : addr, val, size);
+        return;
+    }
+    for (int i = 0; i < size; i++) {
+        s3_mmio_write_byte(s, addr + i, (val >> (8 * i)) & 0xff);
+    }
+}
+
+static uint64_t s3_mmio_read(S3TrioState *s, uint32_t addr, unsigned size)
+{
+    uint64_t val = 0;
+    int port, mfc;
+
+    if (addr < 0x8000) {
+        return (uint64_t)-1;
+    }
+    if (addr >= 0x83b0 && addr <= 0x83df) {
+        for (int i = 0; i < size; i++) {
+            val |= (uint64_t)s3_trio_vga_ioport_read(s, (addr + i) & 0x3ff)
+                   << (8 * i);
+        }
+        return val;
+    }
+    mfc = s3_mmio_packed_mfc(addr);
+    if (mfc >= 0) {
+        uint16_t v = mfc == MF_READ_SEL ? s->read_sel : s->mfc[mfc];
+        return (v >> (8 * (addr & 1))) & ((1u << (8 * size)) - 1);
+    }
+    port = s3_mmio_packed_port(addr);
+    if (port >= 0) {
+        return s3_accel_in(s, port | (addr & 1), size);
+    }
+    return s3_accel_in(s, addr, size);
 }
 
 static uint32_t s3_trio_enable_readb(void *opaque, uint32_t addr)
@@ -572,206 +1841,6 @@ static void s3_trio_dac_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
     S3TrioState *s = opaque;
     trace_s3_vga_dac_writeb(addr, val);
     vga_ioport_write(&s->vga, addr - 0x2ea + VGA_PEL_MSK, val);
-}
-
-static uint16_t* s3_trio_get_register(S3TrioState *s, uint32_t addr, int is_write, uint32_t* val_if_write)
-{
-    uint16_t *p;
-
-    switch (addr) {
-    case REG_DISP_STAT:
-        p = is_write ? &s->h_total : &s->disp_stat;
-        break;
-    case REG_H_DISP:
-        p = is_write ? &s->h_disp : NULL;
-        break;
-    case REG_H_SYNC_START:
-        p = is_write ? &s->h_sync_strt : NULL;
-        break;
-    case REG_H_SYNC_WID:
-        p = is_write ? &s->h_sync_wid : NULL;
-        break;
-    case REG_V_TOTAL:
-        p = is_write ? &s->v_total : NULL;
-        break;
-    case REG_V_DISP:
-        p = is_write ? &s->v_disp : NULL;
-        break;
-    case REG_V_SYNC_STRT:
-        p = is_write ? &s->v_sync_strt : NULL;
-        break;
-    case REG_V_SYNC_WID:
-        p = is_write ? &s->v_sync_wid : NULL;
-        break;
-    case REG_DISP_CNTL:
-        p = is_write ? &s->disp_cntl : NULL;
-        break;
-    case REG_H_TOTAL:
-        p = is_write ? NULL: &s->h_total;
-        break;
-    case REG_SUBSYS_STAT: /* or REG_SUBSYS_CNTL */
-        p = is_write ? &s->subsys_cntl : &s->subsys_stat;
-        break;
-    case REG_ROM_PAGE_SEL:
-        p = is_write ? &s->rom_page_sel : NULL;
-        break;
-    case REG_ADVFUNC_CNTL:
-        p = is_write ? &s->advfunc_cntl : NULL;
-        break;
-    case REG_CUR_Y:
-        p = &s->cur_y;
-        break;
-    case REG_CUR_X:
-        p = &s->cur_x;
-        break;
-    case REG_DESTY_AXSTP:
-        p = is_write ? &s->desty_axstep : NULL;
-        break;
-    case REG_DESTX_DIASTP:
-        p = is_write ? &s->destx_diastp : NULL;
-        break;
-    case REG_ERR_TERM:
-        p = &s->err_term;
-        break;
-    case REG_MAJ_AXIS_PCNT:
-        p = is_write ? &s->maj_axis_pcnt : NULL;
-        break;
-    case REG_GP_STAT: /* or REG_CMD */
-        p = is_write ? &s->cmd : &s->gp_stat;
-        break;
-    case REG_SHORT_STROKE:
-        p = is_write ? &s->short_stroke : NULL;
-        break;
-    case REG_BKGD_COLOR:
-        p = is_write ? &s->bkgd_color : NULL;
-        break;
-    case REG_FRGD_COLOR:
-        p = is_write ? &s->frgd_color : NULL;
-        break;
-    case REG_WRT_MASK:
-        p = is_write ? &s->wrt_mask : NULL;
-        break;
-    case REG_RD_MASK:
-        p = is_write ? &s->rd_mask : NULL;
-        break;
-    case REG_COLOR_CMP:
-        p = is_write ? &s->color_cmp : NULL;
-        break;
-    case REG_BKGD_MIX:
-        p = is_write ? &s->bkgd_mix : NULL;
-        break;
-    case REG_FRGD_MIX:
-        p = is_write ? &s->frgd_mix : NULL;
-        break;
-    case REG_MULTIFUNC_CNTL:
-        if (is_write) {
-            p = &s->mfc[(*val_if_write >> 12) & 0xf];
-            *val_if_write &= 0x0fff;
-        } else {
-            p = NULL;
-        }
-        break;
-    case REG_PIX_TRANS:
-        p = &s->pix_trans;
-        break;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid register 0x%04x\n",
-                      addr);
-        break;
-    }
-
-    return p;
-}
-
-static uint32_t s3_trio_ioport_readb(void *opaque, uint32_t addr)
-{
-    S3TrioState *s = opaque;
-    uint32_t val;
-    uint16_t *p;
-
-    p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0, NULL);
-
-    if (p) {
-        val = (*p >> ((~addr & 1) * 8)) & 0xff;
-    } else {
-        val = 0;
-    }
-
-    trace_s3_vga_io_readb(addr, val);
-    return val;
-}
-
-static uint32_t s3_trio_ioport_readw(void *opaque, uint32_t addr)
-{
-    S3TrioState *s = opaque;
-    uint32_t val;
-    uint16_t *p;
-
-    p = s3_trio_get_register(s, address_to_reg(addr), 0, NULL);
-
-    if (p) {
-        val = *p;
-    } else {
-        val = 0;
-    }
-
-    trace_s3_vga_io_readw(addr, val);
-    return val;
-}
-
-static void s3_trio_post_write(S3TrioState* s, uint32_t addr)
-{
-    switch (address_to_reg(addr)) {
-    case REG_H_DISP:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented write to H_DISP\n");
-        break;
-    case REG_V_DISP:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented write to V_DISP\n");
-        break;
-    case REG_SUBSYS_CNTL:
-        s->subsys_cntl &= ~(1 << 12); /* clear CHPTST */
-        break;
-    case REG_PIX_TRANS:
-        do_cmd_write_pixel(s, s->pix_trans);
-        break;
-    case REG_CMD:
-        do_cmd(s);
-        break;
-    default:
-        break;
-    }
-}
-
-static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
-{
-    S3TrioState *s = opaque;
-    uint16_t *p;
-    uint8_t *c;
-
-    trace_s3_vga_io_writeb(addr, val);
-    p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 1, &val);
-
-    if (p) {
-        c = (uint8_t*)p;
-        c[~addr & 1] = val;
-    }
-
-    s3_trio_post_write(s, addr & ~0x1);
-}
-
-static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
-{
-    S3TrioState *s = opaque;
-    uint16_t *p;
-
-    trace_s3_vga_io_writew(addr, val);
-    p = s3_trio_get_register(s, address_to_reg(addr), 1, &val);
-
-    if (p) {
-        *p = val & 0xffff;
-    }
-
-    s3_trio_post_write(s, addr & ~0x1);
 }
 
 /*
@@ -949,9 +2018,8 @@ static void s3_update_bank(S3TrioState *s)
  * register then selects the 64K page (86Box s3_decode_addr).  Everything
  * else is the standard VGA core behaviour.
  */
-static uint64_t s3_vga_mem_read(void *opaque, hwaddr addr, unsigned size)
+static uint8_t s3_vga_mem_readb(S3TrioState *s, hwaddr addr)
 {
-    S3TrioState *s = opaque;
     VGACommonState *vga = &s->vga;
 
     if ((vga->cr[0x31] & 0x08) &&
@@ -967,10 +2035,8 @@ static uint64_t s3_vga_mem_read(void *opaque, hwaddr addr, unsigned size)
     return vga_mem_readb(vga, addr);
 }
 
-static void s3_vga_mem_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
+static void s3_vga_mem_writeb(S3TrioState *s, hwaddr addr, uint8_t val)
 {
-    S3TrioState *s = opaque;
     VGACommonState *vga = &s->vga;
 
     if ((vga->cr[0x31] & 0x08) &&
@@ -988,12 +2054,44 @@ static void s3_vga_mem_write(void *opaque, hwaddr addr, uint64_t val,
     vga_mem_writeb(vga, addr, val);
 }
 
+static uint64_t s3_vga_mem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    S3TrioState *s = opaque;
+    uint64_t val = 0;
+    int i;
+
+    if (s3_mmio_enabled(s) && addr < 0x10000) {
+        return s3_mmio_read(s, addr, size);
+    }
+    for (i = 0; i < size; i++) {
+        val |= (uint64_t)s3_vga_mem_readb(s, addr + i) << (8 * i);
+    }
+    return val;
+}
+
+static void s3_vga_mem_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    S3TrioState *s = opaque;
+    int i;
+
+    if (s3_mmio_enabled(s) && addr < 0x10000) {
+        s3_mmio_write(s, addr, val, size);
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        s3_vga_mem_writeb(s, addr + i, (val >> (8 * i)) & 0xff);
+    }
+}
+
 static const MemoryRegionOps s3_vga_mem_ops = {
     .read = s3_vga_mem_read,
     .write = s3_vga_mem_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
     .impl.min_access_size = 1,
-    .impl.max_access_size = 1,
+    .impl.max_access_size = 4,
 };
 
 /*
@@ -1379,82 +2477,94 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 }
 
 static const MemoryRegionPortio s3_trio_portio_list[] = {
+    /* entries must be sorted by offset for portio_list_add() */
     { 0x0102, 1, 1, .read = s3_trio_enable_readb, .write = s3_trio_enable_writeb, },
-    { 0x02e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x02e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0x02e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x02e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
     { 0x02ea, 4, 1, .read = s3_trio_dac_ioport_readb, .write = s3_trio_dac_ioport_writeb, },
     { 0x03b4,  2, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03ba,  1, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03c0, 16, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03d4,  2, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03da,  1, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
-    { 0x06e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x06e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x0ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x0ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x0ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x0ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x16e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x1ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x1ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x1ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x1ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x22e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x22e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x26e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x26e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x2ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x2ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x2ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x2ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x32e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x32e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x36e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x36e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x3ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x3ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x3ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x3ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x42e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x42e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x46e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x46e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x4ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x4ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x82e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x82e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x86e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x86e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x8ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x8ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x8ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x8ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x92e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x92e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x96e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x96e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x9ae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x9ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0x9ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0x9ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xa2e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xa2e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xa6e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xa6e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xaae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xaae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xaee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xaee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xb2e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xb2e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xb6e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xb6e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xbae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xbae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xbee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xbee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
-    { 0xe2e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
-    { 0xe2e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0x06e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x06e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x0ae8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x0ae8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x0ee8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x0ee8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x12e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x12e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x16e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x16e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x1ae8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x1ae8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x1ee8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x1ee8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x22e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x22e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x26e8, 2, 1, .read = s3_trio_status_readb, .write = s3_trio_status_writeb, },
+    { 0x26e8, 1, 2, .read = s3_trio_status_readw, .write = s3_trio_status_writew, },
+    { 0x42e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x42e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x42e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x46e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x46e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x46e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x4ae8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x4ae8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x4ae8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x82e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x82e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x82e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x86e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x86e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x86e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x8ae8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x8ae8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x8ae8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x8ee8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x8ee8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x8ee8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x92e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x92e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x92e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x96e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x96e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x96e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x9ae8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x9ae8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x9ae8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0x9ee8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0x9ee8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0x9ee8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xa2e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xa2e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xa2e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xa6e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xa6e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xa6e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xaae8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xaae8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xaae8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xaee8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xaee8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xaee8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xb2e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xb2e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xb2e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xb6e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xb6e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xb6e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xbae8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xbae8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xbae8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xbee8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xbee8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xbee8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
+    { 0xe2e8, 4, 1, .read = s3_trio_accel_readb, .write = s3_trio_accel_writeb, },
+    { 0xe2e8, 4, 2, .read = s3_trio_accel_readw, .write = s3_trio_accel_writew, },
+    { 0xe2e8, 4, 4, .read = s3_trio_accel_readl, .write = s3_trio_accel_writel, },
     PORTIO_END_OF_LIST()
 };
 
@@ -1469,46 +2579,68 @@ static int s3_trio_post_load(void *opaque, int version_id)
 
 static VMStateDescription vmstate_s3_trio = {
     .name = TYPE_S3_TRIO,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = s3_trio_post_load,
     .fields = (VMStateField []) {
         VMSTATE_PCI_DEVICE(dev, S3TrioState),
         VMSTATE_STRUCT(vga, S3TrioState, 0, vmstate_vga_common, VGACommonState),
-        VMSTATE_UINT16(maj_axis, S3TrioState),
-        VMSTATE_UINT16(min_axis, S3TrioState),
         VMSTATE_UINT16(disp_stat, S3TrioState),
-        VMSTATE_UINT16(h_disp, S3TrioState),
-        VMSTATE_UINT16(h_sync_strt, S3TrioState),
-        VMSTATE_UINT16(h_sync_wid, S3TrioState),
-        VMSTATE_UINT16(v_total, S3TrioState),
-        VMSTATE_UINT16(v_disp, S3TrioState),
-        VMSTATE_UINT16(v_sync_strt, S3TrioState),
-        VMSTATE_UINT16(v_sync_wid, S3TrioState),
-        VMSTATE_UINT16(disp_cntl, S3TrioState),
-        VMSTATE_UINT16(h_total, S3TrioState),
         VMSTATE_UINT16(subsys_cntl, S3TrioState),
         VMSTATE_UINT16(subsys_stat, S3TrioState),
-        VMSTATE_UINT16(rom_page_sel, S3TrioState),
+        VMSTATE_UINT16(setup_md, S3TrioState),
         VMSTATE_UINT16(advfunc_cntl, S3TrioState),
-        VMSTATE_UINT16(cur_y, S3TrioState),
         VMSTATE_UINT16(cur_x, S3TrioState),
-        VMSTATE_UINT16(desty_axstep, S3TrioState),
-        VMSTATE_UINT16(destx_diastp, S3TrioState),
-        VMSTATE_UINT16(err_term, S3TrioState),
+        VMSTATE_UINT16(cur_y, S3TrioState),
+        VMSTATE_UINT16(cur_x2, S3TrioState),
+        VMSTATE_UINT16(cur_y2, S3TrioState),
+        VMSTATE_INT16(desty_axstp, S3TrioState),
+        VMSTATE_INT16(desty_axstp2, S3TrioState),
+        VMSTATE_INT16(destx_diastp, S3TrioState),
+        VMSTATE_INT16(x2, S3TrioState),
+        VMSTATE_INT16(err_term, S3TrioState),
+        VMSTATE_INT16(err_term2, S3TrioState),
         VMSTATE_UINT16(maj_axis_pcnt, S3TrioState),
-        VMSTATE_UINT16(gp_stat, S3TrioState),
+        VMSTATE_UINT16(maj_axis_pcnt2, S3TrioState),
         VMSTATE_UINT16(cmd, S3TrioState),
+        VMSTATE_UINT16(cmd2, S3TrioState),
         VMSTATE_UINT16(short_stroke, S3TrioState),
-        VMSTATE_UINT16(bkgd_color, S3TrioState),
-        VMSTATE_UINT16(frgd_color, S3TrioState),
-        VMSTATE_UINT16(wrt_mask, S3TrioState),
-        VMSTATE_UINT16(rd_mask, S3TrioState),
-        VMSTATE_UINT16(color_cmp, S3TrioState),
-        VMSTATE_UINT16(bkgd_mix, S3TrioState),
-        VMSTATE_UINT16(frgd_mix, S3TrioState),
+        VMSTATE_UINT32(bkgd_color, S3TrioState),
+        VMSTATE_UINT32(frgd_color, S3TrioState),
+        VMSTATE_UINT32(wrt_mask, S3TrioState),
+        VMSTATE_UINT32(rd_mask, S3TrioState),
+        VMSTATE_UINT32(color_cmp, S3TrioState),
+        VMSTATE_UINT8(bkgd_mix, S3TrioState),
+        VMSTATE_UINT8(frgd_mix, S3TrioState),
+        VMSTATE_UINT16(multifunc_cntl, S3TrioState),
         VMSTATE_UINT16_ARRAY(mfc, S3TrioState, 16),
-        VMSTATE_UINT16(pix_trans, S3TrioState),
+        VMSTATE_UINT8(read_sel, S3TrioState),
+        VMSTATE_UINT8_ARRAY(pix_trans, S3TrioState, 4),
+        VMSTATE_INT32(cx, S3TrioState),
+        VMSTATE_INT32(cy, S3TrioState),
+        VMSTATE_INT32(dx, S3TrioState),
+        VMSTATE_INT32(dy, S3TrioState),
+        VMSTATE_INT32(sx, S3TrioState),
+        VMSTATE_INT32(sy, S3TrioState),
+        VMSTATE_UINT32(src, S3TrioState),
+        VMSTATE_UINT32(dest, S3TrioState),
+        VMSTATE_UINT32(pattern, S3TrioState),
+        VMSTATE_INT32(poly_cx, S3TrioState),
+        VMSTATE_INT32(poly_cy, S3TrioState),
+        VMSTATE_INT32(poly_cx2, S3TrioState),
+        VMSTATE_INT32(poly_cy2, S3TrioState),
+        VMSTATE_INT32(poly_dx1, S3TrioState),
+        VMSTATE_INT32(poly_dx2, S3TrioState),
+        VMSTATE_INT32(poly_x, S3TrioState),
+        VMSTATE_UINT8(point_1_updated, S3TrioState),
+        VMSTATE_UINT8(point_2_updated, S3TrioState),
+        VMSTATE_UINT8(ssv_state, S3TrioState),
+        VMSTATE_UINT8(ssv_len, S3TrioState),
+        VMSTATE_UINT8(ssv_dir, S3TrioState),
+        VMSTATE_UINT8(ssv_draw, S3TrioState),
+        VMSTATE_UINT32(dat_buf, S3TrioState),
+        VMSTATE_UINT8(dat_count, S3TrioState),
+        VMSTATE_UINT8(busy, S3TrioState),
         VMSTATE_UINT8(ma_ext, S3TrioState),
         VMSTATE_UINT8(bank, S3TrioState),
         VMSTATE_UINT32(hwc_fg_col, S3TrioState),
@@ -1551,6 +2683,27 @@ static void s3_trio_reset(DeviceState *d)
     vga_common_reset(&s->vga);
 
     s->disp_stat |= DISP_STAT_SENSE;
+    s->subsys_cntl = s->subsys_stat = s->setup_md = 0;
+    s->cur_x = s->cur_y = s->cur_x2 = s->cur_y2 = 0;
+    s->desty_axstp = s->desty_axstp2 = s->destx_diastp = s->x2 = 0;
+    s->err_term = s->err_term2 = 0;
+    s->maj_axis_pcnt = s->maj_axis_pcnt2 = 0;
+    s->cmd = s->cmd2 = s->short_stroke = 0;
+    s->bkgd_color = s->frgd_color = 0;
+    s->wrt_mask = s->rd_mask = s->color_cmp = 0;
+    s->bkgd_mix = s->frgd_mix = 0;
+    s->multifunc_cntl = 0;
+    memset(s->mfc, 0, sizeof(s->mfc));
+    s->read_sel = 0;
+    memset(s->pix_trans, 0, sizeof(s->pix_trans));
+    s->cx = s->cy = s->dx = s->dy = s->sx = s->sy = 0;
+    s->src = s->dest = s->pattern = 0;
+    s->poly_cx = s->poly_cy = s->poly_cx2 = s->poly_cy2 = 0;
+    s->poly_dx1 = s->poly_dx2 = s->poly_x = 0;
+    s->point_1_updated = s->point_2_updated = 0;
+    s->ssv_state = s->ssv_len = s->ssv_dir = s->ssv_draw = 0;
+    s->dat_buf = s->dat_count = 0;
+    s->busy = 0;
     s->ma_ext = 0;
     s->bank = 0;
     s->advfunc_cntl = 0;

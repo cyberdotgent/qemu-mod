@@ -49,7 +49,7 @@ static uint8_t s3_inb(S3Test *t, uint16_t port)
     return qtest_inb(t->qts, port);
 }
 
-static void G_GNUC_UNUSED s3_outw(S3Test *t, uint16_t port, uint16_t val)
+static void s3_outw(S3Test *t, uint16_t port, uint16_t val)
 {
     if (t->ppc) {
         uint8_t b[2] = { val & 0xff, val >> 8 };
@@ -59,7 +59,7 @@ static void G_GNUC_UNUSED s3_outw(S3Test *t, uint16_t port, uint16_t val)
     }
 }
 
-static uint16_t G_GNUC_UNUSED s3_inw(S3Test *t, uint16_t port)
+static uint16_t s3_inw(S3Test *t, uint16_t port)
 {
     if (t->ppc) {
         uint8_t b[2];
@@ -915,6 +915,600 @@ static void test_cursor_16bpp(void)
     s3_test_fini(&t);
 }
 
+/* ---- graphics engine --------------------------------------------------- */
+
+enum {
+    P_CUR_Y = 0x82e8, P_CUR_X = 0x86e8, P_DESTY = 0x8ae8, P_DESTX = 0x8ee8,
+    P_ERR_TERM = 0x92e8, P_MAJ = 0x96e8, P_CMD = 0x9ae8, P_BKGD = 0xa2e8,
+    P_FRGD = 0xa6e8, P_WRT_MASK = 0xaae8, P_RD_MASK = 0xaee8,
+    P_COLOR_CMP = 0xb2e8, P_BKGD_MIX = 0xb6e8, P_FRGD_MIX = 0xbae8,
+    P_MFC = 0xbee8, P_PIX_TRANS = 0xe2e8,
+};
+
+/* CMD bits */
+enum {
+    C_WRTDATA = 0x0001, C_PLANAR = 0x0002, C_LASTPIX = 0x0004,
+    C_RADIAL = 0x0008, C_DRAW = 0x0010, C_INC_X = 0x0020, C_YMAJ = 0x0040,
+    C_INC_Y = 0x0080, C_PCDATA = 0x0100, C_BUS16 = 0x0200, C_BUS32 = 0x0400,
+    C_BYTSEQ = 0x1000,
+    C_LINE = 0x2000, C_RECT = 0x4000, C_BITBLT = 0xc000, C_PATBLT = 0xe000,
+};
+
+static void mfc_w(S3Test *t, int index, uint16_t val)
+{
+    s3_outw(t, P_MFC, (index << 12) | (val & 0xfff));
+}
+
+/* enable the engine and give it neutral defaults */
+static void engine_init(S3Test *t)
+{
+    crtc_w(t, 0x40, 0x01);           /* enable 8514 registers */
+    mfc_w(t, 1, 0);                  /* scissors top */
+    mfc_w(t, 2, 0);                  /* left */
+    mfc_w(t, 3, 0xfff);              /* bottom */
+    mfc_w(t, 4, 0xfff);              /* right */
+    mfc_w(t, 0xa, 0);                /* PIX_CNTL: foreground mix */
+    mfc_w(t, 0xe, 0x200);            /* MULT_MISC: 32-bit colour registers */
+    s3_outl(t, P_WRT_MASK, 0xffffffff);
+    s3_outl(t, P_RD_MASK, 0xffffffff);
+    s3_outl(t, P_COLOR_CMP, 0);
+    s3_outw(t, P_BKGD_MIX, 0x07);    /* background colour, copy */
+    s3_outw(t, P_FRGD_MIX, 0x27);    /* foreground colour, copy */
+}
+
+static void engine_rect(S3Test *t, int x, int y, int w, int h, uint16_t cmd)
+{
+    s3_outw(t, P_CUR_X, x);
+    s3_outw(t, P_CUR_Y, y);
+    s3_outw(t, P_MAJ, w - 1);
+    mfc_w(t, 0, h - 1);
+    s3_outw(t, P_CMD, cmd);
+}
+
+static void palette_rgb(S3Test *t)
+{
+    dac_w(t, 0, 0, 0, 0);
+    dac_w(t, 1, 255, 0, 0);
+    dac_w(t, 2, 0, 255, 0);
+    dac_w(t, 3, 0, 0, 255);
+    dac_w(t, 4, 255, 255, 255);
+}
+
+static void test_accel_rect(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    const uint16_t fill = C_RECT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    palette_rgb(&t);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+
+    /* solid fill 50x20 at (100,100) in red */
+    s3_outl(&t, P_FRGD, 1);
+    engine_rect(&t, 100, 100, 50, 20, fill);
+    g_assert_cmphex(s3_inw(&t, P_CMD) & 0x0200, ==, 0);   /* not busy */
+    screendump(&t, &img);
+    check_pixel(&img, 100, 100, 255, 0, 0);
+    check_pixel(&img, 149, 119, 255, 0, 0);
+    check_pixel(&img, 150, 119, 0, 0, 0);
+    check_pixel(&img, 149, 120, 0, 0, 0);
+    check_pixel(&img, 99, 100, 0, 0, 0);
+    image_free(&img);
+
+    /* XOR mix (5) with colour 3 over the red rect: 1 ^ 3 = 2 (green) */
+    s3_outl(&t, P_FRGD, 3);
+    s3_outw(&t, P_FRGD_MIX, 0x25);
+    engine_rect(&t, 110, 105, 10, 5, fill);
+    screendump(&t, &img);
+    check_pixel(&img, 110, 105, 0, 255, 0);
+    check_pixel(&img, 119, 109, 0, 255, 0);
+    check_pixel(&img, 109, 105, 255, 0, 0);
+    image_free(&img);
+
+    /* colour compare: skip destination... no, skip source == 2 */
+    s3_outw(&t, P_FRGD_MIX, 0x27);
+    s3_outl(&t, P_COLOR_CMP, 1);
+    mfc_w(&t, 0xe, 0x300);           /* compare enabled, update when != */
+    s3_outl(&t, P_FRGD, 1);          /* source colour 1 == compare: nothing */
+    engine_rect(&t, 90, 90, 70, 40, fill);
+    screendump(&t, &img);
+    check_pixel(&img, 90, 90, 0, 0, 0);
+    check_pixel(&img, 110, 105, 0, 255, 0);
+    image_free(&img);
+    mfc_w(&t, 0xe, 0x380);           /* update only when == compare */
+    engine_rect(&t, 90, 90, 70, 40, fill);
+    screendump(&t, &img);
+    check_pixel(&img, 90, 90, 255, 0, 0);
+    check_pixel(&img, 159, 129, 255, 0, 0);
+    check_pixel(&img, 160, 129, 0, 0, 0);
+    image_free(&img);
+    mfc_w(&t, 0xe, 0x200);
+
+    /* scissors: only (200..209, 200..209) may be written */
+    mfc_w(&t, 1, 200);
+    mfc_w(&t, 2, 200);
+    mfc_w(&t, 3, 209);
+    mfc_w(&t, 4, 209);
+    s3_outl(&t, P_FRGD, 3);
+    engine_rect(&t, 190, 190, 30, 30, fill);
+    screendump(&t, &img);
+    check_pixel(&img, 200, 200, 0, 0, 255);
+    check_pixel(&img, 209, 209, 0, 0, 255);
+    check_pixel(&img, 199, 200, 0, 0, 0);
+    check_pixel(&img, 210, 200, 0, 0, 0);
+    check_pixel(&img, 200, 210, 0, 0, 0);
+    image_free(&img);
+    mfc_w(&t, 3, 0xfff);
+    mfc_w(&t, 4, 0xfff);
+    mfc_w(&t, 1, 0);
+    mfc_w(&t, 2, 0);
+
+    /* write mask: only bit 1 of the pixel may change */
+    s3_outl(&t, P_WRT_MASK, 0x02);
+    s3_outl(&t, P_FRGD, 0xff);
+    engine_rect(&t, 300, 300, 4, 4, fill);   /* black | 2 = green */
+    screendump(&t, &img);
+    check_pixel(&img, 300, 300, 0, 255, 0);
+    image_free(&img);
+    s3_outl(&t, P_WRT_MASK, 0xffffffff);
+
+    /* draw bit clear: nothing written */
+    s3_outl(&t, P_FRGD, 1);
+    engine_rect(&t, 400, 400, 4, 4, fill & ~C_DRAW);
+    screendump(&t, &img);
+    check_pixel(&img, 400, 400, 0, 0, 0);
+    image_free(&img);
+
+    /* decreasing directions: (400,400) is the bottom right corner */
+    engine_rect(&t, 400, 400, 4, 4, C_RECT | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    check_pixel(&img, 400, 400, 255, 0, 0);
+    check_pixel(&img, 397, 397, 255, 0, 0);
+    check_pixel(&img, 401, 400, 0, 0, 0);
+    check_pixel(&img, 396, 397, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_accel_pixtrans(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    const uint16_t base = C_RECT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA |
+                          C_PCDATA | C_BUS16;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    palette_rgb(&t);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+
+    /* colour data, BYTSEQ set: low byte is the first pixel */
+    s3_outw(&t, P_FRGD_MIX, 0x47);           /* CPU data, copy */
+    engine_rect(&t, 10, 10, 4, 2, base | C_BYTSEQ);
+    g_assert_cmphex(s3_inw(&t, P_CMD) & 0x0200, ==, 0x0200);   /* busy */
+    s3_outw(&t, P_PIX_TRANS, 0x0201);
+    s3_outw(&t, P_PIX_TRANS, 0x0403);
+    s3_outw(&t, P_PIX_TRANS, 0x0201);
+    g_assert_cmphex(s3_inw(&t, P_CMD) & 0x0200, ==, 0x0200);
+    s3_outw(&t, P_PIX_TRANS, 0x0403);
+    g_assert_cmphex(s3_inw(&t, P_CMD) & 0x0200, ==, 0);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 10, 255, 0, 0);
+    check_pixel(&img, 11, 10, 0, 255, 0);
+    check_pixel(&img, 12, 10, 0, 0, 255);
+    check_pixel(&img, 13, 10, 255, 255, 255);
+    check_pixel(&img, 13, 11, 255, 255, 255);
+    check_pixel(&img, 14, 10, 0, 0, 0);
+    image_free(&img);
+
+    /* colour data, BYTSEQ clear: high byte first (8514/A order) */
+    engine_rect(&t, 10, 20, 4, 1, base);
+    s3_outw(&t, P_PIX_TRANS, 0x0201);
+    s3_outw(&t, P_PIX_TRANS, 0x0403);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 20, 0, 255, 0);
+    check_pixel(&img, 11, 20, 255, 0, 0);
+    check_pixel(&img, 12, 20, 255, 255, 255);
+    check_pixel(&img, 13, 20, 0, 0, 255);
+    image_free(&img);
+
+    /* colour compare on CPU data: pixels equal to 0 are transparent */
+    mfc_w(&t, 0xe, 0x300);
+    s3_outl(&t, P_COLOR_CMP, 0);
+    engine_rect(&t, 10, 30, 4, 1, base | C_BYTSEQ);
+    s3_outw(&t, P_PIX_TRANS, 0x0001);
+    s3_outw(&t, P_PIX_TRANS, 0x0300);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 30, 255, 0, 0);
+    check_pixel(&img, 11, 30, 0, 0, 0);
+    check_pixel(&img, 12, 30, 0, 0, 0);
+    check_pixel(&img, 13, 30, 0, 0, 255);
+    image_free(&img);
+    mfc_w(&t, 0xe, 0x200);
+
+    /* mono mask (across the plane): fg colour 1, bg colour 3, MSB first */
+    s3_outw(&t, P_FRGD_MIX, 0x27);
+    s3_outw(&t, P_BKGD_MIX, 0x07);
+    s3_outl(&t, P_FRGD, 1);
+    s3_outl(&t, P_BKGD, 3);
+    engine_rect(&t, 10, 40, 16, 1, base | C_PLANAR);
+    s3_outw(&t, P_PIX_TRANS, 0xf00f);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 40, 255, 0, 0);
+    check_pixel(&img, 13, 40, 255, 0, 0);
+    check_pixel(&img, 14, 40, 0, 0, 255);
+    check_pixel(&img, 21, 40, 0, 0, 255);
+    check_pixel(&img, 22, 40, 255, 0, 0);
+    check_pixel(&img, 25, 40, 255, 0, 0);
+    check_pixel(&img, 26, 40, 0, 0, 0);
+    image_free(&img);
+
+    /* mono mask with BYTSEQ: low byte first */
+    engine_rect(&t, 10, 50, 16, 1, base | C_PLANAR | C_BYTSEQ);
+    s3_outw(&t, P_PIX_TRANS, 0xf00f);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 50, 0, 0, 255);
+    check_pixel(&img, 13, 50, 0, 0, 255);
+    check_pixel(&img, 14, 50, 255, 0, 0);
+    check_pixel(&img, 21, 50, 255, 0, 0);
+    check_pixel(&img, 22, 50, 0, 0, 255);
+    image_free(&img);
+
+    /* mono mask through PIX_CNTL mix select instead of the command bit */
+    mfc_w(&t, 0xa, 0x80);
+    engine_rect(&t, 10, 60, 8, 1, C_RECT | C_INC_Y | C_INC_X | C_DRAW |
+                C_WRTDATA | C_PCDATA);          /* 8-bit bus */
+    s3_outb(&t, P_PIX_TRANS, 0xa5);
+    screendump(&t, &img);
+    /* 0xa5 = 1010 0101, MSB first */
+    check_pixel(&img, 10, 60, 255, 0, 0);
+    check_pixel(&img, 11, 60, 0, 0, 255);
+    check_pixel(&img, 12, 60, 255, 0, 0);
+    check_pixel(&img, 13, 60, 0, 0, 255);
+    check_pixel(&img, 14, 60, 0, 0, 255);
+    check_pixel(&img, 15, 60, 255, 0, 0);
+    check_pixel(&img, 16, 60, 0, 0, 255);
+    check_pixel(&img, 17, 60, 255, 0, 0);
+    check_pixel(&img, 18, 60, 0, 0, 0);
+    image_free(&img);
+    mfc_w(&t, 0xa, 0);
+
+    /* 32-bit bus colour transfer, four pixels per dword */
+    s3_outw(&t, P_FRGD_MIX, 0x47);
+    engine_rect(&t, 10, 70, 4, 1, C_RECT | C_INC_Y | C_INC_X | C_DRAW |
+                C_WRTDATA | C_PCDATA | C_BUS32 | C_BYTSEQ);
+    s3_outl(&t, P_PIX_TRANS, 0x04030201);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 70, 255, 0, 0);
+    check_pixel(&img, 11, 70, 0, 255, 0);
+    check_pixel(&img, 12, 70, 0, 0, 255);
+    check_pixel(&img, 13, 70, 255, 255, 255);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_accel_blit(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    int x, y;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    palette_rgb(&t);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+
+    /* source: 16x8 red block with a green pixel at (3,2) */
+    fill_rect(&t, pitch, 8, 0, 0, 16, 8, 1);
+    put_pixel(&t, pitch, 8, 3, 2, 2);
+
+    s3_outw(&t, P_FRGD_MIX, 0x67);           /* bitmap source, copy */
+    s3_outw(&t, P_CUR_X, 0);
+    s3_outw(&t, P_CUR_Y, 0);
+    s3_outw(&t, P_DESTX, 100);
+    s3_outw(&t, P_DESTY, 200);
+    s3_outw(&t, P_MAJ, 15);
+    mfc_w(&t, 0, 7);
+    s3_outw(&t, P_CMD, C_BITBLT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    check_pixel(&img, 100, 200, 255, 0, 0);
+    check_pixel(&img, 115, 207, 255, 0, 0);
+    check_pixel(&img, 103, 202, 0, 255, 0);
+    check_pixel(&img, 116, 200, 0, 0, 0);
+    check_pixel(&img, 100, 208, 0, 0, 0);
+    image_free(&img);
+
+    /* same blit with decreasing X and Y: coordinates are the far corners */
+    s3_outw(&t, P_CUR_X, 15);
+    s3_outw(&t, P_CUR_Y, 7);
+    s3_outw(&t, P_DESTX, 215);
+    s3_outw(&t, P_DESTY, 307);
+    s3_outw(&t, P_CMD, C_BITBLT | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    check_pixel(&img, 200, 300, 255, 0, 0);
+    check_pixel(&img, 215, 307, 255, 0, 0);
+    check_pixel(&img, 203, 302, 0, 255, 0);
+    check_pixel(&img, 216, 307, 0, 0, 0);
+    image_free(&img);
+
+    /* blit with XOR mix: red ^ blue-fill... use mix 5 on a blue area */
+    fill_rect(&t, pitch, 8, 400, 400, 16, 8, 3);
+    s3_outw(&t, P_FRGD_MIX, 0x65);           /* bitmap source, XOR */
+    s3_outw(&t, P_CUR_X, 0);
+    s3_outw(&t, P_CUR_Y, 0);
+    s3_outw(&t, P_DESTX, 400);
+    s3_outw(&t, P_DESTY, 400);
+    s3_outw(&t, P_CMD, C_BITBLT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    check_pixel(&img, 400, 400, 0, 255, 0);      /* 1 ^ 3 = 2 */
+    check_pixel(&img, 403, 402, 255, 0, 0);      /* 2 ^ 3 = 1 */
+    image_free(&img);
+
+    /* 8x8 pattern fill: checkerboard of 1/2 at (0,16) */
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            put_pixel(&t, pitch, 8, x, 16 + y, ((x + y) & 1) ? 2 : 1);
+        }
+    }
+    s3_outw(&t, P_FRGD_MIX, 0x67);
+    s3_outw(&t, P_CUR_X, 0);
+    s3_outw(&t, P_CUR_Y, 16);
+    s3_outw(&t, P_DESTX, 100);
+    s3_outw(&t, P_DESTY, 300);
+    s3_outw(&t, P_MAJ, 31);
+    mfc_w(&t, 0, 15);
+    s3_outw(&t, P_CMD, C_PATBLT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    /* pattern is aligned to the destination: (100,300) -> pattern (4,4) */
+    check_pixel(&img, 100, 300, 255, 0, 0);
+    check_pixel(&img, 101, 300, 0, 255, 0);
+    check_pixel(&img, 100, 301, 0, 255, 0);
+    check_pixel(&img, 131, 315, 255, 0, 0);      /* pattern (3,3): even */
+    check_pixel(&img, 130, 315, 0, 255, 0);      /* pattern (2,3): odd */
+    check_pixel(&img, 132, 300, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_accel_line(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    const uint16_t line = C_LINE | C_INC_X | C_INC_Y | C_DRAW | C_WRTDATA;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    palette_rgb(&t);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+    s3_outl(&t, P_FRGD, 1);
+
+    /*
+     * Bresenham 45 degree line (10,400)-(30,420): dx = dy = 20.  The S3
+     * compares the error term against MAJ_AXIS_PCNT (86Box), so it is
+     * initialised to 2*dy instead of the textbook 2*dy - dx.
+     */
+    s3_outw(&t, P_CUR_X, 10);
+    s3_outw(&t, P_CUR_Y, 400);
+    s3_outw(&t, P_MAJ, 20);
+    s3_outw(&t, P_ERR_TERM, 2 * 20);             /* 2*dy */
+    s3_outw(&t, P_DESTY, 2 * 20);                /* axial step 2*dy */
+    s3_outw(&t, P_DESTX, 2 * (20 - 20));         /* diagonal step */
+    s3_outw(&t, P_CMD, line);
+    screendump(&t, &img);
+    check_pixel(&img, 10, 400, 255, 0, 0);
+    check_pixel(&img, 20, 410, 255, 0, 0);
+    check_pixel(&img, 30, 420, 255, 0, 0);
+    check_pixel(&img, 10, 401, 0, 0, 0);
+    check_pixel(&img, 31, 421, 0, 0, 0);
+    image_free(&img);
+
+    /* shallow line (100,400)-(140,410): dx = 40, dy = 10, last pixel off */
+    s3_outw(&t, P_CUR_X, 100);
+    s3_outw(&t, P_CUR_Y, 400);
+    s3_outw(&t, P_MAJ, 40);
+    s3_outw(&t, P_ERR_TERM, 2 * 10);
+    s3_outw(&t, P_DESTY, 2 * 10);
+    s3_outw(&t, P_DESTX, 2 * (10 - 40));
+    s3_outw(&t, P_CMD, line | C_LASTPIX);
+    screendump(&t, &img);
+    check_pixel(&img, 100, 400, 255, 0, 0);
+    check_pixel(&img, 120, 405, 255, 0, 0);
+    check_pixel(&img, 139, 410, 255, 0, 0);
+    check_pixel(&img, 140, 410, 0, 0, 0);        /* last pixel off */
+    check_pixel(&img, 100, 401, 0, 0, 0);
+    image_free(&img);
+
+    /* radial (vector) line, direction +X, 10 pixels from (50,450) */
+    s3_outw(&t, P_CUR_X, 50);
+    s3_outw(&t, P_CUR_Y, 450);
+    s3_outw(&t, P_MAJ, 9);
+    s3_outw(&t, P_CMD, C_LINE | C_RADIAL | C_DRAW | C_WRTDATA);
+    screendump(&t, &img);
+    check_pixel(&img, 50, 450, 255, 0, 0);
+    check_pixel(&img, 59, 450, 255, 0, 0);
+    check_pixel(&img, 60, 450, 0, 0, 0);
+    check_pixel(&img, 50, 451, 0, 0, 0);
+    image_free(&img);
+
+    /* radial line, direction -X-Y (0x60) from (200,300) */
+    s3_outw(&t, P_CUR_X, 200);
+    s3_outw(&t, P_CUR_Y, 300);
+    s3_outw(&t, P_MAJ, 4);
+    s3_outw(&t, P_CMD, C_LINE | C_RADIAL | C_DRAW | C_WRTDATA | 0x60);
+    screendump(&t, &img);
+    check_pixel(&img, 200, 300, 255, 0, 0);
+    check_pixel(&img, 196, 296, 255, 0, 0);
+    check_pixel(&img, 195, 295, 0, 0, 0);
+    check_pixel(&img, 201, 301, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_accel_16bpp(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 1280;
+    const uint16_t fill = C_RECT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 16, pitch);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+    s3_outl(&t, P_FRGD, 0xf800);                 /* red */
+    engine_rect(&t, 100, 100, 50, 20, fill);
+    /* colour PIX_TRANS: one 16bpp pixel per word */
+    s3_outw(&t, P_FRGD_MIX, 0x47);
+    engine_rect(&t, 200, 200, 2, 1, fill | C_PCDATA | C_BUS16 | C_BYTSEQ);
+    s3_outw(&t, P_PIX_TRANS, 0x07e0);            /* green */
+    s3_outw(&t, P_PIX_TRANS, 0x001f);            /* blue */
+    /* blit the red block */
+    s3_outw(&t, P_FRGD_MIX, 0x67);
+    s3_outw(&t, P_CUR_X, 100);
+    s3_outw(&t, P_CUR_Y, 100);
+    s3_outw(&t, P_DESTX, 300);
+    s3_outw(&t, P_DESTY, 300);
+    s3_outw(&t, P_MAJ, 49);
+    mfc_w(&t, 0, 19);
+    s3_outw(&t, P_CMD, C_BITBLT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA);
+
+    screendump(&t, &img);
+    check_pixel(&img, 100, 100, 255, 0, 0);
+    check_pixel(&img, 149, 119, 255, 0, 0);
+    check_pixel(&img, 150, 119, 0, 0, 0);
+    check_pixel(&img, 200, 200, 0, 255, 0);
+    check_pixel(&img, 201, 200, 0, 0, 255);
+    check_pixel(&img, 202, 200, 0, 0, 0);
+    check_pixel(&img, 300, 300, 255, 0, 0);
+    check_pixel(&img, 349, 319, 255, 0, 0);
+    check_pixel(&img, 350, 319, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+static void test_accel_32bpp(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 2560;
+    const uint16_t fill = C_RECT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 32, pitch);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+    s3_outl(&t, P_FRGD, 0x00ff0000);             /* red */
+    engine_rect(&t, 100, 100, 50, 20, fill);
+    /* colour PIX_TRANS over the 32-bit bus: one pixel per dword */
+    s3_outw(&t, P_FRGD_MIX, 0x47);
+    engine_rect(&t, 200, 200, 2, 1, fill | C_PCDATA | C_BUS32 | C_BYTSEQ);
+    s3_outl(&t, P_PIX_TRANS, 0x0000ff00);        /* green */
+    s3_outl(&t, P_PIX_TRANS, 0x000000ff);        /* blue */
+    /* colour registers written as two 16-bit halves (MULT_MISC bit 4) */
+    mfc_w(&t, 0xe, 0x000);
+    s3_outw(&t, P_FRGD_MIX, 0x27);
+    s3_outw(&t, P_FRGD, 0xffff);                 /* low word */
+    s3_outw(&t, P_FRGD, 0x00ff);                 /* high word: 0x00ffffff */
+    engine_rect(&t, 300, 300, 4, 4, fill);
+
+    screendump(&t, &img);
+    check_pixel(&img, 100, 100, 255, 0, 0);
+    check_pixel(&img, 149, 119, 255, 0, 0);
+    check_pixel(&img, 150, 119, 0, 0, 0);
+    check_pixel(&img, 200, 200, 0, 255, 0);
+    check_pixel(&img, 201, 200, 0, 0, 255);
+    check_pixel(&img, 300, 300, 255, 255, 255);
+    check_pixel(&img, 303, 303, 255, 255, 255);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+/* engine registers through the memory-mapped window at 0xA0000 */
+static void test_accel_mmio(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    const uint16_t fill = C_RECT | C_INC_Y | C_INC_X | C_DRAW | C_WRTDATA;
+    uint64_t mmio;
+    uint8_t b[4];
+
+    s3_test_init(&t);
+    mmio = t.pci_mem + 0xa0000;
+    s3_set_mode(&t, w, h, 8, pitch);
+    palette_rgb(&t);
+    clear_fb(&t, pitch * h);
+    engine_init(&t);
+    crtc_w(&t, 0x53, 0x10);                      /* enable MMIO */
+
+#define MMIO_W(port, val) do {                                   \
+        b[0] = (val) & 0xff; b[1] = ((val) >> 8) & 0xff;        \
+        qtest_bufwrite(t.qts, mmio + (port), b, 2);              \
+    } while (0)
+#define MMIO_L(port, val) do {                                   \
+        b[0] = (val) & 0xff; b[1] = ((val) >> 8) & 0xff;        \
+        b[2] = ((val) >> 16) & 0xff; b[3] = (val) >> 24;         \
+        qtest_bufwrite(t.qts, mmio + (port), b, 4);              \
+    } while (0)
+
+    MMIO_L(P_FRGD, 3);
+    MMIO_W(P_CUR_X, 50);
+    MMIO_W(P_CUR_Y, 50);
+    MMIO_W(P_MAJ, 9);
+    MMIO_W(P_MFC, (0 << 12) | 4);
+    MMIO_W(P_CMD, fill);
+    /* GP_STAT through the window */
+    qtest_memread(t.qts, mmio + P_CMD, b, 2);
+    g_assert_cmphex(b[1] & 0x02, ==, 0);
+
+    /* packed register aliases: ALT_CURXY (0x8100), ALT_PCNT (0x8148),
+     * ALT_CMD (0x8118) and FRGD_COLOR (0x8124) */
+    MMIO_L(0x8124, 1);
+    MMIO_L(0x8100, (70 << 16) | 70);             /* CUR_Y | CUR_X << 16 */
+    MMIO_L(0x8148, (9 << 16) | 4);               /* MIN_AXIS | MAJ << 16 */
+    MMIO_W(0x8118, fill);
+
+    /* pixel transfer through the window (offsets below 0x8000) */
+    MMIO_W(P_FRGD_MIX, 0x47);
+    MMIO_W(P_CUR_X, 90);
+    MMIO_W(P_CUR_Y, 90);
+    MMIO_W(P_MAJ, 3);
+    MMIO_W(P_MFC, (0 << 12) | 0);
+    MMIO_W(P_CMD, fill | C_PCDATA | C_BUS32 | C_BYTSEQ);
+    MMIO_L(0x0000, 0x04030201);
+
+    /* VGA registers are reachable at 0x83C0-0x83DF */
+    qtest_writeb(t.qts, mmio + 0x83d4, 0x50);
+    g_assert_cmphex(qtest_readb(t.qts, mmio + 0x83d5), ==, crtc_r(&t, 0x50));
+
+    crtc_w(&t, 0x53, 0x00);                      /* back to the VGA window */
+    screendump(&t, &img);
+    check_pixel(&img, 50, 50, 0, 0, 255);
+    check_pixel(&img, 59, 54, 0, 0, 255);
+    check_pixel(&img, 60, 54, 0, 0, 0);
+    check_pixel(&img, 70, 70, 255, 0, 0);
+    check_pixel(&img, 79, 74, 255, 0, 0);
+    check_pixel(&img, 80, 74, 0, 0, 0);
+    check_pixel(&img, 90, 90, 255, 0, 0);
+    check_pixel(&img, 91, 90, 0, 255, 0);
+    check_pixel(&img, 92, 90, 0, 0, 255);
+    check_pixel(&img, 93, 90, 255, 255, 255);
+    image_free(&img);
+#undef MMIO_W
+#undef MMIO_L
+    s3_test_fini(&t);
+}
+
 int main(int argc, char **argv)
 {
     const char *arch = qtest_get_arch();
@@ -941,6 +1535,13 @@ int main(int argc, char **argv)
     qtest_add_func("/s3-trio/crtc/law-base", test_law_base);
     qtest_add_func("/s3-trio/cursor/8bpp", test_cursor_8bpp);
     qtest_add_func("/s3-trio/cursor/16bpp", test_cursor_16bpp);
+    qtest_add_func("/s3-trio/accel/rect", test_accel_rect);
+    qtest_add_func("/s3-trio/accel/pixtrans", test_accel_pixtrans);
+    qtest_add_func("/s3-trio/accel/blit", test_accel_blit);
+    qtest_add_func("/s3-trio/accel/line", test_accel_line);
+    qtest_add_func("/s3-trio/accel/16bpp", test_accel_16bpp);
+    qtest_add_func("/s3-trio/accel/32bpp", test_accel_32bpp);
+    qtest_add_func("/s3-trio/accel/mmio", test_accel_mmio);
 
     return g_test_run();
 }
