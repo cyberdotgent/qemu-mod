@@ -143,6 +143,15 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     msr_mask = ((1 << MSR_LE) | (1 << MSR_PR) |
                 (1 << MSR_DR) | (1 << MSR_FP));
 
+    if (ppc_flags & POWERPC_FLAG_HID0_LE) {
+        /*
+         * Note that MSR_LE is not set in env->msr_mask for this cpu,
+         * and so will never be set in msr.
+         */
+        uint32_t le = extract32(env->spr[SPR_HID0], 3, 1);
+        hflags |= le << MSR_LE;
+    }
+
     if (ppc_flags & POWERPC_FLAG_DE) {
         target_ulong dbcr0 = env->spr[SPR_BOOKE_DBCR0];
         if ((dbcr0 & DBCR0_ICMP) && FIELD_EX64(msr, MSR, DE)) {

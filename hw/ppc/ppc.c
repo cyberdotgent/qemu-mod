@@ -593,6 +593,34 @@ void cpu_ppc_store_tbu (CPUPPCState *env, uint32_t value)
     _cpu_ppc_store_tbu(env, value);
 }
 
+/*
+ * Specific helpers for POWER & PowerPC 601 RTC.
+ *
+ * The 601 has no time base: RTCU counts seconds and RTCL counts
+ * nanoseconds in 128 ns steps (bits 25-31 are always zero) at the
+ * 7.8125 MHz RTC clock. We reuse the time base machinery for it:
+ * the upper word maps to RTCU and the lower word to RTCL.
+ */
+void cpu_ppc601_store_rtcu(CPUPPCState *env, uint32_t value)
+{
+    _cpu_ppc_store_tbu(env, value);
+}
+
+uint32_t cpu_ppc601_load_rtcu(CPUPPCState *env)
+{
+    return _cpu_ppc_load_tbu(env);
+}
+
+void cpu_ppc601_store_rtcl(CPUPPCState *env, uint32_t value)
+{
+    cpu_ppc_store_tbl(env, value & 0x3FFFFF80);
+}
+
+uint32_t cpu_ppc601_load_rtcl(CPUPPCState *env)
+{
+    return cpu_ppc_load_tbl(env) & 0x3FFFFF80;
+}
+
 uint64_t cpu_ppc_load_atbl (CPUPPCState *env)
 {
     ppc_tb_t *tb_env = env->tb_env;

@@ -48,6 +48,33 @@ static target_ulong hash32_bat_size(int mmu_idx,
     return BATU32_BEPI & ~((batu & BATU32_BL) << 15);
 }
 
+/*
+ * PowerPC 601 BATs: the upper word holds BEPI, WIM, Ks, Ku and PP, the
+ * lower word holds BRPN, V and a 6-bit block length in 128KiB units.
+ */
+static target_ulong hash32_bat_601_size(target_ulong batu, target_ulong batl)
+{
+    if (!(batl & BATL32_601_V)) {
+        return 0;
+    }
+
+    return BATU32_BEPI & ~((batl & BATL32_601_BL) << 17);
+}
+
+static int hash32_bat_601_prot(int mmu_idx,
+                               target_ulong batu, target_ulong batl)
+{
+    int key, pp;
+
+    pp = batu & BATU32_601_PP;
+    if (mmuidx_pr(mmu_idx) == 0) {
+        key = !!(batu & BATU32_601_KS);
+    } else {
+        key = !!(batu & BATU32_601_KP);
+    }
+    return ppc_hash32_prot(key, pp, false);
+}
+
 static hwaddr ppc_hash32_bat_lookup(PowerPCCPU *cpu, target_ulong ea,
                                     MMUAccessType access_type, int *prot,
                                     int mmu_idx)
@@ -71,7 +98,11 @@ static hwaddr ppc_hash32_bat_lookup(PowerPCCPU *cpu, target_ulong ea,
         target_ulong batl = BATlt[i];
         target_ulong mask;
 
-        mask = hash32_bat_size(mmu_idx, batu, batl);
+        if (unlikely(env->mmu_model == POWERPC_MMU_601)) {
+            mask = hash32_bat_601_size(batu, batl);
+        } else {
+            mask = hash32_bat_size(mmu_idx, batu, batl);
+        }
         LOG_BATS("%s: %cBAT%d v " TARGET_FMT_lx " BATu " TARGET_FMT_lx
                  " BATl " TARGET_FMT_lx "\n", __func__,
                  ifetch ? 'I' : 'D', i, ea, batu, batl);
@@ -79,7 +110,11 @@ static hwaddr ppc_hash32_bat_lookup(PowerPCCPU *cpu, target_ulong ea,
         if (mask && ((ea & mask) == (batu & BATU32_BEPI))) {
             hwaddr raddr = (batl & mask) | (ea & ~mask);
 
-            *prot = ppc_hash32_bat_prot(batu, batl);
+            if (unlikely(env->mmu_model == POWERPC_MMU_601)) {
+                *prot = hash32_bat_601_prot(mmu_idx, batu, batl);
+            } else {
+                *prot = ppc_hash32_bat_prot(batu, batl);
+            }
 
             return raddr & TARGET_PAGE_MASK;
         }
@@ -120,6 +155,19 @@ static bool ppc_hash32_direct_store(PowerPCCPU *cpu, target_ulong sr,
     CPUPPCState *env = &cpu->env;
 
     qemu_log_mask(CPU_LOG_MMU, "direct store...\n");
+
+    if (env->mmu_model == POWERPC_MMU_601 &&
+        (sr & 0x1FF00000) >> 20 == 0x07f) {
+        /*
+         * Memory-forced I/O controller interface access
+         *
+         * If T=1 and BUID=x'07F', the 601 performs a memory access
+         * to SR[28-31] LA[4-31], bypassing all protection mechanisms.
+         */
+        *raddr = ((sr & 0xF) << 28) | (eaddr & 0x0FFFFFFF);
+        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+        return true;
+    }
 
     if (access_type == MMU_INST_FETCH) {
         /* No code fetch is allowed in direct-store areas */

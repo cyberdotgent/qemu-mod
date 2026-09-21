@@ -74,6 +74,8 @@ static const char *powerpc_excp_name(int excp)
     case POWERPC_EXCP_HISEG:    return "HISEG";
     case POWERPC_EXCP_VPU:      return "VPU";
     case POWERPC_EXCP_PIT:      return "PIT";
+    case POWERPC_EXCP_IO:       return "IO";
+    case POWERPC_EXCP_RUNM:     return "RUNM";
     case POWERPC_EXCP_EMUL:     return "EMUL";
     case POWERPC_EXCP_IFTLB:    return "IFTLB";
     case POWERPC_EXCP_DLTLB:    return "DLTLB";
@@ -657,6 +659,8 @@ static void powerpc_excp_6xx(PowerPCCPU *cpu, int excp)
         /* Set way using a LRU mechanism */
         msr |= ((env->last_way + 1) & (env->nb_ways - 1)) << 17;
         break;
+    case POWERPC_EXCP_IO:        /* IO error exception (601)                 */
+    case POWERPC_EXCP_RUNM:      /* Run mode exception (601)                 */
     case POWERPC_EXCP_FPA:       /* Floating-point assist exception          */
     case POWERPC_EXCP_DABR:      /* Data address breakpoint                  */
     case POWERPC_EXCP_IABR:      /* Instruction address breakpoint           */
@@ -1729,6 +1733,12 @@ void powerpc_excp(PowerPCCPU *cpu, int excp)
     case POWERPC_EXCP_40x:
         powerpc_excp_40x(cpu, excp);
         break;
+    case POWERPC_EXCP_601:
+        /*
+         * The 601 exception model is the 60x one with a reduced set of
+         * vectors (no trace or software TLB miss exceptions) and two
+         * specific ones (IO error, run mode) that we never raise.
+         */
     case POWERPC_EXCP_6xx:
         powerpc_excp_6xx(cpu, excp);
         break;

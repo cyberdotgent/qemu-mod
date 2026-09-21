@@ -972,6 +972,63 @@ void spr_write_dpdes(DisasContext *ctx, int sprn, int gprn)
 #endif
 #endif
 
+/* PowerPC 601 specific registers */
+/* RTC */
+void spr_read_601_rtcl(DisasContext *ctx, int gprn, int sprn)
+{
+    translator_io_start(&ctx->base);
+    gen_helper_load_601_rtcl(cpu_gpr[gprn], tcg_env);
+}
+
+void spr_read_601_rtcu(DisasContext *ctx, int gprn, int sprn)
+{
+    translator_io_start(&ctx->base);
+    gen_helper_load_601_rtcu(cpu_gpr[gprn], tcg_env);
+}
+
+#if !defined(CONFIG_USER_ONLY)
+void spr_write_601_rtcu(DisasContext *ctx, int sprn, int gprn)
+{
+    translator_io_start(&ctx->base);
+    gen_helper_store_601_rtcu(tcg_env, cpu_gpr[gprn]);
+}
+
+void spr_write_601_rtcl(DisasContext *ctx, int sprn, int gprn)
+{
+    translator_io_start(&ctx->base);
+    gen_helper_store_601_rtcl(tcg_env, cpu_gpr[gprn]);
+}
+
+void spr_write_hid0_601(DisasContext *ctx, int sprn, int gprn)
+{
+    gen_helper_store_hid0_601(tcg_env, cpu_gpr[gprn]);
+    /* Must stop the translation as endianness may have changed */
+    ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+}
+#endif
+
+/* Unified bats */
+#if !defined(CONFIG_USER_ONLY)
+void spr_read_601_ubat(DisasContext *ctx, int gprn, int sprn)
+{
+    tcg_gen_ld_tl(cpu_gpr[gprn], tcg_env,
+                  offsetof(CPUPPCState,
+                           IBAT[sprn & 1][(sprn - SPR_IBAT0U) / 2]));
+}
+
+void spr_write_601_ubatu(DisasContext *ctx, int sprn, int gprn)
+{
+    TCGv_i32 t0 = tcg_constant_i32((sprn - SPR_IBAT0U) / 2);
+    gen_helper_store_601_batu(tcg_env, t0, cpu_gpr[gprn]);
+}
+
+void spr_write_601_ubatl(DisasContext *ctx, int sprn, int gprn)
+{
+    TCGv_i32 t0 = tcg_constant_i32((sprn - SPR_IBAT0U) / 2);
+    gen_helper_store_601_batl(tcg_env, t0, cpu_gpr[gprn]);
+}
+#endif
+
 /* PowerPC 40x specific registers */
 #if !defined(CONFIG_USER_ONLY)
 void spr_read_40x_pit(DisasContext *ctx, int gprn, int sprn)
@@ -5017,6 +5074,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->has_bhrb = !!(env->flags & POWERPC_FLAG_BHRB);
 #endif
     ctx->lazy_tlb_flush = env->mmu_model == POWERPC_MMU_32B
+        || env->mmu_model == POWERPC_MMU_601
         || env->mmu_model & POWERPC_MMU_64;
 
     ctx->fpu_enabled = (hflags >> HFLAGS_FP) & 1;

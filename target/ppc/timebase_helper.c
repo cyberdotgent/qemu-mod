@@ -51,6 +51,16 @@ target_ulong helper_load_vtb(CPUPPCState *env)
     return cpu_ppc_load_vtb(env);
 }
 
+target_ulong helper_load_601_rtcl(CPUPPCState *env)
+{
+    return cpu_ppc601_load_rtcl(env);
+}
+
+target_ulong helper_load_601_rtcu(CPUPPCState *env)
+{
+    return cpu_ppc601_load_rtcu(env);
+}
+
 #if defined(TARGET_PPC64) && !defined(CONFIG_USER_ONLY)
 target_ulong helper_load_purr(CPUPPCState *env)
 {
@@ -105,6 +115,16 @@ void helper_store_tbu(CPUPPCState *env, target_ulong val)
         CPUPPCState *cenv = &POWERPC_CPU(ccs)->env;
         cpu_ppc_store_tbu(cenv, val);
     }
+}
+
+void helper_store_601_rtcl(CPUPPCState *env, target_ulong val)
+{
+    cpu_ppc601_store_rtcl(env, val);
+}
+
+void helper_store_601_rtcu(CPUPPCState *env, target_ulong val)
+{
+    cpu_ppc601_store_rtcu(env, val);
 }
 
 void helper_store_atbl(CPUPPCState *env, target_ulong val)

@@ -841,6 +841,7 @@ bool ppc_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 #endif
 
     case POWERPC_MMU_32B:
+    case POWERPC_MMU_601:
         return ppc_hash32_xlate(cpu, eaddr, access_type, raddrp,
                                psizep, protp, mmu_idx, guest_visible);
     case POWERPC_MMU_BOOKE:

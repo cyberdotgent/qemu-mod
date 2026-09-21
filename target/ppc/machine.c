@@ -145,8 +145,9 @@ static int cpu_pre_save(void *opaque)
         env->spr[SPR_IBAT4U + 2 * i + 1] = env->IBAT[1][i + 4];
     }
 
-    /* Used to retain migration compatibility for pre 6.0 for 601 machines. */
-    env->hflags_compat_nmsr = 0;
+    /* Retain migration compatibility for pre 6.0 for 601 machines. */
+    env->hflags_compat_nmsr = (env->flags & POWERPC_FLAG_HID0_LE
+                               ? env->hflags & MSR_LE : 0);
 
     if (tcg_enabled()) {
         /*

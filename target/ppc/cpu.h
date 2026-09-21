@@ -107,9 +107,11 @@ enum {
     POWERPC_EXCP_VPU      = 73, /* Vector unavailable exception              */
     /* 40x specific exceptions                                               */
     POWERPC_EXCP_PIT      = 74, /* Programmable interval timer interrupt     */
-    /* Vectors 75-76 are 601 specific exceptions                             */
+    /* 601 specific exceptions                                               */
+    POWERPC_EXCP_IO       = 75, /* IO error exception                        */
+    POWERPC_EXCP_RUNM     = 76, /* Run mode exception                        */
     /* 602 specific exceptions                                               */
-    POWERPC_EXCP_EMUL      = 77, /* Emulation trap exception                 */
+    POWERPC_EXCP_EMUL     = 77, /* Emulation trap exception                  */
     /* 602/603 specific exceptions                                           */
     POWERPC_EXCP_IFTLB    = 78, /* Instruction fetch TLB miss                */
     POWERPC_EXCP_DLTLB    = 79, /* Data load TLB miss                        */
@@ -200,6 +202,8 @@ typedef enum powerpc_excp_t {
     POWERPC_EXCP_STD,
     /* PowerPC 40x exception model      */
     POWERPC_EXCP_40x,
+    /* PowerPC 601 exception model      */
+    POWERPC_EXCP_601,
     /* PowerPC 603/604/G2 exception model */
     POWERPC_EXCP_6xx,
     /* PowerPC 7xx exception model      */
@@ -248,6 +252,8 @@ typedef enum powerpc_mmu_t {
     POWERPC_MMU_BOOKE      = 0x00000008,
     /* BookE 2.06 MMU model                                    */
     POWERPC_MMU_BOOKE206   = 0x00000009,
+    /* PowerPC 601 MMU model (specific BATs format)            */
+    POWERPC_MMU_601        = 0x0000000A,
 #define POWERPC_MMU_64       0x00010000
     /* 64 bits PowerPC MMU                                     */
     POWERPC_MMU_64B        = POWERPC_MMU_64 | 0x00000001,
@@ -826,7 +832,8 @@ enum {
     POWERPC_FLAG_PX       = 0x00000200,
     POWERPC_FLAG_PMM      = 0x00000400,
     /* Flag for special features                                             */
-    /* Decrementer clock                                                     */
+    /* Decrementer clock: RTC clock (POWER, 601) or bus clock                */
+    POWERPC_FLAG_RTC_CLK  = 0x00010000,
     POWERPC_FLAG_BUS_CLK  = 0x00020000,
     /* Has CFAR                                                              */
     POWERPC_FLAG_CFAR     = 0x00040000,
@@ -844,6 +851,8 @@ enum {
     POWERPC_FLAG_BHRB      = 0x01000000,
     /* Use PPE42-specific behavior                                           */
     POWERPC_FLAG_PPE42     = 0x02000000,
+    /* Has HID0 for LE bit (601)                                             */
+    POWERPC_FLAG_HID0_LE   = 0x04000000,
 };
 
 /*
@@ -854,7 +863,7 @@ enum {
  * the MSR are validated in hreg_compute_hflags.
  */
 enum {
-    HFLAGS_LE = 0,   /* MSR_LE */
+    HFLAGS_LE = 0,   /* MSR_LE -- comes from HID0 on 601 */
     HFLAGS_HV = 1,   /* computed from MSR_HV and other state */
     HFLAGS_64 = 2,   /* computed from MSR_CE and MSR_SF */
     HFLAGS_GTSE = 3, /* computed from SPR_LPCR[GTSE] */
@@ -1690,6 +1699,12 @@ target_ulong cpu_ppc_load_decr(CPUPPCState *env);
 void cpu_ppc_store_decr(CPUPPCState *env, target_ulong value);
 target_ulong cpu_ppc_load_hdecr(CPUPPCState *env);
 void cpu_ppc_store_hdecr(CPUPPCState *env, target_ulong value);
+uint32_t cpu_ppc601_load_rtcl(CPUPPCState *env);
+uint32_t cpu_ppc601_load_rtcu(CPUPPCState *env);
+#if !defined(CONFIG_USER_ONLY)
+void cpu_ppc601_store_rtcl(CPUPPCState *env, uint32_t value);
+void cpu_ppc601_store_rtcu(CPUPPCState *env, uint32_t value);
+#endif
 void cpu_ppc_store_tbu40(CPUPPCState *env, uint64_t value);
 uint64_t cpu_ppc_load_purr(CPUPPCState *env);
 void cpu_ppc_store_purr(CPUPPCState *env, uint64_t value);
@@ -1794,12 +1809,17 @@ void ppc_compat_add_property(Object *obj, const char *name,
 /* SPR definitions */
 #define SPR_MQ                (0x000)
 #define SPR_XER               (0x001)
+#define SPR_601_VRTCU         (0x004)
+#define SPR_601_VRTCL         (0x005)
+#define SPR_601_UDECR         (0x006)
 #define SPR_LR                (0x008)
 #define SPR_CTR               (0x009)
 #define SPR_UAMR              (0x00D)
 #define SPR_DSCR              (0x011)
 #define SPR_DSISR             (0x012)
-#define SPR_DAR               (0x013)
+#define SPR_DAR               (0x013) /* DAE for PowerPC 601 */
+#define SPR_601_RTCU          (0x014)
+#define SPR_601_RTCL          (0x015)
 #define SPR_DECR              (0x016)
 #define SPR_SDR1              (0x019)
 #define SPR_SRR0              (0x01A)
@@ -2307,6 +2327,7 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_HID1              (0x3F1)
 #define SPR_IABR              (0x3F2)
 #define SPR_40x_DBCR0         (0x3F2)
+#define SPR_601_HID2          (0x3F2)
 #define SPR_Exxx_L1CSR0       (0x3F2)
 #define SPR_ICTRL             (0x3F3)
 #define SPR_HID2              (0x3F3)
@@ -2322,6 +2343,7 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define DABR_MASK (~(target_ulong)0x7)
 #define SPR_Exxx_BUCSR        (0x3F5)
 #define SPR_40x_IAC2          (0x3F5)
+#define SPR_601_HID5          (0x3F5)
 #define SPR_40x_DAC1          (0x3F6)
 #define SPR_MSSCR0            (0x3F6)
 #define SPR_970_HID5          (0x3F6)
@@ -2354,6 +2376,7 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_403_PBL2          (0x3FE)
 #define SPR_PIR               (0x3FF)
 #define SPR_403_PBU2          (0x3FF)
+#define SPR_601_HID15         (0x3FF)
 #define SPR_604_HID15         (0x3FF)
 #define SPR_E500_SVR          (0x3FF)
 
@@ -2420,6 +2443,9 @@ enum {
 #define PPC_RES     PPC_INSNS_BASE
     /*   spr/msr access instructions                                         */
 #define PPC_MISC    PPC_INSNS_BASE
+    /* Deprecated instruction sets                                           */
+    /*   Power-to-PowerPC bridge (601): POWER instructions kept by the 601   */
+    PPC_POWER_BR       = 0x0000000000000010ULL,
     /* 64 bits PowerPC instruction set                                       */
     PPC_64B            = 0x0000000000000020ULL,
     /*   New 64 bits extensions (PowerPC 2.0x)                               */
@@ -2528,7 +2554,7 @@ enum {
     /* popcntw and popcntd instructions                                      */
     PPC_POPCNTWD       = 0x8000000000000000ULL,
 
-#define PPC_TCG_INSNS  (PPC_INSNS_BASE | PPC_64B \
+#define PPC_TCG_INSNS  (PPC_INSNS_BASE | PPC_POWER_BR | PPC_64B \
                         | PPC_64BX | PPC_64H | PPC_WAIT | PPC_MFTB \
                         | PPC_ISEL | PPC_POPCNTB \
                         | PPC_STRING | PPC_FLOAT | PPC_FLOAT_EXT \
