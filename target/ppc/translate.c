@@ -3157,6 +3157,617 @@ static void gen_ecowx(DisasContext *ctx)
                        DEF_MEMOP(MO_UL | MO_ALIGN));
 }
 
+/* PowerPC 601 specific instructions (POWER bridge) */
+
+/* abs - abs. */
+static void gen_abs(DisasContext *ctx)
+{
+    TCGv d = cpu_gpr[rD(ctx->opcode)];
+    TCGv a = cpu_gpr[rA(ctx->opcode)];
+
+    tcg_gen_abs_tl(d, a);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, d);
+    }
+}
+
+/* abso - abso. */
+static void gen_abso(DisasContext *ctx)
+{
+    TCGv d = cpu_gpr[rD(ctx->opcode)];
+    TCGv a = cpu_gpr[rA(ctx->opcode)];
+
+    tcg_gen_setcondi_tl(TCG_COND_EQ, cpu_ov, a, 0x80000000);
+    tcg_gen_abs_tl(d, a);
+    tcg_gen_or_tl(cpu_so, cpu_so, cpu_ov);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, d);
+    }
+}
+
+/* clcs */
+static void gen_clcs(DisasContext *ctx)
+{
+    TCGv_i32 t0 = tcg_constant_i32(rA(ctx->opcode));
+    gen_helper_clcs(cpu_gpr[rD(ctx->opcode)], tcg_env, t0);
+    /* Rc=1 sets CR0 to an undefined state */
+}
+
+/* div - div. */
+static void gen_div(DisasContext *ctx)
+{
+    gen_helper_div(cpu_gpr[rD(ctx->opcode)], tcg_env, cpu_gpr[rA(ctx->opcode)],
+                   cpu_gpr[rB(ctx->opcode)]);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* divo - divo. */
+static void gen_divo(DisasContext *ctx)
+{
+    gen_helper_divo(cpu_gpr[rD(ctx->opcode)], tcg_env, cpu_gpr[rA(ctx->opcode)],
+                    cpu_gpr[rB(ctx->opcode)]);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* divs - divs. */
+static void gen_divs(DisasContext *ctx)
+{
+    gen_helper_divs(cpu_gpr[rD(ctx->opcode)], tcg_env, cpu_gpr[rA(ctx->opcode)],
+                    cpu_gpr[rB(ctx->opcode)]);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* divso - divso. */
+static void gen_divso(DisasContext *ctx)
+{
+    gen_helper_divso(cpu_gpr[rD(ctx->opcode)], tcg_env,
+                     cpu_gpr[rA(ctx->opcode)], cpu_gpr[rB(ctx->opcode)]);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/*
+ * doz - doz.
+ *
+ * rD = rB - rA, or 0 if rA is algebraically greater than rB
+ * (PowerPC 601 User's Manual). The pre-2022 QEMU code had the
+ * condition inverted.
+ */
+static void gen_doz(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    tcg_gen_brcond_tl(TCG_COND_GT, cpu_gpr[rA(ctx->opcode)],
+                      cpu_gpr[rB(ctx->opcode)], l1);
+    tcg_gen_sub_tl(cpu_gpr[rD(ctx->opcode)], cpu_gpr[rB(ctx->opcode)],
+                   cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_br(l2);
+    gen_set_label(l1);
+    tcg_gen_movi_tl(cpu_gpr[rD(ctx->opcode)], 0);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* dozo - dozo. */
+static void gen_dozo(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    /* Start with XER OV disabled, the most likely case */
+    tcg_gen_movi_tl(cpu_ov, 0);
+    tcg_gen_brcond_tl(TCG_COND_GT, cpu_gpr[rA(ctx->opcode)],
+                      cpu_gpr[rB(ctx->opcode)], l1);
+    tcg_gen_sub_tl(t0, cpu_gpr[rB(ctx->opcode)], cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_xor_tl(t1, cpu_gpr[rB(ctx->opcode)], cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_xor_tl(t2, cpu_gpr[rA(ctx->opcode)], t0);
+    tcg_gen_andc_tl(t1, t1, t2);
+    tcg_gen_mov_tl(cpu_gpr[rD(ctx->opcode)], t0);
+    tcg_gen_brcondi_tl(TCG_COND_GE, t1, 0, l2);
+    tcg_gen_movi_tl(cpu_ov, 1);
+    tcg_gen_movi_tl(cpu_so, 1);
+    tcg_gen_br(l2);
+    gen_set_label(l1);
+    tcg_gen_movi_tl(cpu_gpr[rD(ctx->opcode)], 0);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* dozi: rD = SIMM - rA, or 0 if rA is algebraically greater than SIMM */
+static void gen_dozi(DisasContext *ctx)
+{
+    target_long simm = SIMM(ctx->opcode);
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    tcg_gen_brcondi_tl(TCG_COND_GT, cpu_gpr[rA(ctx->opcode)], simm, l1);
+    tcg_gen_subfi_tl(cpu_gpr[rD(ctx->opcode)], simm, cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_br(l2);
+    gen_set_label(l1);
+    tcg_gen_movi_tl(cpu_gpr[rD(ctx->opcode)], 0);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* lscbx - lscbx. */
+static void gen_lscbx(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv_i32 t1 = tcg_constant_i32(rD(ctx->opcode));
+    TCGv_i32 t2 = tcg_constant_i32(rA(ctx->opcode));
+    TCGv_i32 t3 = tcg_constant_i32(rB(ctx->opcode));
+
+    gen_addr_reg_index(ctx, t0);
+    gen_helper_lscbx(t0, tcg_env, t0, t1, t2, t3);
+    tcg_gen_andi_tl(cpu_xer, cpu_xer, ~0x7F);
+    tcg_gen_or_tl(cpu_xer, cpu_xer, t0);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, t0);
+    }
+}
+
+/* maskg - maskg. */
+static void gen_maskg(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    TCGv t3 = tcg_temp_new();
+    tcg_gen_movi_tl(t3, 0xFFFFFFFF);
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_andi_tl(t1, cpu_gpr[rS(ctx->opcode)], 0x1F);
+    tcg_gen_addi_tl(t2, t0, 1);
+    tcg_gen_shr_tl(t2, t3, t2);
+    tcg_gen_shr_tl(t3, t3, t1);
+    tcg_gen_xor_tl(cpu_gpr[rA(ctx->opcode)], t2, t3);
+    tcg_gen_brcond_tl(TCG_COND_GE, t0, t1, l1);
+    tcg_gen_neg_tl(cpu_gpr[rA(ctx->opcode)], cpu_gpr[rA(ctx->opcode)]);
+    gen_set_label(l1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* maskir - maskir. */
+static void gen_maskir(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_and_tl(t0, cpu_gpr[rS(ctx->opcode)], cpu_gpr[rB(ctx->opcode)]);
+    tcg_gen_andc_tl(t1, cpu_gpr[rA(ctx->opcode)], cpu_gpr[rB(ctx->opcode)]);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* mul - mul. */
+static void gen_mul(DisasContext *ctx)
+{
+    TCGv_i64 t0 = tcg_temp_new_i64();
+    TCGv_i64 t1 = tcg_temp_new_i64();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_extu_tl_i64(t0, cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_extu_tl_i64(t1, cpu_gpr[rB(ctx->opcode)]);
+    tcg_gen_mul_i64(t0, t0, t1);
+    tcg_gen_trunc_i64_tl(t2, t0);
+    gen_store_spr(SPR_MQ, t2);
+    tcg_gen_shri_i64(t1, t0, 32);
+    tcg_gen_trunc_i64_tl(cpu_gpr[rD(ctx->opcode)], t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* mulo - mulo. */
+static void gen_mulo(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGv_i64 t0 = tcg_temp_new_i64();
+    TCGv_i64 t1 = tcg_temp_new_i64();
+    TCGv t2 = tcg_temp_new();
+    /* Start with XER OV disabled, the most likely case */
+    tcg_gen_movi_tl(cpu_ov, 0);
+    tcg_gen_extu_tl_i64(t0, cpu_gpr[rA(ctx->opcode)]);
+    tcg_gen_extu_tl_i64(t1, cpu_gpr[rB(ctx->opcode)]);
+    tcg_gen_mul_i64(t0, t0, t1);
+    tcg_gen_trunc_i64_tl(t2, t0);
+    gen_store_spr(SPR_MQ, t2);
+    tcg_gen_shri_i64(t1, t0, 32);
+    tcg_gen_trunc_i64_tl(cpu_gpr[rD(ctx->opcode)], t1);
+    tcg_gen_ext32s_i64(t1, t0);
+    tcg_gen_brcond_i64(TCG_COND_EQ, t0, t1, l1);
+    tcg_gen_movi_tl(cpu_ov, 1);
+    tcg_gen_movi_tl(cpu_so, 1);
+    gen_set_label(l1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rD(ctx->opcode)]);
+    }
+}
+
+/* nabs - nabs. */
+static void gen_nabs(DisasContext *ctx)
+{
+    TCGv d = cpu_gpr[rD(ctx->opcode)];
+    TCGv a = cpu_gpr[rA(ctx->opcode)];
+
+    tcg_gen_abs_tl(d, a);
+    tcg_gen_neg_tl(d, d);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, d);
+    }
+}
+
+/* nabso - nabso. */
+static void gen_nabso(DisasContext *ctx)
+{
+    TCGv d = cpu_gpr[rD(ctx->opcode)];
+    TCGv a = cpu_gpr[rA(ctx->opcode)];
+
+    tcg_gen_abs_tl(d, a);
+    tcg_gen_neg_tl(d, d);
+    /* nabs never overflows */
+    tcg_gen_movi_tl(cpu_ov, 0);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, d);
+    }
+}
+
+/* rlmi - rlmi. */
+static void gen_rlmi(DisasContext *ctx)
+{
+    uint32_t mb = MB(ctx->opcode);
+    uint32_t me = ME(ctx->opcode);
+    TCGv t0 = tcg_temp_new();
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_rotl_tl(t0, cpu_gpr[rS(ctx->opcode)], t0);
+    tcg_gen_andi_tl(t0, t0, MASK(mb, me));
+    tcg_gen_andi_tl(cpu_gpr[rA(ctx->opcode)], cpu_gpr[rA(ctx->opcode)],
+                    ~MASK(mb, me));
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], cpu_gpr[rA(ctx->opcode)], t0);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* rrib - rrib. */
+static void gen_rrib(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_movi_tl(t1, 0x80000000);
+    tcg_gen_shr_tl(t1, t1, t0);
+    tcg_gen_shr_tl(t0, cpu_gpr[rS(ctx->opcode)], t0);
+    tcg_gen_and_tl(t0, t0, t1);
+    tcg_gen_andc_tl(t1, cpu_gpr[rA(ctx->opcode)], t1);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sle - sle. */
+static void gen_sle(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_shl_tl(t0, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_subfi_tl(t1, 32, t1);
+    tcg_gen_shr_tl(t1, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_or_tl(t1, t0, t1);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    gen_store_spr(SPR_MQ, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sleq - sleq. */
+static void gen_sleq(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_movi_tl(t2, 0xFFFFFFFF);
+    tcg_gen_shl_tl(t2, t2, t0);
+    tcg_gen_rotl_tl(t0, cpu_gpr[rS(ctx->opcode)], t0);
+    gen_load_spr(t1, SPR_MQ);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_and_tl(t0, t0, t2);
+    tcg_gen_andc_tl(t1, t1, t2);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sliq - sliq. */
+static void gen_sliq(DisasContext *ctx)
+{
+    int sh = SH(ctx->opcode);
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_shli_tl(t0, cpu_gpr[rS(ctx->opcode)], sh);
+    tcg_gen_shri_tl(t1, cpu_gpr[rS(ctx->opcode)], 32 - sh);
+    tcg_gen_or_tl(t1, t0, t1);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    gen_store_spr(SPR_MQ, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* slliq - slliq. */
+static void gen_slliq(DisasContext *ctx)
+{
+    int sh = SH(ctx->opcode);
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_rotli_tl(t0, cpu_gpr[rS(ctx->opcode)], sh);
+    gen_load_spr(t1, SPR_MQ);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_andi_tl(t0, t0,  (0xFFFFFFFFU << sh));
+    tcg_gen_andi_tl(t1, t1, ~(0xFFFFFFFFU << sh));
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sllq - sllq. */
+static void gen_sllq(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_andi_tl(t2, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_movi_tl(t1, 0xFFFFFFFF);
+    tcg_gen_shl_tl(t1, t1, t2);
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x20);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t0, 0, l1);
+    gen_load_spr(t0, SPR_MQ);
+    tcg_gen_and_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    tcg_gen_br(l2);
+    gen_set_label(l1);
+    tcg_gen_shl_tl(t0, cpu_gpr[rS(ctx->opcode)], t2);
+    gen_load_spr(t2, SPR_MQ);
+    tcg_gen_andc_tl(t1, t2, t1);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* slq - slq. */
+static void gen_slq(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_shl_tl(t0, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_subfi_tl(t1, 32, t1);
+    tcg_gen_shr_tl(t1, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_or_tl(t1, t0, t1);
+    gen_store_spr(SPR_MQ, t1);
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x20);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t1, 0, l1);
+    tcg_gen_movi_tl(cpu_gpr[rA(ctx->opcode)], 0);
+    gen_set_label(l1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sraiq - sraiq. */
+static void gen_sraiq(DisasContext *ctx)
+{
+    int sh = SH(ctx->opcode);
+    TCGLabel *l1 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_shri_tl(t0, cpu_gpr[rS(ctx->opcode)], sh);
+    tcg_gen_shli_tl(t1, cpu_gpr[rS(ctx->opcode)], 32 - sh);
+    tcg_gen_or_tl(t0, t0, t1);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_movi_tl(cpu_ca, 0);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t1, 0, l1);
+    tcg_gen_brcondi_tl(TCG_COND_GE, cpu_gpr[rS(ctx->opcode)], 0, l1);
+    tcg_gen_movi_tl(cpu_ca, 1);
+    gen_set_label(l1);
+    tcg_gen_sari_tl(cpu_gpr[rA(ctx->opcode)], cpu_gpr[rS(ctx->opcode)], sh);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sraq - sraq. */
+static void gen_sraq(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_andi_tl(t2, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_shr_tl(t0, cpu_gpr[rS(ctx->opcode)], t2);
+    tcg_gen_sar_tl(t1, cpu_gpr[rS(ctx->opcode)], t2);
+    tcg_gen_subfi_tl(t2, 32, t2);
+    tcg_gen_shl_tl(t2, cpu_gpr[rS(ctx->opcode)], t2);
+    tcg_gen_or_tl(t0, t0, t2);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x20);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t2, 0, l1);
+    tcg_gen_mov_tl(t2, cpu_gpr[rS(ctx->opcode)]);
+    tcg_gen_sari_tl(t1, cpu_gpr[rS(ctx->opcode)], 31);
+    gen_set_label(l1);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t1);
+    tcg_gen_movi_tl(cpu_ca, 0);
+    tcg_gen_brcondi_tl(TCG_COND_GE, t1, 0, l2);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t2, 0, l2);
+    tcg_gen_movi_tl(cpu_ca, 1);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sre - sre. */
+static void gen_sre(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_shr_tl(t0, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_subfi_tl(t1, 32, t1);
+    tcg_gen_shl_tl(t1, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_or_tl(t1, t0, t1);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    gen_store_spr(SPR_MQ, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* srea - srea. */
+static void gen_srea(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_rotr_tl(t0, cpu_gpr[rS(ctx->opcode)], t1);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_sar_tl(cpu_gpr[rA(ctx->opcode)], cpu_gpr[rS(ctx->opcode)], t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sreq */
+static void gen_sreq(DisasContext *ctx)
+{
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_movi_tl(t1, 0xFFFFFFFF);
+    tcg_gen_shr_tl(t1, t1, t0);
+    tcg_gen_rotr_tl(t0, cpu_gpr[rS(ctx->opcode)], t0);
+    gen_load_spr(t2, SPR_MQ);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_and_tl(t0, t0, t1);
+    tcg_gen_andc_tl(t2, t2, t1);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* sriq */
+static void gen_sriq(DisasContext *ctx)
+{
+    int sh = SH(ctx->opcode);
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_shri_tl(t0, cpu_gpr[rS(ctx->opcode)], sh);
+    tcg_gen_shli_tl(t1, cpu_gpr[rS(ctx->opcode)], 32 - sh);
+    tcg_gen_or_tl(t1, t0, t1);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    gen_store_spr(SPR_MQ, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* srliq */
+static void gen_srliq(DisasContext *ctx)
+{
+    int sh = SH(ctx->opcode);
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_rotri_tl(t0, cpu_gpr[rS(ctx->opcode)], sh);
+    gen_load_spr(t1, SPR_MQ);
+    gen_store_spr(SPR_MQ, t0);
+    tcg_gen_andi_tl(t0, t0,  (0xFFFFFFFFU >> sh));
+    tcg_gen_andi_tl(t1, t1, ~(0xFFFFFFFFU >> sh));
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* srlq */
+static void gen_srlq(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGLabel *l2 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    TCGv t2 = tcg_temp_new();
+    tcg_gen_andi_tl(t2, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_movi_tl(t1, 0xFFFFFFFF);
+    tcg_gen_shr_tl(t2, t1, t2);
+    tcg_gen_andi_tl(t0, cpu_gpr[rB(ctx->opcode)], 0x20);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t0, 0, l1);
+    gen_load_spr(t0, SPR_MQ);
+    tcg_gen_and_tl(cpu_gpr[rA(ctx->opcode)], t0, t2);
+    tcg_gen_br(l2);
+    gen_set_label(l1);
+    tcg_gen_shr_tl(t0, cpu_gpr[rS(ctx->opcode)], t2);
+    tcg_gen_and_tl(t0, t0, t2);
+    gen_load_spr(t1, SPR_MQ);
+    tcg_gen_andc_tl(t1, t1, t2);
+    tcg_gen_or_tl(cpu_gpr[rA(ctx->opcode)], t0, t1);
+    gen_set_label(l2);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
+/* srq */
+static void gen_srq(DisasContext *ctx)
+{
+    TCGLabel *l1 = gen_new_label();
+    TCGv t0 = tcg_temp_new();
+    TCGv t1 = tcg_temp_new();
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x1F);
+    tcg_gen_shr_tl(t0, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_subfi_tl(t1, 32, t1);
+    tcg_gen_shl_tl(t1, cpu_gpr[rS(ctx->opcode)], t1);
+    tcg_gen_or_tl(t1, t0, t1);
+    gen_store_spr(SPR_MQ, t1);
+    tcg_gen_andi_tl(t1, cpu_gpr[rB(ctx->opcode)], 0x20);
+    tcg_gen_mov_tl(cpu_gpr[rA(ctx->opcode)], t0);
+    tcg_gen_brcondi_tl(TCG_COND_EQ, t0, 0, l1);
+    tcg_gen_movi_tl(cpu_gpr[rA(ctx->opcode)], 0);
+    gen_set_label(l1);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
+    }
+}
+
 /* 602 - 603 - G2 TLB management */
 
 /* tlbld */
@@ -4519,6 +5130,40 @@ GEN_HANDLER(tlbia, 0x1F, 0x12, 0x0B, 0x03FFFC01, PPC_MEM_TLBIA),
 GEN_HANDLER(tlbsync, 0x1F, 0x16, 0x11, 0x03FFF801, PPC_MEM_TLBSYNC),
 GEN_HANDLER(eciwx, 0x1F, 0x16, 0x0D, 0x00000001, PPC_EXTERN),
 GEN_HANDLER(ecowx, 0x1F, 0x16, 0x09, 0x00000001, PPC_EXTERN),
+GEN_HANDLER(abs, 0x1F, 0x08, 0x0B, 0x0000F800, PPC_POWER_BR),
+GEN_HANDLER(abso, 0x1F, 0x08, 0x1B, 0x0000F800, PPC_POWER_BR),
+GEN_HANDLER(clcs, 0x1F, 0x10, 0x13, 0x0000F800, PPC_POWER_BR),
+GEN_HANDLER(div, 0x1F, 0x0B, 0x0A, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(divo, 0x1F, 0x0B, 0x1A, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(divs, 0x1F, 0x0B, 0x0B, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(divso, 0x1F, 0x0B, 0x1B, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(doz, 0x1F, 0x08, 0x08, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(dozo, 0x1F, 0x08, 0x18, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(dozi, 0x09, 0xFF, 0xFF, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(lscbx, 0x1F, 0x15, 0x08, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(maskg, 0x1F, 0x1D, 0x00, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(maskir, 0x1F, 0x1D, 0x10, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(mul, 0x1F, 0x0B, 0x03, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(mulo, 0x1F, 0x0B, 0x13, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(nabs, 0x1F, 0x08, 0x0F, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(nabso, 0x1F, 0x08, 0x1F, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(rlmi, 0x16, 0xFF, 0xFF, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(rrib, 0x1F, 0x19, 0x10, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sle, 0x1F, 0x19, 0x04, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sleq, 0x1F, 0x19, 0x06, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sliq, 0x1F, 0x18, 0x05, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(slliq, 0x1F, 0x18, 0x07, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sllq, 0x1F, 0x18, 0x06, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(slq, 0x1F, 0x18, 0x04, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sraiq, 0x1F, 0x18, 0x1D, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sraq, 0x1F, 0x18, 0x1C, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sre, 0x1F, 0x19, 0x14, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(srea, 0x1F, 0x19, 0x1C, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sreq, 0x1F, 0x19, 0x16, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(sriq, 0x1F, 0x18, 0x15, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(srliq, 0x1F, 0x18, 0x17, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(srlq, 0x1F, 0x18, 0x16, 0x00000000, PPC_POWER_BR),
+GEN_HANDLER(srq, 0x1F, 0x18, 0x14, 0x00000000, PPC_POWER_BR),
 GEN_HANDLER2(tlbld_6xx, "tlbld", 0x1F, 0x12, 0x1E, 0x03FF0001, PPC_6xx_TLB),
 GEN_HANDLER2(tlbli_6xx, "tlbli", 0x1F, 0x12, 0x1F, 0x03FF0001, PPC_6xx_TLB),
 GEN_HANDLER(mfapidi, 0x1F, 0x13, 0x08, 0x0000F801, PPC_MFAPIDI),

@@ -52,6 +52,7 @@ DEF_HELPER_FLAGS_3(dcbz, TCG_CALL_NO_WG, void, env, tl, int)
 #ifdef TARGET_PPC64
 DEF_HELPER_FLAGS_2(dcbzl, TCG_CALL_NO_WG, void, env, tl)
 #endif
+DEF_HELPER_5(lscbx, tl, env, tl, i32, i32, i32)
 DEF_HELPER_FLAGS_2(ICBI, TCG_CALL_NO_WG, void, env, tl)
 DEF_HELPER_FLAGS_2(ICBIEP, TCG_CALL_NO_WG, void, env, tl)
 
@@ -703,6 +704,11 @@ DEF_HELPER_2(book3s_msgclr, void, env, tl)
 #endif
 
 DEF_HELPER_4(dlmzb, tl, env, tl, tl, i32)
+DEF_HELPER_FLAGS_2(clcs, TCG_CALL_NO_RWG_SE, tl, env, i32)
+DEF_HELPER_3(div, tl, env, tl, tl)
+DEF_HELPER_3(divo, tl, env, tl, tl)
+DEF_HELPER_3(divs, tl, env, tl, tl)
+DEF_HELPER_3(divso, tl, env, tl, tl)
 #if !defined(CONFIG_USER_ONLY)
 DEF_HELPER_2(load_dcr, tl, env, tl)
 DEF_HELPER_3(store_dcr, void, env, tl, tl)
