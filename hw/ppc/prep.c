@@ -43,6 +43,7 @@
 #include "exec/target_page.h"
 #include "system/kvm.h"
 #include "system/reset.h"
+#include "system/blockdev.h"
 #include "trace.h"
 #include "elf.h"
 #include "qemu/units.h"
@@ -334,7 +335,22 @@ static void ibm_40p_init(MachineState *machine)
 
     /* add some more devices */
     if (defaults_enabled()) {
-        m48t59 = NVRAM(isa_create_simple(isa_bus, "isa-m48t59"));
+        DriveInfo *dinfo;
+
+        /*
+         * Optionally back the M48T59 NVRAM with a raw image so that the
+         * firmware's settings survive across runs:
+         *   -drive if=pflash,format=raw,file=40p-nvram.img  (8 KiB image)
+         */
+        isa_dev = isa_new("isa-m48t59");
+        dev = DEVICE(isa_dev);
+        dinfo = drive_get(IF_PFLASH, 0, 0);
+        if (dinfo) {
+            qdev_prop_set_drive_err(dev, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+        }
+        isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
+        m48t59 = NVRAM(isa_dev);
 
         isa_dev = isa_new("cs4231a");
         dev = DEVICE(isa_dev);
