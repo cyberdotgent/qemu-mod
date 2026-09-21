@@ -115,6 +115,7 @@ config PREP
     select M48T59
     select PC87312
     select RS6000_MC
+    select S3_VGA
     select FW_CFG_PPC
 
 config RS6000_MC
