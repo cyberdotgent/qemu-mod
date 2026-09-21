@@ -3,6 +3,11 @@
  *
  * Copyright (c) 2017 Hervé Poussineau
  *
+ * Parts of the S3 Trio64 register semantics, tables and 2D engine
+ * algorithms are derived from 86Box's vid_s3.c:
+ *   Copyright 2008-2019 Sarah Walker.
+ *   Copyright 2016-2019 Miran Grca.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation; either version 2 of
@@ -173,9 +178,6 @@ typedef struct S3TrioState {
     uint8_t origin_x;
     uint8_t origin_y;
     uint8_t unlock_pll;
-    uint8_t unlock_compatibility_registers;
-    uint8_t unlock_control_registers_1;
-    uint8_t unlock_control_registers_2;
 } S3TrioState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
@@ -758,45 +760,200 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
     s3_trio_post_write(s, addr & ~0x1);
 }
 
+/*
+ * S3 extended CRTC registers.  CR30-CR3F are protected by CR38 (register
+ * lock 1, unlock value 0x48) and CR40-CR6D by CR39 (register lock 2,
+ * unlock value 0xA5); CR36 additionally requires CR39 == 0xA5.  Lock
+ * semantics follow 86Box's s3_out().
+ */
+static bool s3_crtc_locked(S3TrioState *s, uint8_t index)
+{
+    uint8_t *cr = s->vga.cr;
+
+    if (index >= 0x20 && index < 0x40 &&
+        index != 0x36 && index != 0x38 && index != 0x39 &&
+        (cr[0x38] & 0xcc) != 0x48) {
+        return true;
+    }
+    if (index >= 0x40 && (cr[0x39] & 0xe0) != 0xa0) {
+        return true;
+    }
+    if (index == 0x36 && cr[0x39] != 0xa5) {
+        return true;
+    }
+    return false;
+}
+
+static bool s3_enhanced_mode(S3TrioState *s)
+{
+    /* CR3A bit 4: enhanced mode (single byte per dot clock, packed) */
+    return s->vga.cr[0x3a] & 0x10;
+}
+
+/*
+ * Colour depth of the display.  In enhanced mode CR67 bits 7-4 select the
+ * pixel format (Trio64 extended miscellaneous control 2, as decoded by
+ * 86Box for chips >= Trio32).  Outside enhanced mode the CRTC is a plain
+ * VGA; the model keeps treating 256-colour modes as one byte per dot, which
+ * is what previous versions of this model always did and what the OpenBIOS
+ * FCode for this card relies on.
+ */
+static int s3_trio_get_bpp(VGACommonState *vga)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+
+    if (!s3_enhanced_mode(s)) {
+        return 8;
+    }
+    switch (vga->cr[0x67] >> 4) {
+    case 3:
+        return 15;
+    case 5:
+        return 16;
+    case 7:
+        return 24;
+    case 13:
+        return 32;
+    default:
+        return 8;
+    }
+}
+
+/*
+ * Display resolution.  The horizontal display end (CR01) counts character
+ * clocks of 8 dot clocks; in 15/16bpp modes the Trio64 runs the CRTC at
+ * twice the pixel clock and in 24bpp at three dots per pixel, so the
+ * value has to be divided accordingly (86Box s3_recalctimings, Trio32/64
+ * cases).  CR5D bit 1 and CR5E bit 1 are the S3 extended horizontal and
+ * vertical overflow bits.
+ */
+static void s3_trio_get_resolution(VGACommonState *vga, int *pwidth,
+                                   int *pheight)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    uint8_t *cr = vga->cr;
+    int width, height;
+
+    width = (cr[VGA_CRTC_H_DISP] | ((cr[0x5d] & 0x02) << 7)) + 1;
+    width *= 8;
+    height = cr[VGA_CRTC_V_DISP_END] |
+        ((cr[VGA_CRTC_OVERFLOW] & 0x02) << 7) |
+        ((cr[VGA_CRTC_OVERFLOW] & 0x40) << 3) |
+        ((cr[0x5e] & 0x02) << 9);
+    height += 1;
+
+    if (s3_enhanced_mode(s)) {
+        switch (s3_trio_get_bpp(vga)) {
+        case 15:
+        case 16:
+            width /= 2;
+            break;
+        case 24:
+            width /= 3;
+            break;
+        default:
+            break;
+        }
+    }
+    *pwidth = width;
+    *pheight = height;
+}
+
+static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
+{
+    uint8_t *cr = s->vga.cr;
+
+    switch (index) {
+    case 0x2d: /* extended chip ID: 0x88 for Trio32/Trio64 */
+        return 0x88;
+    case 0x2e: /* new chip ID: 0x11 = Trio64 (86C764) */
+        return 0x11;
+    case 0x2f: /* revision level */
+        return 0x00;
+    case 0x30: /* chip ID: 0xE1 = Trio64, readable when unlocked */
+        return (((cr[0x38] & 0xcc) == 0x48) || ((cr[0x39] & 0xe0) == 0xa0))
+            ? 0xe1 : 0xff;
+    case 0x36:
+    {
+        /* configuration 1: bits 7-5 encode the installed memory */
+        static const uint8_t smem[] = { 7, 6, 4, 2, 0, 0, 5, 5, 3 };
+        uint8_t val;
+        if (s->vga.vram_size_mb < sizeof(smem)) {
+            val = smem[s->vga.vram_size_mb];
+        } else {
+            val = smem[sizeof(smem) - 1];
+        }
+        return (val << 5) | (cr[0x36] & 0x1f);
+    }
+    case 0x47:
+        return s->origin_x;
+    case 0x49:
+        return s->origin_y;
+    default:
+        return vga_ioport_read(&s->vga, VGA_CRT_DC);
+    }
+}
+
+static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
+                          uint32_t val)
+{
+    if (s3_crtc_locked(s, index)) {
+        trace_s3_vga_crtc_locked(index, val);
+        return;
+    }
+    if (index >= 0x30) {
+        trace_s3_vga_crtc_ext_write(index, val);
+    }
+
+    switch (index) {
+    case 0x08:
+        s->unlock_pll = (val == 0x06);
+        break;
+    case 0x10: /* memory pll data */
+    case 0x11: /* memory pll data */
+    case 0x12: /* video pll data */
+    case 0x13: /* video pll data */
+    case 0x15:
+    case 0x18:
+        if (s->unlock_pll) {
+            qemu_log_mask(LOG_UNIMP,
+                          "s3_trio: unimplemented PLL change\n");
+        } else {
+            vga_ioport_write(&s->vga, addr, val);
+        }
+        break;
+    case 0x47:
+        s->origin_x = val;
+        break;
+    case 0x49:
+        s->origin_y = val;
+        break;
+    default:
+        vga_ioport_write(&s->vga, addr, val);
+        break;
+    }
+}
+
+/* Same rule as vga_ioport_read/write: CRTC ports depend on MISC bit 0 */
+static bool s3_vga_port_ignored(S3TrioState *s, uint32_t addr)
+{
+    return (addr >= 0x3b0 && addr <= 0x3bf && (s->vga.msr & VGA_MIS_COLOR)) ||
+           (addr >= 0x3d0 && addr <= 0x3df && !(s->vga.msr & VGA_MIS_COLOR));
+}
+
 static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
 {
     S3TrioState *s = opaque;
     uint32_t val;
 
+    if (s3_vga_port_ignored(s, addr)) {
+        return 0xff;
+    }
+
     switch (addr) {
     case VGA_CRT_DM:
     case VGA_CRT_DC:
-        switch (s->vga.cr_index) {
-        case 0x2d:
-            val = 0x88;
-            break;
-        case 0x2e:
-            val = 0x10;
-            break;
-        case 0x30:
-            val = 0xe0;
-            break;
-        case 0x36:
-        {
-            static const uint8_t smem[] = { 7, 6, 4, 2, 0, 0, 5, 5, 3 };
-            if (s->vga.vram_size_mb < sizeof(smem)) {
-                val = smem[s->vga.vram_size_mb];
-            } else {
-                val = smem[sizeof(smem) - 1];
-            }
-            val = val << 5;
-            break;
-        }
-        case 0x47:
-            val = s->origin_x;
-            break;
-        case 0x49:
-            val = s->origin_y;
-            break;
-        default:
-            val = vga_ioport_read(&s->vga, addr);
-            break;
-        }
+        val = s3_crtc_read(s, s->vga.cr_index);
         break;
     case VGA_SEQ_D:
         switch (s->vga.sr_index) {
@@ -836,45 +993,13 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     S3TrioState *s = opaque;
 
     trace_s3_vga_io_writeb(addr, val);
+    if (s3_vga_port_ignored(s, addr)) {
+        return;
+    }
     switch (addr) {
     case VGA_CRT_DM:
     case VGA_CRT_DC:
-        switch (s->vga.cr_index) {
-        case 0x08:
-            s->unlock_pll = (val == 0x06);
-            break;
-        case 0x10: /* memory pll data */
-        case 0x11: /* memory pll data */
-        case 0x12: /* video pll data */
-        case 0x13: /* video pll data */
-        case 0x15:
-        case 0x18:
-            if (s->unlock_pll) {
-                qemu_log_mask(LOG_UNIMP,
-                              "s3_trio: unimplemented PLL change\n");
-            } else {
-                vga_ioport_write(&s->vga, addr, val);
-            }
-            break;
-        case 0x33:
-            s->unlock_compatibility_registers = ((val & ~0xad) == 0);
-            break;
-        case 0x38:
-            s->unlock_control_registers_1 = (val == 0x48);
-            break;
-        case 0x39:
-            s->unlock_control_registers_2 = (val == 0xa5);
-            break;
-        case 0x47:
-            s->origin_x = val;
-            break;
-        case 0x49:
-            s->origin_y = val;
-            break;
-        default:
-            vga_ioport_write(&s->vga, addr, val);
-            break;
-        }
+        s3_crtc_write(s, addr, s->vga.cr_index, val);
         break;
     case VGA_SEQ_I:
         s->vga.sr_index = val;
@@ -982,11 +1107,6 @@ static const MemoryRegionPortio s3_trio_portio_list[] = {
     PORTIO_END_OF_LIST()
 };
 
-static int s3_trio_get_bpp(VGACommonState *s)
-{
-    return 8;
-}
-
 static VMStateDescription vmstate_s3_trio = {
     .name = TYPE_S3_TRIO,
     .version_id = 1,
@@ -1057,6 +1177,8 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
         return;
     }
+    /* The Trio64 is a little-endian PCI chip whatever the host CPU is */
+    s->vga.big_endian_fb = false;
     s->vga.legacy_address_space = pci_address_space(dev);
     vga_io_memory = vga_init_io(&s->vga, o, &vga_ports, &vbe_ports);
     memory_region_add_subregion_overlap(s->vga.legacy_address_space,
@@ -1068,6 +1190,7 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
                                              &s->vga);
 
     s->vga.get_bpp = s3_trio_get_bpp;
+    s->vga.get_resolution = s3_trio_get_resolution;
 
     /*
      * Legacy VGA ports.  Register them through the generic portio API so
