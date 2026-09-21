@@ -38,6 +38,7 @@
 #include "trace.h"
 #include "qemu/log.h"
 #include "system/reset.h"
+#include "qemu/range.h"
 
 #define TYPE_S3_TRIO "s3-trio"
 
@@ -178,6 +179,12 @@ typedef struct S3TrioState {
     uint8_t origin_x;
     uint8_t origin_y;
     uint8_t unlock_pll;
+
+    /* extended display start address bits 20-16 (CR31/CR51/CR69) */
+    uint8_t ma_ext;
+    /* 64K/16K CPU bank (CR35/CR51/CR6A) */
+    uint8_t bank;
+    MemoryRegion vga_mem;
 } S3TrioState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
@@ -859,6 +866,129 @@ static void s3_trio_get_resolution(VGACommonState *vga, int *pwidth,
     *pheight = height;
 }
 
+/*
+ * Display parameters.  The logical line width is CR13 extended by CR51
+ * bits 5-4 (or CR43 bit 2 on older chips) and the display start address
+ * CR0C/CR0D is extended by ma_ext, which collects CR31 bits 5-4, CR51
+ * bits 1-0 and CR69 bits 4-0 (86Box s3_recalctimings / s3_out).  The line
+ * compare register gains bit 10 from CR5E bit 6 and is disabled when the
+ * 8514-style enhanced functions are enabled through ADVFUNC_CNTL bit 0.
+ * The VGA core multiplies start_addr by 4 and uses line_offset in bytes,
+ * matching the dword units of the S3 registers in enhanced mode.
+ */
+static void s3_trio_get_params(VGACommonState *vga, VGADisplayParams *params)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    uint8_t *cr = vga->cr;
+    uint32_t line_offset;
+
+    line_offset = cr[VGA_CRTC_OFFSET];
+    if (cr[0x51] & 0x30) {
+        line_offset |= (cr[0x51] & 0x30) << 4;
+    } else if (cr[0x43] & 0x04) {
+        line_offset |= 0x100;
+    }
+    if (!line_offset) {
+        line_offset = 0x100;
+    }
+    line_offset <<= 3;
+    if (!s3_enhanced_mode(s) && (cr[0x31] & 0x08)) {
+        /* enhanced 4bpp mode, drawn like the 8bpp mode per the spec */
+        line_offset <<= 1;
+    }
+    params->line_offset = line_offset;
+
+    params->start_addr = cr[VGA_CRTC_START_LO] |
+        (cr[VGA_CRTC_START_HI] << 8) | (s->ma_ext << 16);
+
+    params->line_compare = cr[VGA_CRTC_LINE_COMPARE] |
+        ((cr[VGA_CRTC_OVERFLOW] & 0x10) << 4) |
+        ((cr[VGA_CRTC_MAX_SCAN] & 0x40) << 3) |
+        ((cr[0x5e] & 0x40) << 4);
+    if (s->advfunc_cntl & 0x01) {
+        params->line_compare = 0xffff;
+    }
+
+    params->hpel = vga->ar[VGA_ATC_PEL];
+    params->hpel_split = vga->ar[VGA_ATC_MODE] & 0x20;
+}
+
+/*
+ * CPU bank for the 64K window at 0xA0000: 64K granularity in chain-4
+ * mode, 16K (times four planes) otherwise, as in 86Box.  CR31 bit 0
+ * enables the bank register in VGA modes.
+ */
+static void s3_update_bank(S3TrioState *s)
+{
+    VGACommonState *vga = &s->vga;
+    int32_t offset;
+
+    if (!(vga->cr[0x31] & 0x01) && !s3_enhanced_mode(s)) {
+        offset = 0;
+    } else if (vga->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) {
+        offset = s->bank << 16;
+    } else {
+        offset = s->bank << 14;
+    }
+    if (offset != vga->bank_offset) {
+        vga->bank_offset = offset;
+        trace_s3_vga_bank(s->bank, offset);
+    }
+}
+
+/*
+ * Legacy VGA memory window (0xA0000-0xBFFFF).  CR31 bit 3 (enhanced memory
+ * mapping) forces a 64K window at 0xA0000 whatever GR06 says; the bank
+ * register then selects the 64K page (86Box s3_decode_addr).  Everything
+ * else is the standard VGA core behaviour.
+ */
+static uint64_t s3_vga_mem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    S3TrioState *s = opaque;
+    VGACommonState *vga = &s->vga;
+
+    if ((vga->cr[0x31] & 0x08) &&
+        ((vga->gr[VGA_GFX_MISC] >> 2) & 3) != 1) {
+        uint32_t off;
+
+        if (addr >= 0x10000) {
+            return 0xff;
+        }
+        off = (vga->bank_offset + addr) & vga->vbe_size_mask;
+        return vga->vram_ptr[off];
+    }
+    return vga_mem_readb(vga, addr);
+}
+
+static void s3_vga_mem_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    S3TrioState *s = opaque;
+    VGACommonState *vga = &s->vga;
+
+    if ((vga->cr[0x31] & 0x08) &&
+        ((vga->gr[VGA_GFX_MISC] >> 2) & 3) != 1) {
+        uint32_t off;
+
+        if (addr >= 0x10000) {
+            return;
+        }
+        off = (vga->bank_offset + addr) & vga->vbe_size_mask;
+        vga->vram_ptr[off] = val;
+        memory_region_set_dirty(&vga->vram, off, 1);
+        return;
+    }
+    vga_mem_writeb(vga, addr, val);
+}
+
+static const MemoryRegionOps s3_vga_mem_ops = {
+    .read = s3_vga_mem_read,
+    .write = s3_vga_mem_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
+};
+
 static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
 {
     uint8_t *cr = s->vga.cr;
@@ -885,10 +1015,25 @@ static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
         }
         return (val << 5) | (cr[0x36] & 0x1f);
     }
+    case 0x31:
+        return (cr[0x31] & 0xcf) | ((s->ma_ext & 3) << 4);
+    case 0x35:
+        return (cr[0x35] & 0xf0) | (s->bank & 0xf);
     case 0x47:
         return s->origin_x;
     case 0x49:
         return s->origin_y;
+    case 0x51:
+        return (cr[0x51] & 0xf0) | ((s->bank >> 2) & 0xc) |
+               ((s->ma_ext >> 2) & 3);
+    case 0x69:
+        return s->ma_ext;
+    case 0x6a:
+        return s->bank;
+    case 0x6b: /* mirrors of CR59/CR5A, expected by S3 video BIOSes */
+        return (cr[0x53] & 0x08) ? (cr[0x59] & 0xfe) : cr[0x59];
+    case 0x6c:
+        return (cr[0x53] & 0x08) ? 0x00 : (cr[0x5a] & 0x80);
     default:
         return vga_ioport_read(&s->vga, VGA_CRT_DC);
     }
@@ -922,11 +1067,40 @@ static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
             vga_ioport_write(&s->vga, addr, val);
         }
         break;
+    case 0x31:
+        vga_ioport_write(&s->vga, addr, val);
+        s->ma_ext = (s->ma_ext & 0x1c) | ((val & 0x30) >> 4);
+        s3_update_bank(s);
+        break;
+    case 0x35:
+        vga_ioport_write(&s->vga, addr, val);
+        s->bank = (s->bank & 0x70) | (val & 0x0f);
+        s3_update_bank(s);
+        break;
+    case 0x3a:
+        vga_ioport_write(&s->vga, addr, val);
+        s3_update_bank(s);
+        break;
     case 0x47:
         s->origin_x = val;
         break;
     case 0x49:
         s->origin_y = val;
+        break;
+    case 0x51:
+        vga_ioport_write(&s->vga, addr, val);
+        s->bank = (s->bank & 0x4f) | ((val & 0x0c) << 2);
+        s->ma_ext = (s->ma_ext & ~0x0c) | ((val & 0x03) << 2);
+        s3_update_bank(s);
+        break;
+    case 0x69:
+        vga_ioport_write(&s->vga, addr, val);
+        s->ma_ext = val & 0x1f;
+        break;
+    case 0x6a:
+        vga_ioport_write(&s->vga, addr, val);
+        s->bank = val;
+        s3_update_bank(s);
         break;
     default:
         vga_ioport_write(&s->vga, addr, val);
@@ -1008,6 +1182,9 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         switch (s->vga.sr_index) {
         case 0x00 ... 0x07:
             vga_ioport_write(&s->vga, addr, val);
+            if (s->vga.sr_index == VGA_SEQ_MEMORY_MODE) {
+                s3_update_bank(s);
+            }
             break;
         case 0x08:
             s->vga.sr[s->vga.sr_index] = val;
@@ -1109,8 +1286,8 @@ static const MemoryRegionPortio s3_trio_portio_list[] = {
 
 static VMStateDescription vmstate_s3_trio = {
     .name = TYPE_S3_TRIO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField []) {
         VMSTATE_PCI_DEVICE(dev, S3TrioState),
         VMSTATE_STRUCT(vga, S3TrioState, 0, vmstate_vga_common, VGACommonState),
@@ -1148,6 +1325,8 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT16(frgd_mix, S3TrioState),
         VMSTATE_UINT16_ARRAY(mfc, S3TrioState, 16),
         VMSTATE_UINT16(pix_trans, S3TrioState),
+        VMSTATE_UINT8(ma_ext, S3TrioState),
+        VMSTATE_UINT8(bank, S3TrioState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1156,6 +1335,28 @@ static const Property s3_trio_properties[] = {
     DEFINE_PROP_UINT32("vram_size_mb", S3TrioState, vga.vram_size_mb, 8),
 };
 
+/*
+ * On the PCI Trio64 the linear address window base (CR59/CR5A) follows
+ * base address register 0: 86Box's s3_pci_write stores config bytes 0x12
+ * and 0x13 into CR5A bit 7 and CR59.  QEMU maps the framebuffer through
+ * the BAR, so the CRTC registers are mirrors for the guest's benefit.
+ */
+static void s3_trio_pci_write_config(PCIDevice *dev, uint32_t address,
+                                     uint32_t val, int len)
+{
+    S3TrioState *s = S3_TRIO(dev);
+
+    pci_default_write_config(dev, address, val, len);
+
+    if (ranges_overlap(address, len, PCI_BASE_ADDRESS_0, 4)) {
+        uint32_t bar = pci_get_long(dev->config + PCI_BASE_ADDRESS_0);
+
+        s->vga.cr[0x59] = bar >> 24;
+        s->vga.cr[0x5a] = (bar >> 16) & 0x80;
+        trace_s3_vga_law_base(bar & 0xff800000);
+    }
+}
+
 static void s3_trio_reset(DeviceState *d)
 {
     S3TrioState *s = S3_TRIO(d);
@@ -1163,6 +1364,10 @@ static void s3_trio_reset(DeviceState *d)
     vga_common_reset(&s->vga);
 
     s->disp_stat |= DISP_STAT_SENSE;
+    s->ma_ext = 0;
+    s->bank = 0;
+    s->advfunc_cntl = 0;
+    s->vga.bank_offset = 0;
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
@@ -1170,8 +1375,6 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
 {
     S3TrioState *s = S3_TRIO(dev);
     Object *o = OBJECT(dev);
-    const MemoryRegionPortio *vga_ports, *vbe_ports;
-    MemoryRegion* vga_io_memory;
 
     /* setup VGA */
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
@@ -1179,11 +1382,24 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     }
     /* The Trio64 is a little-endian PCI chip whatever the host CPU is */
     s->vga.big_endian_fb = false;
-    s->vga.legacy_address_space = pci_address_space(dev);
-    vga_io_memory = vga_init_io(&s->vga, o, &vga_ports, &vbe_ports);
-    memory_region_add_subregion_overlap(s->vga.legacy_address_space,
-                                        0x000a0000, vga_io_memory, 1);
-    memory_region_set_coalescing(vga_io_memory);
+    /*
+     * legacy_address_space is left NULL on purpose: the VGA core would
+     * otherwise overlay a RAM alias of the framebuffer at 0xA0000 in
+     * chain-4 mode, computed from the bank offset current at GR/SR write
+     * time, bypassing the S3 bank register (CR35/CR51/CR6A) and the CR31
+     * enhanced mapping decoded by s3_vga_mem_ops below.
+     */
+    /*
+     * Legacy memory window.  The generic vga_init_io() window is not used
+     * because the S3 decodes CR31 (and, for MMIO, CR53) in front of it; the
+     * VGA and VBE port lists it would return are not used either.
+     */
+    memory_region_init_io(&s->vga_mem, o, &s3_vga_mem_ops, s,
+                          "s3-lowmem", 0x20000);
+    memory_region_set_flush_coalesced(&s->vga_mem);
+    memory_region_add_subregion_overlap(pci_address_space(dev),
+                                        0x000a0000, &s->vga_mem, 1);
+    memory_region_set_coalescing(&s->vga_mem);
     memory_region_set_coalescing(&s->vga.vram);
 
     s->vga.con = qemu_graphic_console_create(DEVICE(s), 0, s->vga.hw_ops,
@@ -1191,6 +1407,7 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
 
     s->vga.get_bpp = s3_trio_get_bpp;
     s->vga.get_resolution = s3_trio_get_resolution;
+    s->vga.get_params = s3_trio_get_params;
 
     /*
      * Legacy VGA ports.  Register them through the generic portio API so
@@ -1209,6 +1426,7 @@ static void s3_trio_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->realize = s3_trio_realize;
+    k->config_write = s3_trio_pci_write_config;
     //k->romfile = "vgabios-s3.bin";
     k->vendor_id = PCI_VENDOR_ID_S3;
     k->device_id = PCI_DEVICE_ID_S3_TRIO;

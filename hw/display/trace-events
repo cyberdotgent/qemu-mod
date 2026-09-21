@@ -29,6 +29,8 @@ s3_vga_io_writeb(uint32_t addr, uint32_t val) "write addr=%04x: 0x%02x"
 s3_vga_io_writew(uint32_t addr, uint32_t val) "write addr=%04x: 0x%04x"
 s3_vga_crtc_ext_write(uint8_t index, uint32_t val) "CR%02x <- 0x%02x"
 s3_vga_crtc_locked(uint8_t index, uint32_t val) "write to locked CR%02x (0x%02x) ignored"
+s3_vga_bank(uint8_t bank, int32_t offset) "bank %u -> offset 0x%x"
+s3_vga_law_base(uint32_t base) "linear address window base 0x%08x"
 
 # vmware_vga.c
 vmware_value_read(uint32_t index, uint32_t value) "index %d, value 0x%x"

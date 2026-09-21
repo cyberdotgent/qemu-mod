@@ -261,9 +261,13 @@ static void s3_set_mode(S3Test *t, int width, int height, int bpp, int pitch)
     crtc_w(t, 0x17, 0xe3);
     crtc_w(t, 0x18, 0xff);
 
-    /* S3 extended CRTC: horizontal/vertical overflow */
+    /*
+     * S3 extended CRTC: horizontal/vertical overflow.  CR5E bit 6 is bit
+     * 10 of the line compare register; without it the split screen would
+     * restart the display at line 1024.
+     */
     crtc_w(t, 0x5d, (hdisp & 0x100) ? 0x02 : 0x00);
-    crtc_w(t, 0x5e, (vdisp & 0x400) ? 0x02 : 0x00);
+    crtc_w(t, 0x5e, 0x40 | ((vdisp & 0x400) ? 0x02 : 0x00));
     /* logical line width bits 9-8 in CR51 bits 5-4 */
     crtc_w(t, 0x51, ((pitch / 8) >> 4) & 0x30);
     /* display start address bits 19-16 */
@@ -364,6 +368,13 @@ static void screendump(S3Test *t, Image *img)
         path);
 
     g_assert(g_file_get_contents(path, &contents, &len, NULL));
+    if (g_getenv("S3_DUMP_DIR")) {
+        static int dump_nr;
+        g_autofree char *keep = g_strdup_printf("%s/s3-%d-%d.ppm",
+                                                g_getenv("S3_DUMP_DIR"),
+                                                (int)getpid(), dump_nr++);
+        g_file_set_contents(keep, contents, len, NULL);
+    }
     unlink(path);
 
     g_assert(len > 3 && contents[0] == 'P' && contents[1] == '6');
@@ -580,25 +591,188 @@ static void test_mode_32bpp(void)
 {
     S3Test t;
     Image img;
-    const int w = 320, h = 240, pitch = 1280;
+    const int w = 640, h = 480, pitch = 2560;
 
     s3_test_init(&t);
     s3_set_mode(&t, w, h, 32, pitch);
     clear_fb(&t, pitch * h);
     fill_rect(&t, pitch, 32, 0, 0, 16, 16, 0x00ff0000);      /* red */
-    fill_rect(&t, pitch, 32, 160, 120, 8, 8, 0x0000ff00);    /* green */
+    fill_rect(&t, pitch, 32, 320, 240, 8, 8, 0x0000ff00);    /* green */
     put_pixel(&t, pitch, 32, w - 1, h - 1, 0x000000ff);      /* blue */
-    fill_rect(&t, pitch, 32, 100, 200, 4, 4, 0x00ffffff);    /* white */
+    fill_rect(&t, pitch, 32, 100, 400, 4, 4, 0x00ffffff);    /* white */
 
     screendump(&t, &img);
     g_assert_cmpint(img.width, ==, w);
     g_assert_cmpint(img.height, ==, h);
     check_pixel(&img, 0, 0, 255, 0, 0);
     check_pixel(&img, 16, 0, 0, 0, 0);
-    check_pixel(&img, 163, 123, 0, 255, 0);
+    check_pixel(&img, 323, 243, 0, 255, 0);
     check_pixel(&img, w - 1, h - 1, 0, 0, 255);
-    check_pixel(&img, 102, 202, 255, 255, 255);
+    check_pixel(&img, 102, 402, 255, 255, 255);
     image_free(&img);
+    s3_test_fini(&t);
+}
+
+/* 1600x1200: vertical display end needs CR5E bit 1, pitch needs CR51 */
+static void test_mode_1600x1200(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 1600, h = 1200, pitch = 1600;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    dac_w(&t, 0, 0, 0, 0);
+    dac_w(&t, 1, 255, 0, 0);
+    dac_w(&t, 2, 0, 0, 255);
+    clear_fb(&t, pitch * h);
+    fill_rect(&t, pitch, 8, 0, 0, 8, 8, 1);
+    fill_rect(&t, pitch, 8, w - 8, h - 8, 8, 8, 2);
+
+    screendump(&t, &img);
+    g_assert_cmpint(img.width, ==, w);
+    g_assert_cmpint(img.height, ==, h);
+    check_pixel(&img, 0, 0, 255, 0, 0);
+    check_pixel(&img, w - 1, h - 1, 0, 0, 255);
+    check_pixel(&img, w - 9, h - 1, 0, 0, 0);
+    check_pixel(&img, w - 1, h - 9, 0, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+/*
+ * Display start address: CR0C/CR0D extended by CR31 bits 5-4, CR51 bits
+ * 1-0 and CR69 bits 4-0, in units of 4 bytes.  Display from 1MB (start
+ * address 0x40000 -> CR69 = 0x04) and from 5MB + 0x400 bytes.
+ */
+static void test_start_address(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+
+    s3_test_init(&t);
+    s3_set_mode(&t, w, h, 8, pitch);
+    dac_w(&t, 0, 0, 0, 0);
+    dac_w(&t, 1, 255, 0, 0);
+    dac_w(&t, 2, 0, 255, 0);
+    dac_w(&t, 3, 0, 0, 255);
+    clear_fb(&t, 6 * 1024 * 1024);
+    /* a red pixel at the very start of the framebuffer */
+    put_pixel(&t, pitch, 8, 0, 0, 1);
+    /* a green pixel at 1MB */
+    qtest_writeb(t.qts, t.lfb + 0x100000, 2);
+    /* a blue pixel at 5MB + 0x400 */
+    qtest_writeb(t.qts, t.lfb + 0x500400, 3);
+
+    crtc_w(&t, 0x69, 0x04);
+    g_assert_cmphex(crtc_r(&t, 0x69), ==, 0x04);
+    /* CR51 bits 1-0 and CR31 bits 5-4 read back the same address bits */
+    g_assert_cmphex(crtc_r(&t, 0x51) & 0x03, ==, 0x01);
+    g_assert_cmphex(crtc_r(&t, 0x31) & 0x30, ==, 0x00);
+    screendump(&t, &img);
+    check_pixel(&img, 0, 0, 0, 255, 0);
+    check_pixel(&img, 1, 0, 0, 0, 0);
+    image_free(&img);
+
+    /* 5MB + 0x400 = start address 0x140100: CR69 = 0x14, CR0C/0D = 0x0100 */
+    crtc_w(&t, 0x0c, 0x01);
+    crtc_w(&t, 0x0d, 0x00);
+    crtc_w(&t, 0x69, 0x14);
+    g_assert_cmphex(crtc_r(&t, 0x31) & 0x30, ==, 0x00);
+    g_assert_cmphex(crtc_r(&t, 0x51) & 0x03, ==, 0x01);
+    screendump(&t, &img);
+    check_pixel(&img, 0, 0, 0, 0, 255);
+    image_free(&img);
+
+    /*
+     * CR31 bits 5-4 and CR51 bits 1-0 only replace their own bits of the
+     * extended address: bit 4 (1MB) stays until CR69 is rewritten.
+     */
+    crtc_w(&t, 0x0c, 0x00);
+    crtc_w(&t, 0x31, 0x89);
+    crtc_w(&t, 0x51, 0x00);
+    g_assert_cmphex(crtc_r(&t, 0x69), ==, 0x10);
+    screendump(&t, &img);
+    check_pixel(&img, 0, 0, 0, 0, 0);
+    image_free(&img);
+
+    /* CR51 bits 1-0 = 1 selects 1MB again; CR69 = 0 returns to the start */
+    crtc_w(&t, 0x51, 0x01);
+    g_assert_cmphex(crtc_r(&t, 0x69), ==, 0x14);
+    crtc_w(&t, 0x69, 0x00);
+    g_assert_cmphex(crtc_r(&t, 0x51) & 0x03, ==, 0x00);
+    screendump(&t, &img);
+    check_pixel(&img, 0, 0, 255, 0, 0);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+/*
+ * Banked access through the 64K window at 0xA0000 (CR31 bit 3 forces the
+ * 64K mapping, CR35 bits 3-0 / CR51 bits 3-2 / CR6A select the bank).
+ */
+static void test_banked_window(void)
+{
+    S3Test t;
+    Image img;
+    const int w = 640, h = 480, pitch = 640;
+    uint64_t win;
+
+    s3_test_init(&t);
+    win = t.pci_mem + 0xa0000;
+    s3_set_mode(&t, w, h, 8, pitch);
+    dac_w(&t, 0, 0, 0, 0);
+    dac_w(&t, 1, 255, 0, 0);
+    dac_w(&t, 2, 0, 255, 0);
+    dac_w(&t, 3, 0, 0, 255);
+    clear_fb(&t, pitch * h);
+
+    /* bank 0: pixel (5, 0) at offset 5 */
+    crtc_w(&t, 0x35, 0x00);
+    qtest_writeb(t.qts, win + 5, 1);
+    /* bank 2: offset 0x20000 + 0x100 = line 204, pixel 256 + ...  */
+    crtc_w(&t, 0x35, 0x02);
+    g_assert_cmphex(crtc_r(&t, 0x35) & 0x0f, ==, 0x02);
+    qtest_writeb(t.qts, win + 0x100, 2);
+    g_assert_cmphex(qtest_readb(t.qts, win + 0x100), ==, 2);
+    g_assert_cmphex(qtest_readb(t.qts, t.lfb + 0x20100), ==, 2);
+    /* bank 4 through CR6A: offset 0x40000 + 0x340 = line 409, pixel 512 */
+    crtc_w(&t, 0x6a, 0x04);
+    g_assert_cmphex(crtc_r(&t, 0x35) & 0x0f, ==, 0x04);
+    g_assert_cmphex(crtc_r(&t, 0x51) & 0x0c, ==, 0x00);
+    qtest_writeb(t.qts, win + 0x340, 3);
+    g_assert_cmphex(qtest_readb(t.qts, t.lfb + 0x40340), ==, 3);
+    /* bank 0x10 (1MB) through CR51 bits 3-2, above the visible screen */
+    crtc_w(&t, 0x35, 0x00);
+    crtc_w(&t, 0x51, 0x04);
+    g_assert_cmphex(crtc_r(&t, 0x6a), ==, 0x10);
+    g_assert_cmphex(crtc_r(&t, 0x51) & 0x0c, ==, 0x04);
+    qtest_writeb(t.qts, win + 0x200, 7);
+    g_assert_cmphex(qtest_readb(t.qts, t.lfb + 0x100200), ==, 7);
+    g_assert_cmphex(qtest_readb(t.qts, t.lfb + 0x200), ==, 0);
+
+    screendump(&t, &img);
+    check_pixel(&img, 5, 0, 255, 0, 0);
+    check_pixel(&img, (0x20100 % pitch), 0x20100 / pitch, 0, 255, 0);
+    check_pixel(&img, (0x40340 % pitch), 0x40340 / pitch, 0, 0, 255);
+    image_free(&img);
+    s3_test_fini(&t);
+}
+
+/* CR59/CR5A follow PCI BAR 0, CR6B/CR6C mirror them */
+static void test_law_base(void)
+{
+    S3Test t;
+
+    s3_test_init(&t);
+    crtc_w(&t, 0x38, 0x48);
+    crtc_w(&t, 0x39, 0xa5);
+    g_assert_cmphex(crtc_r(&t, 0x59), ==, t.bar0_pci >> 24);
+    g_assert_cmphex(crtc_r(&t, 0x5a), ==, (t.bar0_pci >> 16) & 0x80);
+    g_assert_cmphex(crtc_r(&t, 0x6b), ==, t.bar0_pci >> 24);
+    crtc_w(&t, 0x58, 0x13);
+    g_assert_cmphex(crtc_r(&t, 0x58), ==, 0x13);
     s3_test_fini(&t);
 }
 
@@ -622,6 +796,10 @@ int main(int argc, char **argv)
     qtest_add_func("/s3-trio/mode/16bpp", test_mode_16bpp);
     qtest_add_func("/s3-trio/mode/24bpp", test_mode_24bpp);
     qtest_add_func("/s3-trio/mode/32bpp", test_mode_32bpp);
+    qtest_add_func("/s3-trio/mode/1600x1200", test_mode_1600x1200);
+    qtest_add_func("/s3-trio/crtc/start-address", test_start_address);
+    qtest_add_func("/s3-trio/crtc/banked-window", test_banked_window);
+    qtest_add_func("/s3-trio/crtc/law-base", test_law_base);
 
     return g_test_run();
 }
