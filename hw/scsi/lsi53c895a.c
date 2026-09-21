@@ -2410,6 +2410,15 @@ static void lsi_scsi_realize_895A(PCIDevice *dev, Error **errp)
 static void lsi_scsi_realize_810(PCIDevice *dev, Error **errp)
 {
     lsi_scsi_realize_8xx(dev, errp, PCI_DEVICE_ID_LSI_53C810);
+
+    /*
+     * The original 53C810 predates the PCI 2.1 subsystem ID registers and
+     * reads them as zero.  This matters for AIX, whose PCI bus configuration
+     * identifies a device by its subsystem vendor/ID whenever they are
+     * non-zero and only knows the NCR 810 by its plain 1000:0001 device ID.
+     */
+    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, 0);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_ID, 0);
 }
 
 static void lsi_scsi_exit(PCIDevice *dev)
