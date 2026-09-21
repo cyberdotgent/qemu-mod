@@ -596,29 +596,49 @@ void cpu_ppc_store_tbu (CPUPPCState *env, uint32_t value)
 /*
  * Specific helpers for POWER & PowerPC 601 RTC.
  *
- * The 601 has no time base: RTCU counts seconds and RTCL counts
- * nanoseconds in 128 ns steps (bits 25-31 are always zero) at the
- * 7.8125 MHz RTC clock. We reuse the time base machinery for it:
- * the upper word maps to RTCU and the lower word to RTCL.
+ * The 601 has no time base: RTCU counts seconds and RTCL counts the
+ * nanoseconds within the current second in 128 ns steps (7.8125 MHz
+ * RTC clock, so bits 25-31 always read as zero and RTCL wraps at
+ * 10^9). The RTC is kept as a nanosecond offset from the virtual
+ * clock; the decrementer still runs from tb_freq (7.8125 MHz).
  */
+static uint64_t cpu_ppc601_get_rtc_ns(ppc_tb_t *tb_env)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + tb_env->rtc_offset;
+}
+
+static void cpu_ppc601_set_rtc_ns(ppc_tb_t *tb_env, uint64_t ns)
+{
+    tb_env->rtc_offset = ns - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 void cpu_ppc601_store_rtcu(CPUPPCState *env, uint32_t value)
 {
-    _cpu_ppc_store_tbu(env, value);
+    ppc_tb_t *tb_env = env->tb_env;
+    uint64_t ns = cpu_ppc601_get_rtc_ns(tb_env);
+
+    cpu_ppc601_set_rtc_ns(tb_env, (uint64_t)value * NANOSECONDS_PER_SECOND +
+                          ns % NANOSECONDS_PER_SECOND);
 }
 
 uint32_t cpu_ppc601_load_rtcu(CPUPPCState *env)
 {
-    return _cpu_ppc_load_tbu(env);
+    return cpu_ppc601_get_rtc_ns(env->tb_env) / NANOSECONDS_PER_SECOND;
 }
 
 void cpu_ppc601_store_rtcl(CPUPPCState *env, uint32_t value)
 {
-    cpu_ppc_store_tbl(env, value & 0x3FFFFF80);
+    ppc_tb_t *tb_env = env->tb_env;
+    uint64_t ns = cpu_ppc601_get_rtc_ns(tb_env);
+
+    cpu_ppc601_set_rtc_ns(tb_env, ns - ns % NANOSECONDS_PER_SECOND +
+                          (value & 0x3FFFFF80));
 }
 
 uint32_t cpu_ppc601_load_rtcl(CPUPPCState *env)
 {
-    return cpu_ppc_load_tbl(env) & 0x3FFFFF80;
+    return (cpu_ppc601_get_rtc_ns(env->tb_env) % NANOSECONDS_PER_SECOND) &
+           0x3FFFFF80;
 }
 
 uint64_t cpu_ppc_load_atbl (CPUPPCState *env)

@@ -35,6 +35,8 @@ struct ppc_tb_t {
     uint64_t hdecr_next;    /* Tick for next hdecr interrupt  */
     QEMUTimer *hdecr_timer;
     int64_t purr_offset;
+    /* PowerPC 601 RTC: offset in ns added to the virtual clock */
+    int64_t rtc_offset;
     void *opaque;
     uint32_t flags;
 };

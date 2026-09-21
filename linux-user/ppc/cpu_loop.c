@@ -54,14 +54,15 @@ uint64_t cpu_ppc_load_vtb(CPUPPCState *env)
     return cpu_ppc_get_tb(env);
 }
 
+/* PowerPC 601 RTC: seconds and nanoseconds (128 ns granularity) */
 uint32_t cpu_ppc601_load_rtcu(CPUPPCState *env)
 {
-    return cpu_ppc_load_tbu(env);
+    return get_clock_realtime() / NANOSECONDS_PER_SECOND;
 }
 
 uint32_t cpu_ppc601_load_rtcl(CPUPPCState *env)
 {
-    return cpu_ppc_load_tbl(env) & 0x3FFFFF80;
+    return (get_clock_realtime() % NANOSECONDS_PER_SECOND) & 0x3FFFFF80;
 }
 
 /* XXX: to be fixed */
