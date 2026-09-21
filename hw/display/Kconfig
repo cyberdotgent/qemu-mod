@@ -142,6 +142,8 @@ config S3_VGA
     default y if PCI_DEVICES
     depends on PCI
     select VGA
+    select BITBANG_I2C
+    select DDC
 
 config MACFB
     bool

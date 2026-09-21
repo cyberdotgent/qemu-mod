@@ -34,6 +34,10 @@ s3_vga_accel_regs(uint8_t frgd_mix, uint8_t bkgd_mix, uint16_t pix_cntl, uint16_
 s3_vga_accel_pix_trans(uint32_t val, int bytes, uint16_t cmd) "PIX_TRANS 0x%08x (%d bytes) cmd %04x"
 s3_vga_accel_multifunc(int index, uint16_t val) "MULTIFUNC[%x] <- 0x%03x"
 s3_vga_mmio_write(uint32_t addr, uint64_t val, unsigned size) "mmio 0x%05x <- 0x%" PRIx64 " (%u bytes)"
+s3_vga_mmio_read(uint32_t addr, unsigned size) "mmio 0x%05x -> (%u bytes)"
+s3_vga_new_mmio(bool enabled) "new MMIO window at LAW+16MB enabled=%d"
+s3_vga_ddc_write(uint8_t val) "serial port <- 0x%02x"
+s3_vga_ddc_read(uint8_t val) "serial port -> 0x%02x"
 
 # vmware_vga.c
 vmware_value_read(uint32_t index, uint32_t value) "index %d, value 0x%x"

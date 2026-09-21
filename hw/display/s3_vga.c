@@ -43,6 +43,9 @@
 #include "system/reset.h"
 #include "qemu/range.h"
 #include "ui/pixel_ops.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/display/i2c-ddc.h"
+#include "hw/display/edid.h"
 
 #define TYPE_S3_TRIO "s3-trio"
 
@@ -165,6 +168,13 @@ typedef struct S3TrioState {
     PCIDevice dev;
     VGACommonState vga;
     PortioList portio;
+    MemoryRegion bar0;      /* 64MB linear aperture (Trio64V+) */
+    MemoryRegion new_mmio;  /* LAW + 16MB, enabled by CR53 bit 3 */
+
+    /* DDC serial port (new MMIO 0xFF20) */
+    uint8_t serialport;
+    bitbang_i2c_interface bbi2c;
+    I2CDDCState i2cddc;
 
     uint32_t dclk;
     uint32_t mclk;
@@ -223,6 +233,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
 static bool s3_enhanced_mode(S3TrioState *s);
 static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val);
 static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr);
+static void s3_update_new_mmio(S3TrioState *s);
 
 /*
  * ---- Graphics engine ---------------------------------------------------
@@ -1813,6 +1824,142 @@ static uint64_t s3_mmio_read(S3TrioState *s, uint32_t addr, unsigned size)
     return s3_accel_in(s, addr, size);
 }
 
+/*
+ * Trio64V+ "new MMIO": the 64KB register window is mirrored at linear
+ * address window base + 16MB when CR53 bit 3 is set (86Box
+ * s3_updatemapping).  The layout is the same as the old window at 0xA0000
+ * (pixel transfer below 0x8000, engine ports at their I/O address, VGA
+ * registers at 0x83B0-0x83DF, subsystem control at 0x8504/0x8505/0x850C)
+ * with the PCI configuration space readable at 0x8000-0x803F and the DDC
+ * serial port at 0xFF20.  AIX's Trio64V+ driver (pciiga, the GXT110P)
+ * reaches the engine status, the VGA registers and the DDC port only
+ * through this window.
+ *
+ * Serial port register (0xFF20): bit 0 SCL out, bit 1 SDA out, bit 2 SCL
+ * in, bit 3 SDA in, bit 4 enable.
+ */
+#define SERIAL_PORT_SCW 0x01
+#define SERIAL_PORT_SDW 0x02
+#define SERIAL_PORT_SCR 0x04
+#define SERIAL_PORT_SDR 0x08
+#define SERIAL_PORT_EN  0x10
+
+static void s3_update_new_mmio(S3TrioState *s)
+{
+    bool en = s->vga.cr[0x53] & 0x08;
+
+    if (s->new_mmio.enabled != en) {
+        trace_s3_vga_new_mmio(en);
+    }
+    memory_region_set_enabled(&s->new_mmio, en);
+}
+
+static void s3_serialport_write(S3TrioState *s, uint8_t val)
+{
+    s->serialport = val & ~(SERIAL_PORT_SCR | SERIAL_PORT_SDR);
+    if (val & SERIAL_PORT_EN) {
+        bitbang_i2c_set(&s->bbi2c, BITBANG_I2C_SCL, !!(val & SERIAL_PORT_SCW));
+        bitbang_i2c_set(&s->bbi2c, BITBANG_I2C_SDA, !!(val & SERIAL_PORT_SDW));
+    }
+    trace_s3_vga_ddc_write(val);
+}
+
+static uint8_t s3_serialport_read(S3TrioState *s)
+{
+    uint8_t val = s->serialport;
+
+    if (val & SERIAL_PORT_EN) {
+        /* the bus is open drain: a line driven low by us reads low */
+        if (val & SERIAL_PORT_SCW) {
+            val |= SERIAL_PORT_SCR;
+        }
+        if ((val & SERIAL_PORT_SDW) &&
+            bitbang_i2c_set(&s->bbi2c, BITBANG_I2C_SDA, 1)) {
+            val |= SERIAL_PORT_SDR;
+        }
+    }
+    trace_s3_vga_ddc_read(val);
+    return val;
+}
+
+static uint64_t s3_new_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    S3TrioState *s = opaque;
+    uint64_t val = 0;
+    uint32_t off = addr & 0x1ffff;
+
+    if ((off & ~3) == 0xff20) {
+        return s3_serialport_read(s);
+    }
+    off &= 0xffff;
+    trace_s3_vga_mmio_read(off, size);
+    if (off >= 0x8000 && off < 0x8040) {
+        return pci_default_read_config(&s->dev, off & 0x3f, size);
+    }
+    if (off >= 0x83b0 && off <= 0x83df) {
+        for (int i = 0; i < size; i++) {
+            val |= (uint64_t)s3_trio_vga_ioport_read(s, (off + i) & 0x3ff)
+                   << (8 * i);
+        }
+        return val;
+    }
+    switch (off) {
+    case 0x8504:
+        return s->subsys_stat & 0xff;
+    case 0x8505:
+        return (s->subsys_stat >> 8) & 0xff;
+    default:
+        break;
+    }
+    if (!s3_accel_enabled(s)) {
+        return (uint64_t)-1;
+    }
+    return s3_mmio_read(s, off, size);
+}
+
+static void s3_new_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    S3TrioState *s = opaque;
+    uint32_t off = addr & 0x1ffff;
+
+    if ((off & ~3) == 0xff20) {
+        s3_serialport_write(s, val & 0xff);
+        return;
+    }
+    off &= 0xffff;
+    trace_s3_vga_mmio_write(off, val, size);
+    if (off >= 0x83b0 && off <= 0x83df) {
+        for (int i = 0; i < size; i++) {
+            s3_trio_vga_ioport_write(s, (off + i) & 0x3ff,
+                                     (val >> (8 * i)) & 0xff);
+        }
+        return;
+    }
+    switch (off) {
+    case 0x8504:
+    case 0x8505:
+    case 0x850c:
+        for (int i = 0; i < size; i++) {
+            s3_mmio_write_byte(s, off + i, (val >> (8 * i)) & 0xff);
+        }
+        return;
+    default:
+        break;
+    }
+    s3_mmio_write(s, off, val, size);
+}
+
+static const MemoryRegionOps s3_new_mmio_ops = {
+    .read = s3_new_mmio_read,
+    .write = s3_new_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
 static uint32_t s3_trio_enable_readb(void *opaque, uint32_t addr)
 {
     uint32_t val;
@@ -2258,8 +2405,8 @@ static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
         return 0x88;
     case 0x2e: /* new chip ID: 0x11 = Trio64 (86C764) */
         return 0x11;
-    case 0x2f: /* revision level */
-        return 0x00;
+    case 0x2f: /* revision level: 0x40 = Trio64V+ */
+        return 0x40;
     case 0x30: /* chip ID: 0xE1 = Trio64, readable when unlocked */
         return (((cr[0x38] & 0xcc) == 0x48) || ((cr[0x39] & 0xe0) == 0xa0))
             ? 0xe1 : 0xff;
@@ -2364,6 +2511,10 @@ static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
         s->bank = (s->bank & 0x4f) | ((val & 0x0c) << 2);
         s->ma_ext = (s->ma_ext & ~0x0c) | ((val & 0x03) << 2);
         s3_update_bank(s);
+        break;
+    case 0x53:
+        vga_ioport_write(&s->vga, addr, val);
+        s3_update_new_mmio(s);
         break;
     case 0x69:
         vga_ioport_write(&s->vga, addr, val);
@@ -2646,12 +2797,14 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT32(hwc_fg_col, S3TrioState),
         VMSTATE_UINT32(hwc_bg_col, S3TrioState),
         VMSTATE_UINT8(hwc_col_stack_pos, S3TrioState),
+        VMSTATE_UINT8(serialport, S3TrioState),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const Property s3_trio_properties[] = {
     DEFINE_PROP_UINT32("vram_size_mb", S3TrioState, vga.vram_size_mb, 8),
+    DEFINE_EDID_PROPERTIES(S3TrioState, i2cddc.edid_info),
 };
 
 /*
@@ -2713,6 +2866,8 @@ static void s3_trio_reset(DeviceState *d)
     s->hwc_col_stack_pos = 0;
     s->last_hwc_x = s->last_hwc_y = s->last_hwc_ysize = 0;
     s->vga.force_shadow = false;
+    s->serialport = 0;
+    s3_update_new_mmio(s);
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
@@ -2772,8 +2927,38 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     portio_list_init(&s->portio, OBJECT(s), s3_trio_portio_list, s, "s3_trio");
     portio_list_add(&s->portio, pci_address_space_io(dev), 0);
 
+    /* DDC monitor channel behind the new MMIO serial port */
+    {
+        I2CBus *i2cbus = i2c_init_bus(DEVICE(s), "s3-trio.ddc");
+
+        bitbang_i2c_init(&s->bbi2c, i2cbus);
+        i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50);
+        qdev_realize(DEVICE(&s->i2cddc), BUS(i2cbus), &error_abort);
+    }
+
+    /*
+     * BAR 0 is the Trio64V+ 64MB aperture: video memory at the bottom and
+     * the register window ("new MMIO") at +16MB, which CR53 bit 3 turns
+     * on.  AIX's S3 driver expects this layout and finds the adapter
+     * through its 5333:8811 device ID, which the Trio64V+ shares with the
+     * Trio64.
+     */
+    memory_region_init(&s->bar0, o, "s3-trio-bar0", 0x4000000);
+    memory_region_add_subregion(&s->bar0, 0, &s->vga.vram);
+    memory_region_init_io(&s->new_mmio, o, &s3_new_mmio_ops, s,
+                          "s3-trio-mmio", 0x20000);
+    memory_region_set_enabled(&s->new_mmio, false);
+    memory_region_add_subregion(&s->bar0, 0x1000000, &s->new_mmio);
+
     /* setup PCI */
-    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vga.vram);
+    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->bar0);
+}
+
+static void s3_trio_instance_init(Object *o)
+{
+    S3TrioState *s = S3_TRIO(o);
+
+    object_initialize_child(o, "edid", &s->i2cddc, TYPE_I2CDDC);
 }
 
 static void s3_trio_class_init(ObjectClass *klass, const void *data)
@@ -2798,6 +2983,7 @@ static const TypeInfo s3_trio_info = {
     .name          = "s3-trio",
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(S3TrioState),
+    .instance_init = s3_trio_instance_init,
     .class_init    = s3_trio_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
