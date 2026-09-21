@@ -462,6 +462,21 @@ static void ibm_40p_init(MachineState *machine)
     }
 }
 
+/*
+ * AIX drives a SCSI CD-ROM the SCSI-2 way: its scdisk driver reads the
+ * block length from the MODE SENSE block descriptor and, if it differs
+ * from the 512-byte block size configured for cd0, switches the drive
+ * with a MODE SELECT block descriptor before checking the READ CAPACITY
+ * block length.  Without a block descriptor no MODE SELECT is issued
+ * and the 2048-byte READ CAPACITY answer makes the open fail with
+ * EMEDIA, so behave like the period drives here.
+ */
+static GlobalProperty hw_compat_ibm_40p[] = {
+    { "scsi-cd", "quirk_mode_sense_rom_use_dbd", "on" },
+    { "scsi-cd", "quirk_mode_page_set_block_size", "on" },
+};
+static const size_t hw_compat_ibm_40p_len = G_N_ELEMENTS(hw_compat_ibm_40p);
+
 static void ibm_40p_machine_init(MachineClass *mc)
 {
     mc->desc = "IBM RS/6000 7020 (40p)",
@@ -473,6 +488,8 @@ static void ibm_40p_machine_init(MachineClass *mc)
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
     mc->default_display = "s3";
     mc->default_nic = "pcnet";
+    compat_props_add(mc->compat_props, hw_compat_ibm_40p,
+                     hw_compat_ibm_40p_len);
 
     machine_add_audiodev_property(mc);
 }
