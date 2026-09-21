@@ -26,4 +26,19 @@ static inline uint64_t tod2time(uint64_t t)
     return ((t >> 9) * 125) + (((t & 0x1ff) * 125) >> 9);
 }
 
+/*
+ * Unlike the TOD clock, the CPU timer is a signed 64-bit value.  Keep the
+ * quotient and remainder separate so the full architectural range can be
+ * converted without overflowing a signed host integer.
+ */
+static inline int64_t time2tod_signed(int64_t ns)
+{
+    return (ns / 125) * 512 + ((ns % 125) * 512) / 125;
+}
+
+static inline int64_t tod2time_signed(int64_t t)
+{
+    return (t / 512) * 125 + ((t % 512) * 125) / 512;
+}
+
 #endif

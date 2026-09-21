@@ -18,6 +18,7 @@
 #include "hw/core/boards.h"
 #include "system/memory.h"
 #include "hw/s390x/sclp.h"
+#include "hw/s390x/css.h"
 #include "hw/s390x/event-facility.h"
 #include "hw/s390x/s390-pci-bus.h"
 #include "hw/s390x/ipl.h"
@@ -39,6 +40,7 @@ static inline bool sclp_command_code_valid(uint32_t code)
     switch (code & SCLP_CMD_CODE_MASK) {
     case SCLP_CMDW_READ_SCP_INFO:
     case SCLP_CMDW_READ_SCP_INFO_FORCED:
+    case SCLP_CMDW_READ_CHP_INFO:
     case SCLP_CMDW_READ_CPU_INFO:
     case SCLP_CMDW_CONFIGURE_IOA:
     case SCLP_CMDW_DECONFIGURE_IOA:
@@ -85,6 +87,10 @@ static void prepare_cpu_entries(MachineState *ms, CPUEntry *entry, int *count)
     int i;
 
     s390_get_feat_block(S390_FEAT_TYPE_SCLP_CPU, features);
+    /* SIE XA mode is a base processor characteristic, not an assist bit. */
+    if (!s390_is_pv()) {
+        features[0] |= SCLP_CPU_FEATURE_SIE_XA_MODE;
+    }
     for (i = 0, *count = 0; i < ms->possible_cpus->len; i++) {
         if (!ms->possible_cpus->cpus[i].cpu) {
             continue;
@@ -134,7 +140,6 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
     read_info->entries_cpu = cpu_to_be16(cpu_count);
     read_info->offset_cpu = cpu_to_be16(offset_cpu);
     read_info->highest_cpu = cpu_to_be16(machine->smp.max_cpus - 1);
-
     read_info->ibc_val = cpu_to_be32(s390_get_ibc_val());
 
     /* Configuration Characteristic (Extension) */
@@ -150,7 +155,11 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
                             &read_info->fac139);
     }
 
-    read_info->facilities = cpu_to_be64(SCLP_HAS_CPU_INFO |
+    read_info->facilities = cpu_to_be64(SCLP_HAS_CHP_INFO |
+                                        SCLP_HAS_CHP_SUBSYSTEM_COMMAND |
+                                        SCLP_HAS_CPU_INFO |
+                                        SCLP_HAS_LOADPARM |
+                                        SCLP_HAS_READ_WRITE_EVENT |
                                         SCLP_HAS_IOA_RECONFIG);
 
     read_info->mha_pow = s390_get_mha_pow();
@@ -176,6 +185,60 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }
 
+static void sclp_read_chp_info(SCCB *sccb)
+{
+    ReadChpInfo *info = (ReadChpInfo *)sccb;
+    unsigned int ssid;
+    unsigned int schid;
+
+    if (be16_to_cpu(sccb->h.length) < sizeof(*info)) {
+        sccb->h.response_code =
+            cpu_to_be16(SCLP_RC_INSUFFICIENT_SCCB_LENGTH);
+        return;
+    }
+
+    memset(info->installed, 0, sizeof(info->installed));
+    memset(info->standby, 0, sizeof(info->standby));
+    memset(info->online, 0, sizeof(info->online));
+    for (ssid = 0; ssid <= MAX_SSID; ssid++) {
+        for (schid = 0; schid <= MAX_SCHID; schid++) {
+            /*
+             * Read Channel-Path Information is not CSSID-qualified.  CSSID
+             * zero therefore denotes the guest's default CSS image, which
+             * QEMU represents internally with channel_subsys.default_cssid.
+             * An explicit (M=1) lookup of CSSID zero misses every device on
+             * the usual s390-ccw machine, whose internal default is 0xfe.
+             */
+            SubchDev *sch = css_find_subch(0, 0, ssid, schid);
+            SCHIB status;
+            unsigned int path;
+
+            if (!sch || !css_subch_visible(sch)) {
+                continue;
+            }
+            memcpy(&status, &sch->curr_status, sizeof(status));
+            for (path = 0; path < ARRAY_SIZE(status.pmcw.chpid); path++) {
+                uint8_t path_bit = 0x80 >> path;
+                uint8_t bitmap_bit;
+                uint8_t chpid;
+
+                if (!(status.pmcw.pim & path_bit)) {
+                    continue;
+                }
+                chpid = status.pmcw.chpid[path];
+                bitmap_bit = 0x80 >> (chpid % 8);
+                info->installed[chpid / 8] |= bitmap_bit;
+                if (status.pmcw.flags & PMCW_FLAGS_MASK_DNV) {
+                    info->online[chpid / 8] |= bitmap_bit;
+                } else {
+                    info->standby[chpid / 8] |= bitmap_bit;
+                }
+            }
+        }
+    }
+    sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
+}
+
 /* Provide information about the CPU */
 static void sclp_read_cpu_info(SCLPDevice *sclp, SCCB *sccb)
 {
@@ -198,10 +261,8 @@ static void sclp_read_cpu_info(SCLPDevice *sclp, SCCB *sccb)
     cpu_info->nr_standby = cpu_to_be16(0);
 
     /* The standby offset is 16-byte for each CPU */
-    cpu_info->offset_standby = cpu_to_be16(cpu_info->offset_configured
-        + cpu_info->nr_configured*sizeof(CPUEntry));
-
-
+    cpu_info->offset_standby = cpu_to_be16(offsetof(ReadCpuInfo, entries) +
+                                           cpu_count * sizeof(CPUEntry));
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }
 
@@ -244,6 +305,9 @@ static void sclp_execute(SCLPDevice *sclp, SCCB *sccb, uint32_t code)
     case SCLP_CMDW_READ_SCP_INFO:
     case SCLP_CMDW_READ_SCP_INFO_FORCED:
         sclp_c->read_SCP_info(sclp, sccb);
+        break;
+    case SCLP_CMDW_READ_CHP_INFO:
+        sclp_read_chp_info(sccb);
         break;
     case SCLP_CMDW_READ_CPU_INFO:
         sclp_c->read_cpu_info(sclp, sccb);

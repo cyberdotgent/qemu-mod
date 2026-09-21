@@ -43,6 +43,444 @@ static inline float128 ARG128(Int128 i)
     return make_float128(int128_gethi(i), int128_getlo(i));
 }
 
+typedef unsigned __int128 HFPMagnitude;
+
+typedef struct HFPValue {
+    HFPMagnitude fraction;
+    int characteristic;
+    bool negative;
+    int fraction_bits;
+} HFPValue;
+
+static void hfp_store_ext_result(CPUS390XState *env, int reg, HFPValue v,
+                                 bool zero_significance, bool set_cc,
+                                 uintptr_t ra);
+
+static uint64_t hfp_get_reg(CPUS390XState *env, int reg, int bits)
+{
+    return bits == 24 ? *get_freg(env, reg) >> 32 : *get_freg(env, reg);
+}
+
+static void hfp_put_reg(CPUS390XState *env, int reg, int bits, uint64_t value)
+{
+    if (bits == 24) {
+        *get_freg(env, reg) = (*get_freg(env, reg) & UINT32_MAX) |
+                              (value << 32);
+    } else {
+        *get_freg(env, reg) = value;
+    }
+}
+
+static HFPValue hfp_unpack(uint64_t raw, int bits)
+{
+    HFPValue v = {
+        .fraction = raw & ((((uint64_t)1) << bits) - 1),
+        .characteristic = (raw >> bits) & 0x7f,
+        .negative = (raw >> (bits + 7)) & 1,
+        .fraction_bits = bits,
+    };
+
+    return v;
+}
+
+static uint64_t hfp_pack(HFPValue v, int bits)
+{
+    uint64_t frac = v.fraction;
+
+    if (bits != 64) {
+        frac &= (((uint64_t)1) << bits) - 1;
+    }
+    return frac | ((uint64_t)(v.characteristic & 0x7f) << bits) |
+           ((uint64_t)v.negative << (bits + 7));
+}
+
+static void hfp_normalize(HFPValue *v)
+{
+    HFPMagnitude top = (HFPMagnitude)0xf << (v->fraction_bits - 4);
+
+    while (v->fraction && !(v->fraction & top)) {
+        v->fraction <<= 4;
+        v->characteristic--;
+    }
+}
+
+static uint32_t hfp_cc(const HFPValue *v)
+{
+    return v->fraction == 0 ? 0 : v->negative ? 1 : 2;
+}
+
+static void hfp_store_result(CPUS390XState *env, int reg, HFPValue v,
+                             int bits, bool zero_significance, bool set_cc,
+                             uintptr_t ra)
+{
+    uint32_t cc;
+
+    if (v.fraction == 0) {
+        v.negative = false;
+        if (zero_significance &&
+            (env->psw.mask & (1ULL << PSW_SHIFT_MASK_PM))) {
+            cc = 0;
+            if (set_cc) {
+                env->cc_op = cc;
+            }
+            hfp_put_reg(env, reg, bits, hfp_pack(v, bits));
+            tcg_s390_program_interrupt(env, PGM_HFP_SIGNIFICANCE, ra);
+        }
+        v.characteristic = 0;
+    } else if (v.characteristic < 0) {
+        if (env->psw.mask & (1ULL << (PSW_SHIFT_MASK_PM + 1))) {
+            v.characteristic &= 0x7f;
+            cc = hfp_cc(&v);
+            if (set_cc) {
+                env->cc_op = cc;
+            }
+            hfp_put_reg(env, reg, bits, hfp_pack(v, bits));
+            tcg_s390_program_interrupt(env, PGM_HFP_EXP_UNDERFLOW, ra);
+        }
+        v = (HFPValue) { .fraction_bits = bits };
+    } else if (v.characteristic > 127) {
+        v.characteristic &= 0x7f;
+        cc = hfp_cc(&v);
+        if (set_cc) {
+            env->cc_op = cc;
+        }
+        hfp_put_reg(env, reg, bits, hfp_pack(v, bits));
+        tcg_s390_program_interrupt(env, PGM_HFP_EXP_OVERFLOW, ra);
+    }
+    hfp_put_reg(env, reg, bits, hfp_pack(v, bits));
+}
+
+static HFPValue hfp_add_values(HFPValue a, HFPValue b, bool subtract,
+                               bool normalize)
+{
+    HFPMagnitude aw, bw, magnitude;
+    __int128 signed_a, signed_b, sum;
+    int characteristic = MAX(a.characteristic, b.characteristic);
+    int shift;
+
+    aw = a.fraction << 4;
+    bw = b.fraction << 4;
+    shift = characteristic - a.characteristic;
+    aw = shift > (a.fraction_bits / 4) ? 0 : aw >> (shift * 4);
+    shift = characteristic - b.characteristic;
+    bw = shift > (b.fraction_bits / 4) ? 0 : bw >> (shift * 4);
+    signed_a = a.negative ? -(__int128)aw : (__int128)aw;
+    signed_b = b.negative ^ subtract ? -(__int128)bw : (__int128)bw;
+    sum = signed_a + signed_b;
+    magnitude = sum < 0 ? -sum : sum;
+
+    if (magnitude >> (a.fraction_bits + 4)) {
+        magnitude >>= 4;
+        characteristic++;
+    } else if (normalize) {
+        HFPMagnitude top = (HFPMagnitude)0xf << a.fraction_bits;
+
+        while (magnitude && !(magnitude & top)) {
+            magnitude <<= 4;
+            characteristic--;
+        }
+    }
+    return (HFPValue) {
+        .fraction = magnitude >> 4,
+        .characteristic = characteristic,
+        .negative = sum < 0,
+        .fraction_bits = a.fraction_bits,
+    };
+}
+
+/*
+ * op: 0 add normalized, 1 subtract normalized, 2 add unnormalized,
+ * 3 subtract unnormalized, 4 compare, 5 divide.
+ */
+uint32_t HELPER(hfp_binary)(CPUS390XState *env, uint32_t r1, uint64_t raw2,
+                            uint32_t bits, uint32_t op)
+{
+    uintptr_t ra = GETPC();
+    HFPValue a = hfp_unpack(hfp_get_reg(env, r1, bits), bits);
+    HFPValue b = hfp_unpack(raw2, bits);
+    HFPValue result;
+
+    if (op == 4) {
+        result = hfp_add_values(a, b, true, true);
+        return hfp_cc(&result);
+    }
+    if (op == 5) {
+        HFPMagnitude work;
+
+        if (b.fraction == 0) {
+            tcg_s390_program_interrupt(env, PGM_HFP_DIVIDE, ra);
+        }
+        if (a.fraction == 0) {
+            result = (HFPValue) { .fraction_bits = bits };
+        } else {
+            hfp_normalize(&a);
+            hfp_normalize(&b);
+            work = (a.fraction << (bits + 4)) / b.fraction;
+            if (work >> (bits + 4)) {
+                work >>= 4;
+                a.characteristic++;
+            }
+            result = (HFPValue) {
+                .fraction = work >> 4,
+                .characteristic = a.characteristic - b.characteristic + 64,
+                .negative = a.negative != b.negative,
+                .fraction_bits = bits,
+            };
+            hfp_normalize(&result);
+        }
+        hfp_store_result(env, r1, result, bits, false, false, ra);
+        return hfp_cc(&result);
+    }
+
+    result = hfp_add_values(a, b, op & 1, op < 2);
+    hfp_store_result(env, r1, result, bits, true, true, ra);
+    return hfp_cc(&result);
+}
+
+void HELPER(hfp_multiply)(CPUS390XState *env, uint32_t r1, uint64_t raw2,
+                          uint32_t src_bits, uint32_t dest_bits)
+{
+    uintptr_t ra = GETPC();
+    HFPValue a = hfp_unpack(hfp_get_reg(env, r1, src_bits), src_bits);
+    HFPValue b = hfp_unpack(raw2, src_bits);
+    HFPValue result = { .fraction_bits = 2 * src_bits };
+    int resize;
+
+    if (a.fraction && b.fraction) {
+        hfp_normalize(&a);
+        hfp_normalize(&b);
+        result.fraction = a.fraction * b.fraction;
+        result.characteristic = a.characteristic + b.characteristic - 64;
+        result.negative = a.negative != b.negative;
+        hfp_normalize(&result);
+        resize = result.fraction_bits - dest_bits;
+        if (resize > 0) {
+            result.fraction >>= resize;
+        } else {
+            result.fraction <<= -resize;
+        }
+        result.fraction_bits = dest_bits;
+    }
+    if (dest_bits == 112) {
+        hfp_store_ext_result(env, r1, result, false, false, ra);
+    } else {
+        hfp_store_result(env, r1, result, dest_bits, false, false, ra);
+    }
+}
+
+void HELPER(hfp_halve)(CPUS390XState *env, uint32_t r1, uint32_t r2,
+                       uint32_t bits)
+{
+    uintptr_t ra = GETPC();
+    HFPValue v = hfp_unpack(hfp_get_reg(env, r2, bits), bits);
+
+    if (v.fraction) {
+        v.fraction >>= 1;
+        hfp_normalize(&v);
+    }
+    hfp_store_result(env, r1, v, bits, false, false, ra);
+}
+
+/* op: 0 test/copy, 1 complement, 2 negative, 3 positive. */
+uint32_t HELPER(hfp_load)(CPUS390XState *env, uint32_t r1, uint64_t raw2,
+                          uint32_t bits, uint32_t op)
+{
+    HFPValue v = hfp_unpack(raw2, bits);
+
+    if (op == 1) {
+        v.negative = !v.negative;
+    } else if (op == 2) {
+        v.negative = true;
+    } else if (op == 3) {
+        v.negative = false;
+    }
+    hfp_put_reg(env, r1, bits, hfp_pack(v, bits));
+    return hfp_cc(&v);
+}
+
+void HELPER(hfp_round)(CPUS390XState *env, uint32_t r1, uint32_t src_r2)
+{
+    uintptr_t ra = GETPC();
+    HFPValue v = hfp_unpack(*get_freg(env, src_r2), 56);
+
+    v.fraction += (HFPMagnitude)1 << 31;
+    if (v.fraction >> 56) {
+        v.fraction >>= 4;
+        v.characteristic++;
+    }
+    v.fraction >>= 32;
+    v.fraction_bits = 24;
+    hfp_store_result(env, r1, v, 24, false, false, ra);
+}
+
+static HFPValue hfp_get_ext(CPUS390XState *env, int reg)
+{
+    uint64_t high = *get_freg(env, reg);
+    uint64_t low = *get_freg(env, reg + 2);
+
+    return (HFPValue) {
+        .fraction = ((HFPMagnitude)(high & 0x00ffffffffffffffULL) << 56) |
+                    (low & 0x00ffffffffffffffULL),
+        .characteristic = (high >> 56) & 0x7f,
+        .negative = high >> 63,
+        .fraction_bits = 112,
+    };
+}
+
+static void hfp_put_ext(CPUS390XState *env, int reg, HFPValue v)
+{
+    uint64_t high_fraction = v.fraction >> 56;
+    uint64_t low_fraction = v.fraction;
+    uint64_t sign = (uint64_t)v.negative << 63;
+    int low_characteristic = v.fraction || v.characteristic ?
+                             v.characteristic - 14 : 0;
+
+    *get_freg(env, reg) = sign |
+        ((uint64_t)(v.characteristic & 0x7f) << 56) |
+        (high_fraction & 0x00ffffffffffffffULL);
+    *get_freg(env, reg + 2) = sign |
+        ((uint64_t)(low_characteristic & 0x7f) << 56) |
+        (low_fraction & 0x00ffffffffffffffULL);
+}
+
+static void hfp_store_ext_result(CPUS390XState *env, int reg, HFPValue v,
+                                 bool zero_significance, bool set_cc,
+                                 uintptr_t ra)
+{
+    uint32_t cc;
+
+    if (v.fraction == 0) {
+        v.negative = false;
+        if (zero_significance &&
+            (env->psw.mask & (1ULL << PSW_SHIFT_MASK_PM))) {
+            if (set_cc) {
+                env->cc_op = 0;
+            }
+            hfp_put_ext(env, reg, v);
+            tcg_s390_program_interrupt(env, PGM_HFP_SIGNIFICANCE, ra);
+        }
+        v.characteristic = 0;
+    } else if (v.characteristic < 0) {
+        if (env->psw.mask & (1ULL << (PSW_SHIFT_MASK_PM + 1))) {
+            v.characteristic &= 0x7f;
+            cc = hfp_cc(&v);
+            if (set_cc) {
+                env->cc_op = cc;
+            }
+            hfp_put_ext(env, reg, v);
+            tcg_s390_program_interrupt(env, PGM_HFP_EXP_UNDERFLOW, ra);
+        }
+        v = (HFPValue) { .fraction_bits = 112 };
+    } else if (v.characteristic > 127) {
+        v.characteristic &= 0x7f;
+        cc = hfp_cc(&v);
+        if (set_cc) {
+            env->cc_op = cc;
+        }
+        hfp_put_ext(env, reg, v);
+        tcg_s390_program_interrupt(env, PGM_HFP_EXP_OVERFLOW, ra);
+    }
+    hfp_put_ext(env, reg, v);
+}
+
+/* op: 0 add, 1 subtract, 4 compare. */
+uint32_t HELPER(hfp_ext_binary)(CPUS390XState *env, uint32_t r1,
+                                uint32_t r2, uint32_t op)
+{
+    uintptr_t ra = GETPC();
+    HFPValue result = hfp_add_values(hfp_get_ext(env, r1),
+                                     hfp_get_ext(env, r2), op == 1, true);
+
+    if (op != 4) {
+        hfp_store_ext_result(env, r1, result, true, true, ra);
+    }
+    return hfp_cc(&result);
+}
+
+static void hfp_mul_128(HFPMagnitude a, HFPMagnitude b, uint64_t p[4])
+{
+    uint64_t av[2] = { a, a >> 64 };
+    uint64_t bv[2] = { b, b >> 64 };
+    unsigned int i, j;
+
+    memset(p, 0, 4 * sizeof(*p));
+    for (i = 0; i < 2; i++) {
+        for (j = 0; j < 2; j++) {
+            HFPMagnitude product = (HFPMagnitude)av[i] * bv[j];
+            unsigned int k = i + j;
+            HFPMagnitude sum = (HFPMagnitude)p[k] + (uint64_t)product;
+            uint64_t carry = sum >> 64;
+
+            p[k] = sum;
+            sum = (HFPMagnitude)p[k + 1] + (uint64_t)(product >> 64) + carry;
+            p[k + 1] = sum;
+            carry = sum >> 64;
+            while (carry && ++k + 1 < 4) {
+                sum = (HFPMagnitude)p[k + 1] + carry;
+                p[k + 1] = sum;
+                carry = sum >> 64;
+            }
+        }
+    }
+}
+
+static void hfp_u256_shift_left_4(uint64_t p[4])
+{
+    p[3] = (p[3] << 4) | (p[2] >> 60);
+    p[2] = (p[2] << 4) | (p[1] >> 60);
+    p[1] = (p[1] << 4) | (p[0] >> 60);
+    p[0] <<= 4;
+}
+
+void HELPER(hfp_ext_multiply)(CPUS390XState *env, uint32_t r1,
+                              uint32_t r2, uint32_t src_bits)
+{
+    uintptr_t ra = GETPC();
+    HFPValue a = src_bits == 112 ? hfp_get_ext(env, r1) :
+                 hfp_unpack(hfp_get_reg(env, r1, 56), 56);
+    HFPValue b = src_bits == 112 ? hfp_get_ext(env, r2) :
+                 hfp_unpack(hfp_get_reg(env, r2, 56), 56);
+    HFPValue result = { .fraction_bits = 112 };
+
+    if (a.fraction && b.fraction) {
+        hfp_normalize(&a);
+        hfp_normalize(&b);
+        result.characteristic = a.characteristic + b.characteristic - 64;
+        result.negative = a.negative != b.negative;
+        if (src_bits == 56) {
+            result.fraction = a.fraction * b.fraction;
+            hfp_normalize(&result);
+        } else {
+            uint64_t product[4];
+
+            hfp_mul_128(a.fraction, b.fraction, product);
+            if (!(product[3] & 0x00000000f0000000ULL)) {
+                hfp_u256_shift_left_4(product);
+                result.characteristic--;
+            }
+            result.fraction = ((HFPMagnitude)
+                ((product[2] >> 48) | (product[3] << 16)) << 64) |
+                ((product[1] >> 48) | (product[2] << 16));
+        }
+    }
+    hfp_store_ext_result(env, r1, result, false, false, ra);
+}
+
+void HELPER(hfp_ext_round)(CPUS390XState *env, uint32_t r1, uint32_t r2)
+{
+    uintptr_t ra = GETPC();
+    HFPValue v = hfp_get_ext(env, r2);
+
+    v.fraction += (HFPMagnitude)1 << 55;
+    if (v.fraction >> 112) {
+        v.fraction >>= 4;
+        v.characteristic++;
+    }
+    v.fraction >>= 56;
+    v.fraction_bits = 56;
+    hfp_store_result(env, r1, v, 56, false, false, ra);
+}
+
 uint8_t s390_softfloat_exc_to_ieee(unsigned int exc)
 {
     uint8_t s390_exc = 0;

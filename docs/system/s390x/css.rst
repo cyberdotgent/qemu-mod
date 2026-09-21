@@ -25,7 +25,10 @@ The device number can range from ``0-0xffff``.
 
 If the ``devno`` property is not specified for a device, QEMU will choose the
 next free device number in subchannel set 0, skipping to the next subchannel
-set if no more device numbers are free.
+set if no more device numbers are free. Some emulated device models use a
+model-specific starting number: FBA disks start at ``0200``, ECKD disks at
+``0300``, QETH adapters at ``0400``, tape drives at ``0580``, and 3270
+terminals at ``0700``.
 
 QEMU places a device at the first free subchannel in the specified subchannel
 set. If a device is hotunplugged and later replugged, it may appear at a

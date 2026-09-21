@@ -12,6 +12,7 @@
 #define HW_S390_TOD_H
 
 #include "hw/core/qdev.h"
+#include "qemu/thread.h"
 #include "tcg/s390-tod.h"
 #include "qom/object.h"
 
@@ -36,6 +37,17 @@ struct S390TODState {
     S390TOD base;
     /* Used by KVM to remember if the TOD is stopped and base is valid. */
     bool stopped;
+
+    /*
+     * STORE CLOCK and STORE CLOCK EXTENDED must return globally unique,
+     * correctly ordered values.  TCG host time has coarser resolution than
+     * the architectural 104-bit clock, so retain the most recent value and
+     * advance its extension when necessary.
+     */
+    QemuMutex unique_lock;
+    uint64_t unique_high;
+    uint64_t unique_low;
+    bool unique_valid;
 };
 
 struct S390TODClass {

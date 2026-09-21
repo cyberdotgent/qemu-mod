@@ -820,6 +820,18 @@ static void s390_cpu_model_initfn(Object *obj)
 }
 
 static S390CPUModel s390_qemu_cpu_model;
+static uint8_t s390_kvm_cpu_version = 0xff;
+
+void s390_set_kvm_cpu_version(uint8_t version)
+{
+    g_assert(QTAILQ_EMPTY_RCU(&cpus_queue));
+    s390_kvm_cpu_version = version;
+}
+
+uint8_t s390_get_kvm_cpu_version(void)
+{
+    return s390_kvm_cpu_version;
+}
 
 /* Set the qemu CPU model (on machine initialization). Must not be called
  * once CPUs have been created.

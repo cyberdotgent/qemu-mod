@@ -487,7 +487,8 @@ void HELPER(sacf)(CPUS390XState *env, uint64_t a1)
 {
     HELPER_LOG("%s: %16" PRIx64 "\n", __func__, a1);
 
-    if (!(env->psw.mask & PSW_MASK_DAT)) {
+    if (!(env->psw.mask & PSW_MASK_DAT) ||
+        !(env->cregs[0] & CR0_SECONDARY)) {
         tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
     }
 
@@ -499,6 +500,10 @@ void HELPER(sacf)(CPUS390XState *env, uint64_t a1)
     case 0x100:
         env->psw.mask &= ~PSW_MASK_ASC;
         env->psw.mask |= PSW_ASC_SECONDARY;
+        break;
+    case 0x200:
+        env->psw.mask &= ~PSW_MASK_ASC;
+        env->psw.mask |= PSW_ASC_ACCREG;
         break;
     case 0x300:
         if ((env->psw.mask & PSW_MASK_PSTATE) != 0) {

@@ -117,6 +117,12 @@ typedef enum IOInstEnding {
 } IOInstEnding;
 
 typedef struct SubchDev SubchDev;
+typedef struct S390QdioOps {
+    int (*siga)(SubchDev *sch, uint8_t function, uint32_t output_mask,
+                uint32_t input_mask, uint64_t aob);
+    void (*ssqd)(SubchDev *sch, void *descriptor);
+} S390QdioOps;
+
 struct SubchDev {
     /* channel-subsystem related things: */
     SCHIB curr_status;           /* Needs alignment and thus must come first */
@@ -129,21 +135,32 @@ struct SubchDev {
     hwaddr channel_prog;
     CCW1 last_cmd;
     bool last_cmd_valid;
+    /* TIC execution is synchronous, so this state need not migrate. */
+    bool last_ccw_was_tic;
     bool ccw_fmt_1;
     bool thinint_active;
     uint8_t ccw_no_data_cnt;
-    uint8_t ccw_tic_cnt;
+    uint32_t ccw_tic_cnt;
     uint16_t migrated_schid; /* used for mismatch detection */
     CcwDataStream cds;
     /* transport-provided data: */
     int (*ccw_cb) (SubchDev *, CCW1);
+    bool ccw_cb_first;
+    void (*cancel_cb)(SubchDev *);
+    void (*enable_cb)(SubchDev *);
     void (*disable_cb)(SubchDev *);
     IOInstEnding (*do_subchannel_work) (SubchDev *);
     void (*irb_cb)(SubchDev *, IRB *);
+    void (*status_clear_cb)(SubchDev *);
     SenseId id;
     void *driver_data;
     ESW esw;
+    bool ccw_async_pending;
+    const S390QdioOps *qdio_ops;
 };
+
+/* A virtual device owns the current CCW and will complete it asynchronously. */
+#define CSS_CCW_PENDING (-EINPROGRESS)
 
 static inline void sch_gen_unit_exception(SubchDev *sch)
 {
@@ -203,10 +220,13 @@ void css_subch_assign(uint8_t cssid, uint8_t ssid, uint16_t schid,
 void css_sch_build_virtual_schib(SubchDev *sch, uint8_t chpid, uint8_t type);
 int css_sch_build_schib(SubchDev *sch, CssDevId *dev_id);
 unsigned int css_find_free_chpid(uint8_t cssid);
+unsigned int css_find_virtual_chpid(uint8_t cssid, uint8_t type);
 uint16_t css_build_subchannel_id(SubchDev *sch);
 void copy_scsw_to_guest(SCSW *dest, const SCSW *src);
 void copy_esw_to_guest(ESW *dest, const ESW *src);
 void css_inject_io_interrupt(SubchDev *sch);
+bool css_inject_qdio_pci(SubchDev *sch);
+bool css_generate_unsolicited_io_interrupt(SubchDev *sch, uint8_t dstat);
 void css_reset(void);
 void css_reset_sch(SubchDev *sch);
 void css_crw_add_to_queue(CRW crw);
@@ -219,6 +239,7 @@ void css_generate_css_crws(uint8_t cssid);
 void css_clear_sei_pending(void);
 IOInstEnding s390_ccw_cmd_request(SubchDev *sch);
 IOInstEnding do_subchannel_work_virtual(SubchDev *sub);
+void css_virtual_ccw_complete(SubchDev *sch, int ret);
 IOInstEnding do_subchannel_work_passthrough(SubchDev *sub);
 void build_irb_passthrough(SubchDev *sch, IRB *irb);
 void build_irb_virtual(SubchDev *sch, IRB *irb);
@@ -287,6 +308,16 @@ extern const PropertyInfo css_devid_ro_propinfo;
  * is responsible for unregistering and freeing it.
  */
 SubchDev *css_create_sch(CssDevId bus_id, Error **errp);
+
+/**
+ * Create a subchannel, preferring device numbers at or above @devno_start.
+ *
+ * An explicit @bus_id is handled exactly like css_create_sch(). For an
+ * automatically assigned @bus_id, allocation starts at @devno_start and
+ * wraps after the highest device number.
+ */
+SubchDev *css_create_sch_at(CssDevId bus_id, uint16_t devno_start,
+                            Error **errp);
 
 /** Turn on css migration */
 void css_register_vmstate(void);

@@ -37,6 +37,7 @@
 #define MMU_USER_IDX 0
 
 #define S390_MAX_CPUS 248
+#define S390_TX_MAX_PAGES 8
 
 typedef struct PSW {
     uint64_t mask;
@@ -63,10 +64,20 @@ typedef struct CPUArchState {
     uint32_t fpc;          /* floating-point control register */
     uint32_t cc_op;
     bool bpbc;             /* branch prediction blocking */
+    uint8_t tx_depth;      /* transactional-execution nesting depth */
+    bool tx_constrained;   /* current transaction is constrained */
+    uint8_t tx_gprmask;    /* even/odd GPR-pair restoration mask */
+    uint8_t tx_page_count;
+    uint64_t tx_start_addr;
+    uint64_t tx_saved_regs[16];
+    hwaddr tx_pages[S390_TX_MAX_PAGES];
+    uint8_t *tx_page_data[S390_TX_MAX_PAGES];
 
     float_status fpu_status; /* passed to softfloat lib */
 
     PSW psw;
+    PSW captured_z_psw;
+    bool esa_mode;
 
     S390CrashReason crash_reason;
 
@@ -112,6 +123,7 @@ typedef struct CPUArchState {
 
 #if !defined(CONFIG_USER_ONLY)
     uint64_t tlb_fill_tec;   /* translation exception code during tlb_fill */
+    uint8_t tlb_fill_arn;    /* access register used during tlb_fill */
     int tlb_fill_exc;        /* exception number seen during tlb_fill */
 #endif
 
@@ -220,6 +232,7 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_SPECIAL_OP                  0x0013
 #define PGM_OPERAND                     0x0015
 #define PGM_TRACE_TABLE                 0x0016
+#define PGM_TRANSACTION_CONSTRAINT      0x0018
 #define PGM_VECTOR_PROCESSING           0x001b
 #define PGM_SPACE_SWITCH                0x001c
 #define PGM_HFP_SQRT                    0x001d
@@ -230,12 +243,16 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_EX_TRANS                    0x0023
 #define PGM_PRIM_AUTH                   0x0024
 #define PGM_SEC_AUTH                    0x0025
+#define PGM_LFX_TRANS                   0x0026
+#define PGM_LSX_TRANS                   0x0027
 #define PGM_ALET_SPEC                   0x0028
 #define PGM_ALEN_SPEC                   0x0029
 #define PGM_ALE_SEQ                     0x002a
 #define PGM_ASTE_VALID                  0x002b
 #define PGM_ASTE_SEQ                    0x002c
 #define PGM_EXT_AUTH                    0x002d
+#define PGM_LSTE_SEQ                    0x002e
+#define PGM_ASTE_INSTANCE               0x002f
 #define PGM_STACK_FULL                  0x0030
 #define PGM_STACK_EMPTY                 0x0031
 #define PGM_STACK_SPEC                  0x0032
@@ -247,6 +264,7 @@ extern const VMStateDescription vmstate_s390_cpu;
 #define PGM_REG_THIRD_TRANS             0x003b
 #define PGM_MONITOR                     0x0040
 #define PGM_PER                         0x0080
+#define PGM_TXF_EVENT                   0x0200
 #define PGM_CRYPTO                      0x0119
 
 /* External Interrupts */
@@ -353,7 +371,13 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 
 /* Control register 0 bits */
 #define CR0_LOWPROT             0x0000000010000000ULL
+#define CR0_EXT_AUTH            0x0000000008000000ULL
 #define CR0_SECONDARY           0x0000000004000000ULL
+#define CR0_FETCH_PROT_OVERRIDE 0x0000000002000000ULL
+#define CR0_STORE_PROT_OVERRIDE 0x0000000001000000ULL
+#define CR0_ASN_LX_REUSE        0x0000000000080000ULL
+#define CR0_TRANSACTIONAL_EXE   0x0080000000000000ULL
+#define CR0_ASF                 0x0000000000010000ULL
 #define CR0_EDAT                0x0000000000800000ULL
 #define CR0_AFP                 0x0000000000040000ULL
 #define CR0_VECTOR              0x0000000000020000ULL
@@ -366,12 +390,27 @@ QEMU_BUILD_BUG_ON(FLAG_MASK_DAT != PSW_MASK_DAT >> FLAG_MASK_PSW_SHIFT);
 
 /* Control register 14 bits */
 #define CR14_CHANNEL_REPORT_SC  0x0000000010000000ULL
+#define CR14_ASN_TRANSLATION    0x0000000000080000ULL
+#define CR14_ASN_FIRST_ORIGIN   0x000000000007ffffULL
+
+/* Address-space-control-element bits */
+#define ASCE_SPACE_SWITCH_EVENT 0x0000000000000040ULL
+#define TEA_SPACE_SWITCH_EVENT  0x0000000080000000ULL
+
+/* Control register 12 bits */
+#define CR12_BRANCH_TRACE       0x8000000000000000ULL
+#define CR12_MODE_TRACE         0x4000000000000000ULL
+#define CR12_TRACE_ENTRY_MASK   0x3ffffffffffffffcULL
+#define CR12_ASN_TRACE          0x0000000000000002ULL
+#define CR12_EXPLICIT_TRACE     0x0000000000000001ULL
 
 /* MMU */
 #define MMU_PRIMARY_IDX         0
 #define MMU_SECONDARY_IDX       1
 #define MMU_HOME_IDX            2
 #define MMU_REAL_IDX            3
+#define MMU_ACCREG_IDX_BASE     4
+#define MMU_ACCREG_IDX(arn)     (MMU_ACCREG_IDX_BASE + (arn))
 
 static inline int s390x_env_mmu_index(CPUS390XState *env, bool ifetch)
 {
@@ -397,7 +436,7 @@ static inline int s390x_env_mmu_index(CPUS390XState *env, bool ifetch)
     case PSW_ASC_HOME:
         return MMU_HOME_IDX;
     case PSW_ASC_ACCREG:
-        /* Fallthrough: access register mode is not yet supported */
+        return MMU_ACCREG_IDX(0);
     default:
         abort();
     }

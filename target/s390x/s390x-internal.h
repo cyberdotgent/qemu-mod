@@ -220,7 +220,14 @@ static inline hwaddr decode_basedisp_s(CPUS390XState *env, uint32_t ipb,
         *ar = reg;
     }
 
-    return addr;
+    /*
+     * S-format I/O instructions use an ordinary effective address.  As for
+     * addresses formed by translated instructions, wrap the base/displacement
+     * sum according to the current addressing mode.  In particular, bits
+     * 0-31 of a z/Architecture GPR remain unchanged in 24- and 31-bit mode
+     * and must not accidentally become part of the effective address.
+     */
+    return wrap_address(env, addr);
 }
 
 /* Base/displacement are at the same locations. */
@@ -324,6 +331,12 @@ void s390_handle_wait(S390CPU *cpu);
 hwaddr s390_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
 LowCore *cpu_map_lowcore(CPUS390XState *env);
 void cpu_unmap_lowcore(CPUS390XState *env, LowCore *lowcore);
+void s390_lowcore_store_psw(CPUS390XState *env, LowCore *lowcore,
+                            size_t z_offset, size_t esa_offset,
+                            uint64_t mask, uint64_t addr);
+void s390_lowcore_load_psw(CPUS390XState *env, const LowCore *lowcore,
+                           size_t z_offset, size_t esa_offset,
+                           uint64_t *mask, uint64_t *addr);
 #endif /* CONFIG_USER_ONLY */
 
 
@@ -354,11 +367,13 @@ void ioinst_handle_msch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
                         uintptr_t ra);
 void ioinst_handle_ssch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
                         uintptr_t ra);
+void ioinst_handle_stcps(S390CPU *cpu, uint32_t ipb, uintptr_t ra);
 void ioinst_handle_stcrw(S390CPU *cpu, uint32_t ipb, uintptr_t ra);
 void ioinst_handle_stsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
                          uintptr_t ra);
 int ioinst_handle_tsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb, uintptr_t ra);
 void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra);
+void ioinst_handle_siga(S390CPU *cpu, uintptr_t ra);
 void ioinst_handle_schm(S390CPU *cpu, uint64_t reg1, uint64_t reg2,
                         uint32_t ipb, uintptr_t ra);
 void ioinst_handle_rsch(S390CPU *cpu, uint64_t reg1, uintptr_t ra);
@@ -377,14 +392,37 @@ hwaddr mmu_real2abs(CPUS390XState *env, hwaddr raddr);
 bool mmu_absolute_addr_valid(hwaddr addr, bool is_write);
 /* Special access mode only valid for mmu_translate() */
 #define MMU_S390_LRA        -1
+#define MMU_S390_STRAG      -2
+#define MMU_S390_TPROT      -3
 int mmu_translate(CPUS390XState *env, vaddr vaddr, int rw, uint64_t asc,
-                  hwaddr *raddr, int *flags, uint64_t *tec);
+                  hwaddr *raddr, int *flags, uint64_t *tec, int *lra_cc);
+int mmu_translate_with_key(CPUS390XState *env, vaddr vaddr, int rw,
+                           uint64_t asc, int access_key, hwaddr *raddr,
+                           int *flags, uint64_t *tec, int *lra_cc);
+int mmu_translate_real_with_key(CPUS390XState *env, hwaddr raddr, int rw,
+                                int access_key, hwaddr *addr, int *flags,
+                                uint64_t *tec);
 int mmu_translate_real(CPUS390XState *env, hwaddr raddr, int rw,
                        hwaddr *addr, int *flags, uint64_t *tec);
+int s390_tprot(CPUS390XState *env, vaddr addr, uint64_t asc, uint8_t access_key,
+               uint64_t *tec);
+void s390_tx_begin(CPUS390XState *env, uint64_t start_addr, uint8_t gprmask);
+void s390_tx_commit(CPUS390XState *env);
+void s390_tx_abort(CPUS390XState *env);
+void s390_tx_reset(CPUS390XState *env);
+int s390_tx_track_page(CPUS390XState *env, hwaddr page);
+int s390_mmu_translate_alet(CPUS390XState *env, uint32_t alet, uint16_t eax,
+                            int rw, bool special_art, uint64_t *asce,
+                            bool *fetch_only, uint32_t *aste_origin,
+                            uint32_t aste_words[16]);
 
 
 /* misc_helper.c */
+bool handle_diag_080(CPUS390XState *env, uint64_t r1, uint64_t r3,
+                     uintptr_t ra);
 int handle_diag_288(CPUS390XState *env, uint64_t r1, uint64_t r3);
+bool handle_diag_204(CPUS390XState *env, uint64_t r1, uint64_t r3,
+                     uintptr_t ra);
 /* Return whether a CPU reset is pending */
 bool handle_diag_308(CPUS390XState *env, uint64_t r1, uint64_t r3,
                      uintptr_t ra);

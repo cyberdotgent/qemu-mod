@@ -24,7 +24,12 @@ or vfio-ap is also available.
 .. toctree::
    s390x/vfio-ap
    s390x/css
+   s390x/3215
    s390x/3270
+   s390x/fba
+   s390x/3590
+   s390x/3390
+   s390x/qeth
    s390x/vfio-ccw
    s390x/pcidevices
 

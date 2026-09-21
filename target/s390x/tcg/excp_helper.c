@@ -23,6 +23,7 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
+#include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-loop.h"
 #include "s390x-internal.h"
@@ -133,6 +134,10 @@ void s390_cpu_record_sigbus(CPUState *cs, vaddr address,
 
 static inline uint64_t cpu_mmu_idx_to_asc(int mmu_idx)
 {
+    if (mmu_idx >= MMU_ACCREG_IDX_BASE) {
+        return PSW_ASC_ACCREG | (mmu_idx - MMU_ACCREG_IDX_BASE);
+    }
+
     switch (mmu_idx) {
     case MMU_PRIMARY_IDX:
         return PSW_ASC_PRIMARY;
@@ -160,13 +165,14 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     vaddr = address;
 
-    if (mmu_idx < MMU_REAL_IDX) {
+    if (mmu_idx < MMU_REAL_IDX || mmu_idx >= MMU_ACCREG_IDX_BASE) {
         asc = cpu_mmu_idx_to_asc(mmu_idx);
         /* 31-Bit mode */
         if (!(env->psw.mask & PSW_MASK_64)) {
             vaddr &= 0x7fffffff;
         }
-        excp = mmu_translate(env, vaddr, access_type, asc, &raddr, &prot, &tec);
+        excp = mmu_translate(env, vaddr, access_type, asc, &raddr, &prot, &tec,
+                             NULL);
     } else if (mmu_idx == MMU_REAL_IDX) {
         /* 31-Bit mode */
         if (!(env->psw.mask & PSW_MASK_64)) {
@@ -177,8 +183,22 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         g_assert_not_reached();
     }
 
-    env->tlb_fill_exc = excp;
-    env->tlb_fill_tec = tec;
+    if (!excp && access_type == MMU_DATA_STORE && env->tx_depth) {
+        excp = s390_tx_track_page(env, raddr);
+        if (excp) {
+            tec = vaddr & TARGET_PAGE_MASK;
+        }
+    }
+    if (!excp && env->tx_depth && access_type != MMU_DATA_STORE) {
+        /*
+         * The s390 TLB is unified, so an instruction or load fill can make
+         * the same page writable.  Keep such entries read-only while a
+         * transaction is active; the first store then faults back through
+         * this function and snapshots the page before installing write
+         * access.
+         */
+        prot &= ~PAGE_WRITE;
+    }
 
     if (!excp) {
         qemu_log_mask(CPU_LOG_MMU,
@@ -188,6 +208,18 @@ bool s390_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                      mmu_idx, TARGET_PAGE_SIZE);
         return true;
     }
+
+    /*
+     * Preserve the metadata of a pending translation exception.  A
+     * successful fill can occur while TCG unwinds the faulting access; it
+     * must not clear the exception or replace its TEC with an uninitialized
+     * success-path value before the interruption is delivered.
+     */
+    env->tlb_fill_exc = excp;
+    env->tlb_fill_tec = tec;
+    env->tlb_fill_arn = mmu_idx >= MMU_ACCREG_IDX_BASE ?
+                        mmu_idx - MMU_ACCREG_IDX_BASE : 0;
+
     if (probe) {
         return false;
     }
@@ -208,13 +240,21 @@ static void do_program_interrupt(CPUS390XState *env)
     uint64_t mask, addr;
     LowCore *lowcore;
     int ilen = env->int_pgm_ilen;
+    int code;
     bool set_trans_exc_code = false;
     bool advance = false;
 
-    assert((env->int_pgm_code == PGM_SPECIFICATION && ilen == 0) ||
+    if (env->tx_depth) {
+        s390_tx_abort(env);
+        env->int_pgm_code |= PGM_TXF_EVENT;
+    }
+    code = env->int_pgm_code & 0xff;
+
+    assert(((code == PGM_SPECIFICATION ||
+             code == PGM_SPACE_SWITCH) && ilen == 0) ||
            ilen == 2 || ilen == 4 || ilen == 6);
 
-    switch (env->int_pgm_code) {
+    switch (code) {
     case PGM_PER:
         /* advance already handled */
         break;
@@ -224,11 +264,33 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_REG_THIRD_TRANS:
     case PGM_SEGMENT_TRANS:
     case PGM_PAGE_TRANS:
-        assert(env->int_pgm_code == env->tlb_fill_exc);
+        assert(code == env->tlb_fill_exc);
         set_trans_exc_code = true;
         break;
+    case PGM_SPACE_SWITCH:
+    case PGM_AFX_TRANS:
+    case PGM_ASX_TRANS:
+    case PGM_LX_TRANS:
+    case PGM_EX_TRANS:
+    case PGM_PRIM_AUTH:
+    case PGM_SEC_AUTH:
+    case PGM_LFX_TRANS:
+    case PGM_LSX_TRANS:
+    case PGM_ALEN_SPEC:
+    case PGM_ALE_SEQ:
+    case PGM_ASTE_VALID:
+    case PGM_ASTE_SEQ:
+    case PGM_EXT_AUTH:
+    case PGM_LSTE_SEQ:
+    case PGM_ASTE_INSTANCE:
+        set_trans_exc_code = true;
+        break;
+    case PGM_ALET_SPEC:
+        set_trans_exc_code = true;
+        advance = true;
+        break;
     case PGM_PROTECTION:
-        assert(env->int_pgm_code == env->tlb_fill_exc);
+        assert(code == env->tlb_fill_exc);
         set_trans_exc_code = true;
         advance = true;
         break;
@@ -251,14 +313,13 @@ static void do_program_interrupt(CPUS390XState *env)
     case PGM_OPERAND:
     case PGM_HFP_SQRT:
     case PGM_PC_TRANS_SPEC:
-    case PGM_ALET_SPEC:
     case PGM_MONITOR:
         advance = true;
         break;
     }
 
     /* advance the PSW if our exception is not nullifying */
-    if (advance) {
+    if (advance && !(env->int_pgm_code & PGM_TXF_EVENT)) {
         env->psw.addr += ilen;
     }
 
@@ -266,8 +327,27 @@ static void do_program_interrupt(CPUS390XState *env)
                   "%s: code=0x%x ilen=%d psw: %" PRIx64 " %" PRIx64 "\n",
                   __func__, env->int_pgm_code, ilen, env->psw.mask,
                   env->psw.addr);
-
     lowcore = cpu_map_lowcore(env);
+
+    switch (code) {
+    case PGM_ASCE_TYPE:
+    case PGM_REG_FIRST_TRANS:
+    case PGM_REG_SEC_TRANS:
+    case PGM_REG_THIRD_TRANS:
+    case PGM_SEGMENT_TRANS:
+    case PGM_PAGE_TRANS:
+    case PGM_ALET_SPEC:
+    case PGM_ALEN_SPEC:
+    case PGM_ALE_SEQ:
+    case PGM_ASTE_VALID:
+    case PGM_ASTE_SEQ:
+    case PGM_EXT_AUTH:
+    case PGM_PROTECTION:
+        lowcore->exc_access_id = env->tlb_fill_arn;
+        break;
+    default:
+        break;
+    }
 
     /* Signal PER events with the exception.  */
     if (env->per_perc_atmid) {
@@ -278,15 +358,21 @@ static void do_program_interrupt(CPUS390XState *env)
     }
 
     if (set_trans_exc_code) {
-        lowcore->trans_exc_code = cpu_to_be64(env->tlb_fill_tec);
+        if (env->esa_mode) {
+            stl_be_p((uint8_t *)lowcore + 0x090, env->tlb_fill_tec);
+        } else {
+            lowcore->trans_exc_code = cpu_to_be64(env->tlb_fill_tec);
+        }
     }
 
     lowcore->pgm_ilen = cpu_to_be16(ilen);
     lowcore->pgm_code = cpu_to_be16(env->int_pgm_code);
-    lowcore->program_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->program_old_psw.addr = cpu_to_be64(env->psw.addr);
-    mask = be64_to_cpu(lowcore->program_new_psw.mask);
-    addr = be64_to_cpu(lowcore->program_new_psw.addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, program_old_psw), 0x028,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, program_new_psw), 0x068,
+                          &mask, &addr);
     lowcore->per_breaking_event_addr = cpu_to_be64(env->gbea);
 
     cpu_unmap_lowcore(env, lowcore);
@@ -303,10 +389,13 @@ static void do_svc_interrupt(CPUS390XState *env)
 
     lowcore->svc_code = cpu_to_be16(env->int_svc_code);
     lowcore->svc_ilen = cpu_to_be16(env->int_svc_ilen);
-    lowcore->svc_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->svc_old_psw.addr = cpu_to_be64(env->psw.addr + env->int_svc_ilen);
-    mask = be64_to_cpu(lowcore->svc_new_psw.mask);
-    addr = be64_to_cpu(lowcore->svc_new_psw.addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, svc_old_psw), 0x020,
+                           s390_cpu_get_psw_mask(env),
+                           env->psw.addr + env->int_svc_ilen);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, svc_new_psw), 0x060,
+                          &mask, &addr);
 
     cpu_unmap_lowcore(env, lowcore);
 
@@ -359,12 +448,18 @@ static void do_ext_interrupt(CPUS390XState *env)
                (env->cregs[0] & CR0_CKC_SC)) {
         lowcore->ext_int_code = cpu_to_be16(EXT_CLOCK_COMP);
         lowcore->cpu_addr = 0;
-        env->pending_int &= ~INTERRUPT_EXT_CLOCK_COMPARATOR;
+        /*
+         * The clock-comparator condition remains pending while the TOD
+         * clock exceeds the comparator.  SCKC clears or reschedules it.
+         */
     } else if ((env->pending_int & INTERRUPT_EXT_CPU_TIMER) &&
                (env->cregs[0] & CR0_CPU_TIMER_SC)) {
         lowcore->ext_int_code = cpu_to_be16(EXT_CPU_TIMER);
         lowcore->cpu_addr = 0;
-        env->pending_int &= ~INTERRUPT_EXT_CPU_TIMER;
+        /*
+         * The CPU-timer condition remains pending while the timer is
+         * negative.  SPT clears or reschedules it.
+         */
     } else if (qemu_s390_flic_has_service(flic) &&
                (env->cregs[0] & CR0_SERVICE_SC)) {
         uint32_t param;
@@ -377,10 +472,12 @@ static void do_ext_interrupt(CPUS390XState *env)
         g_assert_not_reached();
     }
 
-    mask = be64_to_cpu(lowcore->external_new_psw.mask);
-    addr = be64_to_cpu(lowcore->external_new_psw.addr);
-    lowcore->external_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->external_old_psw.addr = cpu_to_be64(env->psw.addr);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, external_new_psw), 0x058,
+                          &mask, &addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, external_old_psw), 0x018,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
 
     cpu_unmap_lowcore(env, lowcore);
 
@@ -404,10 +501,12 @@ static void do_io_interrupt(CPUS390XState *env)
     lowcore->subchannel_nr = cpu_to_be16(io->nr);
     lowcore->io_int_parm = cpu_to_be32(io->parm);
     lowcore->io_int_word = cpu_to_be32(io->word);
-    lowcore->io_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->io_old_psw.addr = cpu_to_be64(env->psw.addr);
-    mask = be64_to_cpu(lowcore->io_new_psw.mask);
-    addr = be64_to_cpu(lowcore->io_new_psw.addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, io_old_psw), 0x038,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, io_new_psw), 0x078,
+                          &mask, &addr);
 
     cpu_unmap_lowcore(env, lowcore);
     g_free(io);
@@ -490,10 +589,12 @@ static void do_mchk_interrupt(CPUS390XState *env)
     lowcore->clock_comp_save_area = cpu_to_be64(env->ckc >> 8);
 
     lowcore->mcic = cpu_to_be64(mcic);
-    lowcore->mcck_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->mcck_old_psw.addr = cpu_to_be64(env->psw.addr);
-    mask = be64_to_cpu(lowcore->mcck_new_psw.mask);
-    addr = be64_to_cpu(lowcore->mcck_new_psw.addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, mcck_old_psw), 0x030,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, mcck_new_psw), 0x070,
+                          &mask, &addr);
 
     cpu_unmap_lowcore(env, lowcore);
 
@@ -595,6 +696,14 @@ bool s390_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         if (env->ex_value) {
             /* Execution of the target insn is indivisible from
                the parent EXECUTE insn.  */
+            return false;
+        }
+        if (env->tx_constrained) {
+            /*
+             * A constrained transaction is guaranteed to complete.  On the
+             * supported one-vCPU TCG path there can be no CPU conflict, so
+             * defer asynchronous interruptions until TEND.
+             */
             return false;
         }
         if (s390_cpu_has_int(cpu)) {

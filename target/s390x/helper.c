@@ -63,7 +63,8 @@ hwaddr s390_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
      * We want to read code even if IEP is active. Use MMU_DATA_LOAD instead
      * of MMU_INST_FETCH.
      */
-    if (mmu_translate(env, page, MMU_DATA_LOAD, asc, &raddr, &prot, &tec)) {
+    if (mmu_translate(env, page, MMU_DATA_LOAD, asc, &raddr, &prot, &tec,
+                      NULL)) {
         return -1;
     }
     raddr += (addr & ~TARGET_PAGE_MASK);
@@ -115,6 +116,41 @@ void cpu_unmap_lowcore(CPUS390XState *env, LowCore *lowcore)
     address_space_unmap(as, lowcore, sizeof(LowCore), true, sizeof(LowCore));
 }
 
+void s390_lowcore_store_psw(CPUS390XState *env, LowCore *lowcore,
+                            size_t z_offset, size_t esa_offset,
+                            uint64_t mask, uint64_t addr)
+{
+    uint8_t *p = (uint8_t *)lowcore;
+
+    if (env->esa_mode) {
+        uint64_t short_psw = ((mask ^ PSW_MASK_SHORTPSW) &
+                              PSW_MASK_SHORT_CTRL) |
+                             (addr & PSW_MASK_SHORT_ADDR);
+
+        stq_be_p(p + esa_offset, short_psw);
+    } else {
+        stq_be_p(p + z_offset, mask);
+        stq_be_p(p + z_offset + 8, addr);
+    }
+}
+
+void s390_lowcore_load_psw(CPUS390XState *env, const LowCore *lowcore,
+                           size_t z_offset, size_t esa_offset,
+                           uint64_t *mask, uint64_t *addr)
+{
+    const uint8_t *p = (const uint8_t *)lowcore;
+
+    if (env->esa_mode) {
+        uint64_t short_psw = ldq_be_p(p + esa_offset);
+
+        *mask = (short_psw & PSW_MASK_SHORT_CTRL) ^ PSW_MASK_SHORTPSW;
+        *addr = short_psw & PSW_MASK_SHORT_ADDR;
+    } else {
+        *mask = ldq_be_p(p + z_offset);
+        *addr = ldq_be_p(p + z_offset + 8);
+    }
+}
+
 void do_restart_interrupt(CPUS390XState *env)
 {
     uint64_t mask, addr;
@@ -122,10 +158,12 @@ void do_restart_interrupt(CPUS390XState *env)
 
     lowcore = cpu_map_lowcore(env);
 
-    lowcore->restart_old_psw.mask = cpu_to_be64(s390_cpu_get_psw_mask(env));
-    lowcore->restart_old_psw.addr = cpu_to_be64(env->psw.addr);
-    mask = be64_to_cpu(lowcore->restart_new_psw.mask);
-    addr = be64_to_cpu(lowcore->restart_new_psw.addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, restart_old_psw), 0x008,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, restart_new_psw), 0x000,
+                          &mask, &addr);
 
     cpu_unmap_lowcore(env, lowcore);
     env->pending_int &= ~INTERRUPT_RESTART;

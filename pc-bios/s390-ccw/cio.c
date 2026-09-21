@@ -20,7 +20,8 @@
 
 static char chsc_page[PAGE_SIZE] __attribute__((__aligned__(PAGE_SIZE)));
 
-static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb);
+static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, bool c64,
+                    Irb *irb);
 
 int enable_mss_facility(void)
 {
@@ -76,7 +77,7 @@ int basic_sense(SubChannelId schid, uint16_t cutype, void *sense_data,
     };
     Irb irb;
 
-    return __do_cio(schid, ptr2u32(&senseCcw), CCW_FMT1, &irb);
+    return __do_cio(schid, ptr2u32(&senseCcw), CCW_FMT1, true, &irb);
 }
 
 static bool irb_error(Irb *irb)
@@ -307,16 +308,17 @@ static void print_irb_err(Irb *irb)
  * Returns 0 on success, -1 if unexpected status pending and we need to retry,
  * otherwise returns condition code from ssch/tsch for error cases.
  */
-static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb)
+static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, bool c64,
+                    Irb *irb)
 {
     /*
-     * QEMU's CIO implementation requires prefetch and 64-bit idaws. We
-     * allow all paths.
+     * QEMU's CIO implementation requires prefetch.  The ORB selects the
+     * IDAW format used by the channel program.  We allow all paths.
      */
     CmdOrb orb = {
         .fmt = fmt,
         .pfch = 1,
-        .c64 = 1,
+        .c64 = c64,
         .lpm = 0xFF,
         .cpa = ccw_addr,
     };
@@ -340,7 +342,32 @@ static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb)
         return rc;
     }
 
-    consume_io_int();
+    while (true) {
+        SubChannelId interrupt_schid;
+        Irb unexpected_irb;
+
+        consume_io_int();
+        if (lowcore->subchannel_id == schid.sch_id &&
+            lowcore->subchannel_nr == schid.sch_no) {
+            break;
+        }
+
+        /*
+         * Firmware enables every I/O-interruption subclass while waiting for
+         * a synchronous CCW.  A different enabled device can therefore
+         * interrupt first, for example when a user presses Enter on a 3270
+         * during IPL.  Clear that subchannel's pending status and continue
+         * waiting for the CCW we actually started.
+         *
+         * Adapter interrupts have no subchannel status to clear.
+         */
+        if (lowcore->io_int_word & IO_INT_WORD_AI) {
+            continue;
+        }
+        interrupt_schid.sch_id = lowcore->subchannel_id;
+        interrupt_schid.sch_no = lowcore->subchannel_nr;
+        tsch(interrupt_schid, &unexpected_irb);
+    }
 
     /* collect status */
     rc = tsch(schid, irb);
@@ -367,14 +394,15 @@ static int __do_cio(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb)
  *
  * Returns non-zero on error.
  */
-int do_cio(SubChannelId schid, uint16_t cutype, uint32_t ccw_addr, int fmt)
+static int do_cio_internal(SubChannelId schid, uint16_t cutype,
+                           uint32_t ccw_addr, int fmt, bool c64)
 {
     Irb irb = {};
     SenseDataEckdDasd sd;
     int rc, retries = 0;
 
     while (true) {
-        rc = __do_cio(schid, ccw_addr, fmt, &irb);
+        rc = __do_cio(schid, ccw_addr, fmt, c64, &irb);
 
         if (rc == -1) {
             retries++;
@@ -419,4 +447,25 @@ int do_cio(SubChannelId schid, uint16_t cutype, uint32_t ccw_addr, int fmt)
     }
 
     return rc;
+}
+
+int do_cio(SubChannelId schid, uint16_t cutype, uint32_t ccw_addr, int fmt)
+{
+    return do_cio_internal(schid, cutype, ccw_addr, fmt, true);
+}
+
+int do_cio_raw(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb)
+{
+    int rc;
+
+    do {
+        rc = __do_cio(schid, ccw_addr, fmt, true, irb);
+    } while (rc == -1);
+    return rc;
+}
+
+int do_cio_32bit_ida(SubChannelId schid, uint16_t cutype,
+                     uint32_t ccw_addr, int fmt)
+{
+    return do_cio_internal(schid, cutype, ccw_addr, fmt, false);
 }

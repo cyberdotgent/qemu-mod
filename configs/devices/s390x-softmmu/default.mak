@@ -3,6 +3,7 @@
 # Uncomment the following lines to disable these optional devices:
 #
 #CONFIG_TERMINAL3270=n
+#CONFIG_TERMINAL3215=n
 #CONFIG_VFIO_AP=n
 #CONFIG_VFIO_CCW=n
 #CONFIG_VIRTIO_PCI=n

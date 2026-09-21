@@ -18,6 +18,22 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/3270-ccw.h"
 
+#define TERMINAL3270_AUTO_DEVNO 0x0700
+#define TERMINAL3270_AUTO_CHPID 0xffff
+
+static const Property emulated_ccw_3270_properties[] = {
+    DEFINE_PROP_UINT16("chpid", EmulatedCcw3270Device, chpid,
+                       TERMINAL3270_AUTO_CHPID),
+    DEFINE_PROP_UINT16("control-unit-type", EmulatedCcw3270Device, cu_type,
+                       EMULATED_CCW_3270_CU_TYPE),
+    DEFINE_PROP_UINT8("control-unit-model", EmulatedCcw3270Device, cu_model,
+                      EMULATED_CCW_3270_CU_MODEL),
+    DEFINE_PROP_UINT16("device-type", EmulatedCcw3270Device, dev_type,
+                       EMULATED_CCW_3270_DEV_TYPE),
+    DEFINE_PROP_UINT8("device-model", EmulatedCcw3270Device, dev_model,
+                      EMULATED_CCW_3270_DEV_MODEL),
+};
+
 /* Handle READ ccw commands from guest */
 static int handle_payload_3270_read(EmulatedCcw3270Device *dev, CCW1 *ccw)
 {
@@ -25,11 +41,15 @@ static int handle_payload_3270_read(EmulatedCcw3270Device *dev, CCW1 *ccw)
     CcwDevice *ccw_dev = CCW_DEVICE(dev);
     int len;
 
-    if (!ccw->cda) {
+    /* SKIP suppresses storage references, so the CDA is not inspected. */
+    if (!ccw->cda && !(ccw->flags & CCW_FLAG_SKIP)) {
         return -EFAULT;
     }
 
-    len = ck->read_payload_3270(dev);
+    len = ck->read_payload_3270(dev, ccw);
+    if (len == CSS_CCW_PENDING) {
+        return len;
+    }
     if (len < 0) {
         return len;
     }
@@ -45,14 +65,17 @@ static int handle_payload_3270_write(EmulatedCcw3270Device *dev, CCW1 *ccw)
     CcwDevice *ccw_dev = CCW_DEVICE(dev);
     int len;
 
-    if (!ccw->cda) {
+    if (ccw->count && !ccw->cda && ccw->cmd_code != TC_EAU &&
+        ccw->cmd_code != TC_SELRM && ccw->cmd_code != TC_SELRB &&
+        ccw->cmd_code != TC_SELRMP && ccw->cmd_code != TC_SELRBP &&
+        ccw->cmd_code != TC_SELWRITE) {
         return -EFAULT;
     }
 
-    len = ck->write_payload_3270(dev, ccw->cmd_code);
+    len = ck->write_payload_3270(dev, ccw);
 
-    if (len <= 0) {
-        return len ? len : -EIO;
+    if (len < 0) {
+        return len;
     }
 
     ccw_dev->sch->curr_status.scsw.count = ccw->count - len;
@@ -63,12 +86,24 @@ static int emulated_ccw_3270_cb(SubchDev *sch, CCW1 ccw)
 {
     int rc = 0;
     EmulatedCcw3270Device *dev = sch->driver_data;
+    EmulatedCcw3270Class *ck = EMULATED_CCW_3270_GET_CLASS(dev);
 
     switch (ccw.cmd_code) {
+    case TC_NOP:
+    case TC_SENSE:
+    case TC_SENSEID:
+        rc = ck->control_3270 ? ck->control_3270(dev, &ccw) : -ENOSYS;
+        break;
+    case TC_EAU:
     case TC_WRITESF:
     case TC_WRITE:
     case TC_EWRITE:
     case TC_EWRITEA:
+    case TC_SELRM:
+    case TC_SELRB:
+    case TC_SELRMP:
+    case TC_SELRBP:
+    case TC_SELWRITE:
         rc = handle_payload_3270_write(dev, &ccw);
         break;
     case TC_RDBUF:
@@ -84,15 +119,32 @@ static int emulated_ccw_3270_cb(SubchDev *sch, CCW1 ccw)
         /* I/O error, specific devices generate specific conditions */
         SCHIB *schib = &sch->curr_status;
 
+        if (!sch->sense_data[0]) {
+            sch->sense_data[0] = 0x40;    /* intervention-req */
+        }
         sch->curr_status.scsw.dstat = SCSW_DSTAT_UNIT_CHECK;
-        sch->sense_data[0] = 0x40;    /* intervention-req */
+        if (sch->sense_data[0] != 0x40) {
+            sch->curr_status.scsw.dstat |= SCSW_DSTAT_CHANNEL_END |
+                                           SCSW_DSTAT_DEVICE_END;
+        }
         schib->scsw.ctrl &= ~SCSW_ACTL_START_PEND;
         schib->scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;
         schib->scsw.ctrl |= SCSW_STCTL_PRIMARY | SCSW_STCTL_SECONDARY |
                    SCSW_STCTL_ALERT | SCSW_STCTL_STATUS_PEND;
+        schib->scsw.cpa = sch->channel_prog + 8;
     }
 
     return rc;
+}
+
+static void emulated_ccw_3270_cancel(SubchDev *sch)
+{
+    EmulatedCcw3270Device *dev = sch->driver_data;
+    EmulatedCcw3270Class *ck = EMULATED_CCW_3270_GET_CLASS(dev);
+
+    if (ck->cancel) {
+        ck->cancel(dev);
+    }
 }
 
 static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
@@ -105,7 +157,7 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     SubchDev *sch;
     Error *err = NULL;
 
-    sch = css_create_sch(cdev->devno, errp);
+    sch = css_create_sch_at(cdev->devno, TERMINAL3270_AUTO_DEVNO, errp);
     if (!sch) {
         return;
     }
@@ -116,7 +168,12 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
 
     sch->driver_data = dev;
     cdev->sch = sch;
-    chpid = css_find_free_chpid(sch->cssid);
+    /* All emulated 3270 devices in a CSS share their virtual channel path. */
+    chpid = dev->chpid;
+    if (chpid == TERMINAL3270_AUTO_CHPID) {
+        chpid = css_find_virtual_chpid(sch->cssid,
+                                       EMULATED_CCW_3270_CHPID_TYPE);
+    }
 
     if (chpid > MAX_CHPID) {
         error_setg(&err, "No available chpid to use.");
@@ -124,11 +181,17 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     }
 
     sch->id.reserved = 0xff;
-    sch->id.cu_type = EMULATED_CCW_3270_CU_TYPE;
+    sch->id.cu_type = dev->cu_type;
+    sch->id.cu_model = dev->cu_model;
+    sch->id.dev_type = dev->dev_type;
+    sch->id.dev_model = dev->dev_model;
     css_sch_build_virtual_schib(sch, (uint8_t)chpid,
                                 EMULATED_CCW_3270_CHPID_TYPE);
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = emulated_ccw_3270_cb;
+    sch->ccw_cb_first = true;
+    sch->cancel_cb = emulated_ccw_3270_cancel;
+    sch->disable_cb = emulated_ccw_3270_cancel;
     sch->irb_cb = build_irb_virtual;
 
     ck->init(dev, &err);
@@ -156,6 +219,7 @@ static void emulated_ccw_3270_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = emulated_ccw_3270_realize;
     dc->hotpluggable = false;
+    device_class_set_props(dc, emulated_ccw_3270_properties);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 

@@ -34,12 +34,15 @@ static void qemu_s390_tod_set(S390TODState *td, const S390TOD *tod,
 {
     CPUState *cpu;
 
+    qemu_mutex_lock(&td->unique_lock);
     td->base = *tod;
 
     td->base.low -= time2tod(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (td->base.low > tod->low) {
         td->base.high--;
     }
+    td->unique_valid = false;
+    qemu_mutex_unlock(&td->unique_lock);
 
     /*
      * The TOD has been changed and we have to recalculate the CKC values

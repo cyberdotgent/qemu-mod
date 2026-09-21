@@ -53,6 +53,15 @@ static int cpu_pre_save(void *opaque)
     }
 
     if (tcg_enabled()) {
+        /*
+         * Transaction snapshots contain host pointers and are deliberately
+         * not migration state.  Restart an in-flight constrained transaction
+         * at TBEGINC so the migrated architectural state is nontransactional
+         * and guest memory contains no uncommitted writes.
+         */
+        if (cpu->env.tx_depth) {
+            s390_tx_abort(&cpu->env);
+        }
         tcg_s390_tod_updated(CPU(cpu), RUN_ON_CPU_NULL);
     }
 
@@ -254,6 +263,26 @@ static const VMStateDescription vmstate_diag318 = {
     }
 };
 
+static bool esa_mode_needed(void *opaque)
+{
+    S390CPU *cpu = opaque;
+
+    return cpu->env.esa_mode;
+}
+
+static const VMStateDescription vmstate_esa_mode = {
+    .name = "cpu/esa-mode",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esa_mode_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.esa_mode, S390CPU),
+        VMSTATE_UINT64(env.captured_z_psw.mask, S390CPU),
+        VMSTATE_UINT64(env.captured_z_psw.addr, S390CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_s390_cpu = {
     .name = "cpu",
     .post_load = cpu_post_load,
@@ -291,6 +320,7 @@ const VMStateDescription vmstate_s390_cpu = {
         &vmstate_bpbc,
         &vmstate_etoken,
         &vmstate_diag318,
+        &vmstate_esa_mode,
         NULL
     },
 };

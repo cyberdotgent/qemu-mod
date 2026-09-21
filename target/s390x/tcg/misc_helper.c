@@ -27,7 +27,7 @@
 #include "exec/helper-proto.h"
 #include "qemu/timer.h"
 #include "exec/cputlb.h"
-#include "accel/tcg/cpu-ldst-common.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/target_page.h"
@@ -56,6 +56,132 @@
 #define HELPER_LOG(x...)
 #endif
 
+uint64_t HELPER(ecag)(uint64_t address)
+{
+    unsigned int ai = extract64(address, 4, 4);
+    unsigned int li = extract64(address, 1, 3);
+
+    /* Address bits 40-55 are reserved. */
+    if (address & 0xffff00) {
+        return -1;
+    }
+
+    switch (ai) {
+    case 0:
+        /*
+         * Topology summary: cache level 0 is private to this CPU and
+         * cache levels 1-7 are not implemented.
+         */
+        return 0x0400000000000000ULL;
+    case 1:
+        /* Cache-line size for the implemented level 0 cache. */
+        return li == 0 ? 256 : -1;
+    case 2:
+        /* Fictitious 512 KiB total size for the level 0 cache. */
+        return li == 0 ? 256 * 2048 : -1;
+    default:
+        return -1;
+    }
+}
+
+uint32_t HELPER(pfpo)(CPUS390XState *env)
+{
+    uint32_t control = env->regs[0];
+    bool test = control & 0x80000000;
+    unsigned int operation_type = extract32(control, 24, 7);
+    unsigned int rounding_method = extract32(control, 0, 4);
+
+    /*
+     * PFPO permits a machine to implement a subset of the conversion
+     * operations.  TCG currently implements the test-operation interface
+     * and reports every conversion operation as unsupported.
+     */
+    if (operation_type != 1 ||
+        (rounding_method >= 2 && rounding_method <= 7)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+
+    env->regs[1] = deposit64(env->regs[1], 0, 32, 0);
+    if (test) {
+        return 3;
+    }
+
+    tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+}
+
+uint32_t HELPER(svs)(CPUS390XState *env, uint32_t r1)
+{
+    /*
+     * SVS manages the coupling-facility list-notification summary state.
+     * QEMU does not provide list-notification vectors, so the only global
+     * summary state it can expose is the inactive state.  Setting or
+     * resetting that state therefore completes immediately.
+     */
+    switch ((uint32_t)env->regs[1]) {
+    case 1:                         /* set global summary */
+        return 0;
+    case 3:                         /* reset global summary */
+        env->regs[r1 + 1] = 0;      /* no active local summaries */
+        return 0;
+    default:
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+}
+
+/*
+ * In a one-vCPU TCG machine a constrained transaction cannot conflict with
+ * another CPU.  Keep asynchronous interruptions pending until TEND, making
+ * the permitted constrained instruction sequence indivisible.  System TCG
+ * also snapshots first-written pages and selected GPR pairs so a synchronous
+ * constraint or program interruption can roll the transaction back.
+ */
+uint32_t HELPER(tbeginc)(CPUS390XState *env, uint32_t b1, uint32_t i2,
+                         uint64_t start_addr)
+{
+    if (!(env->cregs[0] & CR0_TRANSACTIONAL_EXE)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if (b1 != 0) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, GETPC());
+    }
+    if (env->tx_depth != 0) {
+#ifdef CONFIG_USER_ONLY
+        env->tx_depth = 0;
+        env->tx_constrained = false;
+#else
+        s390_tx_abort(env);
+#endif
+        tcg_s390_program_interrupt(env, PGM_TXF_EVENT |
+                                   PGM_TRANSACTION_CONSTRAINT, GETPC());
+    }
+
+#ifdef CONFIG_USER_ONLY
+    env->tx_depth = 1;
+    env->tx_constrained = true;
+#else
+    s390_tx_begin(env, start_addr, extract32(i2, 8, 8));
+#endif
+    return 0;
+}
+
+uint32_t HELPER(tend)(CPUS390XState *env)
+{
+    if (!(env->cregs[0] & CR0_TRANSACTIONAL_EXE)) {
+        tcg_s390_program_interrupt(env, PGM_SPECIAL_OP, GETPC());
+    }
+    if (env->tx_depth == 0) {
+        return 2;
+    }
+
+#ifdef CONFIG_USER_ONLY
+    env->tx_depth = 0;
+    env->tx_constrained = false;
+#else
+    s390_tx_commit(env);
+#endif
+    return 0;
+}
+
 /* Raise an exception statically from a TB.  */
 void HELPER(exception)(CPUS390XState *env, uint32_t excp)
 {
@@ -77,12 +203,15 @@ uint64_t HELPER(stpt)(CPUS390XState *env)
      */
     return UINT64_MAX - (uint64_t)cpu_get_host_ticks();
 #else
-    return time2tod(env->cputm - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t deadline = env->cputm;
+    int64_t remaining = deadline -
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    return time2tod_signed(remaining);
 #endif
 }
 
-/* Store Clock */
-uint64_t HELPER(stck)(CPUS390XState *env)
+static uint64_t get_tod_clock(CPUS390XState *env)
 {
 #ifdef CONFIG_USER_ONLY
     struct timespec ts;
@@ -102,17 +231,219 @@ uint64_t HELPER(stck)(CPUS390XState *env)
 #endif
 }
 
+#ifdef CONFIG_USER_ONLY
+static __thread uint64_t user_unique_high;
+static __thread uint64_t user_unique_low;
+static __thread bool user_unique_valid;
+#endif
+
+/* Store Clock Fast does not provide the uniqueness guarantee of STCK. */
+uint64_t HELPER(stckf)(CPUS390XState *env)
+{
+    return get_tod_clock(env);
+}
+
+/* Store Clock */
+uint64_t HELPER(stck)(CPUS390XState *env)
+{
+#ifdef CONFIG_USER_ONLY
+    uint64_t clock = get_tod_clock(env);
+
+    if (user_unique_valid && clock <= user_unique_high) {
+        clock = user_unique_high + 1;
+    }
+    user_unique_high = clock;
+    user_unique_low = 0;
+    user_unique_valid = true;
+    return clock;
+#else
+    S390TODState *td = s390_get_todstate();
+    uint64_t clock = get_tod_clock(env);
+
+    qemu_mutex_lock(&td->unique_lock);
+    if (td->unique_valid && clock <= td->unique_high) {
+        clock = td->unique_high + 1;
+    }
+    td->unique_high = clock;
+    td->unique_low = 0;
+    td->unique_valid = true;
+    qemu_mutex_unlock(&td->unique_lock);
+    return clock;
+#endif
+}
+
+#ifdef CONFIG_USER_ONLY
+void HELPER(stcke)(CPUS390XState *env, uint64_t addr, uint32_t mmu_idx)
+{
+    const uint64_t ext_mask = (1ULL << 40) - 1;
+    uint64_t clock = get_tod_clock(env);
+    uint64_t extension;
+    uintptr_t ra = GETPC();
+
+    probe_write_access(env, wrap_address(env, addr), 16, ra);
+    if (!user_unique_valid || clock > user_unique_high) {
+        extension = 1;
+    } else {
+        clock = user_unique_high;
+        extension = (user_unique_low + 1) & ext_mask;
+        if (!extension) {
+            clock++;
+            extension = 1;
+        }
+    }
+    user_unique_high = clock;
+    user_unique_low = extension;
+    user_unique_valid = true;
+
+    cpu_stq_be_mmuidx_ra(env, wrap_address(env, addr), clock >> 8,
+                         mmu_idx, ra);
+    cpu_stq_be_mmuidx_ra(env, wrap_address(env, addr + 8),
+                         (clock << 56) | (extension << 16) | env->todpr,
+                         mmu_idx, ra);
+}
+#endif
+
 #ifndef CONFIG_USER_ONLY
+void HELPER(stcke)(CPUS390XState *env, uint64_t addr, uint32_t mmu_idx)
+{
+    const uint64_t ext_mask = (1ULL << 40) - 1;
+    S390TODState *td = s390_get_todstate();
+    uint64_t clock = get_tod_clock(env);
+    uint64_t extension;
+    uint64_t word0, word1;
+    uintptr_t ra = GETPC();
+
+    /*
+     * STCKE checks the complete 16-byte result area before retrieving the
+     * clock, so an exception on the second doubleword cannot leave a partial
+     * clock value behind.
+     */
+    probe_write_access(env, wrap_address(env, addr), 16, ra);
+
+    qemu_mutex_lock(&td->unique_lock);
+    if (!td->unique_valid || clock > td->unique_high) {
+        extension = 1;
+    } else {
+        clock = td->unique_high;
+        extension = (td->unique_low + 1) & ext_mask;
+        if (!extension) {
+            clock++;
+            extension = 1;
+        }
+    }
+    td->unique_high = clock;
+    td->unique_low = extension;
+    td->unique_valid = true;
+    qemu_mutex_unlock(&td->unique_lock);
+
+    word0 = clock >> 8;
+    word1 = (clock << 56) | (extension << 16) | env->todpr;
+    cpu_stq_be_mmuidx_ra(env, wrap_address(env, addr), word0, mmu_idx, ra);
+    cpu_stq_be_mmuidx_ra(env, wrap_address(env, addr + 8), word1, mmu_idx, ra);
+}
+
+static void ptff_store(CPUS390XState *env, const uint8_t *buf, size_t len,
+                       int mmu_idx, uintptr_t ra)
+{
+    uint64_t addr = env->regs[1];
+    MemOpIdx oi = make_memop_idx(MO_UB, mmu_idx);
+
+    for (size_t i = 0; i < len; i++) {
+        cpu_stb_mmu(env, wrap_address(env, addr + i), buf[i], oi, ra);
+    }
+}
+
+uint32_t HELPER(ptff)(CPUS390XState *env, uint32_t mmu_idx)
+{
+    uint8_t functions[16] = { 0 };
+    uint8_t result[256] = { 0 };
+    uint32_t fc = env->regs[0] & 0x7f;
+    uintptr_t ra = GETPC();
+    uint64_t clock;
+    size_t len;
+
+    if (env->regs[0] & 0x80) {
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+
+    /*
+     * QAF itself is implicit.  Report the query functions implemented by
+     * TCG and installed in the selected CPU model, but do not claim the
+     * steering-control or multiple-epoch functions that TCG cannot perform.
+     */
+    s390_get_feat_block(S390_FEAT_TYPE_PTFF, functions);
+    functions[0] = (functions[0] & 0x7c) | 0x80;
+    memset(functions + 1, 0, sizeof(functions) - 1);
+
+    if (fc != 0 && !test_be_bit(fc, functions)) {
+        if (fc >= 64 && !(env->psw.mask & PSW_MASK_PSTATE)) {
+            return 3;
+        }
+        tcg_s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+    }
+
+    switch (fc) {
+    case 0: /* Query available functions */
+        ptff_store(env, functions, sizeof(functions), mmu_idx, ra);
+        return 0;
+    case 1: /* Query TOD offset */
+        len = 32;
+        break;
+    case 2: /* Query steering information */
+        len = 56;
+        break;
+    case 3: /* Query physical clock */
+        len = 8;
+        break;
+    case 4: /* Query UTC information: all zero when STP is not installed */
+        ptff_store(env, result, sizeof(result), mmu_idx, ra);
+        return 0;
+    case 5: /* Query TOD offset user */
+        len = 40;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    /*
+     * QEMU does not steer its TCG TOD clock separately from the host clock.
+     * Consequently the current TOD value is also its physical-clock value,
+     * while TOD, logical-TOD, epoch, and user offsets are all zero.
+     */
+    clock = HELPER(stckf)(env);
+    stq_be_p(result, clock);
+    ptff_store(env, result, len, mmu_idx, ra);
+    return 0;
+}
+
 /* SCLP service call */
 uint32_t HELPER(servc)(CPUS390XState *env, uint64_t r1, uint64_t r2)
 {
+    /*
+     * SERVC operands are the low 32 bits of the selected general registers.
+     * In particular, ESA/390 callers are free to retain unrelated values in
+     * the high halves.  Passing the full 64-bit SCCB register to the memory
+     * layer turns those values into a spurious addressing exception.
+     */
+    uint32_t sccb = r1;
+    uint32_t code = r2;
+
     bql_lock();
-    int r = sclp_service_call(env_archcpu(env), r1, r2);
+    int r = sclp_service_call(env_archcpu(env), sccb, code);
     bql_unlock();
     if (r < 0) {
         tcg_s390_program_interrupt(env, -r, GETPC());
     }
     return r;
+}
+
+void HELPER(esea)(CPUS390XState *env, uint32_t r1)
+{
+    uint16_t new_eax = extract64(env->regs[r1], 0, 16);
+    uint16_t old_eax = extract64(env->cregs[8], 16, 16);
+
+    env->regs[r1] = deposit64(env->regs[r1], 16, 16, old_eax);
+    env->cregs[8] = deposit64(env->cregs[8], 16, 16, new_eax);
 }
 
 void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
@@ -133,6 +464,18 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
         /* yield */
         r = 0;
         break;
+    case 0x80:
+        /* MSSF service-processor call */
+        bql_lock();
+        handle_diag_080(env, r1, r3, GETPC());
+        bql_unlock();
+        r = 0;
+        break;
+    case 0x204:
+        /* LPAR RMF interface */
+        handle_diag_204(env, r1, r3, GETPC());
+        r = 0;
+        break;
     case 0x308:
         /* ipl */
         bql_lock();
@@ -141,6 +484,19 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
             cpu_loop_exit(CPU(env_archcpu(env)));
         }
         bql_unlock();
+        r = 0;
+        break;
+    case 0x31c:
+        /*
+         * CZAM removable-media notification.  The z/VSE recovery loader
+         * issues subfunction zero after its tape image has been placed in
+         * storage.  There is no action for QEMU to take: the s390-ccw
+         * firmware has already performed that service.
+         */
+        if (env->regs[r3] != 0) {
+            r = -1;
+            break;
+        }
         r = 0;
         break;
     case 0x288:
@@ -212,9 +568,12 @@ static void update_ckc_timer(CPUS390XState *env)
 
         /* nanoseconds */
         time = tod2time(time);
+        if (time < INT64_MAX) {
+            time++;
+        }
     }
 
-    timer_mod(env->tod_timer, time);
+    timer_mod(env->tod_timer, MIN(time, (uint64_t)INT64_MAX));
 }
 
 /* Set Clock Comparator */
@@ -268,16 +627,29 @@ uint64_t HELPER(stckc)(CPUS390XState *env)
 /* Set CPU Timer */
 void HELPER(spt)(CPUS390XState *env, uint64_t time)
 {
-    if (time == -1ULL) {
-        return;
+    int64_t delta = tod2time_signed(time);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t deadline = now + delta;
+    S390CPU *cpu = env_archcpu(env);
+
+    bql_lock();
+    timer_del(env->cpu_timer);
+    env->pending_int &= ~INTERRUPT_EXT_CPU_TIMER;
+    env->cputm = deadline;
+
+    if ((int64_t)time < 0) {
+        cpu_inject_cpu_timer(cpu);
+    } else {
+        /*
+         * The interruption condition starts when the CPU timer is
+         * negative, not when it is zero.  QEMU's virtual timers use
+         * nanosecond granularity, so schedule at the first representable
+         * instant after zero.
+         */
+        timer_mod(env->cpu_timer,
+                  deadline == INT64_MAX ? deadline : deadline + 1);
     }
-
-    /* nanoseconds */
-    time = tod2time(time);
-
-    env->cputm = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + time;
-
-    timer_mod(env->cpu_timer, env->cputm);
+    bql_unlock();
 }
 
 /* Store System Information */
@@ -509,11 +881,29 @@ void HELPER(schm)(CPUS390XState *env, uint64_t r1, uint64_t r2, uint64_t inst)
     bql_unlock();
 }
 
+void HELPER(siga)(CPUS390XState *env)
+{
+    S390CPU *cpu = env_archcpu(env);
+
+    bql_lock();
+    ioinst_handle_siga(cpu, GETPC());
+    bql_unlock();
+}
+
 void HELPER(ssch)(CPUS390XState *env, uint64_t r1, uint64_t inst)
 {
     S390CPU *cpu = env_archcpu(env);
     bql_lock();
     ioinst_handle_ssch(cpu, r1, inst >> 16, GETPC());
+    bql_unlock();
+}
+
+void HELPER(stcps)(CPUS390XState *env, uint64_t inst)
+{
+    S390CPU *cpu = env_archcpu(env);
+
+    bql_lock();
+    ioinst_handle_stcps(cpu, inst >> 16, GETPC());
     bql_unlock();
 }
 

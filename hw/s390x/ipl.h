@@ -22,11 +22,17 @@
 #include "qom/object.h"
 #include "target/s390x/kvm/pv.h"
 
+typedef struct CcwDevice CcwDevice;
+typedef struct S390CcwMachineState S390CcwMachineState;
+
 #define DIAG308_FLAGS_LP_VALID 0x80
 #define MAX_BOOT_DEVS 8 /* Max number of devices that may have a bootindex */
 
 void s390_ipl_convert_loadparm(char *ascii_lp, uint8_t *ebcdic_lp);
 void s390_ipl_fmt_loadparm(uint8_t *loadparm, char *str, Error **errp);
+bool s390_ipl_build_ccw_iplb(CcwDevice *dev, IplParameterBlock *iplb,
+                             Error **errp);
+void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp);
 void s390_rebuild_iplb(uint16_t index, IplParameterBlock *iplb);
 void s390_ipl_update_diag308(IplParameterBlock *iplb);
 int s390_ipl_prepare_pv_header(struct S390PVResponse *pv_resp,
@@ -64,6 +70,7 @@ struct S390IPLState {
     IplParameterBlock iplb_pv;
     QemuIplParameters qipl;
     uint64_t start_addr;
+    uint64_t start_mask;
     uint64_t compat_start_addr;
     uint64_t bios_start_addr;
     uint64_t compat_bios_start_addr;

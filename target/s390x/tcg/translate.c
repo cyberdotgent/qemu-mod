@@ -376,7 +376,7 @@ static inline uint64_t ld_code4(CPUS390XState *env, DisasContext *s,
     return (uint64_t)(uint32_t) translator_ldl_end(env, &s->base, pc, MO_BE);
 }
 
-static int get_mem_index(DisasContext *s)
+static int get_mem_index_by_base(DisasContext *s, int base)
 {
 #ifdef CONFIG_USER_ONLY
     return MMU_USER_IDX;
@@ -392,6 +392,8 @@ static int get_mem_index(DisasContext *s)
         return MMU_SECONDARY_IDX;
     case PSW_ASC_HOME >> FLAG_MASK_PSW_SHIFT:
         return MMU_HOME_IDX;
+    case PSW_ASC_ACCREG >> FLAG_MASK_PSW_SHIFT:
+        return MMU_ACCREG_IDX(base);
     default:
         g_assert_not_reached();
     }
@@ -944,6 +946,23 @@ static int get_field1(const DisasContext *s, enum DisasFieldIndexO o,
     return s->fields.c[c];
 }
 
+static int get_mem_index(DisasContext *s)
+{
+    return get_mem_index_by_base(s,
+                                 have_field(s, b2) ? get_field(s, b2) : 0);
+}
+
+static int get_mem_index1(DisasContext *s)
+{
+    return get_mem_index_by_base(s,
+                                 have_field(s, b1) ? get_field(s, b1) : 0);
+}
+
+static TCGv_i32 get_mem_indices(DisasContext *s)
+{
+    return tcg_constant_i32(get_mem_index1(s) | get_mem_index(s) << 8);
+}
+
 /* Describe the layout of each field in each format.  */
 typedef struct DisasField {
     unsigned int beg:8;
@@ -1038,6 +1057,7 @@ typedef struct {
 #define IF_AFP1     0x0001      /* r1 is a fp reg for HFP/FPS instructions */
 #define IF_AFP2     0x0002      /* r2 is a fp reg for HFP/FPS instructions */
 #define IF_AFP3     0x0004      /* r3 is a fp reg for HFP/FPS instructions */
+#define IF_AFP12    (IF_AFP1 | IF_AFP2)
 #define IF_BFP      0x0008      /* binary floating point instruction */
 #define IF_DFP      0x0010      /* decimal floating point instruction */
 #define IF_PRIV     0x0020      /* privileged instruction */
@@ -1187,6 +1207,74 @@ static DisasJumpType op_abs(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+#ifndef CONFIG_USER_ONLY
+static DisasJumpType op_bakr(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    gen_helper_bakr(dest, tcg_env, tcg_constant_i32(r1),
+                    tcg_constant_i32(r2), tcg_constant_i64(s->pc_tmp));
+    if (r2) {
+        return help_goto_indirect(s, dest);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pr(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pr(tcg_env);
+    return DISAS_NORETURN;
+}
+
+static DisasJumpType do_ereg(DisasContext *s, bool is_64)
+{
+    gen_helper_ereg(tcg_env, tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, r2)),
+                    tcg_constant_i32(is_64));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ereg(DisasContext *s, DisasOps *o)
+{
+    return do_ereg(s, false);
+}
+
+static DisasJumpType op_eregg(DisasContext *s, DisasOps *o)
+{
+    return do_ereg(s, true);
+}
+
+static DisasJumpType op_esta(DisasContext *s, DisasOps *o)
+{
+    gen_helper_esta(cc_op, tcg_env,
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, r2)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_msta(DisasContext *s, DisasOps *o)
+{
+    gen_helper_msta(tcg_env, tcg_constant_i32(get_field(s, r1)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pc(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pc(dest, tcg_env, o->in2, tcg_constant_i64(s->pc_tmp));
+    return help_goto_indirect(s, dest);
+}
+#endif
+
 static DisasJumpType op_absf32(DisasContext *s, DisasOps *o)
 {
     tcg_gen_andi_i64(o->out, o->in2, 0x7fffffffull);
@@ -1261,10 +1349,12 @@ static DisasJumpType op_asi(DisasContext *s, DisasOps *o)
 
     o->in1 = tcg_temp_new_i64();
     if (non_atomic) {
-        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     } else {
         /* Perform the atomic addition in memory. */
-        tcg_gen_atomic_fetch_add_i64(o->in1, o->addr1, o->in2, get_mem_index(s),
+        tcg_gen_atomic_fetch_add_i64(o->in1, o->addr1, o->in2,
+                                     get_mem_index1(s),
                                      s->insn->data);
     }
 
@@ -1272,7 +1362,8 @@ static DisasJumpType op_asi(DisasContext *s, DisasOps *o)
     tcg_gen_add_i64(o->out, o->in1, o->in2);
 
     if (non_atomic) {
-        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     }
     return DISAS_NEXT;
 }
@@ -1283,10 +1374,12 @@ static DisasJumpType op_asiu64(DisasContext *s, DisasOps *o)
 
     o->in1 = tcg_temp_new_i64();
     if (non_atomic) {
-        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     } else {
         /* Perform the atomic addition in memory. */
-        tcg_gen_atomic_fetch_add_i64(o->in1, o->addr1, o->in2, get_mem_index(s),
+        tcg_gen_atomic_fetch_add_i64(o->in1, o->addr1, o->in2,
+                                     get_mem_index1(s),
                                      s->insn->data);
     }
 
@@ -1295,7 +1388,8 @@ static DisasJumpType op_asiu64(DisasContext *s, DisasOps *o)
     tcg_gen_add2_i64(o->out, cc_src, o->in1, cc_src, o->in2, cc_src);
 
     if (non_atomic) {
-        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     }
     return DISAS_NEXT;
 }
@@ -1376,10 +1470,12 @@ static DisasJumpType op_ni(DisasContext *s, DisasOps *o)
     o->in1 = tcg_temp_new_i64();
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     } else {
         /* Perform the atomic operation in memory. */
-        tcg_gen_atomic_fetch_and_i64(o->in1, o->addr1, o->in2, get_mem_index(s),
+        tcg_gen_atomic_fetch_and_i64(o->in1, o->addr1, o->in2,
+                                     get_mem_index1(s),
                                      s->insn->data);
     }
 
@@ -1387,7 +1483,8 @@ static DisasJumpType op_ni(DisasContext *s, DisasOps *o)
     tcg_gen_and_i64(o->out, o->in1, o->in2);
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     }
     return DISAS_NEXT;
 }
@@ -1400,6 +1497,75 @@ static DisasJumpType op_bas(DisasContext *s, DisasOps *o)
     } else {
         return DISAS_NEXT;
     }
+}
+
+static void set_addressing_mode_and_target(TCGv_i64 target)
+{
+    TCGv_i64 mode = tcg_temp_new_i64();
+    TCGv_i64 target31 = tcg_temp_new_i64();
+    TCGv_i64 target24 = tcg_temp_new_i64();
+    TCGv_i64 is64 = tcg_temp_new_i64();
+
+    /*
+     * A one in bit 63 of the branch address selects 64-bit mode.  Otherwise,
+     * bit 32 selects 31-bit mode and zero selects 24-bit mode.  QEMU records
+     * 64-bit mode as the combination of PSW_MASK_32 and PSW_MASK_64.
+     */
+    tcg_gen_andi_i64(is64, target, 1);
+    tcg_gen_shli_i64(mode, is64, 32);
+    tcg_gen_shli_i64(is64, is64, 31);
+    tcg_gen_or_i64(mode, mode, is64);
+    tcg_gen_andi_i64(is64, target, 0x80000000);
+    tcg_gen_or_i64(mode, mode, is64);
+    tcg_gen_andi_i64(psw_mask, psw_mask,
+                     ~(PSW_MASK_32 | PSW_MASK_64));
+    tcg_gen_or_i64(psw_mask, psw_mask, mode);
+
+    tcg_gen_andi_i64(target24, target, 0xffffff);
+    tcg_gen_andi_i64(target31, target, 0x7fffffff);
+    tcg_gen_movcond_i64(TCG_COND_NE, target31, is64,
+                        tcg_constant_i64(0), target31, target24);
+    tcg_gen_andi_i64(is64, target, 1);
+    tcg_gen_andi_i64(target, target, -2);
+    tcg_gen_movcond_i64(TCG_COND_NE, target, is64,
+                        tcg_constant_i64(0), target, target31);
+}
+
+static DisasJumpType op_bassm(DisasContext *s, DisasOps *o)
+{
+    int r2 = get_field(s, r2);
+
+    pc_to_link_info(o->out, s, s->pc_tmp);
+    if (s->base.tb->flags & FLAG_MASK_64) {
+        tcg_gen_ori_i64(o->out, o->out, 1);
+    }
+    if (r2) {
+        set_addressing_mode_and_target(o->in2);
+        return help_goto_indirect(s, o->in2);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_bsm(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+
+    if (r1) {
+        if (s->base.tb->flags & FLAG_MASK_64) {
+            tcg_gen_ori_i64(regs[r1], regs[r1], 1);
+        } else if (s->base.tb->flags & FLAG_MASK_32) {
+            tcg_gen_ori_i64(regs[r1], regs[r1], 0x80000000);
+        } else {
+            tcg_gen_andi_i64(regs[r1], regs[r1], ~0x80000000ULL);
+        }
+    }
+
+    if (r2) {
+        set_addressing_mode_and_target(o->in2);
+        return help_goto_indirect(s, o->in2);
+    }
+    return DISAS_NEXT;
 }
 
 static void save_link_info(DisasContext *s, DisasOps *o)
@@ -1919,13 +2085,14 @@ static DisasJumpType op_clc(DisasContext *s, DisasOps *o)
         mop = ctz32(l + 1) | MO_BE;
         /* Do not update cc_src yet: loading cc_dst may cause an exception. */
         src = tcg_temp_new_i64();
-        tcg_gen_qemu_ld_i64(src, o->addr1, get_mem_index(s), mop);
+        tcg_gen_qemu_ld_i64(src, o->addr1, get_mem_index1(s), mop);
         tcg_gen_qemu_ld_i64(cc_dst, o->in2, get_mem_index(s), mop);
         gen_op_update2_cc_i64(s, CC_OP_LTUGTU_64, src, cc_dst);
         return DISAS_NEXT;
     default:
         vl = tcg_constant_i32(l);
-        gen_helper_clc(cc_op, tcg_env, vl, o->addr1, o->in2);
+        gen_helper_clc(cc_op, tcg_env, vl, o->addr1, o->in2,
+                       get_mem_indices(s));
         set_cc_static(s);
         return DISAS_NEXT;
     }
@@ -2010,6 +2177,21 @@ static DisasJumpType op_clst(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static DisasJumpType op_cuse(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+
+    if ((r1 | r2) & 1) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+
+    gen_helper_cuse(tcg_env, tcg_constant_i32(r1), tcg_constant_i32(r2));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_cps(DisasContext *s, DisasOps *o)
 {
     TCGv_i64 t = tcg_temp_new_i64();
@@ -2085,6 +2267,7 @@ static DisasJumpType op_csst(DisasContext *s, DisasOps *o)
 static DisasJumpType op_csp(DisasContext *s, DisasOps *o)
 {
     MemOp mop = s->insn->data;
+    int r2 = get_field(s, r2);
     TCGv_i64 addr, old, cc;
     TCGLabel *lab = gen_new_label();
 
@@ -2095,12 +2278,14 @@ static DisasJumpType op_csp(DisasContext *s, DisasOps *o)
     old = tcg_temp_new_i64();
     tcg_gen_andi_i64(addr, o->in2, -1ULL << (mop & MO_SIZE));
     tcg_gen_atomic_cmpxchg_i64(old, addr, o->in1, o->out2,
-                               get_mem_index(s), mop | MO_ALIGN);
+                               get_mem_index_by_base(s, r2),
+                               mop | MO_ALIGN);
 
     /* Are the memory and expected values (un)equal?  */
     cc = tcg_temp_new_i64();
     tcg_gen_setcond_i64(TCG_COND_NE, cc, o->in1, old);
     tcg_gen_extrl_i64_i32(cc_op, cc);
+    set_cc_static(s);
 
     /* Write back the output now, so that it happens before the
        following branch, so that we don't need local temps.  */
@@ -2119,9 +2304,149 @@ static DisasJumpType op_csp(DisasContext *s, DisasOps *o)
     gen_helper_purge(tcg_env);
     gen_set_label(lab);
 
-    return DISAS_NEXT;
+    /*
+     * CSP/CSPG are serializing and may purge cached translations.  End the
+     * translated block so an immediately following access cannot reuse a
+     * translation that the successful operation purged.
+     */
+    return DISAS_TOO_MANY;
 }
 #endif
+
+static DisasJumpType op_decimal(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal(cc_op, tcg_env,
+                       tcg_constant_i32(s->insn->data),
+                       tcg_constant_i32(get_field(s, l1)),
+                       o->addr1, o->in2,
+                       tcg_constant_i32(get_mem_index1(s)),
+                       tcg_constant_i32(get_mem_index(s)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_mul(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_mul(tcg_env, tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_mem_index1(s)),
+                           tcg_constant_i32(get_mem_index(s)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_div(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_div(tcg_env, tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_mem_index1(s)),
+                           tcg_constant_i32(get_mem_index(s)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_decimal_srp(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_decimal_srp(cc_op, tcg_env,
+                           tcg_constant_i32(get_field(s, l1)),
+                           o->addr1, o->in2,
+                           tcg_constant_i32(get_field(s, i3)),
+                           tcg_constant_i32(get_mem_index1(s)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_binary(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+    TCGv_i32 result = data >> 8 == 5 ? tcg_temp_new_i32() : cc_op;
+
+    if (data >> 8 == 5) {
+        update_cc_op(s);
+    }
+    gen_helper_hfp_binary(result, tcg_env,
+                          tcg_constant_i32(get_field(s, r1)), o->in2,
+                          tcg_constant_i32(data & 0xff),
+                          tcg_constant_i32(data >> 8));
+    if (data >> 8 != 5) {
+        set_cc_static(s);
+    }
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_multiply(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+
+    update_cc_op(s);
+    gen_helper_hfp_multiply(tcg_env,
+                            tcg_constant_i32(get_field(s, r1)), o->in2,
+                            tcg_constant_i32(data & 0xff),
+                            tcg_constant_i32(data >> 8));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_halve(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_halve(tcg_env,
+                         tcg_constant_i32(get_field(s, r1)),
+                         tcg_constant_i32(get_field(s, r2)),
+                         tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_load(DisasContext *s, DisasOps *o)
+{
+    uint32_t data = s->insn->data;
+
+    gen_helper_hfp_load(cc_op, tcg_env,
+                        tcg_constant_i32(get_field(s, r1)), o->in2,
+                        tcg_constant_i32(data & 0xff),
+                        tcg_constant_i32(data >> 8));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_round(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_round(tcg_env,
+                         tcg_constant_i32(get_field(s, r1)),
+                         tcg_constant_i32(get_field(s, r2)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_binary(DisasContext *s, DisasOps *o)
+{
+    gen_helper_hfp_ext_binary(cc_op, tcg_env,
+                              tcg_constant_i32(get_field(s, r1)),
+                              tcg_constant_i32(get_field(s, r2)),
+                              tcg_constant_i32(s->insn->data));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_multiply(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_ext_multiply(tcg_env,
+                                tcg_constant_i32(get_field(s, r1)),
+                                tcg_constant_i32(get_field(s, r2)),
+                                tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_hfp_ext_round(DisasContext *s, DisasOps *o)
+{
+    update_cc_op(s);
+    gen_helper_hfp_ext_round(tcg_env,
+                             tcg_constant_i32(get_field(s, r1)),
+                             tcg_constant_i32(get_field(s, r2)));
+    return DISAS_NEXT;
+}
 
 static DisasJumpType op_cvb(DisasContext *s, DisasOps *o)
 {
@@ -2231,6 +2556,9 @@ static DisasJumpType op_diag(DisasContext *s, DisasOps *o)
     TCGv_i32 func_code = tcg_constant_i32(get_field(s, i2));
 
     gen_helper_diag(tcg_env, r1, r3, func_code);
+    if (get_field(s, i2) == 0x204) {
+        gen_op_movi_cc(s, 0);
+    }
     return DISAS_NEXT;
 }
 #endif
@@ -2318,10 +2646,57 @@ static DisasJumpType op_ear(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static void gen_set_access_reg(int reg, TCGv_i32 value)
+{
+    const intptr_t offset = offsetof(CPUS390XState, aregs[reg]);
+
+#ifndef CONFIG_USER_ONLY
+    TCGv_i32 old = tcg_temp_new_i32();
+    TCGLabel *same = gen_new_label();
+
+    /*
+     * Access-register MMU indices identify the register, rather than its
+     * ALET, so a changed value invalidates translations cached for that
+     * register.  Avoid doing the comparatively expensive partial TLB flush
+     * when instructions such as CPYA repeatedly install the value already
+     * present; this is common in z/OS address-space management paths.
+     */
+    tcg_gen_ld_i32(old, tcg_env, offset);
+    tcg_gen_brcond_i32(TCG_COND_EQ, old, value, same);
+    tcg_gen_st_i32(value, tcg_env, offset);
+    gen_helper_flush_ars(tcg_env, tcg_constant_i32(reg),
+                         tcg_constant_i32(reg));
+    gen_set_label(same);
+#else
+    tcg_gen_st_i32(value, tcg_env, offset);
+#endif
+}
+
+static DisasJumpType op_cpya(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+    int r2 = get_field(s, r2);
+    TCGv_i32 value = tcg_temp_new_i32();
+
+    tcg_gen_ld_i32(value, tcg_env,
+                   offsetof(CPUS390XState, aregs[r2]));
+    gen_set_access_reg(r1, value);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ed(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
+    TCGv_i32 mark = tcg_constant_i32(s->insn->data);
+
+    gen_helper_ed(cc_op, tcg_env, l, o->addr1, o->in2, mark);
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_ecag(DisasContext *s, DisasOps *o)
 {
-    /* No cache information provided.  */
-    tcg_gen_movi_i64(o->out, -1);
+    gen_helper_ecag(o->out, o->in2);
     return DISAS_NEXT;
 }
 
@@ -2519,6 +2894,62 @@ static DisasJumpType op_ipm(DisasContext *s, DisasOps *o)
 }
 
 #ifndef CONFIG_USER_ONLY
+static void gen_check_extract_authority(DisasContext *s)
+{
+    if (s->base.tb->flags & FLAG_MASK_PSTATE) {
+        TCGv_i64 cr0 = tcg_temp_new_i64();
+        TCGLabel *authorized = gen_new_label();
+
+        tcg_gen_ld_i64(cr0, tcg_env, offsetof(CPUS390XState, cregs[0]));
+        tcg_gen_andi_i64(cr0, cr0, CR0_EXT_AUTH);
+        tcg_gen_brcondi_i64(TCG_COND_NE, cr0, 0, authorized);
+        gen_program_exception(s, PGM_PRIVILEGED);
+        gen_set_label(authorized);
+    }
+}
+
+static DisasJumpType op_iac(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 asc = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+    int r1 = get_field(s, r1);
+
+    if (!(s->base.tb->flags & FLAG_MASK_DAT)) {
+        gen_program_exception(s, PGM_SPECIAL_OP);
+        return DISAS_NORETURN;
+    }
+    gen_check_extract_authority(s);
+    tcg_gen_extract_i64(asc, psw_mask, PSW_SHIFT_ASC, 2);
+
+    /*
+     * The two PSW ASC bits are physically ordered AR,SPACE, whereas IAC
+     * reports the architected mode number as AR * 2 + SPACE.  Consequently
+     * access-register and secondary modes (01 and 10 in the PSW encoding)
+     * have to be exchanged.
+     */
+    tcg_gen_shri_i64(t, asc, 1);
+    tcg_gen_andi_i64(asc, asc, 1);
+    tcg_gen_shli_i64(asc, asc, 1);
+    tcg_gen_or_i64(asc, asc, t);
+
+    tcg_gen_extrl_i64_i32(cc_op, asc);
+    set_cc_static(s);
+    tcg_gen_deposit_i64(regs[r1], regs[r1], asc, 8, 8);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ipk(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 key = tcg_temp_new_i64();
+
+    gen_check_extract_authority(s);
+
+    tcg_gen_extract_i64(key, psw_mask, PSW_SHIFT_KEY, 4);
+    tcg_gen_shli_i64(key, key, 4);
+    tcg_gen_deposit_i64(regs[2], regs[2], key, 0, 8);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_idte(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 m4;
@@ -2529,7 +2960,7 @@ static DisasJumpType op_idte(DisasContext *s, DisasOps *o)
         m4 = tcg_constant_i32(0);
     }
     gen_helper_idte(tcg_env, o->in1, o->in2, m4);
-    return DISAS_NEXT;
+    return DISAS_TOO_MANY;
 }
 
 static DisasJumpType op_ipte(DisasContext *s, DisasOps *o)
@@ -2542,12 +2973,65 @@ static DisasJumpType op_ipte(DisasContext *s, DisasOps *o)
         m4 = tcg_constant_i32(0);
     }
     gen_helper_ipte(tcg_env, o->in1, o->in2, m4);
-    return DISAS_NEXT;
+    /*
+     * The helper purges cached translations.  End the current translated
+     * block so a following memory access cannot reuse a TLB entry embedded
+     * in this block before the purge takes effect.
+     */
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_esea(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+
+    gen_helper_esea(tcg_env, r1);
+    /*
+     * The extended authorization index participates in access-register
+     * translation.  Translations authorized under the old EAX must not be
+     * reused after ESEA installs the new value.
+     */
+    gen_helper_flush_ars(tcg_env, tcg_constant_i32(0),
+                         tcg_constant_i32(15));
+    return DISAS_TOO_MANY;
 }
 
 static DisasJumpType op_iske(DisasContext *s, DisasOps *o)
 {
     gen_helper_iske(o->out, tcg_env, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_irbm(DisasContext *s, DisasOps *o)
+{
+    gen_helper_irbm(o->out, tcg_env, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_lasp(DisasContext *s, DisasOps *o)
+{
+    gen_helper_lasp(cc_op, tcg_env, o->addr1, o->in2,
+                    tcg_constant_i32(get_mem_index1(s)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_rrbm(DisasContext *s, DisasOps *o)
+{
+    gen_helper_rrbm(o->out, tcg_env, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ivsk(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 arn = tcg_constant_i32(get_field(s, r2));
+
+    if (!(s->base.tb->flags & FLAG_MASK_DAT)) {
+        gen_program_exception(s, PGM_SPECIAL_OP);
+        return DISAS_NORETURN;
+    }
+    gen_check_extract_authority(s);
+    gen_helper_ivsk(o->out, tcg_env, o->in2, arn);
     return DISAS_NEXT;
 }
 #endif
@@ -2906,8 +3390,23 @@ static DisasJumpType op_lctlg(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_lra(DisasContext *s, DisasOps *o)
 {
-    gen_helper_lra(o->out, tcg_env, o->out, o->in2);
+    TCGv_i32 is_long = tcg_constant_i32(s->fields.op == 0xe3 &&
+                                        s->fields.op2 == 0x03);
+    TCGv_i32 arn = tcg_constant_i32(get_field(s, b2));
+
+    gen_helper_lra(o->out, tcg_env, o->out, o->in2, is_long, arn);
     set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_strag(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 arn = tcg_constant_i32(get_field(s, b2));
+    TCGv_i64 real = tcg_temp_new_i64();
+
+    gen_helper_strag(real, tcg_env, o->in2, arn);
+    tcg_gen_qemu_st_i64(real, o->addr1, get_mem_index1(s),
+                        MO_BEUQ | MO_ALIGN_8);
     return DISAS_NEXT;
 }
 
@@ -2959,7 +3458,8 @@ static DisasJumpType op_lam(DisasContext *s, DisasOps *o)
     TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
     TCGv_i32 r3 = tcg_constant_i32(get_field(s, r3));
 
-    gen_helper_lam(tcg_env, r1, o->in2, r3);
+    gen_helper_lam(tcg_env, r1, o->in2, r3,
+                   tcg_constant_i32(get_mem_index(s)));
     return DISAS_NEXT;
 }
 
@@ -3170,7 +3670,7 @@ static DisasJumpType op_mov2(DisasContext *s, DisasOps *o)
 static DisasJumpType op_mov2e(DisasContext *s, DisasOps *o)
 {
     int b2 = get_field(s, b2);
-    TCGv_i64 ar1 = tcg_temp_new_i64();
+    TCGv_i32 ar1 = tcg_temp_new_i32();
     int r1 = get_field(s, r1);
 
     o->out = o->in2;
@@ -3178,24 +3678,25 @@ static DisasJumpType op_mov2e(DisasContext *s, DisasOps *o)
 
     switch (s->base.tb->flags & FLAG_MASK_ASC) {
     case PSW_ASC_PRIMARY >> FLAG_MASK_PSW_SHIFT:
-        tcg_gen_movi_i64(ar1, 0);
+        tcg_gen_movi_i32(ar1, 0);
         break;
     case PSW_ASC_ACCREG >> FLAG_MASK_PSW_SHIFT:
-        tcg_gen_movi_i64(ar1, 1);
-        break;
-    case PSW_ASC_SECONDARY >> FLAG_MASK_PSW_SHIFT:
         if (b2) {
-            tcg_gen_ld32u_i64(ar1, tcg_env, offsetof(CPUS390XState, aregs[b2]));
+            tcg_gen_ld_i32(ar1, tcg_env,
+                           offsetof(CPUS390XState, aregs[b2]));
         } else {
-            tcg_gen_movi_i64(ar1, 0);
+            tcg_gen_movi_i32(ar1, 0);
         }
         break;
+    case PSW_ASC_SECONDARY >> FLAG_MASK_PSW_SHIFT:
+        tcg_gen_movi_i32(ar1, 1);
+        break;
     case PSW_ASC_HOME >> FLAG_MASK_PSW_SHIFT:
-        tcg_gen_movi_i64(ar1, 2);
+        tcg_gen_movi_i32(ar1, 2);
         break;
     }
 
-    tcg_gen_st32_i64(ar1, tcg_env, offsetof(CPUS390XState, aregs[r1]));
+    gen_set_access_reg(r1, ar1);
     return DISAS_NEXT;
 }
 
@@ -3212,13 +3713,14 @@ static DisasJumpType op_mvc(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_mvc(tcg_env, l, o->addr1, o->in2);
+    gen_helper_mvc(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     return DISAS_NEXT;
 }
 
 static DisasJumpType op_mvcrl(DisasContext *s, DisasOps *o)
 {
-    gen_helper_mvcrl(tcg_env, regs[0], o->addr1, o->in2);
+    gen_helper_mvcrl(tcg_env, regs[0], o->addr1, o->in2,
+                      get_mem_indices(s));
     return DISAS_NEXT;
 }
 
@@ -3226,7 +3728,7 @@ static DisasJumpType op_mvcin(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_mvcin(tcg_env, l, o->addr1, o->in2);
+    gen_helper_mvcin(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     return DISAS_NEXT;
 }
 
@@ -3313,13 +3815,38 @@ static DisasJumpType op_mvcs(DisasContext *s, DisasOps *o)
     set_cc_static(s);
     return DISAS_NEXT;
 }
+
+static DisasJumpType op_mvck(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, l1);
+    int r3 = get_field(s, r3);
+
+    gen_helper_mvck(cc_op, tcg_env, regs[r1], o->addr1, o->in2, regs[r3],
+                    get_mem_indices(s));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_mvcdk(DisasContext *s, DisasOps *o)
+{
+    gen_helper_mvcdk(tcg_env, regs[0], o->addr1, o->in2, regs[1],
+                     get_mem_indices(s));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_mvcsk(DisasContext *s, DisasOps *o)
+{
+    gen_helper_mvcsk(tcg_env, regs[0], o->addr1, o->in2, regs[1],
+                     get_mem_indices(s));
+    return DISAS_NEXT;
+}
 #endif
 
 static DisasJumpType op_mvn(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_mvn(tcg_env, l, o->addr1, o->in2);
+    gen_helper_mvn(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     return DISAS_NEXT;
 }
 
@@ -3327,7 +3854,7 @@ static DisasJumpType op_mvo(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_mvo(tcg_env, l, o->addr1, o->in2);
+    gen_helper_mvo(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     return DISAS_NEXT;
 }
 
@@ -3355,7 +3882,7 @@ static DisasJumpType op_mvz(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_mvz(tcg_env, l, o->addr1, o->in2);
+    gen_helper_mvz(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     return DISAS_NEXT;
 }
 
@@ -3468,7 +3995,7 @@ static DisasJumpType op_nc(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_nc(cc_op, tcg_env, l, o->addr1, o->in2);
+    gen_helper_nc(cc_op, tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -3502,7 +4029,7 @@ static DisasJumpType op_oc(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_oc(cc_op, tcg_env, l, o->addr1, o->in2);
+    gen_helper_oc(cc_op, tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -3534,10 +4061,12 @@ static DisasJumpType op_oi(DisasContext *s, DisasOps *o)
     o->in1 = tcg_temp_new_i64();
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     } else {
         /* Perform the atomic operation in memory. */
-        tcg_gen_atomic_fetch_or_i64(o->in1, o->addr1, o->in2, get_mem_index(s),
+        tcg_gen_atomic_fetch_or_i64(o->in1, o->addr1, o->in2,
+                                    get_mem_index1(s),
                                     s->insn->data);
     }
 
@@ -3545,7 +4074,8 @@ static DisasJumpType op_oi(DisasContext *s, DisasOps *o)
     tcg_gen_or_i64(o->out, o->in1, o->in2);
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     }
     return DISAS_NEXT;
 }
@@ -3555,6 +4085,31 @@ static DisasJumpType op_pack(DisasContext *s, DisasOps *o)
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
     gen_helper_pack(tcg_env, l, o->addr1, o->in2);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_plo(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 a2 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    TCGv_i64 a4 = get_address(s, 0, get_field(s, b4), get_field(s, d4));
+
+    /* PLO is a single interlocked operation across all of its operands. */
+    if (tb_cflags(s->base.tb) & CF_PARALLEL) {
+        update_psw_addr(s);
+        update_cc_op(s);
+        gen_exception(EXCP_ATOMIC);
+        return DISAS_NORETURN;
+    }
+
+    update_cc_op(s);
+    gen_helper_plo(cc_op, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)),
+                   tcg_constant_i32(get_field(s, r3)), a2, a4,
+                   tcg_constant_i32(get_mem_index_by_base(
+                       s, get_field(s, b2))),
+                   tcg_constant_i32(get_mem_index_by_base(
+                       s, get_field(s, b4))));
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 
@@ -3604,7 +4159,7 @@ static DisasJumpType op_popcnt(DisasContext *s, DisasOps *o)
 static DisasJumpType op_ptlb(DisasContext *s, DisasOps *o)
 {
     gen_helper_ptlb(tcg_env);
-    return DISAS_NEXT;
+    return DISAS_TOO_MANY;
 }
 #endif
 
@@ -3841,7 +4396,10 @@ static DisasJumpType op_sam(DisasContext *s, DisasOps *o)
 static DisasJumpType op_sar(DisasContext *s, DisasOps *o)
 {
     int r1 = get_field(s, r1);
-    tcg_gen_st32_i64(o->in2, tcg_env, offsetof(CPUS390XState, aregs[r1]));
+    TCGv_i32 value = tcg_temp_new_i32();
+
+    tcg_gen_extrl_i64_i32(value, o->in2);
+    gen_set_access_reg(r1, value);
     return DISAS_NEXT;
 }
 
@@ -4051,7 +4609,8 @@ static DisasJumpType op_ectg(DisasContext *s, DisasOps *o)
     gen_addi_and_wrap_i64(s, o->addr1, regs[r3], 0);
 
     /* load the third operand into r3 before modifying anything */
-    tcg_gen_qemu_ld_i64(regs[r3], o->addr1, get_mem_index(s), MO_BEUQ);
+    tcg_gen_qemu_ld_i64(regs[r3], o->addr1,
+                        get_mem_index_by_base(s, r3), MO_BEUQ);
 
     /* subtract CPU timer from first operand and store in GR0 */
     gen_helper_stpt(tmp, tcg_env);
@@ -4065,14 +4624,28 @@ static DisasJumpType op_ectg(DisasContext *s, DisasOps *o)
 #ifndef CONFIG_USER_ONLY
 static DisasJumpType op_spka(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_shri_i64(o->in2, o->in2, 4);
-    tcg_gen_deposit_i64(psw_mask, psw_mask, o->in2, PSW_SHIFT_KEY, 4);
-    return DISAS_NEXT;
+    gen_helper_spka(tcg_env, o->in2);
+    return DISAS_TOO_MANY;
 }
 
 static DisasJumpType op_sske(DisasContext *s, DisasOps *o)
 {
-    gen_helper_sske(tcg_env, o->in1, o->in2);
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+    TCGv_i32 m3 = tcg_constant_i32(get_field(s, m3));
+
+    gen_op_calc_cc(s);
+    gen_helper_sske(cc_op, tcg_env, r1, r2, m3);
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_pfmf(DisasContext *s, DisasOps *o)
+{
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+
+    gen_helper_pfmf(tcg_env, r1, r2);
     return DISAS_NEXT;
 }
 
@@ -4107,7 +4680,17 @@ static DisasJumpType op_stap(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_stck(DisasContext *s, DisasOps *o)
 {
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
     gen_helper_stck(o->out, tcg_env);
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    /* ??? We don't implement clock states.  */
+    gen_op_movi_cc(s, 0);
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_stckf(DisasContext *s, DisasOps *o)
+{
+    gen_helper_stckf(o->out, tcg_env);
     /* ??? We don't implement clock states.  */
     gen_op_movi_cc(s, 0);
     return DISAS_NEXT;
@@ -4115,26 +4698,13 @@ static DisasJumpType op_stck(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_stcke(DisasContext *s, DisasOps *o)
 {
-    TCGv_i64 c1 = tcg_temp_new_i64();
-    TCGv_i64 c2 = tcg_temp_new_i64();
-    TCGv_i64 todpr = tcg_temp_new_i64();
-    gen_helper_stck(c1, tcg_env);
-    /* 16 bit value store in an uint32_t (only valid bits set) */
-    tcg_gen_ld32u_i64(todpr, tcg_env, offsetof(CPUS390XState, todpr));
-    /* Shift the 64-bit value into its place as a zero-extended
-       104-bit value.  Note that "bit positions 64-103 are always
-       non-zero so that they compare differently to STCK"; we set
-       the least significant bit to 1.  */
-    tcg_gen_shli_i64(c2, c1, 56);
-    tcg_gen_shri_i64(c1, c1, 8);
-    tcg_gen_ori_i64(c2, c2, 0x10000);
-    tcg_gen_or_i64(c2, c2, todpr);
-    tcg_gen_qemu_st_i64(c1, o->in2, get_mem_index(s), MO_BEUQ);
-    tcg_gen_addi_i64(o->in2, o->in2, 8);
-    tcg_gen_qemu_st_i64(c2, o->in2, get_mem_index(s), MO_BEUQ);
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    gen_helper_stcke(tcg_env, o->in2,
+                     tcg_constant_i32(get_mem_index(s)));
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
     /* ??? We don't implement clock states.  */
     gen_op_movi_cc(s, 0);
-    return DISAS_NEXT;
+    return DISAS_TOO_MANY;
 }
 
 #ifndef CONFIG_USER_ONLY
@@ -4190,7 +4760,13 @@ static DisasJumpType op_stidp(DisasContext *s, DisasOps *o)
 static DisasJumpType op_spt(DisasContext *s, DisasOps *o)
 {
     gen_helper_spt(tcg_env, o->in2);
-    return DISAS_NEXT;
+    /*
+     * Setting an already-expired CPU timer can make an external interruption
+     * pending.  Return to the main loop at this instruction boundary so the
+     * interruption is recognized before a following instruction executes.
+     */
+    s->exit_to_mainloop = true;
+    return DISAS_TOO_MANY;
 }
 
 static DisasJumpType op_stfl(DisasContext *s, DisasOps *o)
@@ -4274,14 +4850,14 @@ static DisasJumpType op_schm(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_siga(DisasContext *s, DisasOps *o)
 {
-    /* From KVM code: Not provided, set CC = 3 for subchannel not operational */
-    gen_op_movi_cc(s, 3);
+    gen_helper_siga(tcg_env);
+    set_cc_static(s);
     return DISAS_NEXT;
 }
 
 static DisasJumpType op_stcps(DisasContext *s, DisasOps *o)
 {
-    /* The instruction is suppressed if not provided. */
+    gen_helper_stcps(tcg_env, o->in2);
     return DISAS_NEXT;
 }
 
@@ -4344,7 +4920,7 @@ static DisasJumpType op_stnosm(DisasContext *s, DisasOps *o)
        restart, we'll have the wrong SYSTEM MASK in place.  */
     t = tcg_temp_new_i64();
     tcg_gen_shri_i64(t, psw_mask, 56);
-    tcg_gen_qemu_st_i64(t, o->addr1, get_mem_index(s), MO_UB);
+    tcg_gen_qemu_st_i64(t, o->addr1, get_mem_index1(s), MO_UB);
 
     if (s->fields.op == 0xac) {
         tcg_gen_andi_i64(psw_mask, psw_mask,
@@ -4412,7 +4988,8 @@ static DisasJumpType op_stam(DisasContext *s, DisasOps *o)
     TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
     TCGv_i32 r3 = tcg_constant_i32(get_field(s, r3));
 
-    gen_helper_stam(tcg_env, r1, o->in2, r3);
+    gen_helper_stam(tcg_env, r1, o->in2, r3,
+                    tcg_constant_i32(get_mem_index(s)));
     return DISAS_NEXT;
 }
 
@@ -4490,10 +5067,9 @@ static DisasJumpType op_stmh(DisasContext *s, DisasOps *o)
     int r3 = get_field(s, r3);
     TCGv_i64 t = tcg_temp_new_i64();
     TCGv_i64 t4 = tcg_constant_i64(4);
-    TCGv_i64 t32 = tcg_constant_i64(32);
 
     while (1) {
-        tcg_gen_shl_i64(t, regs[r1], t32);
+        tcg_gen_shri_i64(t, regs[r1], 32);
         tcg_gen_qemu_st_i64(t, o->in2, get_mem_index(s), MO_BEUL);
         if (r1 == r3) {
             break;
@@ -4644,6 +5220,156 @@ static DisasJumpType op_tcxb(DisasContext *s, DisasOps *o)
 
 #ifndef CONFIG_USER_ONLY
 
+static DisasJumpType op_extract_asn(DisasContext *s, DisasOps *o)
+{
+    gen_helper_extract_asn(tcg_env,
+                           tcg_constant_i32(get_field(s, r1)),
+                           tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_extract_asn_instance(DisasContext *s, DisasOps *o)
+{
+    gen_helper_extract_asn_instance(tcg_env,
+                                    tcg_constant_i32(get_field(s, r1)),
+                                    tcg_constant_i32(s->insn->data));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ssar(DisasContext *s, DisasOps *o)
+{
+    gen_helper_ssar(tcg_env, tcg_constant_i32(get_field(s, r1)));
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_ssair(DisasContext *s, DisasOps *o)
+{
+    gen_helper_ssair(tcg_env, tcg_constant_i32(get_field(s, r1)));
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_pt(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pt(dest, tcg_env,
+                  tcg_constant_i32(get_field(s, r1)),
+                  tcg_constant_i32(get_field(s, r2)),
+                  tcg_constant_i64(s->pc_tmp));
+    return help_goto_indirect(s, dest);
+}
+
+static DisasJumpType op_pti(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    gen_helper_pti(dest, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)),
+                   tcg_constant_i32(get_field(s, r2)),
+                   tcg_constant_i64(s->pc_tmp));
+    return help_goto_indirect(s, dest);
+}
+
+/*
+ * TCG does not provide adjunct-processor queues.  PQAP is nevertheless
+ * installed so that guests can discover that fact using TAPQ, just as KVM
+ * does when no AP driver has registered a queue callback.
+ */
+static DisasJumpType op_pqap(DisasContext *s, DisasOps *o)
+{
+    tcg_gen_movi_i64(regs[1], 0x00010000); /* AP_RESPONSE_Q_NOT_AVAIL */
+    tcg_gen_movi_i32(cc_op, 3);
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_svs(DisasContext *s, DisasOps *o)
+{
+    gen_helper_svs(cc_op, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cfs(DisasContext *s, DisasOps *o)
+{
+    /*
+     * The operand-free form used for local serialization succeeds without
+     * an attached coupling facility.  With one vCPU there is no remote
+     * participant to synchronize.
+     */
+    tcg_gen_movi_i32(cc_op, 0);
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_tbeginc(DisasContext *s, DisasOps *o)
+{
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    gen_helper_tbeginc(cc_op, tcg_env,
+                       tcg_constant_i32(get_field(s, b1)),
+                       tcg_constant_i32(get_field(s, i2)),
+                       tcg_constant_i64(s->pc_tmp - s->ilen));
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    set_cc_static(s);
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_tend(DisasContext *s, DisasOps *o)
+{
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    gen_helper_tend(cc_op, tcg_env);
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    set_cc_static(s);
+    return DISAS_TOO_MANY;
+}
+
+static DisasJumpType op_pfpo(DisasContext *s, DisasOps *o)
+{
+    gen_helper_pfpo(cc_op, tcg_env);
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_ptff(DisasContext *s, DisasOps *o)
+{
+    gen_helper_ptff(cc_op, tcg_env,
+                    tcg_constant_i32(get_mem_index_by_base(s, 1)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_linkage_branch(DisasContext *s, DisasOps *o)
+{
+    TCGv_i64 dest = tcg_temp_new_i64();
+    TCGv_i32 r1 = tcg_constant_i32(get_field(s, r1));
+    TCGv_i32 r2 = tcg_constant_i32(get_field(s, r2));
+
+    update_cc_op(s);
+    per_breaking_event(s);
+    if (s->insn->data) {
+        gen_helper_bsg(dest, tcg_env, r1, r2,
+                       tcg_constant_i64(s->pc_tmp));
+    } else {
+        gen_helper_bsa(dest, tcg_env, r1, r2,
+                       tcg_constant_i64(s->pc_tmp));
+    }
+    return help_goto_indirect(s, dest);
+}
+
+static DisasJumpType op_tar(DisasContext *s, DisasOps *o)
+{
+    gen_helper_tar(cc_op, tcg_env,
+                   tcg_constant_i32(get_field(s, r1)),
+                   tcg_constant_i32(get_field(s, r2)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_testblock(DisasContext *s, DisasOps *o)
 {
     gen_helper_testblock(cc_op, tcg_env, o->in2);
@@ -4653,7 +5379,8 @@ static DisasJumpType op_testblock(DisasContext *s, DisasOps *o)
 
 static DisasJumpType op_tprot(DisasContext *s, DisasOps *o)
 {
-    gen_helper_tprot(cc_op, tcg_env, o->addr1, o->in2);
+    gen_helper_tprot(cc_op, tcg_env, o->addr1, o->in2,
+                     tcg_constant_i32(get_field(s, b1)));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -4669,11 +5396,111 @@ static DisasJumpType op_tp(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static DisasJumpType op_cdzt(DisasContext *s, DisasOps *o)
+{
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cdzt(tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cxzt(DisasContext *s, DisasOps *o)
+{
+    if (get_field(s, r1) & 2) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cxzt(tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_czdt(DisasContext *s, DisasOps *o)
+{
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_czdt(cc_op, tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_czxt(DisasContext *s, DisasOps *o)
+{
+    if (get_field(s, r1) & 2) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_czxt(cc_op, tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cdpt(DisasContext *s, DisasOps *o)
+{
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cdpt(tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cxpt(DisasContext *s, DisasOps *o)
+{
+    if (get_field(s, r1) & 2) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cxpt(tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cpdt(DisasContext *s, DisasOps *o)
+{
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cpdt(cc_op, tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+static DisasJumpType op_cpxt(DisasContext *s, DisasOps *o)
+{
+    if (get_field(s, r1) & 2) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+    o->addr1 = get_address(s, 0, get_field(s, b2), get_field(s, d2));
+    gen_helper_cpxt(cc_op, tcg_env, o->addr1,
+                    tcg_constant_i32(get_field(s, l2) + 1),
+                    tcg_constant_i32(get_field(s, r1)),
+                    tcg_constant_i32(get_field(s, m3)));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
 static DisasJumpType op_tr(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_tr(tcg_env, l, o->addr1, o->in2);
+    gen_helper_tr(tcg_env, l, o->addr1, o->in2, get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -4688,11 +5515,40 @@ static DisasJumpType op_tre(DisasContext *s, DisasOps *o)
     return DISAS_NEXT;
 }
 
+static DisasJumpType op_trte(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+
+    if (r1 & 1) {
+        gen_program_exception(s, PGM_SPECIFICATION);
+        return DISAS_NORETURN;
+    }
+
+    gen_helper_trte(cc_op, tcg_env, tcg_constant_i32(r1),
+                    tcg_constant_i32(get_field(s, r2)),
+                    tcg_constant_i32(get_field(s, m3)),
+                    tcg_constant_i32(s->insn->data));
+    set_cc_static(s);
+    return DISAS_NEXT;
+}
+
+#ifndef CONFIG_USER_ONLY
+static DisasJumpType op_trace(DisasContext *s, DisasOps *o)
+{
+    gen_helper_trace(tcg_env,
+                     tcg_constant_i32(get_field(s, r1)),
+                     tcg_constant_i32(get_field(s, r3)),
+                     o->in2, tcg_constant_i32(get_mem_index(s)));
+    return DISAS_NEXT;
+}
+#endif
+
 static DisasJumpType op_trt(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_trt(cc_op, tcg_env, l, o->addr1, o->in2);
+    gen_helper_trt(cc_op, tcg_env, l, o->addr1, o->in2,
+                   get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -4701,7 +5557,8 @@ static DisasJumpType op_trtr(DisasContext *s, DisasOps *o)
 {
     TCGv_i32 l = tcg_constant_i32(get_field(s, l1));
 
-    gen_helper_trtr(cc_op, tcg_env, l, o->addr1, o->in2);
+    gen_helper_trtr(cc_op, tcg_env, l, o->addr1, o->in2,
+                    get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -4802,28 +5659,28 @@ static DisasJumpType op_xc(DisasContext *s, DisasOps *o)
 
         l++;
         while (l >= 8) {
-            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index(s), MO_UQ);
+            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index1(s), MO_UQ);
             l -= 8;
             if (l > 0) {
                 tcg_gen_addi_i64(o->addr1, o->addr1, 8);
             }
         }
         if (l >= 4) {
-            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index(s), MO_UL);
+            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index1(s), MO_UL);
             l -= 4;
             if (l > 0) {
                 tcg_gen_addi_i64(o->addr1, o->addr1, 4);
             }
         }
         if (l >= 2) {
-            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index(s), MO_UW);
+            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index1(s), MO_UW);
             l -= 2;
             if (l > 0) {
                 tcg_gen_addi_i64(o->addr1, o->addr1, 2);
             }
         }
         if (l) {
-            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index(s), MO_UB);
+            tcg_gen_qemu_st_i64(o->in2, o->addr1, get_mem_index1(s), MO_UB);
         }
         gen_op_movi_cc(s, 0);
         return DISAS_NEXT;
@@ -4832,7 +5689,8 @@ static DisasJumpType op_xc(DisasContext *s, DisasOps *o)
     /* But in general we'll defer to a helper.  */
     o->in2 = get_address(s, 0, b2, d2);
     t32 = tcg_constant_i32(l);
-    gen_helper_xc(cc_op, tcg_env, t32, o->addr1, o->in2);
+    gen_helper_xc(cc_op, tcg_env, t32, o->addr1, o->in2,
+                  get_mem_indices(s));
     set_cc_static(s);
     return DISAS_NEXT;
 }
@@ -4864,10 +5722,12 @@ static DisasJumpType op_xi(DisasContext *s, DisasOps *o)
     o->in1 = tcg_temp_new_i64();
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     } else {
         /* Perform the atomic operation in memory. */
-        tcg_gen_atomic_fetch_xor_i64(o->in1, o->addr1, o->in2, get_mem_index(s),
+        tcg_gen_atomic_fetch_xor_i64(o->in1, o->addr1, o->in2,
+                                     get_mem_index1(s),
                                      s->insn->data);
     }
 
@@ -4875,7 +5735,8 @@ static DisasJumpType op_xi(DisasContext *s, DisasOps *o)
     tcg_gen_xor_i64(o->out, o->in1, o->in2);
 
     if (!s390_has_feat(S390_FEAT_INTERLOCKED_ACCESS_2)) {
-        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), s->insn->data);
+        tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                            s->insn->data);
     }
     return DISAS_NEXT;
 }
@@ -5212,6 +6073,27 @@ static void wout_r1_32h(DisasContext *s, DisasOps *o)
 }
 #define SPEC_wout_r1_32h 0
 
+static void wout_r1_la(DisasContext *s, DisasOps *o)
+{
+    int r1 = get_field(s, r1);
+
+    /*
+     * LA and LAY update only the part of the register selected by the
+     * current addressing mode.  get_address() has already wrapped the
+     * effective address to 24 or 31 bits; in z/Architecture mode retain
+     * bits 0-31 of the architected register in those modes.  This also
+     * matches ESA/390 operation: its 32-bit GPR is the low half of the
+     * z/Architecture register, while the unavailable high half is unchanged.
+     * In 64-bit addressing mode the complete register is replaced.
+     */
+    if (s->base.tb->flags & FLAG_MASK_64) {
+        store_reg(r1, o->out);
+    } else {
+        store_reg32_i64(r1, o->out);
+    }
+}
+#define SPEC_wout_r1_la 0
+
 static void wout_r1_P32(DisasContext *s, DisasOps *o)
 {
     int r1 = get_field(s, r1);
@@ -5306,48 +6188,58 @@ static void wout_cond_e1e2(DisasContext *s, DisasOps *o)
 
 static void wout_m1_8(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_UB);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s), MO_UB);
 }
 #define SPEC_wout_m1_8 0
 
 static void wout_m1_16(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUW);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s), MO_BEUW);
 }
 #define SPEC_wout_m1_16 0
 
 #ifndef CONFIG_USER_ONLY
 static void wout_m1_16a(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUW | MO_ALIGN);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                        MO_BEUW | MO_ALIGN);
 }
 #define SPEC_wout_m1_16a 0
 #endif
 
 static void wout_m1_32(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUL);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s), MO_BEUL);
 }
 #define SPEC_wout_m1_32 0
 
 #ifndef CONFIG_USER_ONLY
 static void wout_m1_32a(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUL | MO_ALIGN);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                        MO_BEUL | MO_ALIGN);
 }
 #define SPEC_wout_m1_32a 0
 #endif
 
 static void wout_m1_64(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUQ);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s), MO_BEUQ);
 }
 #define SPEC_wout_m1_64 0
+
+static void wout_m1_64_ser(DisasContext *s, DisasOps *o)
+{
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s), MO_BEUQ);
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+}
+#define SPEC_wout_m1_64_ser 0
 
 #ifndef CONFIG_USER_ONLY
 static void wout_m1_64a(DisasContext *s, DisasOps *o)
 {
-    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index(s), MO_BEUQ | MO_ALIGN);
+    tcg_gen_qemu_st_i64(o->out, o->addr1, get_mem_index1(s),
+                        MO_BEUQ | MO_ALIGN);
 }
 #define SPEC_wout_m1_64a 0
 #endif
@@ -5549,7 +6441,7 @@ static void in1_m1_8u(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_UB);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_UB);
 }
 #define SPEC_in1_m1_8u 0
 
@@ -5557,7 +6449,7 @@ static void in1_m1_16s(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_BESW);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_BESW);
 }
 #define SPEC_in1_m1_16s 0
 
@@ -5565,7 +6457,7 @@ static void in1_m1_16u(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_BEUW);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_BEUW);
 }
 #define SPEC_in1_m1_16u 0
 
@@ -5573,7 +6465,7 @@ static void in1_m1_32s(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_BESL);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_BESL);
 }
 #define SPEC_in1_m1_32s 0
 
@@ -5581,7 +6473,7 @@ static void in1_m1_32u(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_BEUL);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_BEUL);
 }
 #define SPEC_in1_m1_32u 0
 
@@ -5589,7 +6481,7 @@ static void in1_m1_64(DisasContext *s, DisasOps *o)
 {
     in1_la1(s, o);
     o->in1 = tcg_temp_new_i64();
-    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index(s), MO_BEUQ);
+    tcg_gen_qemu_ld_i64(o->in1, o->addr1, get_mem_index1(s), MO_BEUQ);
 }
 #define SPEC_in1_m1_64 0
 
@@ -6013,6 +6905,8 @@ enum DisasInsnEnum {
 #define FAC_Z           S390_FEAT_ZARCH
 #define FAC_CASS        S390_FEAT_COMPARE_AND_SWAP_AND_STORE
 #define FAC_DFP         S390_FEAT_DFP
+#define FAC_DFPZ        S390_FEAT_DFP_ZONED_CONVERSION
+#define FAC_DFPP        S390_FEAT_DFP_PACKED_CONVERSION
 #define FAC_DFPR        S390_FEAT_FLOATING_POINT_SUPPORT_ENH /* DFP-rounding */
 #define FAC_DO          S390_FEAT_STFLE_45 /* distinct-operands */
 #define FAC_EE          S390_FEAT_EXECUTE_EXT
@@ -6022,6 +6916,10 @@ enum DisasInsnEnum {
 #define FAC_FPRGR       S390_FEAT_FLOATING_POINT_SUPPORT_ENH /* FPR-GR-transfer */
 #define FAC_GIE         S390_FEAT_GENERAL_INSTRUCTIONS_EXT
 #define FAC_HFP_MA      S390_FEAT_HFP_MADDSUB
+#define FAC_PFPO        S390_FEAT_PFPO
+#define FAC_CTE         S390_FEAT_CONSTRAINT_TRANSACTIONAL_EXE
+#define FAC_TE          S390_FEAT_TRANSACTIONAL_EXE
+#define FAC_PARSE       S390_FEAT_PARSING_ENH
 #define FAC_HW          S390_FEAT_STFLE_45 /* high-word */
 #define FAC_IEEEE_SIM   S390_FEAT_FLOATING_POINT_SUPPORT_ENH /* IEEE-exception-simulation */
 #define FAC_MIE         S390_FEAT_STFLE_49 /* misc-instruction-extensions */
@@ -6033,9 +6931,14 @@ enum DisasInsnEnum {
 #define FAC_SCF         S390_FEAT_STORE_CLOCK_FAST
 #define FAC_SFLE        S390_FEAT_STFLE
 #define FAC_ILA         S390_FEAT_STFLE_45 /* interlocked-access-facility 1 */
+#define FAC_IRBM        S390_FEAT_INSERT_REFERENCE_BITS_MULT
+#define FAC_RRBM        S390_FEAT_RESET_REFERENCE_BITS_MULT
 #define FAC_MVCOS       S390_FEAT_MOVE_WITH_OPTIONAL_SPEC
 #define FAC_LPP         S390_FEAT_SET_PROGRAM_PARAMETERS /* load-program-parameter */
 #define FAC_DAT_ENH     S390_FEAT_DAT_ENH
+#define FAC_EDAT        S390_FEAT_EDAT
+#define FAC_ASNLXR      S390_FEAT_ASN_LX_REUSE
+#define FAC_TODS        S390_FEAT_TOD_CLOCK_STEERING
 #define FAC_E2          S390_FEAT_EXTENDED_TRANSLATION_2
 #define FAC_EH          S390_FEAT_STFLE_49 /* execution-hint */
 #define FAC_PPA         S390_FEAT_STFLE_49 /* processor-assist */

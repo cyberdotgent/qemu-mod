@@ -7,8 +7,24 @@ css_chpid_add(uint8_t cssid, uint8_t chpid, uint8_t type) "CSS: add chpid %x.%02
 css_new_image(uint8_t cssid, const char *default_cssid) "CSS: add css image 0x%02x %s"
 css_assign_subch(const char *do_assign, uint8_t cssid, uint8_t ssid, uint16_t schid, uint16_t devno) "CSS: %s %x.%x.%04x (devno 0x%04x)"
 css_io_interrupt(int cssid, int ssid, int schid, uint32_t intparm, uint8_t isc, const char *conditional) "CSS: I/O interrupt on sch %x.%x.%04x (intparm 0x%08x, isc 0x%x) %s"
+css_tsch_irb(uint16_t devno, uint16_t flags, uint16_t ctrl, uint32_t cpa, uint8_t dstat, uint8_t cstat, uint16_t count) "CSS: TSCH devno=0x%04x flags=0x%04x ctrl=0x%04x cpa=0x%08x dstat=0x%02x cstat=0x%02x count=%u"
 css_adapter_interrupt(uint8_t isc) "CSS: adapter I/O interrupt (isc 0x%x)"
 css_do_sic(uint16_t mode, uint8_t isc) "CSS: set interruption mode 0x%x on isc 0x%x"
+css_ccw(uint16_t devno, uint64_t addr, uint8_t cmd, uint32_t cda, uint16_t count, uint8_t flags) "CSS: devno=0x%04x ccw=0x%" PRIx64 " cmd=0x%02x cda=0x%08x count=0x%04x flags=0x%02x"
+css_ccw_error(uint16_t devno, uint64_t addr, int ret) "CSS: devno=0x%04x ccw=0x%" PRIx64 " error=%d"
+
+# 3590-ccw.c
+tape3590_ccw(uint16_t devno, uint8_t cmd, uint32_t cda, uint16_t count, uint8_t flags, uint32_t block_id) "3590-CCW: devno=0x%04x cmd=0x%02x cda=0x%08x count=0x%04x flags=0x%02x block=0x%08x"
+
+# eckd-ccw.c
+eckd_ccw(uint16_t devno, uint8_t cmd, uint32_t cda, uint16_t count, uint8_t flags, uint16_t cyl, uint16_t head, uint8_t record) "ECKD-CCW: devno=0x%04x cmd=0x%02x cda=0x%08x count=0x%04x flags=0x%02x CCHHR=%04x/%04x/%02x"
+eckd_locate(uint16_t devno, uint8_t operation, uint8_t count, uint16_t cyl, uint16_t head, uint8_t record, uint16_t length) "ECKD-LR: devno=0x%04x op=0x%02x count=%u CCHHR=%04x/%04x/%02x length=%u"
+eckd_read(uint16_t devno, uint8_t cmd, uint16_t cyl, uint16_t head, uint8_t record, uint32_t length, uint16_t count) "ECKD-READ: devno=0x%04x cmd=0x%02x CCHHR=%04x/%04x/%02x record-length=%u ccw-count=%u"
+eckd_search_key(uint16_t devno, uint8_t cmd, uint16_t cyl, uint16_t head, uint8_t record, int comparison, bool match) "ECKD-SEARCH-KEY: devno=0x%04x cmd=0x%02x CCHHR=%04x/%04x/%02x comparison=%d match=%d"
+eckd_search_id(uint16_t devno, uint16_t wanted_cyl, uint16_t wanted_head, uint8_t wanted_record, uint16_t found_cyl, uint16_t found_head, uint8_t found_record, bool match) "ECKD-SEARCH-ID: devno=0x%04x wanted=%04x/%04x/%02x found=%04x/%04x/%02x match=%d"
+eckd_write_chain(uint16_t devno, bool continuation, uint32_t expected, uint32_t used, uint16_t count, uint8_t flags) "ECKD-WRITE-CHAIN: devno=0x%04x continuation=%d expected=%u used=%u count=%u flags=0x%02x"
+eckd_write_ckd(uint16_t devno, uint16_t cyl, uint16_t head, uint8_t record, uint8_t key_length, uint16_t data_length, uint32_t supplied, uint32_t track_used) "ECKD-WRITE-CKD: devno=0x%04x CCHHR=%04x/%04x/%02x key=%u data=%u supplied=%u track-used=%u"
+eckd_unit_check(uint16_t devno, uint8_t sense0, uint8_t sense1, uint16_t cyl, uint16_t head, uint8_t record, unsigned int record_count) "ECKD-UNIT-CHECK: devno=0x%04x sense=%02x/%02x CCHHR=%04x/%04x/%02x records=%u"
 
 # virtio-ccw.c
 virtio_ccw_interpret_ccw(int cssid, int ssid, int schid, int cmd_code) "VIRTIO-CCW: %x.%x.%04x: interpret command 0x%x"

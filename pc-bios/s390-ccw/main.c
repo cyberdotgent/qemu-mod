@@ -50,9 +50,33 @@ void write_subsystem_identification(void)
     lowcore->io_int_parm = 0;
 }
 
+/*
+ * A load-normal reset disables all subchannels.  The architectural IPL
+ * operation leaves the selected IPL subchannel enabled, so restore that
+ * state after the reset and before entering the loaded program.
+ */
+void enable_ipl_subchannel(void)
+{
+    if (cutype == CU_TYPE_VIRTIO && virtio_get_device_type() == VIRTIO_ID_NET) {
+        enable_subchannel(net_schid);
+    } else {
+        enable_subchannel(blk_schid);
+    }
+}
+
 void write_iplb_location(void)
 {
-    if (virtio_is_supported(virtio_get_device()) &&
+    /*
+     * Do not call virtio_is_supported() here.  That function issues a
+     * SENSE ID CCW, but this runs after the IPL channel program has loaded
+     * the guest lowcore.  Waiting for that I/O installs the firmware's
+     * interruption PSW over the guest's new-I/O PSW.
+     *
+     * find_boot_device() has already established both the control-unit type
+     * and, for virtio devices, the device type.  Use that cached result so
+     * the handoff remains free of channel I/O.
+     */
+    if (cutype == CU_TYPE_VIRTIO &&
         virtio_get_device_type() != VIRTIO_ID_NET) {
         lowcore->ptr_iplb = ptr2u32(&iplb);
     }
@@ -114,6 +138,8 @@ static int is_dev_possibly_bootable(int dev_no, int sch_no)
             return false;
         case CU_TYPE_DASD_3990:
         case CU_TYPE_DASD_2107:
+        case CU_TYPE_DASD_FBA:
+        case CU_TYPE_TAPE_3590:
             return true;
         default:
             return false;
@@ -302,9 +328,17 @@ static int virtio_setup(void)
 static void ipl_ccw_device(void)
 {
     switch (cutype) {
-    case CU_TYPE_DASD_3990:
     case CU_TYPE_DASD_2107:
+        eckd_ipl(blk_schid, cutype);
+        break;
+    case CU_TYPE_DASD_3990:
         dasd_ipl(blk_schid, cutype);
+        break;
+    case CU_TYPE_DASD_FBA:
+        fba_ipl(blk_schid, cutype);
+        break;
+    case CU_TYPE_TAPE_3590:
+        tape_3590_ipl(blk_schid, cutype);
         break;
     case CU_TYPE_VIRTIO:
         if (virtio_setup() == 0) {

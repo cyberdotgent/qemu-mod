@@ -15,6 +15,7 @@
 #include "hw/core/qdev.h"
 #include "hw/s390x/css.h"
 #include "hw/s390x/css-bridge.h"
+#include "hw/s390x/ipl/qipl.h"
 
 struct CcwDevice {
     DeviceState parent_obj;
@@ -40,6 +41,8 @@ struct CCWDeviceClass {
     void (*unplug)(HotplugHandler *, DeviceState *, Error **);
     bool (*realize)(CcwDevice *, Error **);
     void (*refill_ids)(CcwDevice *);
+    /* Build the IPL parameter block for a directly IPL-able CCW device. */
+    bool (*build_iplb)(CcwDevice *, IplParameterBlock *, Error **);
 };
 
 static inline CcwDevice *to_ccw_dev_fast(DeviceState *d)

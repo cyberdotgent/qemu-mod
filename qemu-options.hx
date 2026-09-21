@@ -1120,6 +1120,99 @@ SRST
         ``qemu.wav``.
 ERST
 
+DEF("dev3270", HAS_ARG, QEMU_OPTION_dev3270,
+    "-dev3270 port=port[,devno=ccw-address][,chpid=id][,device-type=type][,device-model=model]\n"
+    "                add a 3270 terminal listening on the loopback interface\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3270 port=port[,devno=ccw-address][,chpid=id][,device-type=type][,device-model=model]``
+    Add a 3270 terminal backed by a TN3270 socket server listening on the
+    loopback interface. The server does not wait for a client when QEMU starts.
+    If ``devno`` is omitted, QEMU assigns an available CCW device number.
+    If ``chpid`` is omitted, QEMU assigns or reuses a virtual channel path.
+    ``device-type`` and ``device-model`` select the Sense ID presented to the
+    guest; they default to 3278 model 2. ``control-unit-type`` and
+    ``control-unit-model`` can likewise override the default 3274 model 1D
+    identity.
+
+    This option is equivalent to creating a socket chardev with
+    ``server=on,wait=off,tn3270=on`` and attaching an ``x-terminal3270`` device
+    to it. It can be specified multiple times to create terminals listening on
+    different ports.
+ERST
+
+DEF("dev3215", HAS_ARG, QEMU_OPTION_dev3215,
+    "-dev3215 [chardev=id][,devno=ccw-address][,id=id]\n"
+    "                add an IBM 3215 console (stdio by default)\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3215 [chardev=id][,devno=ccw-address][,id=id]``
+    Add an IBM 3215 console printer-keyboard. Without ``chardev``, QEMU
+    creates a stdio backend with terminal signal handling disabled and uses
+    local input echo. This claims stdio in the same way as ``-serial stdio``
+    and suppresses the default serial console and monitor. Only one stdio
+    backend can be used unless it is explicitly multiplexed.
+
+    With ``chardev``, attach an existing character backend and leave local
+    echo disabled. A three- or four-digit hexadecimal ``devno`` such as
+    ``009`` or ``0009`` means ``fe.0.0009``. If ``devno`` is omitted, QEMU
+    assigns an available CCW device number.
+ERST
+
+DEF("dev9336", HAS_ARG, QEMU_OPTION_dev9336,
+    "-dev9336 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,blocks=n][,id=id]\n"
+    "-dev9336 drive=node[,devno=ccw-address][,blocks=n][,id=id]\n"
+    "                add an emulated 9336-20 FBA disk\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev9336 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,blocks=n][,id=id]``
+  \
+``-dev9336 drive=node[,devno=ccw-address][,blocks=n][,id=id]``
+    Add an emulated 9336 model 20 fixed-block disk. With ``file``, QEMU
+    creates an ``if=none`` block backend; ``format`` defaults to ``raw``.
+    Alternatively, ``drive`` attaches an existing block node or ``-drive``
+    backend. A three- or four-digit hexadecimal ``devno`` such as ``200`` or
+    ``0200`` means ``fe.0.0200``. The option can be repeated for multiple
+    disks.
+ERST
+
+DEF("dev3590", HAS_ARG, QEMU_OPTION_dev3590,
+    "-dev3590 [file=file][,devno=ccw-address][,ident=type][,readonly=on|off][,id=id]\n"
+    "-dev3590 drive=node[,devno=ccw-address][,ident=type][,id=id]\n"
+    "                add an AWS-backed IBM 3590 A50 tape drive\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3590 [file=file][,devno=ccw-address][,ident=type][,readonly=on|off][,id=id]``
+  \
+``-dev3590 drive=node[,devno=ccw-address][,ident=type][,id=id]``
+    Add an emulated IBM 3590 A50 tape drive backed by an AWS image. With
+    ``file``, QEMU creates a raw, read-only block backend by default. If both
+    ``file`` and ``drive`` are omitted, the drive starts empty.
+    Alternatively, ``drive`` attaches an existing block backend. A three- or
+    four-digit hexadecimal ``devno`` such as ``580`` or ``0580`` means
+    ``fe.0.0580``. ``ident`` selects a compatibility identity from ``3410``,
+    ``3411``, ``3420``, ``3422``, ``3430``, ``3480``, ``3490``, ``3590``,
+    ``8809``, ``9347``, and ``9348``; it defaults to ``3590``. The option can
+    be repeated for multiple tape drives.
+ERST
+
+DEF("dev3390", HAS_ARG, QEMU_OPTION_dev3390,
+    "-dev3390 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,id=id]\n"
+    "-dev3390 drive=node[,devno=ccw-address][,id=id]\n"
+    "                add an emulated 2107/3390 ECKD disk\n",
+    QEMU_ARCH_S390X)
+SRST
+``-dev3390 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,id=id]``
+  \
+``-dev3390 drive=node[,devno=ccw-address][,id=id]``
+    Add an emulated IBM 3390 ECKD disk on a 2107 control unit. The guest byte
+    stream must be an uncompressed ``CKD_P370`` or ``CKD_P064`` image; the
+    outer block backend may be raw or qcow2. With ``file``, ``format`` defaults
+    to ``raw``. Alternatively, ``drive`` attaches an existing block node or
+    ``-drive`` backend. A three- or four-digit hexadecimal ``devno`` such as
+    ``200`` or ``0200`` means ``fe.0.0200``. The option can be repeated.
+ERST
+
 DEF("device", HAS_ARG, QEMU_OPTION_device,
     "-device driver[,prop=value[,...]]\n"
     "                add device (based on driver)\n"
@@ -4611,6 +4704,36 @@ SRST
 ``-kernel bzImage``
     Use bzImage as kernel image. The kernel can be either a Linux kernel
     or in multiboot format.
+
+    On s390x, a filename ending in ``.INS`` is treated as an HMC
+    list-directed-load control file. Its raw components are loaded at their
+    specified addresses and execution starts from the short IPL PSW at address
+    zero.
+ERST
+
+DEF("ipl", HAS_ARG, QEMU_OPTION_ipl,
+    "-ipl ccw-address IPL from the specified CCW device (s390x only)\n",
+    QEMU_ARCH_S390X)
+SRST
+``-ipl ccw-address``
+    On s390x, IPL from the specified CCW device. ``ccw-address`` can be a
+    one-to-four-digit hexadecimal device number (for example ``1000``), or a
+    full QEMU CCW address such as ``fe.0.1000``. A short device number must be
+    unique across channel-subsystem and subchannel-set IDs.
+
+    This is a convenience form of the ``ipl`` property on the
+    ``s390-ccw-virtio`` machine. It cannot be combined with ``-kernel`` or a
+    device ``bootindex`` property.
+ERST
+
+DEF("loadparm", HAS_ARG, QEMU_OPTION_loadparm,
+    "-loadparm string set the s390x IPL load parameter\n", QEMU_ARCH_S390X)
+SRST
+``-loadparm string``
+    Set the s390x IPL load parameter. Up to eight characters from
+    ``[A-Za-z0-9. ]`` are accepted; lower-case letters are converted to upper
+    case. This is a convenience form of the ``loadparm`` property on the
+    ``s390-ccw-virtio`` machine.
 ERST
 
 DEF("shim", HAS_ARG, QEMU_OPTION_shim, \

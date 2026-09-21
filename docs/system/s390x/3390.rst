@@ -1,0 +1,39 @@
+Emulated 3390 ECKD disks
+========================
+
+QEMU can expose a plain CKD or CKD64 byte stream as an IBM 3390 ECKD disk on
+an emulated 2107 control unit. The image engine accepts the uncompressed
+Hercules-compatible ``CKD_P370`` and ``CKD_P064`` layouts. Compressed CCKD
+and CCKD64 are intentionally not device formats.
+
+The concise command line is::
+
+  -dev3390 file=dosres.qcow2,format=qcow2,devno=200
+
+The outer QEMU block backend may be raw, qcow2, or another block format; its
+virtual byte stream must contain the plain CKD image. An existing backend can
+instead be attached with::
+
+  -dev3390 drive=dosres-node,devno=200
+
+Three- and four-digit hexadecimal device numbers are accepted, so ``200`` and
+``0200`` both select ``fe.0.0200``. Without ``devno``, 3390 disks are
+allocated starting at ``0300``.
+
+The supported geometry is 15 tracks per cylinder and up to 65,520 cylinders,
+covering named 3390-1, 3390-2, 3390-3, 3390-9, 3390-27, and 3390-54 sizes.
+Geometry comes from the CKD byte-stream length rather than from the outer
+container's allocated size.
+
+Image creation
+--------------
+
+``work/ckd-qcow2-init.py`` in the source checkout is a dasdinit-like
+development tool which creates a qcow2 container holding a CKD64 image. For
+example::
+
+  python3 work/ckd-qcow2-init.py dosres.qcow2 3390-3 DOSRES
+  python3 work/ckd-qcow2-init.py archive.qcow2 3390-54 ARCHIV
+
+Use ``--ckd`` for ``CKD_P370`` instead of the default ``CKD_P064``. Images
+can be exported for Hercules with ``qemu-img convert -O raw``.

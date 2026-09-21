@@ -1,8 +1,11 @@
 s390x_ss.add(when: 'CONFIG_TCG', if_true: files(
+  'dfp_helper.c',
   'int_helper.c',
+  'linkage_helper.c',
   'mem_helper.c',
   'misc_helper.c',
 ))
+s390x_ss.add(libdecnumber)
 s390x_common_ss.add(when: 'CONFIG_TCG', if_true: files(
   'cc_helper.c',
   'crypto_helper.c',

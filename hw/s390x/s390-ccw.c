@@ -18,6 +18,7 @@
 #include "hw/s390x/css.h"
 #include "hw/s390x/css-bridge.h"
 #include "hw/s390x/s390-ccw.h"
+#include "hw/s390x/ipl.h"
 #include "system/system.h"
 
 IOInstEnding s390_ccw_cmd_request(SubchDev *sch)
@@ -178,9 +179,11 @@ static void s390_ccw_instance_init(Object *obj)
 static void s390_ccw_class_init(ObjectClass *klass, const void *data)
 {
     S390CCWDeviceClass *cdc = S390_CCW_DEVICE_CLASS(klass);
+    CCWDeviceClass *ccw_dc = CCW_DEVICE_CLASS(klass);
 
     cdc->realize = s390_ccw_realize;
     cdc->unrealize = s390_ccw_unrealize;
+    ccw_dc->build_iplb = s390_ipl_build_ccw_iplb;
 }
 
 static const TypeInfo s390_ccw_info = {

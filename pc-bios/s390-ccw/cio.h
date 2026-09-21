@@ -111,6 +111,9 @@ struct scsw {
 #define SCSW_CSTAT_ICCHK    0x02
 #define SCSW_CSTAT_CHAINCHK 0x01
 
+/* I/O-interruption-code flags */
+#define IO_INT_WORD_AI      0x80000000
+
 /*
  * subchannel information block
  */
@@ -229,7 +232,6 @@ typedef struct ccw1 {
 #define CCW_CMD_DASD_SEEK             0x07
 #define CCW_CMD_DASD_SEARCH_ID_EQ     0x31
 #define CCW_CMD_DASD_READ_MT          0x86
-
 /*
  * Command-mode operation request block
  */
@@ -263,6 +265,8 @@ struct ciw {
 
 #define CU_TYPE_UNKNOWN         0x0000
 #define CU_TYPE_DASD_2107       0x2107
+#define CU_TYPE_DASD_FBA        0x6310
+#define CU_TYPE_TAPE_3590       0x3590
 #define CU_TYPE_VIRTIO          0x3832
 #define CU_TYPE_DASD_3990       0x3990
 
@@ -369,6 +373,9 @@ uint16_t cu_type(SubChannelId schid);
 int basic_sense(SubChannelId schid, uint16_t cutype, void *sense_data,
                  uint16_t data_size);
 int do_cio(SubChannelId schid, uint16_t cutype, uint32_t ccw_addr, int fmt);
+int do_cio_raw(SubChannelId schid, uint32_t ccw_addr, int fmt, Irb *irb);
+int do_cio_32bit_ida(SubChannelId schid, uint16_t cutype,
+                     uint32_t ccw_addr, int fmt);
 
 /*
  * Some S390 specific IO instructions as inline

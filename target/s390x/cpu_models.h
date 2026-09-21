@@ -48,7 +48,7 @@ typedef struct S390CPUModel {
     uint16_t lowest_ibc;    /* lowest IBC that the hardware supports */
     uint32_t cpu_id;        /* CPU id */
     uint8_t cpu_id_format;  /* CPU id format bit */
-    uint8_t cpu_ver;        /* CPU version, usually "ff" for kvm */
+    uint8_t cpu_ver;        /* CPU version */
 } S390CPUModel;
 
 /*
@@ -115,6 +115,8 @@ S390CPUDef const *s390_find_cpu_def(uint16_t type, uint8_t gen, uint8_t ec_ga,
                                     S390FeatBitmap features);
 void s390_set_qemu_cpu_model(uint16_t type, uint8_t gen, uint8_t ec_ga,
                              const S390FeatInit feat_init);
+void s390_set_kvm_cpu_version(uint8_t version);
+uint8_t s390_get_kvm_cpu_version(void);
 void s390_cpu_list(void);
 
 bool kvm_s390_cpu_models_supported(void);

@@ -1,0 +1,58 @@
+3215 console
+============
+
+The IBM 3215 is a line-mode console printer-keyboard.  QEMU's ``3215-ccw``
+device implements its channel interface and connects the operator side to a
+QEMU character backend.  It is useful for guests which support a traditional
+3215 or 1052 console but do not require a 3270 display terminal.
+
+The concise form creates a stdio backend and attaches it at device 0009::
+
+  -dev3215 devno=009
+
+This form owns standard input and output, disables local terminal signal
+handling, enables input echo, and suppresses QEMU's default serial console and
+monitor.  Configure a separate monitor, for example
+``-monitor unix:qemu-monitor.sock,server=on,wait=off``, if one is needed.
+
+The expanded form accepts any character backend::
+
+  -chardev stdio,id=operator,signal=off \
+  -device 3215-ccw,id=console,chardev=operator,devno=fe.0.0009,echo=on
+
+A socket-backed console can instead be exposed as follows::
+
+  -chardev socket,id=operator,host=127.0.0.1,port=3215,server=on,wait=off \
+  -device 3215-ccw,id=console,chardev=operator,devno=fe.0.0009
+
+The socket carries ordinary text lines, not Telnet or TN3270 records.  Local
+echo is disabled by default in the expanded form and can be enabled with the
+device's ``echo=on`` property.
+
+``-dev3215`` also accepts ``chardev=ID`` to attach an existing backend without
+creating stdio, and ``id=ID`` to select the QEMU device ID.  Three-digit S/370
+and four-digit ESA/390 hexadecimal device numbers are both accepted: ``009``
+and ``0009`` both become ``fe.0.0009``.  Multiple devices are supported when
+each uses a distinct character backend; only one backend may own stdio unless
+the user explicitly configures multiplexing.
+
+Guest interface
+---------------
+
+The device implements Write without Carrier Return (01), NOP (03), Basic
+Sense (04), Write with Automatic Carrier Return (09), Read Inquiry (0A),
+Audible Alarm (0B), and Sense ID (E4).  Input is assembled into records on CR
+or LF, with CR/LF coalescing, backspace/delete editing, a 150-byte line limit,
+and a bounded queue.  Read Inquiry waits asynchronously when no line is ready;
+new input completes that read or raises an unsolicited attention interruption.
+Halt, clear, reset, command/data chaining, residual counts, and one-byte sense
+status are handled by the channel device.
+
+Queued complete input lines and partial line-editing state are migratable, but
+an active Read Inquiry prevents migration because its channel data stream
+refers to source guest memory.  Character-stream connections themselves are
+external state and must be re-established at the destination.
+
+The seven-byte device identity matches the Hercules ``3215-C`` model.  The
+``-C`` suffix in Hercules describes its panel integration; it is not a
+different guest-visible channel protocol.

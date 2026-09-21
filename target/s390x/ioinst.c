@@ -59,6 +59,34 @@ int ioinst_disassemble_sch_ident(uint32_t value, int *m, int *cssid, int *ssid,
     return 0;
 }
 
+void ioinst_handle_siga(S390CPU *cpu, uintptr_t ra)
+{
+    CPUS390XState *env = &cpu->env;
+    uint64_t ident = env->regs[1];
+    int cssid, ssid, schid, m;
+    SubchDev *sch;
+    uint8_t function = env->regs[0] & 0xff;
+    int cc;
+
+    if (function & 0x78) {
+        s390_program_interrupt(env, PGM_OPERAND, ra);
+        return;
+    }
+    if (ioinst_disassemble_sch_ident(ident, &m, &cssid, &ssid, &schid)) {
+        s390_program_interrupt(env, PGM_OPERAND, ra);
+        return;
+    }
+    sch = css_find_subch(m, cssid, ssid, schid);
+    if (!sch || !css_subch_visible(sch) || !sch->qdio_ops ||
+        !sch->qdio_ops->siga) {
+        setcc(cpu, 3);
+        return;
+    }
+    cc = sch->qdio_ops->siga(sch, function, env->regs[2] & 0xffffffff,
+                             env->regs[3] & 0xffffffff, env->regs[3]);
+    setcc(cpu, cc);
+}
+
 void ioinst_handle_xsch(S390CPU *cpu, uint64_t reg1, uintptr_t ra)
 {
     int cssid, ssid, schid, m;
@@ -223,6 +251,7 @@ void ioinst_handle_ssch(S390CPU *cpu, uint64_t reg1, uint32_t ipb, uintptr_t ra)
         setcc(cpu, 3);
         return;
     }
+    trace_ioinst_ssch(sch->devno, env->psw.addr);
     setcc(cpu, css_do_ssch(sch, &orb));
 }
 
@@ -256,6 +285,72 @@ void ioinst_handle_stcrw(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
             }
             s390_cpu_virt_mem_handle_exc(cpu, ra);
         }
+    }
+}
+
+void ioinst_handle_stcps(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
+{
+    CPUS390XState *env = &cpu->env;
+    uint8_t active_chpids[32] = { 0 };
+    uint64_t addr;
+    uint8_t ar;
+    unsigned int ssid;
+    unsigned int schid;
+
+    addr = get_address_from_regs(env, ipb, &ar);
+    if (addr & 31) {
+        s390_program_interrupt(env, PGM_SPECIFICATION, ra);
+        return;
+    }
+
+    /*
+     * STCPS reports channel paths on which an enabled, valid subchannel is
+     * currently active.  QEMU's channel subsystem uses CSS 0 for its
+     * emulated devices; scan every subchannel set because MSS can expose
+     * more than set zero.  lpum identifies the path selected for the
+     * operation, with its most-significant set bit indexing pmcw.chpid[].
+     */
+    for (ssid = 0; ssid <= MAX_SSID; ssid++) {
+        for (schid = 0; schid <= MAX_SCHID; schid++) {
+            SubchDev *sch = css_find_subch(1, 0, ssid, schid);
+            SCHIB status;
+            unsigned int path;
+            uint8_t lpum;
+            uint8_t chpid;
+
+            if (!sch || !css_subch_visible(sch)) {
+                continue;
+            }
+            memcpy(&status, &sch->curr_status, sizeof(status));
+            if ((status.pmcw.flags &
+                 (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) !=
+                (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA) ||
+                (status.scsw.ctrl &
+                 (SCSW_ACTL_SUBCH_ACTIVE | SCSW_ACTL_DEVICE_ACTIVE)) !=
+                (SCSW_ACTL_SUBCH_ACTIVE | SCSW_ACTL_DEVICE_ACTIVE)) {
+                continue;
+            }
+            lpum = status.pmcw.lpum;
+            if (!lpum) {
+                continue;
+            }
+            for (path = 0; path < ARRAY_SIZE(status.pmcw.chpid); path++) {
+                if (lpum & (0x80 >> path)) {
+                    break;
+                }
+            }
+            chpid = status.pmcw.chpid[path];
+            active_chpids[chpid / 8] |= 0x80 >> (chpid % 8);
+        }
+    }
+
+    trace_ioinst_stcps(addr, ldl_be_p(active_chpids));
+    if (s390_is_pv()) {
+        s390_cpu_pv_mem_write(cpu, addr, active_chpids,
+                              sizeof(active_chpids));
+    } else if (s390_cpu_virt_mem_write(cpu, addr, ar, active_chpids,
+                                       sizeof(active_chpids)) != 0) {
+        s390_cpu_virt_mem_handle_exc(cpu, ra);
     }
 }
 
@@ -314,6 +409,10 @@ void ioinst_handle_stsch(S390CPU *cpu, uint64_t reg1, uint32_t ipb,
             cc = 0;
         }
     }
+    trace_ioinst_stsch(cssid, ssid, schid, cc,
+                       sch ? sch->curr_status.pmcw.flags : 0,
+                       sch ? sch->curr_status.pmcw.devno : 0,
+                       sch ? sch->curr_status.pmcw.chars : 0);
     if (cc != 3) {
         if (s390_is_pv()) {
             s390_cpu_pv_mem_write(cpu, addr, &schib, sizeof(schib));
@@ -401,9 +500,13 @@ typedef struct ChscResp {
 #define CHSC_MIN_RESP_LEN 0x0008
 
 #define CHSC_SCPD 0x0002
+#define CHSC_SSD  0x0004
+#define CHSC_SSCUD 0x0006
 #define CHSC_SCSC 0x0010
 #define CHSC_SDA  0x0031
+#define CHSC_SDCAL 0x0034
 #define CHSC_SEI  0x000e
+#define CHSC_SSQD 0x0024
 
 #define CHSC_SCPD_0_M 0x20000000
 #define CHSC_SCPD_0_C 0x10000000
@@ -466,6 +569,151 @@ static void ioinst_handle_chsc_scpd(ChscReq *req, ChscResp *res)
     res->param = cpu_to_be32(rfmt);
 }
 
+#define CHSC_SSD_SSID_MASK 0x0030
+#define CHSC_SSD_M         0x0040
+#define CHSC_SSD_FMT_MASK  0x000f
+#define CHSC_SSD_VALID_SCH 0x80
+#define CHSC_SSD_VALID_DEV 0x40
+#define CHSC_SSD_DESC_SIZE 32
+static void ioinst_handle_chsc_ssd(ChscReq *req, ChscResp *res)
+{
+    uint32_t param0 = be32_to_cpu(req->param0);
+    uint32_t param1 = be32_to_cpu(req->param1);
+    uint16_t ssidfmt = param0 >> 16;
+    uint16_t first = param0;
+    uint16_t last = param1;
+    uint8_t ssid = (ssidfmt & CHSC_SSD_SSID_MASK) >> 4;
+    uint8_t *desc = (uint8_t *)res->data;
+    unsigned int capacity;
+    unsigned int count;
+    uint16_t schid;
+
+    /*
+     * Store Subchannel Description Data has a fixed 16-byte request in
+     * format 0.  Each returned descriptor is 32 bytes.
+     */
+    if (be16_to_cpu(req->len) != sizeof(*req) ||
+        (ssidfmt & ~(CHSC_SSD_M | CHSC_SSD_SSID_MASK |
+                     CHSC_SSD_FMT_MASK)) ||
+        (ssidfmt & CHSC_SSD_FMT_MASK) || (param1 >> 16) || req->param2 ||
+        last < first) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    capacity = (TARGET_PAGE_SIZE - sizeof(*req) - CHSC_MIN_RESP_LEN) /
+               CHSC_SSD_DESC_SIZE;
+    count = MIN((unsigned int)last - first + 1, capacity);
+    for (schid = first; count; schid++, count--) {
+        SubchDev *sch = css_find_subch(0, 0, ssid, schid);
+        PMCW pmcw;
+
+        memset(desc, 0, CHSC_SSD_DESC_SIZE);
+        if (sch && css_subch_visible(sch)) {
+            pmcw = sch->curr_status.pmcw;
+            desc[0] = CHSC_SSD_VALID_SCH;
+            if (pmcw.flags & PMCW_FLAGS_MASK_DNV) {
+                desc[0] |= CHSC_SSD_VALID_DEV;
+            }
+            desc[1] = pmcw.devno;
+            stw_be_p(desc + 2, pmcw.devno);
+            desc[4] = pmcw.pim;
+            stw_be_p(desc + 6, schid);
+            memcpy(desc + 8, pmcw.chpid, sizeof(pmcw.chpid));
+        }
+        desc += CHSC_SSD_DESC_SIZE;
+    }
+
+    count = MIN((unsigned int)last - first + 1, capacity);
+    res->len = cpu_to_be16(CHSC_MIN_RESP_LEN +
+                           count * CHSC_SSD_DESC_SIZE);
+    res->code = cpu_to_be16(0x0001);
+    res->param = 0;
+}
+
+#define CHSC_SSCUD_M          0x2000
+#define CHSC_SSCUD_FMT_MASK   0x00f0
+#define CHSC_SSCUD_SSID_MASK  0x0003
+#define CHSC_SSCUD_VALID_SCH  0x80
+#define CHSC_SSCUD_VALID_DEV  0x40
+#define CHSC_SSCUD_DESC_SIZE  32
+static void ioinst_handle_chsc_sscud(ChscReq *req, ChscResp *res)
+{
+    uint32_t param0 = be32_to_cpu(req->param0);
+    uint32_t param1 = be32_to_cpu(req->param1);
+    uint16_t ssidfmt = param0 >> 16;
+    uint16_t first = param0;
+    uint16_t last = param1;
+    uint8_t cssid = param1 >> 16;
+    uint8_t ssid = ssidfmt & CHSC_SSCUD_SSID_MASK;
+    uint8_t *desc = (uint8_t *)res->data;
+    unsigned int capacity;
+    unsigned int count;
+    uint16_t schid;
+
+    /*
+     * Store Subchannel Control-Unit Data, format 0.  QEMU exposes the
+     * default channel subsystem only, but accepts the multiple-CSS form
+     * used by current z/OS when it explicitly selects CSS 0.
+     */
+    if (be16_to_cpu(req->len) != sizeof(*req) ||
+        (ssidfmt & ~(CHSC_SSCUD_M | CHSC_SSCUD_FMT_MASK |
+                     CHSC_SSCUD_SSID_MASK)) ||
+        (ssidfmt & CHSC_SSCUD_FMT_MASK) ||
+        (param1 & 0xff000000) || req->param2 || last < first ||
+        cssid != 0 || (cssid && !(ssidfmt & CHSC_SSCUD_M))) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    capacity = (TARGET_PAGE_SIZE - sizeof(*req) - CHSC_MIN_RESP_LEN) /
+               CHSC_SSCUD_DESC_SIZE;
+    count = MIN((unsigned int)last - first + 1, capacity);
+    for (schid = first; count; schid++, count--) {
+        SubchDev *sch = css_find_subch(0, cssid, ssid, schid);
+        PMCW pmcw;
+        unsigned int path;
+
+        memset(desc, 0, CHSC_SSCUD_DESC_SIZE);
+        if (sch && css_subch_visible(sch)) {
+            pmcw = sch->curr_status.pmcw;
+            desc[0] = CHSC_SSCUD_VALID_SCH;
+            if (pmcw.flags & PMCW_FLAGS_MASK_DNV) {
+                desc[0] |= CHSC_SSCUD_VALID_DEV;
+            }
+            desc[1] = pmcw.pim;
+            stw_be_p(desc + 2, pmcw.devno);
+            stw_be_p(desc + 6, schid);
+            memcpy(desc + 8, pmcw.chpid, sizeof(pmcw.chpid));
+            for (path = 0; path < ARRAY_SIZE(pmcw.chpid); path++) {
+                uint16_t cun;
+
+                if (!(pmcw.pim & (0x80 >> path))) {
+                    continue;
+                }
+                /*
+                 * Match the conventional emulated-control-unit numbering
+                 * used by Hercules: the device-number tens digit selects
+                 * the CU, and the low byte identifies its channel path.
+                 */
+                cun = ((pmcw.devno & 0x00f0) << 4) | pmcw.chpid[path];
+                stw_be_p(desc + 16 + path * 2, cun);
+            }
+        }
+        desc += CHSC_SSCUD_DESC_SIZE;
+    }
+
+    count = MIN((unsigned int)last - first + 1, capacity);
+    res->len = cpu_to_be16(CHSC_MIN_RESP_LEN +
+                           count * CHSC_SSCUD_DESC_SIZE);
+    res->code = cpu_to_be16(0x0001);
+    res->param = 0;
+}
+
 #define CHSC_SCSC_0_M 0x20000000
 #define CHSC_SCSC_0_FMT 0x000f0000
 #define CHSC_SCSC_0_CSSID 0x0000ff00
@@ -506,12 +754,15 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
     memset(general_chars, 0, sizeof(general_chars));
     memset(chsc_chars, 0, sizeof(chsc_chars));
 
-    general_chars[0] = cpu_to_be32(0x03000000);
+    general_chars[0] = cpu_to_be32(0x03080000);
     general_chars[1] = cpu_to_be32(0x00079000);
     general_chars[3] = cpu_to_be32(0x00080000);
 
-    chsc_chars[0] = cpu_to_be32(0x40000000);
-    chsc_chars[3] = cpu_to_be32(0x00040000);
+    /*
+     * Store Channel-Path Description, Store Subchannel Control-Unit Data,
+     * Store Subchannel Description Data, and Store Subchannel QDIO Data.
+     */
+    chsc_chars[0] = cpu_to_be32(0x70800000);
 
     memcpy(res->data, general_chars, sizeof(general_chars));
     memcpy(res->data + sizeof(general_chars), chsc_chars, sizeof(chsc_chars));
@@ -571,6 +822,41 @@ out:
     res->code = cpu_to_be16(resp_code);
     res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
     res->param = 0;
+}
+
+#define CHSC_SDCAL_ATYPE_CSS_IMG 4
+static void ioinst_handle_chsc_sdcal(ChscReq *req, ChscResp *res)
+{
+    uint16_t len = be16_to_cpu(req->len);
+    uint32_t param0 = be32_to_cpu(req->param0);
+    uint8_t atype = param0 >> 24;
+    uint8_t fmt = (param0 >> 16) & 0xf;
+    uint8_t *entry = (uint8_t *)res->data + 8;
+
+    /*
+     * Store Domain Configuration Attributes List, attribute type 4:
+     * channel-subsystem images, MIF images, and logical partitions.
+     *
+     * QEMU currently presents one channel-subsystem image and does not
+     * model MIF or logical partitions.  The first entry must describe the
+     * default image, which is exposed to the guest as CSSID 0.
+     */
+    if (len != 0x0020 || atype != CHSC_SDCAL_ATYPE_CSS_IMG ||
+        fmt != 0 || (param0 & 0x00f0ffff) ||
+        req->param1 || req->param2) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    res->len = cpu_to_be16(20);
+    res->code = cpu_to_be16(0x0001);
+    res->param = 0;
+    entry[0] = 0; /* Default CSSID. */
+    entry[1] = 0; /* Default MIF image ID. */
+    entry[2] = 0; /* No logical-partition model. */
+    entry[3] = 0;
 }
 
 static int chsc_sei_nt0_get_event(void *res)
@@ -664,10 +950,61 @@ static void ioinst_handle_chsc_sei(ChscReq *req, ChscResp *res)
     res->param = 0;
 }
 
-static void ioinst_handle_chsc_unimplemented(ChscResp *res)
+static void ioinst_handle_chsc_invalid(ChscResp *res)
 {
     res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
-    res->code = cpu_to_be16(0x0004);
+    /*
+     * The command code is not recognized.  Response code 0x0004 means that
+     * the command is recognized but not supported by this configuration,
+     * which is observably different to operating systems probing for newer
+     * CHSC commands.
+     */
+    res->code = cpu_to_be16(0x0002);
+    res->param = 0;
+}
+
+static void ioinst_handle_chsc_ssqd(ChscReq *req, ChscResp *res)
+{
+    uint32_t param0 = be32_to_cpu(req->param0);
+    uint32_t param1 = be32_to_cpu(req->param1);
+    uint16_t ssidfmt = param0 >> 16;
+    uint16_t first = param0;
+    uint16_t last = param1;
+    uint8_t ssid = (ssidfmt & 0x30) >> 4;
+    uint8_t *desc = (uint8_t *)res->data;
+    unsigned int count;
+    uint16_t schid;
+
+    if ((ssidfmt & ~0x003f) || (ssidfmt & 0x000f) || last < first) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+    count = (unsigned int)last - first + 1;
+    if (CHSC_MIN_RESP_LEN + count * 32 > TARGET_PAGE_SIZE - 16) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    for (schid = first; ; schid++) {
+        SubchDev *sch = css_find_subch(0, 0, ssid, schid);
+
+        memset(desc, 0, 32);
+        stw_be_p(desc + 2, schid);
+        if (sch && css_subch_visible(sch) && sch->qdio_ops &&
+            sch->qdio_ops->ssqd) {
+            sch->qdio_ops->ssqd(sch, desc);
+        }
+        desc += 32;
+        if (schid == last) {
+            break;
+        }
+    }
+    res->len = cpu_to_be16(CHSC_MIN_RESP_LEN + count * 32);
+    res->code = cpu_to_be16(0x0001);
     res->param = 0;
 }
 
@@ -713,7 +1050,8 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     memset((char *)req + len, 0, TARGET_PAGE_SIZE - len);
     res = (void *)((char *)req + len);
     command = be16_to_cpu(req->command);
-    trace_ioinst_chsc_cmd(command, len);
+    trace_ioinst_chsc_cmd(command, len, be32_to_cpu(req->param0),
+                          be32_to_cpu(req->param1));
     switch (command) {
     case CHSC_SCSC:
         ioinst_handle_chsc_scsc(req, res);
@@ -721,14 +1059,26 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     case CHSC_SCPD:
         ioinst_handle_chsc_scpd(req, res);
         break;
+    case CHSC_SSD:
+        ioinst_handle_chsc_ssd(req, res);
+        break;
+    case CHSC_SSCUD:
+        ioinst_handle_chsc_sscud(req, res);
+        break;
     case CHSC_SDA:
         ioinst_handle_chsc_sda(req, res);
+        break;
+    case CHSC_SDCAL:
+        ioinst_handle_chsc_sdcal(req, res);
         break;
     case CHSC_SEI:
         ioinst_handle_chsc_sei(req, res);
         break;
+    case CHSC_SSQD:
+        ioinst_handle_chsc_ssqd(req, res);
+        break;
     default:
-        ioinst_handle_chsc_unimplemented(res);
+        ioinst_handle_chsc_invalid(res);
         break;
     }
 

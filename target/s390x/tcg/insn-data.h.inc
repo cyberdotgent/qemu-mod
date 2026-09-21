@@ -37,6 +37,19 @@
     F(0xb34a, AXBR,    RRE,   Z,   x1, x2, new_x, x1, axb, f128, IF_BFP)
     F(0xed0a, AEB,     RXE,   Z,   e1, m2_32u, new, e1, aeb, f32, IF_BFP)
     F(0xed1a, ADB,     RXE,   Z,   f1, m2_64, new, f1, adb, f64, IF_BFP)
+/* ADD DECIMAL */
+    C(0xfa00, AP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0)
+/* ADD NORMALIZED (HFP) */
+    E(0x3600, AXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_binary, 0, 0, IF_AFP12)
+    E(0x2a00, ADR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 56, IF_AFP12)
+    E(0x3a00, AER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 24, IF_AFP12)
+    E(0x6a00, AD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 56, IF_AFP1)
+    E(0x7a00, AE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 24, IF_AFP1)
+/* ADD UNNORMALIZED (HFP) */
+    E(0x2e00, AWR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x238, IF_AFP12)
+    E(0x3e00, AUR,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x218, IF_AFP12)
+    E(0x6e00, AW,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x238, IF_AFP1)
+    E(0x7e00, AU,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x218, IF_AFP1)
 /* ADD HIGH */
     C(0xb9c8, AHHHR,   RRF_a, HW,  r2_sr32, r3_sr32, new, r1_32h, add, adds32)
     C(0xb9d8, AHHLR,   RRF_a, HW,  r2_sr32, r3, new, r1_32h, add, adds32)
@@ -115,6 +128,10 @@
 /* BRANCH AND SAVE */
     C(0x0d00, BASR,    RR_a,  Z,   0, r2_nz, r1, 0, bas, 0)
     C(0x4d00, BAS,     RX_a,  Z,   0, a2, r1, 0, bas, 0)
+/* BRANCH AND SAVE AND SET MODE */
+    C(0x0c00, BASSM,   RR_a,  Z,   0, r2, r1, 0, bassm, 0)
+/* BRANCH AND SET MODE */
+    C(0x0b00, BSM,     RR_a,  Z,   0, r2, 0, 0, bsm, 0)
 /* BRANCH RELATIVE AND SAVE */
     C(0xa705, BRAS,    RI_b,  Z,   0, 0, r1, 0, basi, 0)
     C(0xc005, BRASL,   RIL_b, Z,   0, 0, r1, 0, basi, 0)
@@ -159,8 +176,13 @@
 /* CHECKSUM */
     C(0xb241, CKSM,    RRE,   Z,   r1_o, ra2_E, new, r1_32, cksm, 0)
 
+/* COMPARE UNTIL SUBSTRING EQUAL */
+    C(0xb257, CUSE,    RRE,   Z,   0, 0, 0, 0, cuse, 0)
+
 /* COPY SIGN */
     F(0xb372, CPSDR,   RRF_b, FPSSH, f3, f2, new, f1, cps, 0, IF_AFP1 | IF_AFP2 | IF_AFP3)
+/* COPY ACCESS */
+    C(0xb24d, CPYA,    RRE,   Z,   0, 0, 0, 0, cpya, 0)
 
 /* COMPARE */
     C(0x1900, CR,      RR_a,  Z,   r1_o, r2_o, 0, 0, 0, cmps32)
@@ -175,6 +197,13 @@
     F(0xb349, CXBR,    RRE,   Z,   x1, x2, 0, 0, cxb, 0, IF_BFP)
     F(0xed09, CEB,     RXE,   Z,   e1, m2_32u, 0, 0, ceb, 0, IF_BFP)
     F(0xed19, CDB,     RXE,   Z,   f1, m2_64, 0, 0, cdb, 0, IF_BFP)
+/* COMPARE DECIMAL */
+    D(0xf900, CP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 2)
+/* COMPARE (HFP) */
+    E(0x2900, CDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x438, IF_AFP12)
+    E(0x3900, CER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x418, IF_AFP12)
+    E(0x6900, CD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x438, IF_AFP1)
+    E(0x7900, CE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x418, IF_AFP1)
 /* COMPARE AND SIGNAL */
     F(0xb308, KEBR,    RRE,   Z,   e1, e2, 0, 0, keb, 0, IF_BFP)
     F(0xb318, KDBR,    RRE,   Z,   f1, f2, 0, 0, kdb, 0, IF_BFP)
@@ -356,6 +385,13 @@
     C(0xe397, DL,      RXY_a, Z,   r1_D32, m2_32u, new_P, r1_P32, divu32, 0)
     C(0xb987, DLGR,    RRE,   Z,   0, r2_o, r1_P, 0, divu64, 0)
     C(0xe387, DLG,     RXY_a, Z,   0, m2_64, r1_P, 0, divu64, 0)
+/* DIVIDE DECIMAL */
+    C(0xfd00, DP,      SS_a,  Z,   la1, a2, 0, 0, decimal_div, 0)
+/* DIVIDE (HFP) */
+    E(0x2d00, DDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x538, IF_AFP12)
+    E(0x3d00, DER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x518, IF_AFP12)
+    E(0x6d00, DD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x538, IF_AFP1)
+    E(0x7d00, DE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x518, IF_AFP1)
 /* DIVIDE SINGLE */
     C(0xb90d, DSGR,    RRE,   Z,   r1p1, r2, r1_P, 0, divs64, 0)
     C(0xb91d, DSGFR,   RRE,   Z,   r1p1, r2_32s, r1_P, 0, divs64, 0)
@@ -364,6 +400,11 @@
 /* DIVIDE TO INTEGER */
     D(0xb35b, DIDBR,   RRF_b, Z,   0, 0, 0, 0, dib, 0, 64)
     D(0xb353, DIEBR,   RRF_b, Z,   0, 0, 0, 0, dib, 0, 32)
+
+/* EDIT */
+    D(0xde00, ED,      SS_a,  Z,   la1, a2, 0, 0, ed, 0, 0)
+/* EDIT AND MARK */
+    D(0xdf00, EDMK,    SS_a,  Z,   la1, a2, 0, 0, ed, 0, 1)
 
 /* EXCLUSIVE OR */
     C(0x1700, XR,      RR_a,  Z,   r1, r2, new, r1_32, xor, nz32)
@@ -402,6 +443,9 @@
 /* INSERT CHARACTER */
     C(0x4300, IC,      RX_a,  Z,   0, m2_8u, 0, r1_8, mov2, 0)
     C(0xe373, ICY,     RXY_a, LD,  0, m2_8u, 0, r1_8, mov2, 0)
+/* HALVE (HFP) */
+    E(0x2400, HDR,     RR_a,  Z,   0, 0, 0, 0, hfp_halve, 0, 56, IF_AFP12)
+    E(0x3400, HER,     RR_a,  Z,   0, 0, 0, 0, hfp_halve, 0, 24, IF_AFP12)
 /* INSERT CHARACTERS UNDER MASK */
     D(0xbf00, ICM,     RS_b,  Z,   0, a2, r1, 0, icm, 0, 0)
     D(0xeb81, ICMY,    RSY_b, LD,  0, a2, r1, 0, icm, 0, 0)
@@ -415,7 +459,6 @@
     D(0xa503, IILL,    RI_a,  Z,   r1_o, i2_16u, r1, 0, insi, 0, 0x1000)
 /* INSERT PROGRAM MASK */
     C(0xb222, IPM,     RRE,   Z,   0, 0, r1, 0, ipm, 0)
-
 /* LOAD */
     C(0x1800, LR,      RR_a,  Z,   0, r2_o, 0, cond_r1r2_32, mov2, 0)
     D(0x5800, L,       RX_a,  Z,   0, a2, new, r1_32, ld32s, 0, 0)
@@ -431,6 +474,18 @@
     F(0x7800, LE,      RX_a,  Z,   0, m2_32u, 0, e1, mov2, 0, IF_AFP1)
     F(0xed64, LEY,     RXY_a, LD,  0, m2_32u, 0, e1, mov2, 0, IF_AFP1)
     F(0xb365, LXR,     RRE,   Z,   x2h, x2l, 0, x1_P, movx, 0, IF_AFP1)
+/* LOAD HFP SIGN/TEST OPERATIONS */
+    E(0x2000, LPDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x338, IF_AFP12)
+    E(0x2100, LNDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x238, IF_AFP12)
+    E(0x2200, LTDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x038, IF_AFP12)
+    E(0x2300, LCDR,    RR_a,  Z,   0, f2, 0, 0, hfp_load, 0, 0x138, IF_AFP12)
+    E(0x3000, LPER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x318, IF_AFP12)
+    E(0x3100, LNER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x218, IF_AFP12)
+    E(0x3200, LTER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x018, IF_AFP12)
+    E(0x3300, LCER,    RR_a,  Z,   0, e2, 0, 0, hfp_load, 0, 0x118, IF_AFP12)
+/* LOAD ROUNDED (HFP) */
+    F(0x2500, LDXR,    RR_a,  Z,   0, x2, new, 0, hfp_ext_round, 0, IF_AFP12)
+    F(0x3500, LEDR,    RR_a,  Z,   0, 0, 0, 0, hfp_round, 0, IF_AFP12)
 /* LOAD IMMEDIATE */
     C(0xc001, LGFI,    RIL_a, EI,  0, i2, 0, r1, mov2, 0)
 /* LOAD RELATIVE LONG */
@@ -438,8 +493,8 @@
     D(0xc408, LGRL,    RIL_b, GIE, 0, ri2, r1, 0, ld64, 0, MO_ALIGN)
     D(0xc40c, LGFRL,   RIL_b, GIE, 0, ri2, r1, 0, ld32s, 0, MO_ALIGN)
 /* LOAD ADDRESS */
-    C(0x4100, LA,      RX_a,  Z,   0, a2, 0, r1, mov2, 0)
-    C(0xe371, LAY,     RXY_a, LD,  0, a2, 0, r1, mov2, 0)
+    C(0x4100, LA,      RX_a,  Z,   0, a2, 0, r1_la, mov2, 0)
+    C(0xe371, LAY,     RXY_a, LD,  0, a2, 0, r1_la, mov2, 0)
 /* LOAD ADDRESS EXTENDED */
     C(0x5100, LAE,     RX_a,  Z,   0, a2, 0, r1, mov2e, 0)
     C(0xe375, LAEY,    RXY_a, GIE, 0, a2, 0, r1, mov2e, 0)
@@ -693,6 +748,16 @@
     C(0xe396, ML,      RXY_a, Z,   r1p1_32u, m2_32u, new, r1_D32, mul, 0)
     C(0xb986, MLGR,    RRE,   Z,   r1p1, r2_o, r1_P, 0, mul128, 0)
     C(0xe386, MLG,     RXY_a, Z,   r1p1, m2_64, r1_P, 0, mul128, 0)
+/* MULTIPLY DECIMAL */
+    C(0xfc00, MP,      SS_a,  Z,   la1, a2, 0, 0, decimal_mul, 0)
+/* MULTIPLY (HFP) */
+    E(0x2600, MXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_multiply, 0, 112, IF_AFP12)
+    E(0x2700, MXDR,    RR_a,  Z,   x1, f2, new_x, 0, hfp_ext_multiply, 0, 56, IF_AFP12)
+    E(0x2c00, MDR,     RR_a,  Z,   0, f2, 0, 0, hfp_multiply, 0, 0x3838, IF_AFP12)
+    E(0x3c00, MDER,    RR_a,  Z,   0, e2, 0, 0, hfp_multiply, 0, 0x3818, IF_AFP12)
+    E(0x6700, MXD,     RX_a,  Z,   x1, m2_64, 0, 0, hfp_multiply, 0, 0x7038, IF_AFP1)
+    E(0x6c00, MD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_multiply, 0, 0x3838, IF_AFP1)
+    E(0x7c00, MDE,     RX_a,  Z,   0, m2_32u, 0, 0, hfp_multiply, 0, 0x3818, IF_AFP1)
 /* MULTIPLY SINGLE */
     C(0xb252, MSR,     RRE,   Z,   r1_o, r2_o, new, r1_32, mul, 0)
     C(0xb9fd, MSRKC,   RRF_a, MIE2,r3_32s, r2_32s, new, r1_32, mul, muls32)
@@ -760,6 +825,8 @@
     C(0xe900, PKA,     SS_f,  E2,  la1, a2, 0, 0, pka, 0)
 /* PACK UNICODE */
     C(0xe100, PKU,     SS_f,  E2,  la1, a2, 0, 0, pku, 0)
+/* PERFORM LOCKED OPERATION */
+    C(0xee00, PLO,     SS_e,  Z,   0, 0, 0, 0, plo, 0)
 
 /* POPULATION COUNT */
     C(0xb9e1, POPCNT,  RRF_c, PC,  0, r2_o, r1, 0, popcnt, nz64)
@@ -819,6 +886,8 @@
     D(0x8b00, SLA,     RS_a,  Z,   r1, sh, new, r1_32, sla, 0, 31)
     D(0xebdd, SLAK,    RSY_a, DO,  r3, sh, new, r1_32, sla, 0, 31)
     D(0xeb0b, SLAG,    RSY_a, Z,   r3, sh, r1, 0, sla, 0, 63)
+/* SHIFT AND ROUND DECIMAL */
+    C(0xf000, SRP,     SS_c,  Z,   la1, a2, 0, 0, decimal_srp, 0)
 /* SHIFT LEFT SINGLE LOGICAL */
     C(0x8900, SLL,     RS_a,  Z,   r1_o, sh, new, r1_32, sll, 0)
     C(0xebdf, SLLK,    RSY_a, DO,  r3_o, sh, new, r1_32, sll, 0)
@@ -887,8 +956,8 @@
     C(0xe32f, STRVG,   RXY_a, Z,   la2, r1_o, new, m1_64, rev64, 0)
 
 /* STORE CLOCK */
-    F(0xb205, STCK,    S,     Z,   la2, 0, new, m1_64, stck, 0, IF_IO)
-    F(0xb27c, STCKF,   S,     SCF, la2, 0, new, m1_64, stck, 0, IF_IO)
+    F(0xb205, STCK,    S,     Z,   la2, 0, new, m1_64_ser, stck, 0, IF_IO)
+    F(0xb27c, STCKF,   S,     SCF, la2, 0, new, m1_64, stckf, 0, IF_IO)
 /* STORE CLOCK EXTENDED */
     F(0xb278, STCKE,   S,     Z,   0, a2, 0, 0, stcke, 0, IF_IO)
 
@@ -924,6 +993,19 @@
     F(0xb34b, SXBR,    RRE,   Z,   x1, x2, new_x, x1, sxb, f128, IF_BFP)
     F(0xed0b, SEB,     RXE,   Z,   e1, m2_32u, new, e1, seb, f32, IF_BFP)
     F(0xed1b, SDB,     RXE,   Z,   f1, m2_64, new, f1, sdb, f64, IF_BFP)
+/* SUBTRACT DECIMAL */
+    D(0xfb00, SP,      SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 1)
+/* SUBTRACT NORMALIZED (HFP) */
+    E(0x3700, SXR,     RR_a,  Z,   x1, x2, new_x, 0, hfp_ext_binary, 0, 1, IF_AFP12)
+    E(0x2b00, SDR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x138, IF_AFP12)
+    E(0x3b00, SER,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x118, IF_AFP12)
+    E(0x6b00, SD,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x138, IF_AFP1)
+    E(0x7b00, SE,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x118, IF_AFP1)
+/* SUBTRACT UNNORMALIZED (HFP) */
+    E(0x2f00, SWR,     RR_a,  Z,   0, f2, 0, 0, hfp_binary, 0, 0x338, IF_AFP12)
+    E(0x3f00, SUR,     RR_a,  Z,   0, e2, 0, 0, hfp_binary, 0, 0x318, IF_AFP12)
+    E(0x6f00, SW,      RX_a,  Z,   0, m2_64, 0, 0, hfp_binary, 0, 0x338, IF_AFP1)
+    E(0x7f00, SU,      RX_a,  Z,   0, m2_32u, 0, 0, hfp_binary, 0, 0x318, IF_AFP1)
 /* SUBTRACT HALFWORD */
     C(0x4b00, SH,      RX_a,  Z,   r1, m2_16s, new, r1_32, sub, subs32)
     C(0xe37b, SHY,     RXY_a, LD,  r1, m2_16s, new, r1_32, sub, subs32)
@@ -967,6 +1049,16 @@
     F(0xed11, TCDB,    RXE,   Z,   f1, a2, 0, 0, tcdb, 0, IF_BFP)
     F(0xed12, TCXB,    RXE,   Z,   x1, a2, 0, 0, tcxb, 0, IF_BFP)
 
+/* CONVERT BETWEEN ZONED DECIMAL AND DECIMAL FLOATING POINT */
+    F(0xeda8, CZDT,    RSL_b, DFPZ, 0, 0, 0, 0, czdt, 0, IF_DFP)
+    F(0xeda9, CZXT,    RSL_b, DFPZ, 0, 0, 0, 0, czxt, 0, IF_DFP)
+    F(0xedaa, CDZT,    RSL_b, DFPZ, 0, 0, 0, 0, cdzt, 0, IF_DFP)
+    F(0xedab, CXZT,    RSL_b, DFPZ, 0, 0, 0, 0, cxzt, 0, IF_DFP)
+    F(0xedac, CPDT,    RSL_b, DFPP, 0, 0, 0, 0, cpdt, 0, IF_DFP)
+    F(0xedad, CPXT,    RSL_b, DFPP, 0, 0, 0, 0, cpxt, 0, IF_DFP)
+    F(0xedae, CDPT,    RSL_b, DFPP, 0, 0, 0, 0, cdpt, 0, IF_DFP)
+    F(0xedaf, CXPT,    RSL_b, DFPP, 0, 0, 0, 0, cxpt, 0, IF_DFP)
+
 /* TEST DECIMAL */
     C(0xebc0, TP,      RSL,   E2,  la1, 0, 0, 0, tp, 0)
 
@@ -986,6 +1078,10 @@
     C(0xd000, TRTR,    SS_a,  ETF3, la1, a2, 0, 0, trtr, 0)
 /* TRANSLATE EXTENDED */
     C(0xb2a5, TRE,     RRE,   Z,   0, r2, r1_P, 0, tre, 0)
+/* TRANSLATE AND TEST EXTENDED */
+    D(0xb9bf, TRTE,    RRF_c, PARSE, 0, 0, 0, 0, trte, 0, 0)
+/* TRANSLATE AND TEST REVERSE EXTENDED */
+    D(0xb9bd, TRTRE,   RRF_c, PARSE, 0, 0, 0, 0, trte, 0, 1)
 
 /* TRANSLATE ONE TO ONE */
     C(0xb993, TROO,    RRF_c, E2,  0, 0, 0, 0, trXX, 0)
@@ -1004,6 +1100,9 @@
     C(0xea00, UNPKA,   SS_a,  E2,  la1, a2, 0, 0, unpka, 0)
 /* UNPACK UNICODE */
     C(0xe200, UNPKU,   SS_a,  E2,  la1, a2, 0, 0, unpku, 0)
+
+/* ZERO AND ADD DECIMAL */
+    D(0xf800, ZAP,     SS_a,  Z,   la1, a2, 0, 0, decimal, 0, 3)
 
 /* MSA Instructions */
     D(0xb91e, KMAC,    RRE,   MSA,  0, 0, 0, 0, msa, 0, S390_FEAT_TYPE_KMAC)
@@ -1335,15 +1434,80 @@
     F(0xe74a, VFTCI,   VRI_e, V,   0, 0, 0, 0, vftci, 0, IF_VEC)
 
 #ifndef CONFIG_USER_ONLY
+/* BRANCH AND SET AUTHORITY / BRANCH IN SUBSPACE GROUP */
+    D(0xb25a, BSA,     RRE,   Z,   0, 0, 0, 0, linkage_branch, 0, 0)
+    D(0xb258, BSG,     RRE,   Z,   0, 0, 0, 0, linkage_branch, 0, 1)
+/* TEST ACCESS */
+    C(0xb24c, TAR,     RRE,   Z,   0, 0, 0, 0, tar, 0)
+/* EXTRACT PRIMARY/SECONDARY ASN */
+    D(0xb226, EPAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 4)
+    D(0xb227, ESAR,    RRE,   Z,   0, 0, 0, 0, extract_asn, 0, 3)
+/* EXTRACT PRIMARY/SECONDARY ASN AND INSTANCE */
+    D(0xb99a, EPAIR,   RRE,   ASNLXR, 0, 0, 0, 0,
+      extract_asn_instance, 0, 4)
+    D(0xb99b, ESAIR,   RRE,   ASNLXR, 0, 0, 0, 0,
+      extract_asn_instance, 0, 3)
+/* EXTRACT AND SET EXTENDED AUTHORITY */
+    F(0xb99d, ESEA,    RRE,   Z,   0, 0, 0, 0, esea, 0, IF_PRIV)
+/* SET SECONDARY ASN */
+    C(0xb225, SSAR,    RRE,   Z,   0, 0, 0, 0, ssar, 0)
+/* SET SECONDARY ASN WITH INSTANCE */
+    C(0xb99f, SSAIR,   RRE,   ASNLXR, 0, 0, 0, 0, ssair, 0)
+/* PROGRAM TRANSFER */
+    C(0xb228, PT,      RRE,   Z,   0, 0, 0, 0, pt, 0)
+/* PROGRAM TRANSFER WITH INSTANCE */
+    C(0xb99e, PTI,     RRE,   ASNLXR, 0, 0, 0, 0, pti, 0)
+/* PROCESS QUEUE AUXILIARY PROCESSOR */
+    F(0xb2af, PQAP,    RRE,   Z,   0, 0, 0, 0, pqap, 0, IF_PRIV)
+/* SET VECTOR SUMMARY */
+    F(0xb265, SVS,     RRE,   Z,   r1p1, 0, 0, 0, svs, 0, IF_PRIV)
+/*
+ * The B264 firmware instruction submits a request to a coupling facility.
+ * TCG supports its operand-free local-serialization form.
+ */
+    C(0xb264, CFS,     RRE,   Z,   0, 0, 0, 0, cfs, 0)
+/* TRANSACTION BEGIN CONSTRAINED */
+    F(0xe561, TBEGINC, SIL, CTE,   0, 0, 0, 0, tbeginc, 0, 0)
+/* TRANSACTION END */
+    F(0xb2f8, TEND,      S,  TE,   0, 0, 0, 0, tend, 0, 0)
+/* PERFORM FLOATING-POINT OPERATION */
+    C(0x010a, PFPO,    E,     PFPO, 0, 0, 0, 0, pfpo, 0)
+/* PERFORM TIMING FACILITY FUNCTION */
+    F(0x0104, PTFF,    E,     TODS,
+      0, 0, 0, 0, ptff, 0, IF_IO)
+/* PROGRAM RETURN */
+    C(0x0101, PR,      E,     Z,   0, 0, 0, 0, pr, 0)
+/* PROGRAM CALL */
+    C(0xb218, PC,      S,     Z,   0, a2, 0, 0, pc, 0)
+/* EXTRACT STACKED REGISTERS */
+    C(0xb249, EREG,    RRE,   Z,   0, 0, 0, 0, ereg, 0)
+    C(0xb90e, EREGG,   RRE,   Z,   0, 0, 0, 0, eregg, 0)
+/* EXTRACT STACKED STATE */
+    C(0xb24a, ESTA,    RRE,   Z,   0, 0, 0, 0, esta, 0)
+/* MODIFY STACKED STATE */
+    C(0xb247, MSTA,    RRE,   Z,   0, 0, 0, 0, msta, 0)
 /* COMPARE AND SWAP AND PURGE */
     E(0xb250, CSP,     RRE,   Z,   r1_32u, ra2, r1_P, 0, csp, 0, MO_BEUL, IF_PRIV)
     E(0xb98a, CSPG,    RRE, DAT_ENH, r1_o, ra2, r1_P, 0, csp, 0, MO_BEUQ, IF_PRIV)
 /* DIAGNOSE (KVM hypercall) */
     F(0x8300, DIAG,    RSI,   Z,   0, 0, 0, 0, diag, 0, IF_PRIV | IF_IO)
+/* INSERT ADDRESS SPACE CONTROL */
+    C(0xb224, IAC,     RRE,   Z,   0, 0, 0, 0, iac, 0)
+/* INSERT PSW KEY */
+    C(0xb20b, IPK,     S,     Z,   0, 0, 0, 0, ipk, 0)
 /* INSERT STORAGE KEY EXTENDED */
     F(0xb229, ISKE,    RRE,   Z,   0, r2_o, new, r1_8, iske, 0, IF_PRIV)
+/* INSERT REFERENCE BITS MULTIPLE */
+    F(0xb9ac, IRBM,    RRE,   IRBM, 0, r2_o, new, r1, irbm, 0, IF_PRIV)
+/* INSERT VIRTUAL STORAGE KEY */
+    F(0xb223, IVSK,    RRE,   Z,   0, r2_o, new, r1_8, ivsk, 0, 0)
+/* LOAD ADDRESS SPACE PARAMETERS */
+    F(0xe500, LASP,    SSE,   Z,   la1, a2, 0, 0, lasp, 0, IF_PRIV)
+    F(0xe502, STRAG,   SSE,   Z,   la1, a2, 0, 0, strag, 0, IF_PRIV)
 /* INVALIDATE DAT TABLE ENTRY */
     F(0xb98e, IPDE,    RRF_b, Z,   r1_o, r2_o, 0, 0, idte, 0, IF_PRIV)
+/* BRANCH AND STACK */
+    C(0xb240, BAKR,    RRE,   Z,   0, 0, 0, 0, bakr, 0)
 /* INVALIDATE PAGE TABLE ENTRY */
     F(0xb221, IPTE,    RRF_a, Z,   r1_o, r2_o, 0, 0, ipte, 0, IF_PRIV)
 /* LOAD CONTROL */
@@ -1366,13 +1530,25 @@
     C(0xda00, MVCP,    SS_d,  Z,   la1, a2, 0, 0, mvcp, 0)
 /* MOVE TO SECONDARY */
     C(0xdb00, MVCS,    SS_d,  Z,   la1, a2, 0, 0, mvcs, 0)
+/* MOVE WITH KEY */
+    C(0xd900, MVCK,    SS_d,  Z,   la1, a2, 0, 0, mvck, 0)
+/* MOVE WITH DESTINATION KEY */
+    C(0xe50f, MVCDK,   SSE,   Z,   la1, a2, 0, 0, mvcdk, 0)
+/* MOVE WITH SOURCE KEY */
+    C(0xe50e, MVCSK,   SSE,   Z,   la1, a2, 0, 0, mvcsk, 0)
 /* PURGE TLB */
+    F(0xb248, PALB,    RRE,   Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
     F(0xb20d, PTLB,    S,     Z,   0, 0, 0, 0, ptlb, 0, IF_PRIV)
+/* PERFORM FRAME MANAGEMENT FUNCTION */
+    F(0xb9af, PFMF,    RRE,   EDAT, 0, 0, 0, 0, pfmf, 0, IF_PRIV)
 /* RESET REFERENCE BIT EXTENDED */
     F(0xb22a, RRBE,    RRE,   Z,   0, r2_o, 0, 0, rrbe, 0, IF_PRIV)
+/* RESET REFERENCE BITS MULTIPLE */
+    F(0xb9ae, RRBM,    RRE,   RRBM, 0, r2_o, new, r1, rrbm, 0, IF_PRIV)
 /* SERVICE CALL LOGICAL PROCESSOR (PV hypercall) */
     F(0xb220, SERVC,   RRE,   Z,   r1_o, r2_o, 0, 0, servc, 0, IF_PRIV | IF_IO)
-/* SET ADDRESS SPACE CONTROL FAST */
+/* SET ADDRESS SPACE CONTROL */
+    C(0xb219, SAC,     S,     Z,   0, a2, 0, 0, sacf, 0)
     C(0xb279, SACF,    S,     Z,   0, a2, 0, 0, sacf, 0)
 /* SET CLOCK */
     F(0xb204, SCK,     S,     Z,   0, m2_64a, 0, 0, sck, 0, IF_PRIV | IF_IO)
@@ -1385,9 +1561,9 @@
 /* SET PREFIX */
     F(0xb210, SPX,     S,     Z,   0, m2_32ua, 0, 0, spx, 0, IF_PRIV)
 /* SET PSW KEY FROM ADDRESS */
-    F(0xb20a, SPKA,    S,     Z,   0, a2, 0, 0, spka, 0, IF_PRIV)
+    F(0xb20a, SPKA,    S,     Z,   0, a2, 0, 0, spka, 0, 0)
 /* SET STORAGE KEY EXTENDED */
-    F(0xb22b, SSKE,    RRF_c, Z,   r1_o, r2_o, 0, 0, sske, 0, IF_PRIV)
+    F(0xb22b, SSKE,    RRF_c, Z,   0, 0, 0, 0, sske, 0, IF_PRIV)
 /* SET SYSTEM MASK */
     F(0x8000, SSM,     S,     Z,   0, m2_8u, 0, 0, ssm, 0, IF_PRIV)
 /* SIGNAL PROCESSOR */
@@ -1420,6 +1596,8 @@
     F(0xb22c, TB,      RRE,   Z,   0, r2_o, 0, 0, testblock, 0, IF_PRIV)
 /* TEST PROTECTION */
     C(0xe501, TPROT,   SSE,   Z,   la1, a2, 0, 0, tprot, 0)
+/* TRACE */
+    F(0x9900, TRACE,   RS_a,  Z,   0, a2, 0, 0, trace, 0, IF_PRIV | IF_IO)
 
 /* CCW I/O Instructions */
     F(0xb276, XSCH,    S,     Z,   0, 0, 0, 0, xsch, 0, IF_PRIV | IF_IO)

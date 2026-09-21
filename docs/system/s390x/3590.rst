@@ -1,0 +1,91 @@
+Emulated 3590 tapes
+===================
+
+QEMU can expose an AWS tape image as a channel-attached IBM 3590 A50 tape
+drive.  The device reports control-unit type/model ``3590/11`` and device
+type/model ``3590/60``.  AWS record boundaries, multi-chunk records, tape
+marks, forward and backward positioning, and block IDs are maintained by a
+medium layer separate from the guest-visible 3590 command implementation.
+
+The concise command line is::
+
+  -dev3590 file=install.aws,devno=580
+
+If ``devno`` is omitted, automatic allocation begins at ``0580``.
+
+This creates a read-only raw backend by default.  ``readonly=off`` allows the
+backend to be opened for writing.  An existing block node can instead be
+attached with ``drive=NODE``.  Three- and four-digit hexadecimal device
+numbers are accepted, so ``580`` and ``0580`` both select ``fe.0.0580``.
+
+Some guests select a tape driver from the reported hardware identity.  The
+optional ``ident`` parameter changes that compatibility identity while
+retaining the AWS-backed 3590 command engine.  For example, Linux guests that
+require a 3490 identity can use::
+
+  -dev3590 file=tape.aws,devno=580,ident=3490
+
+The accepted identities are the Hercules tape-device whitelist: ``3410``,
+``3411``, ``3420``, ``3422``, ``3430``, ``3480``, ``3490``, ``3590``,
+``8809``, ``9347``, and ``9348``.  The default is ``3590``.  The selected
+profile controls the subchannel identity, Sense ID response, and identity
+fields in Read Device Characteristics.  It does not change record limits or
+enable the historical command set of the named drive.
+
+The implemented commands cover Write, Write Tape Mark, Synchronize, Erase
+Gap, Read IPL, NOP, Sense, Read Forward, Rewind, Read Previous, Rewind
+Unload, Read Block ID, forward and backward block/file spacing, Locate, Read
+Media Characteristics, Read Device Characteristics, Medium Sense, Mode Set,
+Set Tape-Write Immediate, and Sense ID.  The maximum logical record size is
+256 KiB.  As in Hercules, data chaining is rejected for Write, so a
+guest-written record is limited to the 65535-byte CCW count.
+
+Writing at the current logical position replaces that point and truncates the
+old tail, including when writing a tape mark.  QEMU emits Hercules-compatible
+six-byte AWS headers and splits records into chunks when necessary.  A failed
+write, truncate, or flush fences the mounted volume so later modifying
+commands fail predictably instead of continuing from an uncertain position.
+Unload and remount clears that fence after the image has been revalidated.
+
+Runtime media changes
+---------------------
+
+A drive can start empty::
+
+  -dev3590 id=tape0,devno=580
+
+The standard removable-media QMP commands can then mount an AWS image::
+
+  { "execute": "blockdev-add",
+    "arguments": { "node-name": "tape-file", "driver": "file",
+                   "filename": "install.aws" } }
+  { "execute": "blockdev-add",
+    "arguments": { "node-name": "tape-medium", "driver": "raw",
+                   "read-only": true, "file": "tape-file" } }
+  { "execute": "blockdev-insert-medium",
+    "arguments": { "id": "tape0", "node-name": "tape-medium" } }
+  { "execute": "blockdev-close-tray", "arguments": { "id": "tape0" } }
+
+Use ``blockdev-open-tray`` followed by ``blockdev-remove-medium`` to unmount
+it.  A media change resets tape position and raises device attention when the
+subchannel is enabled.
+
+IPL and CZAM recovery media
+---------------------------
+
+Select the tape with the operator-style IPL option::
+
+  qemu-system-s390x -M s390-ccw-virtio \
+    -dev3590 file=install.aws,devno=580 -ipl 580
+
+The s390-ccw firmware executes the architected implied format-0 Read IPL CCW
+at address zero; it does not use QEMU's ``-kernel`` loader.  Recovery media
+for CZAM-only systems can use the first records as self-modifying Read IPL
+channel programs before returning the final IPL PSW and loader.  Those
+records are interpreted by the channel subsystem directly from the mounted
+tape; QEMU does not scan for a private header or reconstruct the AWS image in
+guest storage.
+
+Migration is currently disabled for this device.  A future migration format
+must identify and validate the externally supplied tape medium at the
+destination before restoring its logical position and buffered record.

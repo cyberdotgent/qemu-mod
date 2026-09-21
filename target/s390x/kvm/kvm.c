@@ -96,6 +96,7 @@
 #define PRIV_E3_MPCIFC                  0xd0
 #define PRIV_E3_STPCIFC                 0xd4
 
+#define DIAG_LPAR_RMF                   0x204
 #define DIAG_TIMEREVENT                 0x288
 #define DIAG_IPL                        0x308
 #define DIAG_SET_CONTROL_PROGRAM_CODES  0x318
@@ -1211,8 +1212,7 @@ static int handle_b2(S390CPU *cpu, struct kvm_run *run, uint8_t ipa1)
         ioinst_handle_sal(cpu, env->regs[1], RA_IGNORED);
         break;
     case PRIV_B2_SIGA:
-        /* Not provided, set CC = 3 for subchannel not operational */
-        setcc(cpu, 3);
+        ioinst_handle_siga(cpu, RA_IGNORED);
         break;
     case PRIV_B2_SCLP_CALL:
         kvm_sclp_service_call(cpu, run, ipbh0);
@@ -1482,6 +1482,15 @@ static void kvm_handle_diag_308(S390CPU *cpu, struct kvm_run *run)
     handle_diag_308(&cpu->env, r1, r3, RA_IGNORED);
 }
 
+static void kvm_handle_diag_204(S390CPU *cpu, struct kvm_run *run)
+{
+    uint64_t r1, r3;
+
+    r1 = (run->s390_sieic.ipa & 0x00f0) >> 4;
+    r3 = run->s390_sieic.ipa & 0x000f;
+    handle_diag_204(&cpu->env, r1, r3, RA_IGNORED);
+}
+
 static int handle_sw_breakpoint(S390CPU *cpu, struct kvm_run *run)
 {
     CPUS390XState *env = &cpu->env;
@@ -1546,6 +1555,9 @@ static int handle_diag(S390CPU *cpu, struct kvm_run *run, uint32_t ipb)
      */
     func_code = decode_basedisp_rs(&cpu->env, ipb, NULL) & DIAG_KVM_CODE_MASK;
     switch (func_code) {
+    case DIAG_LPAR_RMF:
+        kvm_handle_diag_204(cpu, run);
+        break;
     case DIAG_TIMEREVENT:
         kvm_handle_diag_288(cpu, run);
         break;
@@ -2381,7 +2393,7 @@ bool kvm_s390_get_host_cpu_model(S390CPUModel *model, Error **errp)
     }
     model->cpu_id = cpuid_id(prop.cpuid);
     model->cpu_id_format = cpuid_format(prop.cpuid);
-    model->cpu_ver = 0xff;
+    model->cpu_ver = s390_get_kvm_cpu_version();
 
     /* get supported cpu features indicated via STFL(E) */
     s390_add_from_feat_block(model->features, S390_FEAT_TYPE_STFL,

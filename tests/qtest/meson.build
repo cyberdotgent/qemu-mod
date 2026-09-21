@@ -282,7 +282,14 @@ qtests_aarch64 = \
 
 qtests_s390x = \
   qtests_filter + \
+  (config_all_devices.has_key('CONFIG_TERMINAL3215') ? ['terminal3215-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_TERMINAL3270') ? ['terminal3270-test'] : []) + \
+  ['3590-ccw-test'] + \
+  ['eckd-ccw-test'] + \
+  ['fba-ccw-test'] + \
+  ['qeth-ccw-test'] + \
   ['boot-serial-test',
+   's390x-ipl-test',
    'drive_del-test',
    'device-plug-test',
    'virtio-ccw-test',

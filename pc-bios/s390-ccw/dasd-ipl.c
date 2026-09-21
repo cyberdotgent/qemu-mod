@@ -243,3 +243,109 @@ int dasd_ipl(SubChannelId schid, uint16_t cutype)
     jump_to_low_kernel();
     return -1;
 }
+
+/*
+ * IPL an emulated ECKD device without the channel-program rewriting needed
+ * by vfio-ccw.  IPL records such as z/VSE's are self modifying and need not
+ * have zipl's READ/TIC shape: execute the medium-supplied format-0 program
+ * exactly as loaded.
+ */
+int eckd_ipl(SubChannelId schid, uint16_t cutype)
+{
+    Ccw0 *read_ipl = (Ccw0 *)0x1000;
+
+    memset(read_ipl, 0, sizeof(*read_ipl));
+    read_ipl->cmd_code = CCW_CMD_READ_IPL;
+    read_ipl->cda = 0;
+    read_ipl->sli = 1;
+    read_ipl->count = 0x18;
+    enable_prefixing();
+    if (do_cio(schid, cutype, 0x1000, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to read ECKD IPL record");
+        return -EIO;
+    }
+    if (do_cio(schid, cutype, 0x08, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to run ECKD IPL channel program");
+        return -EIO;
+    }
+    disable_prefixing();
+    jump_to_low_kernel_esa();
+    return -1;
+}
+
+/*
+ * IPL an emulated FBA device.  Unlike the vfio-ccw CKD path above, an
+ * emulated FBA device can execute the IPL channel program without splitting
+ * or rewriting it.  Read IPL installs the IPL PSW and the channel program at
+ * absolute addresses 0 and 8; execute that program and then enter the PSW.
+ */
+int fba_ipl(SubChannelId schid, uint16_t cutype)
+{
+    Ccw0 *read_ipl = (Ccw0 *)0x1000;
+
+    memset(read_ipl, 0, sizeof(*read_ipl));
+    read_ipl->cmd_code = CCW_CMD_READ_IPL;
+    read_ipl->cda = 0;
+    read_ipl->sli = 1;
+    read_ipl->count = 0x18;
+    enable_prefixing();
+    if (do_cio(schid, cutype, 0x1000, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to read FBA IPL record");
+        return -EIO;
+    }
+    /*
+     * QEMU's virtual channel subsystem does not accept zero as an ORB channel
+     * program address.  Continue at the IPL CCW loaded at absolute address 8
+     * in a second start, preserving the architectural post-Read-IPL position
+     * in the emulated device.
+     */
+    if (do_cio_32bit_ida(schid, cutype, 0x08, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to run FBA IPL channel program");
+        return -EIO;
+    }
+    disable_prefixing();
+
+    /*
+     * Enter the IPL PSW exactly as supplied by the medium.  In particular,
+     * an ESA/390 loader must be allowed to select z/Architecture itself with
+     * SIGP Set Architecture Mode; forcing the addressing-mode bits here
+     * changes the architected IPL state underneath it.
+     */
+    jump_to_low_kernel_esa();
+    return -1;
+}
+
+/* IPL a 3590 tape using the architected implied format-0 Read IPL CCW. */
+int tape_3590_ipl(SubChannelId schid, uint16_t cutype)
+{
+    Ccw0 *read_ipl = (Ccw0 *)0;
+
+    /*
+     * CZAM removable-media loaders consume the IPL load parameter from
+     * absolute 0x90 before they are able to query it through SCLP.
+     */
+    if (have_iplb) {
+        memcpy((void *)0x90, iplb.loadparm, LOADPARM_LEN);
+    }
+
+    memset(read_ipl, 0, sizeof(*read_ipl));
+    read_ipl->cmd_code = CCW_CMD_READ_IPL;
+    read_ipl->cda = 0;
+    read_ipl->chain = 1;
+    read_ipl->sli = 1;
+    read_ipl->count = 0x18;
+
+    enable_prefixing();
+    if (do_cio(schid, cutype, 0, CCW_FMT0)) {
+        disable_prefixing();
+        puts("Failed to run 3590 IPL channel program");
+        return -EIO;
+    }
+    disable_prefixing();
+    jump_to_low_kernel_esa();
+    return -1;
+}
