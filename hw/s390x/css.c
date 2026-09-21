@@ -1994,6 +1994,13 @@ void css_do_tsch_update_subch(SubchDev *sch)
         if (schib->pmcw.chars & PMCW_CHARS_MASK_CSENSE) {
             memset(sch->sense_data, 0 , sizeof(sch->sense_data));
         }
+        /*
+         * Clearing the status-pending condition also withdraws the
+         * I/O-interruption request for this subchannel.  Otherwise a guest
+         * that consumes the status with I/O interruptions disabled is woken
+         * later by a stale interruption that no longer has any status.
+         */
+        css_clear_io_interrupt(css_build_subchannel_id(sch), sch->schid);
         if (sch->status_clear_cb) {
             sch->status_clear_cb(sch);
         }

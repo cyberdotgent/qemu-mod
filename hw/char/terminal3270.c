@@ -1308,9 +1308,18 @@ static void terminal_cancel(EmulatedCcw3270Device *dev)
     t->pos = 0;
 }
 
-static void terminal_reset(DeviceState *dev)
+static void terminal_reset_hold(Object *obj, ResetType type)
 {
-    Terminal3270 *t = TERMINAL_3270(dev);
+    Terminal3270 *t = TERMINAL_3270(obj);
+    EmulatedCcw3270Class *ck = EMULATED_CCW_3270_GET_CLASS(obj);
+
+    /*
+     * Reset the subchannel first so that a channel program interrupted by
+     * the reset is cancelled and the subchannel is no longer busy.
+     */
+    if (ck->parent_phases.hold) {
+        ck->parent_phases.hold(obj, type);
+    }
 
     terminal_cancel_pending(t);
     terminal_clear_records(t);
@@ -1598,9 +1607,11 @@ static void terminal_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     EmulatedCcw3270Class *ck = EMULATED_CCW_3270_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     device_class_set_props(dc, terminal_properties);
-    device_class_set_legacy_reset(dc, terminal_reset);
+    resettable_class_set_parent_phases(rc, NULL, terminal_reset_hold, NULL,
+                                       &ck->parent_phases);
     dc->unrealize = terminal_unrealize;
     object_class_property_add_str(klass, "terminal-type", terminal_get_type,
                                   NULL);

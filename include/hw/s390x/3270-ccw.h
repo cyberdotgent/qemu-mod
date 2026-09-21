@@ -79,6 +79,7 @@ struct EmulatedCcw3270Device {
 
 struct EmulatedCcw3270Class {
     CCWDeviceClass parent_class;
+    ResettablePhases parent_phases;
 
     void (*init)(EmulatedCcw3270Device *, Error **);
     void (*cancel)(EmulatedCcw3270Device *);

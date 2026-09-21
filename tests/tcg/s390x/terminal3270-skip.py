@@ -101,8 +101,10 @@ def main():
                     if "QMP" not in greeting:
                         raise RuntimeError("missing QMP greeting")
                     qmp_command(stream, "qmp_capabilities")
-                    qmp_command(stream, "cont")
 
+                    # Negotiate the terminal while the CPU is still stopped
+                    # so guest execution cannot race terminal readiness or
+                    # leave a pre-reset read request behind.
                     if recv_exact(terminal, len(TN3270_OFFER)) != TN3270_OFFER:
                         raise RuntimeError(
                             "unexpected TN3270 negotiation offer"
@@ -110,10 +112,6 @@ def main():
                     terminal.sendall(TN3270_ANSWER)
                     recv_record(terminal)  # QEMU connection banner
 
-                    # Restart with an already negotiated terminal so guest
-                    # execution cannot race terminal readiness.
-                    qmp_command(stream, "stop")
-                    qmp_command(stream, "system_reset")
                     qmp_command(stream, "cont")
 
                 request = recv_record(terminal)

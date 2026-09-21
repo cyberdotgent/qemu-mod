@@ -402,9 +402,15 @@ static void terminal3215_cancel(SubchDev *sch)
     t->read_pending = false;
 }
 
-static void terminal3215_reset(DeviceState *dev)
+static void terminal3215_reset_hold(Object *obj, ResetType type)
 {
-    Terminal3215 *t = TERMINAL_3215(dev);
+    Terminal3215 *t = TERMINAL_3215(obj);
+    Terminal3215Class *tc = TERMINAL_3215_GET_CLASS(obj);
+
+    /* Reset the subchannel first so an interrupted channel program ends. */
+    if (tc->parent_phases.hold) {
+        tc->parent_phases.hold(obj, type);
+    }
 
     t->read_pending = false;
     t->attention_pending = false;
@@ -551,12 +557,15 @@ static const Property terminal3215_properties[] = {
 static void terminal3215_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    Terminal3215Class *tc = TERMINAL_3215_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = terminal3215_realize;
     dc->unrealize = terminal3215_unrealize;
     dc->hotpluggable = false;
     dc->vmsd = &terminal3215_vmstate;
-    device_class_set_legacy_reset(dc, terminal3215_reset);
+    resettable_class_set_parent_phases(rc, NULL, terminal3215_reset_hold, NULL,
+                                       &tc->parent_phases);
     device_class_set_props(dc, terminal3215_properties);
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
@@ -565,6 +574,7 @@ static const TypeInfo terminal3215_info = {
     .name = TYPE_TERMINAL_3215,
     .parent = TYPE_CCW_DEVICE,
     .instance_size = sizeof(Terminal3215),
+    .class_size = sizeof(Terminal3215Class),
     .class_init = terminal3215_class_init,
 };
 

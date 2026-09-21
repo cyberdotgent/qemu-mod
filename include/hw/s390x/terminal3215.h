@@ -11,6 +11,11 @@
 #include "qom/object.h"
 
 #define TYPE_TERMINAL_3215 "3215-ccw"
-OBJECT_DECLARE_SIMPLE_TYPE(Terminal3215, TERMINAL_3215)
+OBJECT_DECLARE_TYPE(Terminal3215, Terminal3215Class, TERMINAL_3215)
+
+struct Terminal3215Class {
+    CCWDeviceClass parent_class;
+    ResettablePhases parent_phases;
+};
 
 #endif
