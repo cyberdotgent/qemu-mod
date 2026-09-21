@@ -1069,7 +1069,12 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
 
     s->vga.get_bpp = s3_trio_get_bpp;
 
-    isa_register_portio_list(NULL, &s->portio, 0, s3_trio_portio_list, s, "s3_trio");
+    /*
+     * Legacy VGA ports.  Register them through the generic portio API so
+     * the device does not depend on an ISA bus being present.
+     */
+    portio_list_init(&s->portio, OBJECT(s), s3_trio_portio_list, s, "s3_trio");
+    portio_list_add(&s->portio, pci_address_space_io(dev), 0);
 
     /* setup PCI */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vga.vram);
