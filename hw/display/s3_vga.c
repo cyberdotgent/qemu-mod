@@ -2751,6 +2751,15 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
                                              &s->vga);
 
     s->vga.get_bpp = s3_trio_get_bpp;
+
+    /*
+     * The Trio64 predates the PCI 2.1 subsystem ID registers and reads them
+     * as zero.  AIX identifies PCI adapters by the subsystem vendor/ID when
+     * they are non-zero, and only knows the S3 Trio by its 5333:8811 device
+     * ID, so do not let the PCI core fill in QEMU's default subsystem ID.
+     */
+    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, 0);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_ID, 0);
     s->vga.get_resolution = s3_trio_get_resolution;
     s->vga.get_params = s3_trio_get_params;
     s->vga.cursor_invalidate = s3_cursor_invalidate;
