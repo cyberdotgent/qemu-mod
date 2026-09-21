@@ -26,7 +26,10 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/rtc/m48t59.h"
+#include "system/block-backend.h"
+#include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "system/runstate.h"
 #include "system/rtc.h"
@@ -182,6 +185,35 @@ static void set_up_watchdog(M48t59State *NVRAM, uint8_t value)
             interval = (1 << (2 * (value & 0x03))) * ((value >> 2) & 0x1F);
             timer_mod(NVRAM->wd_timer, ((uint64_t)time(NULL) * 1000) +
                            ((interval * 1000) >> 4));
+        }
+    }
+}
+
+/*
+ * Size of the general-purpose NVRAM area, i.e. everything below the
+ * clock/alarm/watchdog/control registers at the top of the chip. Only
+ * this area is persisted to the optional backing image: the registers
+ * above it are derived from the host clock and QEMU timers at runtime.
+ */
+static uint32_t m48t59_nvram_size(const M48t59State *NVRAM)
+{
+    switch (NVRAM->model) {
+    case 2:
+        return 0x7f8;
+    case 8:
+        return 0x1ff8;
+    default:
+        return 0x1ff0;
+    }
+}
+
+/* Write-through of a single general-purpose NVRAM byte to the image */
+static void m48t59_persist_byte(M48t59State *NVRAM, uint32_t addr)
+{
+    if (NVRAM->blk && addr < m48t59_nvram_size(NVRAM)) {
+        if (blk_pwrite(NVRAM->blk, addr, 1, &NVRAM->buffer[addr], 0) < 0) {
+            error_report("%s: write of NVRAM data to backing store failed",
+                         blk_name(NVRAM->blk));
         }
     }
 }
@@ -346,6 +378,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
     do_write:
         if (addr < NVRAM->size) {
             NVRAM->buffer[addr] = val & 0xFF;
+            m48t59_persist_byte(NVRAM, addr);
         }
         break;
     }
@@ -522,10 +555,47 @@ static const MemoryRegionOps nvram_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+/*
+ * After an incoming migration the buffer restored from the stream is the
+ * authoritative copy; write it back to the image once the VM is running
+ * (the block layer is only activated then), as spapr_nvram does.
+ */
+static void m48t59_postload_update_cb(void *opaque, bool running,
+                                      RunState state)
+{
+    M48t59State *NVRAM = opaque;
+
+    qemu_del_vm_change_state_handler(NVRAM->vmstate);
+    NVRAM->vmstate = NULL;
+
+    if (blk_pwrite(NVRAM->blk, 0, m48t59_nvram_size(NVRAM), NVRAM->buffer,
+                   0) < 0) {
+        error_report("%s: write of NVRAM data to backing store failed",
+                     blk_name(NVRAM->blk));
+    }
+}
+
+int m48t59_post_load_common(M48t59State *NVRAM)
+{
+    if (NVRAM->blk && !NVRAM->vmstate) {
+        NVRAM->vmstate =
+            qemu_add_vm_change_state_handler(m48t59_postload_update_cb, NVRAM);
+    }
+    return 0;
+}
+
+static int m48t59_sysbus_post_load(void *opaque, int version_id)
+{
+    M48txxSysBusState *d = opaque;
+
+    return m48t59_post_load_common(&d->state);
+}
+
 static const VMStateDescription vmstate_m48t59 = {
     .name = "m48t59",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = m48t59_sysbus_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(lock, M48t59State),
         VMSTATE_UINT16(addr, M48t59State),
@@ -566,6 +636,32 @@ const MemoryRegionOps m48t59_io_ops = {
 void m48t59_realize_common(M48t59State *s, Error **errp)
 {
     s->buffer = g_malloc0(s->size);
+
+    if (s->blk) {
+        uint32_t nvram_size = m48t59_nvram_size(s);
+        int64_t len = blk_getlength(s->blk);
+
+        if (len < 0) {
+            error_setg_errno(errp, -len,
+                             "could not get length of NVRAM backing image");
+            return;
+        }
+        if (len < s->size) {
+            error_setg(errp, "NVRAM backing image is too small: "
+                       "%" PRId64 " bytes, need at least %u bytes",
+                       len, s->size);
+            return;
+        }
+        if (blk_set_perm(s->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, errp) < 0) {
+            return;
+        }
+        /* Only the general-purpose area is persisted; see m48t59_nvram_size */
+        if (blk_pread(s->blk, 0, nvram_size, s->buffer, 0) < 0) {
+            error_setg(errp, "could not read NVRAM backing image");
+            return;
+        }
+    }
     if (s->model == 59) {
         s->alrm_timer = timer_new_ns(rtc_clock, &alarm_cb, s);
         s->wd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, &watchdog_cb, s);
@@ -620,6 +716,7 @@ static void m48txx_sysbus_toggle_lock(Nvram *obj, int lock)
 
 static const Property m48t59_sysbus_properties[] = {
     DEFINE_PROP_INT32("base-year", M48txxSysBusState, state.base_year, 0),
+    DEFINE_PROP_DRIVE("drive", M48txxSysBusState, state.blk),
 };
 
 static void m48txx_sysbus_class_init(ObjectClass *klass, const void *data)

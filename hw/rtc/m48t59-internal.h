@@ -53,6 +53,9 @@ typedef struct M48t59State {
     QEMUTimer *wd_timer;
     /* NVRAM storage */
     uint8_t *buffer;
+    /* Optional persistent backing store for the general-purpose NVRAM area */
+    BlockBackend *blk;
+    VMChangeStateEntry *vmstate;
     /* Model parameters */
     uint32_t model; /* 2 = m48t02, 8 = m48t08, 59 = m48t59 */
     /* NVRAM storage */
@@ -64,6 +67,7 @@ uint32_t m48t59_read(M48t59State *NVRAM, uint32_t addr);
 void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val);
 void m48t59_reset_common(M48t59State *NVRAM);
 void m48t59_realize_common(M48t59State *s, Error **errp);
+int m48t59_post_load_common(M48t59State *s);
 
 static inline void m48t59_toggle_lock(M48t59State *NVRAM, int lock)
 {
