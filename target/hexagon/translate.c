@@ -65,6 +65,7 @@ TCGv hex_llsc_val;
 TCGv_i64 hex_llsc_val_i64;
 #ifndef CONFIG_USER_ONLY
 TCGv_i64 hex_cycle_count;
+TCGv hex_imprecise_exception;
 #endif
 TCGv hex_vstore_addr[VSTORES_MAX];
 TCGv hex_vstore_size[VSTORES_MAX];
@@ -73,8 +74,8 @@ TCGv hex_vstore_pending[VSTORES_MAX];
 #ifndef CONFIG_USER_ONLY
 TCGv_i32 hex_greg[NUM_GREGS];
 TCGv_i32 hex_t_sreg[NUM_SREGS];
-TCGv_i32 hex_cause_code;
 #endif
+static TCGv_i32 hex_cause_code;
 
 static const char * const hexagon_prednames[] = {
   "p0", "p1", "p2", "p3"
@@ -128,19 +129,14 @@ intptr_t ctx_tmp_vreg_off(DisasContext *ctx, int regnum,
     return offset;
 }
 
-static void gen_exception(int excp, uint32_t PC)
+static void gen_precise_exception(int cause, uint32_t PC)
 {
-    gen_helper_raise_exception(tcg_env, tcg_constant_i32(excp),
+    tcg_gen_movi_i32(hex_cause_code, cause);
+    gen_helper_raise_exception(tcg_env, tcg_constant_i32(HEX_EVENT_PRECISE),
                                tcg_constant_i32(PC));
 }
 
 #ifndef CONFIG_USER_ONLY
-static inline void gen_precise_exception(int excp, uint32_t PC)
-{
-    tcg_gen_movi_i32(hex_cause_code, excp);
-    gen_exception(HEX_EVENT_PRECISE, PC);
-}
-
 static void gen_pcycle_counters(DisasContext *ctx)
 {
     if (ctx->pcycle_enabled) {
@@ -217,6 +213,12 @@ static void gen_end_tb(DisasContext *ctx)
         gen_goto_tb(ctx, 0, ctx->base.tb->pc, true);
         gen_set_label(skip);
         gen_goto_tb(ctx, 1, ctx->next_PC, false);
+    } else if (!ctx->pkt.pkt_has_cof) {
+        /*
+         * Packet with no deferred COF that still ends the TB. PC is
+         * not updated during commit, so set it explicitly to next_PC.
+         */
+         gen_goto_tb(ctx, 0, ctx->next_PC, true);
     } else {
         tcg_gen_lookup_and_goto_ptr();
     }
@@ -224,14 +226,10 @@ static void gen_end_tb(DisasContext *ctx)
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
-void hex_gen_exception_end_tb(DisasContext *ctx, int excp)
+void hex_gen_exception_end_tb(DisasContext *ctx, int cause)
 {
     gen_exec_counters(ctx);
-#ifdef CONFIG_USER_ONLY
-    gen_exception(excp, ctx->pkt.pc);
-#else
-    gen_precise_exception(excp, ctx->pkt.pc);
-#endif
+    gen_precise_exception(cause, ctx->pkt.pc);
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
@@ -239,13 +237,13 @@ void hex_gen_exception_end_tb(DisasContext *ctx, int excp)
  * Generate exception for decode failures. Unlike gen_exception_end_tb,
  * this is used when decode fails before ctx->next_PC is initialized.
  */
-static void gen_exception_decode_fail(DisasContext *ctx, int nwords, int excp)
+static void gen_exception_decode_fail(DisasContext *ctx, int nwords, int cause)
 {
     target_ulong fail_pc = ctx->base.pc_next + nwords * sizeof(uint32_t);
 
     gen_exec_counters(ctx);
     tcg_gen_movi_tl(hex_gpr[HEX_REG_PC], fail_pc);
-    gen_exception(excp, fail_pc);
+    gen_precise_exception(cause, fail_pc);
     ctx->base.is_jmp = DISAS_NORETURN;
     ctx->base.pc_next = fail_pc;
 }
@@ -289,6 +287,7 @@ static bool check_for_attrib(Packet *pkt, int attrib)
     return false;
 }
 
+#ifndef CONFIG_USER_ONLY
 static bool check_for_opcode(Packet *pkt, uint16_t opcode)
 {
     for (int i = 0; i < pkt->num_insns; i++) {
@@ -298,6 +297,7 @@ static bool check_for_opcode(Packet *pkt, uint16_t opcode)
     }
     return false;
 }
+#endif
 
 static bool need_slot_cancelled(Packet *pkt)
 {
@@ -319,6 +319,8 @@ static bool sreg_write_ends_tb(int reg_num)
            reg_num == HEX_SREG_STID ||
            reg_num == HEX_SREG_IMASK ||
            reg_num == HEX_SREG_IPENDAD ||
+           reg_num == HEX_SREG_IPEND ||
+           reg_num == HEX_SREG_IAD ||
            reg_num == HEX_SREG_BESTWAIT ||
            reg_num == HEX_SREG_SCHEDCFG;
 }
@@ -352,6 +354,9 @@ static bool has_sreg_write_ends_tb(Packet const *pkt)
 static bool pkt_ends_tb(Packet *pkt)
 {
     if (pkt->pkt_has_cof) {
+        return true;
+    }
+    if (check_for_attrib(pkt, A_ICFLUSHOP)) {
         return true;
     }
 #ifndef CONFIG_USER_ONLY
@@ -577,10 +582,7 @@ static void analyze_packet(DisasContext *ctx)
 static void gen_start_packet(DisasContext *ctx)
 {
     Packet *pkt = &ctx->pkt;
-    target_ulong next_PC = (check_for_opcode(pkt, Y2_k0lock) ||
-                            check_for_opcode(pkt, Y2_tlblock)) ?
-                               ctx->base.pc_next :
-                               ctx->base.pc_next + pkt->encod_pkt_size_in_bytes;
+    target_ulong next_PC = ctx->base.pc_next + pkt->encod_pkt_size_in_bytes;
     int i;
 
     /* Clear out the disassembly context */
@@ -830,8 +832,10 @@ static void gen_sreg_writes(DisasContext *ctx)
             gen_helper_modify_ssr(tcg_env, ctx->t_sreg_new_value[reg_num],
                                   old_reg);
         } else if ((reg_num == HEX_SREG_STID) ||
-                   (reg_num == HEX_SREG_IMASK) ||
-                   (reg_num == HEX_SREG_IPENDAD)) {
+                    (reg_num == HEX_SREG_IMASK) ||
+                   (reg_num == HEX_SREG_IPENDAD) ||
+                   (reg_num == HEX_SREG_IPEND) ||
+                   (reg_num == HEX_SREG_IAD)) {
             if (ctx->need_commit && reg_num < HEX_SREG_GLB_START) {
                 tcg_gen_mov_tl(hex_t_sreg[reg_num],
                                ctx->t_sreg_new_value[reg_num]);
@@ -1060,6 +1064,22 @@ static void update_exec_counters(DisasContext *ctx)
     ctx->num_cycles += PCYCLES_PER_PACKET;
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * A tlbp instruction may detect multiple TLB matches and set a pending
+ * imprecise exception.  Raise it after the packet that ran the tlbp.
+ */
+static void check_imprecise_exception(DisasContext *ctx)
+{
+    TCGv PC = tcg_constant_tl(ctx->pkt.pc);
+    TCGLabel *label = gen_new_label();
+
+    tcg_gen_brcondi_tl(TCG_COND_EQ, hex_imprecise_exception, 0, label);
+    gen_helper_raise_exception(tcg_env, hex_imprecise_exception, PC);
+    gen_set_label(label);
+}
+#endif
+
 static void gen_commit_packet(DisasContext *ctx)
 {
     /*
@@ -1159,6 +1179,10 @@ static void gen_commit_packet(DisasContext *ctx)
         ctx->pkt.vhist_insn->generate(ctx);
     }
 
+#ifndef CONFIG_USER_ONLY
+    check_imprecise_exception(ctx);
+#endif
+
     if (ctx->pkt_ends_tb || ctx->base.is_jmp == DISAS_NORETURN) {
         gen_end_tb(ctx);
     }
@@ -1209,8 +1233,9 @@ static void hexagon_tr_init_disas_context(DisasContextBase *dcbase,
     ctx->num_hvx_insns = 0;
     ctx->branch_cond = TCG_COND_NEVER;
     ctx->is_tight_loop = FIELD_EX32(hex_flags, TB_FLAGS, IS_TIGHT_LOOP);
-    ctx->short_circuit = hex_cpu->short_circuit;
+    ctx->short_circuit = hex_cpu->cfg.short_circuit;
     ctx->hex_def = HEXAGON_CPU_GET_CLASS(hex_cpu)->hex_def;
+    ctx->ieee_fp_extension = hex_cpu->cfg.ieee_fp_extension;
 #ifndef CONFIG_USER_ONLY
     ctx->num_cycles = 0;
     ctx->pcycle_enabled = FIELD_EX32(hex_flags, TB_FLAGS, PCYCLE_ENABLED);
@@ -1267,7 +1292,7 @@ static void hexagon_tr_translate_packet(DisasContextBase *dcbase, CPUState *cpu)
          * so end the TLB after every packet.
          */
         HexagonCPU *hex_cpu = env_archcpu(env);
-        if (hex_cpu->lldb_compat && qemu_loglevel_mask(CPU_LOG_TB_CPU)) {
+        if (hex_cpu->cfg.lldb_compat && qemu_loglevel_mask(CPU_LOG_TB_CPU)) {
             ctx->base.is_jmp = DISAS_TOO_MANY;
         }
     }
@@ -1360,11 +1385,13 @@ void hexagon_translate_init(void)
         offsetof(CPUHexagonState, llsc_val), "llsc_val");
     hex_llsc_val_i64 = tcg_global_mem_new_i64(tcg_env,
         offsetof(CPUHexagonState, llsc_val_i64), "llsc_val_i64");
-#ifndef CONFIG_USER_ONLY
     hex_cause_code = tcg_global_mem_new_i32(tcg_env,
         offsetof(CPUHexagonState, cause_code), "cause_code");
+#ifndef CONFIG_USER_ONLY
     hex_cycle_count = tcg_global_mem_new_i64(tcg_env,
         offsetof(CPUHexagonState, t_cycle_count), "t_cycle_count");
+    hex_imprecise_exception = tcg_global_mem_new(tcg_env,
+        offsetof(CPUHexagonState, imprecise_exception), "imprecise_exception");
 #endif
     for (i = 0; i < STORES_MAX; i++) {
         snprintf(store_addr_names[i], NAME_LEN, "store_addr_%d", i);

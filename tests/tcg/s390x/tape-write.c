@@ -20,12 +20,16 @@
 LowCore *lowcore;
 
 static Ccw1 ccw __attribute__((aligned(8)));
+#ifndef TAPE_WRITE_PROTECT_TEST
 static uint8_t read_buffer[64] __attribute__((aligned(8)));
+#endif
 static const uint8_t first[] = "first-record";
+#ifndef TAPE_WRITE_PROTECT_TEST
 static const uint8_t obsolete[] = "obsolete-record";
 static const uint8_t old_tail[] = "obsolete-tail";
 static const uint8_t replacement[] = "replacement";
 static const uint8_t final[] = "final-record";
+#endif
 
 static uint32_t addr32(const void *p)
 {
@@ -65,6 +69,7 @@ static int command(SubChannelId schid, uint8_t code, const void *data,
     return run_io(schid, irb);
 }
 
+#ifndef TAPE_WRITE_PROTECT_TEST
 static int normal(SubChannelId schid, uint8_t code, const void *data,
                   uint16_t count)
 {
@@ -97,6 +102,7 @@ static int read_record(SubChannelId schid, const uint8_t *expected,
     }
     return 0;
 }
+#endif
 
 static int setup_subchannel(SubChannelId schid)
 {

@@ -16,6 +16,7 @@
 #include "qemu/notify.h"
 #include "hw/s390x/sclp.h"
 #include "hw/s390x/css.h"
+#include "qapi/qapi-types-machine-s390x.h"
 
 #define TYPE_S390_CCW_MACHINE               "s390-ccw-machine"
 
@@ -30,6 +31,7 @@ struct S390CcwMachineState {
     bool aes_key_wrap;
     bool dea_key_wrap;
     bool pv;
+    bool secure_boot;
     uint8_t loadparm[8];
     CssDevId ipl_devno;
     bool ipl_devno_set;
@@ -38,6 +40,7 @@ struct S390CcwMachineState {
     Notifier ipl_notifier;
     uint64_t memory_limit;
     uint64_t max_pagesize;
+    BootCertificatesList *boot_certs;
 
     SCLPDevice *sclp;
 };
@@ -62,6 +65,8 @@ struct S390CcwMachineClass {
     /*< public >*/
     int max_threads;
     bool use_cpi;
+    bool use_certs;
+    bool use_secure;
 };
 
 #endif

@@ -329,7 +329,7 @@ int tape_3590_ipl(SubChannelId schid, uint16_t cutype)
      * absolute 0x90 before they are able to query it through SCLP.
      */
     if (have_iplb) {
-        memcpy((void *)0x90, iplb.loadparm, LOADPARM_LEN);
+        memcpy((void *)0x90, iplb->loadparm, LOADPARM_LEN);
     }
 
     memset(read_ipl, 0, sizeof(*read_ipl));

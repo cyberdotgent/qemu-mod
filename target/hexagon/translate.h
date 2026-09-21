@@ -81,6 +81,7 @@ typedef struct DisasContext {
     target_ulong branch_dest;
     bool is_tight_loop;
     bool short_circuit;
+    bool ieee_fp_extension;
     bool read_after_write;
     bool has_hvx_overlap;
     TCGv new_value[TOTAL_PER_THREAD_REGS];
@@ -96,7 +97,9 @@ bool is_gather_store_insn(DisasContext *ctx);
 #ifndef CONFIG_USER_ONLY
 static inline void ctx_log_greg_write(DisasContext *ctx, int rnum)
 {
-    assert(rnum <= HEX_GREG_G3);
+    if (rnum > HEX_GREG_G3) {
+        return;
+    }
     ctx->greg_log[ctx->greg_log_idx] = rnum;
     ctx->greg_log_idx++;
 }
@@ -329,7 +332,7 @@ extern TCGv_i32 hex_t_sreg[NUM_SREGS];
 #endif
 
 
-void hex_gen_exception_end_tb(DisasContext *ctx, int excp);
+void hex_gen_exception_end_tb(DisasContext *ctx, int cause);
 
 void process_store(DisasContext *ctx, int slot_num);
 

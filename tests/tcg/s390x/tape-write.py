@@ -44,45 +44,47 @@ def parse_aws(path):
     return records
 
 
+def run_guest(qemu, guest, image, readonly):
+    result = subprocess.run([
+        qemu,
+        "-machine", "s390-ccw-virtio",
+        "-cpu", "max",
+        "-nodefaults",
+        "-display", "none",
+        "-monitor", "none",
+        "-action", "panic=exit-failure",
+        "-dev3590", f"file={image},readonly={readonly},ident=3490,devno=580",
+        "-kernel", guest,
+    ], timeout=30)
+    return result.returncode
+
+
 def main():
-    if len(sys.argv) != 4:
-        raise SystemExit(f"usage: {sys.argv[0]} QEMU GUEST PROTECT_GUEST")
-    qemu, guest, protect_guest = sys.argv[1:]
+    args = sys.argv[1:]
+    protect = False
+    if args and args[0] == "--protect":
+        protect = True
+        args = args[1:]
+    if len(args) != 2:
+        raise SystemExit(f"usage: {sys.argv[0]} [--protect] QEMU GUEST")
+    qemu, guest = args
     expected = [b"first-record", b"replacement", None, b"final-record"]
 
     with tempfile.TemporaryDirectory(prefix="qemu-tape-write-") as tmp:
         image = pathlib.Path(tmp, "write.aws")
         image.touch()
-        result = subprocess.run([
-            qemu,
-            "-machine", "s390-ccw-virtio",
-            "-cpu", "max",
-            "-nodefaults",
-            "-display", "none",
-            "-monitor", "none",
-            "-action", "panic=exit-failure",
-            "-dev3590", f"file={image},readonly=off,ident=3490,devno=580",
-            "-kernel", guest,
-        ], timeout=30)
-        if result.returncode:
-            return result.returncode
+        if protect:
+            # The guest only checks that writes to a read-only tape are
+            # rejected with the expected unit check, so an empty image
+            # is sufficient.
+            return run_guest(qemu, guest, image, "on")
+
+        ret = run_guest(qemu, guest, image, "off")
+        if ret:
+            return ret
         actual = parse_aws(image)
         if actual != expected:
             raise RuntimeError(f"unexpected AWS contents: {actual!r}")
-
-        result = subprocess.run([
-            qemu,
-            "-machine", "s390-ccw-virtio",
-            "-cpu", "max",
-            "-nodefaults",
-            "-display", "none",
-            "-monitor", "none",
-            "-action", "panic=exit-failure",
-            "-dev3590", f"file={image},readonly=on,ident=3490,devno=580",
-            "-kernel", protect_guest,
-        ], timeout=30)
-        if result.returncode:
-            return result.returncode
     return 0
 
 

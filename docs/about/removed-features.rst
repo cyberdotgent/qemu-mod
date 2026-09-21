@@ -1241,7 +1241,7 @@ RISC-V default machine (removed in 11.1)
 ''''''''''''''''''''''''''''''''''''''''
 
 RISC-V used to define ``spike`` as the default machine if no machine option
-was given via the command line.  This happend because ``spike`` was the first
+was given via the command line.  This happened because ``spike`` was the first
 RISC-V machine implemented in QEMU and setting it as default was
 convenient at that time.  Now we have 7 riscv64 and 6 riscv32 machines
 and having ``spike`` as a default is no longer justified.
@@ -1250,6 +1250,16 @@ The default machine option has been removed, forcing users to always set the
 machine they want to use to avoid confusion.  Existing users of the ``spike``
 machine must ensure that they're setting the ``spike`` machine in the
 command line (``-M spike``).
+
+Arm ``musicpal`` machine (removed in 11.2)
+''''''''''''''''''''''''''''''''''''''''''
+
+The ``musicpal`` machine was an emulation of the Freecom MusicPal, an
+"internet radio" device from the mid-2000s. This hardware was never
+supported in upstream Linux, was based on a Marvell SoC with no public
+documentation, and is now obsolete. We accidentally broke booting this
+board in 2024, without anybody noticing; it has therefore been removed
+without a deprecation period.
 
 linux-user mode CPUs
 --------------------

@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "internal.h"
 #include "tcg/tcg-op.h"
@@ -36,6 +37,76 @@
 #endif
 
 #include "genptr.h"
+
+static void gen_sabsdiff_i32(TCGv_i32 d, TCGv_i32 a, TCGv_i32 b)
+{
+    TCGv_i32 t = tcg_temp_new_i32();
+
+    tcg_gen_sub_i32(t, a, b);
+    tcg_gen_sub_i32(d, b, a);
+    tcg_gen_movcond_i32(TCG_COND_LT, d, a, b, d, t);
+}
+
+static void gen_sabsdiff_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_smin_vec(vece, t, a, b);
+    tcg_gen_smax_vec(vece, d, a, b);
+    tcg_gen_sub_vec(vece, d, d, t);
+}
+
+void gen_gvec_sabsdiff(unsigned vece, uint32_t dofs, uint32_t aofs,
+                       uint32_t bofs, uint32_t oprsz, uint32_t maxsz)
+{
+    static const TCGOpcode vecop_list[] = {
+        INDEX_op_sub_vec, INDEX_op_smin_vec, INDEX_op_smax_vec, 0
+    };
+    static const GVecGen3 ops[4] = {
+        [MO_16] = { .fniv = gen_sabsdiff_vec,
+                    .fno = gen_helper_gvec_sabsdiff_h,
+                    .opt_opc = vecop_list,
+                    .vece = MO_16 },
+        [MO_32] = { .fni4 = gen_sabsdiff_i32,
+                    .fniv = gen_sabsdiff_vec,
+                    .fno = gen_helper_gvec_sabsdiff_w,
+                    .opt_opc = vecop_list,
+                    .vece = MO_32 },
+    };
+
+    tcg_debug_assert(vece == MO_16 || vece == MO_32);
+    tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &ops[vece]);
+}
+
+static void gen_uabsdiff_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_umin_vec(vece, t, a, b);
+    tcg_gen_umax_vec(vece, d, a, b);
+    tcg_gen_sub_vec(vece, d, d, t);
+}
+
+void gen_gvec_uabsdiff(unsigned vece, uint32_t dofs, uint32_t aofs,
+                       uint32_t bofs, uint32_t oprsz, uint32_t maxsz)
+{
+    static const TCGOpcode vecop_list[] = {
+        INDEX_op_sub_vec, INDEX_op_umin_vec, INDEX_op_umax_vec, 0
+    };
+    static const GVecGen3 ops[4] = {
+        [MO_8] = { .fniv = gen_uabsdiff_vec,
+                   .fno = gen_helper_gvec_uabsdiff_b,
+                   .opt_opc = vecop_list,
+                   .vece = MO_8 },
+        [MO_16] = { .fniv = gen_uabsdiff_vec,
+                    .fno = gen_helper_gvec_uabsdiff_h,
+                    .opt_opc = vecop_list,
+                    .vece = MO_16 },
+    };
+
+    tcg_debug_assert(vece == MO_8 || vece == MO_16);
+    tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &ops[vece]);
+}
 
 TCGv gen_read_reg(TCGv result, int num)
 {
@@ -89,6 +160,17 @@ TCGv get_result_gpr(DisasContext *ctx, int rnum)
     } else {
         return hex_gpr[rnum];
     }
+}
+
+TCGv gen_unalias_gpr_src(TCGv src, TCGv dst)
+{
+    if (src != dst) {
+        return src;
+    }
+
+    TCGv tmp = tcg_temp_new();
+    tcg_gen_mov_tl(tmp, src);
+    return tmp;
 }
 
 static TCGv_i64 get_result_gpr_pair(DisasContext *ctx, int rnum)
@@ -187,14 +269,18 @@ static const uint32_t sreg_immut_masks[NUM_SREGS] = {
     [HEX_SREG_SSR] = 0x00008000,
     [HEX_SREG_CCR] = 0x10e0ff24,
     [HEX_SREG_HTID] = IMMUTABLE,
-    [HEX_SREG_IMASK] = 0xffff0000,
     [HEX_SREG_GEVB] = 0x000000ff,
 };
 
 G_GNUC_UNUSED
 static void gen_log_sreg_write(DisasContext *ctx, int rnum, TCGv_i32 val)
 {
-    const uint32_t reg_mask = sreg_immut_masks[rnum];
+    uint32_t reg_mask = sreg_immut_masks[rnum];
+
+    if (rnum == HEX_SREG_IMASK &&
+        ctx->hex_def->hex_version < HEX_VER_V81) {
+        reg_mask = 0xffff0000;
+    }
 
     if (reg_mask != IMMUTABLE) {
         if (rnum < HEX_SREG_GLB_START) {
@@ -330,6 +416,23 @@ static inline void gen_read_ctrl_reg(DisasContext *ctx, const int reg_num,
     } else if (reg_num == HEX_REG_QEMU_HVX_CNT) {
         tcg_gen_addi_tl(dest, hex_gpr[HEX_REG_QEMU_HVX_CNT],
                         ctx->num_hvx_insns);
+#ifndef CONFIG_USER_ONLY
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        gen_helper_sreg_read(dest, tcg_env,
+                             tcg_constant_i32(HEX_SREG_TIMERLO));
+    } else if (reg_num == HEX_REG_UTIMERHI) {
+        gen_helper_sreg_read(dest, tcg_env,
+                             tcg_constant_i32(HEX_SREG_TIMERHI));
+#else
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        TCGv_i64 utimer = tcg_temp_new_i64();
+        gen_helper_utimer(utimer);
+        tcg_gen_extrl_i64_i32(dest, utimer);
+    } else if (reg_num == HEX_REG_UTIMERHI) {
+        TCGv_i64 utimer = tcg_temp_new_i64();
+        gen_helper_utimer(utimer);
+        tcg_gen_extrh_i64_i32(dest, utimer);
+#endif
     } else {
         tcg_gen_mov_tl(dest, hex_gpr[reg_num]);
     }
@@ -358,6 +461,18 @@ static inline void gen_read_ctrl_reg_pair(DisasContext *ctx, const int reg_num,
         tcg_gen_addi_tl(hvx_cnt, hex_gpr[HEX_REG_QEMU_HVX_CNT],
                         ctx->num_hvx_insns);
         tcg_gen_concat_i32_i64(dest, hvx_cnt, hex_gpr[reg_num + 1]);
+#ifndef CONFIG_USER_ONLY
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        TCGv lo = tcg_temp_new();
+        TCGv hi = tcg_temp_new();
+        gen_helper_sreg_read(lo, tcg_env, tcg_constant_i32(HEX_SREG_TIMERLO));
+        gen_helper_sreg_read(hi, tcg_env, tcg_constant_i32(HEX_SREG_TIMERHI));
+        tcg_gen_concat_i32_i64(dest, lo, hi);
+#else
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        /* One helper call, so the pair is a coherent 64-bit snapshot. */
+        gen_helper_utimer(dest);
+#endif
     } else {
         tcg_gen_concat_i32_i64(dest,
             hex_gpr[reg_num],
@@ -495,7 +610,7 @@ static inline void gen_store_conditional4(DisasContext *ctx,
     zero = tcg_constant_tl(0);
     tmp = tcg_temp_new();
     tcg_gen_atomic_cmpxchg_tl(tmp, hex_llsc_addr, hex_llsc_val, src,
-                              ctx->mem_idx, MO_32 | MO_ALIGN);
+                              ctx->mem_idx, MO_LE | MO_32 | MO_ALIGN);
     tcg_gen_movcond_tl(TCG_COND_EQ, pred, tmp, hex_llsc_val,
                        one, zero);
     tcg_gen_br(done);
@@ -520,7 +635,7 @@ static inline void gen_store_conditional8(DisasContext *ctx,
     zero = tcg_constant_i64(0);
     tmp = tcg_temp_new_i64();
     tcg_gen_atomic_cmpxchg_i64(tmp, hex_llsc_addr, hex_llsc_val_i64, src,
-                               ctx->mem_idx, MO_64 | MO_ALIGN);
+                               ctx->mem_idx, MO_LE | MO_64 | MO_ALIGN);
     tcg_gen_movcond_i64(TCG_COND_EQ, tmp, tmp, hex_llsc_val_i64,
                         one, zero);
     tcg_gen_extrl_i64_i32(pred, tmp);

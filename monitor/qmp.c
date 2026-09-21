@@ -23,7 +23,8 @@
  */
 
 #include "qemu/osdep.h"
-
+#include "qemu/aio-wait.h"
+#include "qemu/lockable.h"
 #include "chardev/char-io.h"
 #include "monitor-internal.h"
 #include "qapi/error.h"
@@ -342,7 +343,8 @@ static QMPRequest *monitor_qmp_requests_pop_any_with_lock(void)
     return req_obj;
 }
 
-static QMPRequest *monitor_qmp_dispatcher_pop_any(void)
+static QMPRequest * coroutine_fn
+monitor_qmp_dispatcher_pop_any(void)
 {
     while (true) {
         /*
