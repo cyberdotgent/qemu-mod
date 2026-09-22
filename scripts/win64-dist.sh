@@ -157,8 +157,9 @@ EOF
 if $make_zip; then
     info "Creating archive"
     command -v zip >/dev/null || die "'zip' not found in PATH"
+    # zip(1) rejects '--' before the archive name, so it is spelled out here.
     (cd -- "$(dirname -- "$out_dir")" && rm -f -- "$(basename -- "$out_dir").zip" &&
-     zip -qr9 -- "$(basename -- "$out_dir").zip" "$(basename -- "$out_dir")")
+     zip -qr9 "$(basename -- "$out_dir").zip" "$(basename -- "$out_dir")")
     info "Archive: $out_dir.zip"
 fi
 
