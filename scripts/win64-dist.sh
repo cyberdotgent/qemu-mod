@@ -78,8 +78,10 @@ rm -rf -- "$staging"
 "$meson" install -C "$build_dir" --destdir "$staging" --no-rebuild ${strip:+"$strip"} \
     >"$staging.log" 2>&1 ||
     { sed -n '$p' "$staging.log" >&2
-      die "meson install failed (full log: $staging.log) -- build the emulators first, e.g.
-    ninja -C $build_dir qemu-system-x86_64.exe qemu-system-ppc.exe"; }
+      die "meson install failed (full log: $staging.log) -- build the emulators first.
+    Every softmmu target installs TWO binaries: the console one and the GUI-subsystem
+    'w' variant, and the install manifest requires both, e.g.
+    ninja -C $build_dir qemu-system-x86_64.exe qemu-system-x86_64w.exe"; }
 rm -f -- "$staging.log"
 
 installed=$staging/${prefix#/}
