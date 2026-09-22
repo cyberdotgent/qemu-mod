@@ -7,6 +7,35 @@
 #include "hw/i386/apic.h"
 #include "exec/vaddr.h"
 
+#ifndef CONFIG_WHPX_VMX_CAPS
+/*
+ * mingw-w64 before version 12 declares WHV_CAPABILITY_CODE only up to
+ * WHvCapabilityCodeProcessorPerfmonFeatures and omits the nested
+ * virtualization (VMX) capability codes, which whpx_get_supported_msr_feature()
+ * uses unconditionally.  Supply them here when the toolchain headers are too
+ * old; the values are the ABI constants documented in Microsoft's
+ * WinHvPlatformDefs.h.  Macros rather than an enum, so that the real
+ * WHV_CAPABILITY_CODE type stays exactly as the toolchain declares it.
+ */
+#define WHvCapabilityCodeVmxBasic             0x00002000
+#define WHvCapabilityCodeVmxPinbasedCtls      0x00002001
+#define WHvCapabilityCodeVmxProcbasedCtls     0x00002002
+#define WHvCapabilityCodeVmxExitCtls          0x00002003
+#define WHvCapabilityCodeVmxEntryCtls         0x00002004
+#define WHvCapabilityCodeVmxMisc              0x00002005
+#define WHvCapabilityCodeVmxCr0Fixed0         0x00002006
+#define WHvCapabilityCodeVmxCr0Fixed1         0x00002007
+#define WHvCapabilityCodeVmxCr4Fixed0         0x00002008
+#define WHvCapabilityCodeVmxCr4Fixed1         0x00002009
+#define WHvCapabilityCodeVmxVmcsEnum          0x0000200A
+#define WHvCapabilityCodeVmxProcbasedCtls2    0x0000200B
+#define WHvCapabilityCodeVmxEptVpidCap        0x0000200C
+#define WHvCapabilityCodeVmxTruePinbasedCtls  0x0000200D
+#define WHvCapabilityCodeVmxTrueProcbasedCtls 0x0000200E
+#define WHvCapabilityCodeVmxTrueExitCtls      0x0000200F
+#define WHvCapabilityCodeVmxTrueEntryCtls     0x00002010
+#endif /* !CONFIG_WHPX_VMX_CAPS */
+
 typedef enum WhpxBreakpointState {
     WHPX_BP_CLEARED = 0,
     WHPX_BP_SET_PENDING,

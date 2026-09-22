@@ -2684,6 +2684,14 @@ config_host_data.set('CONFIG_INOTIFY1', have_inotify_init1)
 # has_header_symbol
 config_host_data.set('CONFIG_BLKZONED',
                      cc.has_header_symbol('linux/blkzoned.h', 'BLKOPENZONE'))
+# mingw-w64 < 12 declares WHV_CAPABILITY_CODE without the nested
+# virtualization (VMX) capability codes that whpx_get_supported_msr_feature()
+# needs, so the presence of winhvplatform.h alone is not enough.
+config_host_data.set('CONFIG_WHPX_VMX_CAPS',
+                     'CONFIG_WHPX' in accelerators and
+                     cc.has_header_symbol('winhvplatformdefs.h',
+                                          'WHvCapabilityCodeVmxBasic',
+                                          prefix: '#include <windows.h>'))
 config_host_data.set('CONFIG_EPOLL', host_os == 'linux')
 config_host_data.set('CONFIG_FALLOCATE_PUNCH_HOLE',
                      cc.has_header_symbol('linux/falloc.h', 'FALLOC_FL_PUNCH_HOLE') and
