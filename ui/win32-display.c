@@ -4,15 +4,20 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * A display backend built directly on the Win32 API, as an alternative to
- * SDL on Windows hosts.  It is deliberately shaped like the other native
- * backend (ui/cocoa.m): one self-contained file, implementing nothing but
- * QemuDisplay and DisplayChangeListenerOps, with no hooks into the emulator
- * core beyond those two interfaces.  Keeping the surface that narrow is what
- * lets upstream changes to ui/console.h be absorbed mechanically.
+ * SDL on Windows hosts.  It implements nothing but QemuDisplay and
+ * DisplayChangeListenerOps, with no hooks into the emulator core beyond
+ * those two interfaces.  Keeping the surface that narrow is what lets
+ * upstream changes to ui/console.h be absorbed mechanically.
+ *
+ * This file owns one render window per console.  They are children of the
+ * single frame window in ui/win32-tabs.c, which owns the tab strip, the menu
+ * bar and everything else that has to reason about all the consoles at once.
  *
  * The 2D path blits the guest surface straight from pixman memory with
  * StretchDIBits(), so there is no intermediate copy and no texture to keep in
- * sync.  It is the default and needs nothing beyond the Win32 API.
+ * sync.  Because the render window's client area is always exactly the area
+ * the image is stretched into, the zoom factor is expressed purely as a
+ * window size and the blit itself never has to know about it.
  *
  * The GL path (-display win32,gl=on) goes through EGL rather than WGL.  That
  * is deliberate: QEMU's blit shaders are '#version 300 es', and the GL context
@@ -25,8 +30,11 @@
  * The GL code below is structured like ui/gtk-egl.c and ui/sdl2-gl.c -- one
  * EGL context and one window surface per console, a QemuGLShader for the
  * surface blit, and a scanout mode for guest-supplied textures -- so that
- * upstream changes to the shared helpers stay easy to absorb.  dma-buf is
- * deliberately absent: it is a Linux concept and CONFIG_GBM is off here.
+ * upstream changes to the shared helpers stay easy to absorb.  Each console's
+ * EGLSurface is created from its child HWND and lives exactly as long as that
+ * HWND does; tab switches only show and hide the window, so no surface is
+ * ever recreated behind the guest's back.  dma-buf is deliberately absent: it
+ * is a Linux concept and CONFIG_GBM is off here.
  */
 
 #include "qemu/osdep.h"
@@ -45,6 +53,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/kbd-state.h"
+#include "ui/win32-display.h"
 #include "ui/win32-kbd-hook.h"
 #include "standard-headers/linux/input-event-codes.h"
 
@@ -54,8 +63,6 @@
 #include "ui/shader.h"
 #endif
 
-#define WIN32_WINDOW_CLASS  "QemuWin32Display"
-
 /*
  * Refresh pacing, mirroring ui/sdl2.c: poll aggressively while events are
  * arriving, then fall back to the default interval once things go quiet.
@@ -64,55 +71,23 @@
 #define WIN32_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
                               / WIN32_REFRESH_INTERVAL_BUSY + 1)
 
-struct win32_console {
-    DisplayChangeListener dcl;
-    DisplaySurface *surface;
-    DisplayOptions *opts;
-    HWND hwnd;
-    QKbdState *kbd;
-    int idx;
-    bool hidden;
-    int idle_counter;
+int win32_num_outputs;
+struct win32_console *win32_consoles;
+DisplayOptions *win32_opts;
 
-    /* saved geometry, for leaving fullscreen again */
-    WINDOWPLACEMENT saved_placement;
-    LONG_PTR saved_style;
+bool gui_grab;
+bool alt_grab;
+bool ctrl_grab;
 
-#ifdef CONFIG_OPENGL
-    bool opengl;
-    DisplayGLCtx dgc;
-    EGLSurface esurface;
-    EGLContext ectx;
-    QemuGLShader *gls;
-    int updates;
-    bool scanout_mode;
-    bool y0_top;
-    egl_fb guest_fb;
-    egl_fb win_fb;
-#endif
-};
+bool absolute_enabled;
+bool guest_cursor;
+HCURSOR guest_sprite;
+HCURSOR cursor_arrow;
 
-static int win32_num_outputs;
-static struct win32_console *win32_consoles;
 static ATOM win32_class_atom;
-
-static bool gui_grab;
-static bool gui_fullscreen;
-static bool gui_saved_grab;
-static bool alt_grab;
-static bool ctrl_grab;
-
-static bool absolute_enabled;
-static bool guest_cursor;
 static int guest_x, guest_y;
-static HCURSOR guest_sprite;
-static HCURSOR cursor_arrow;
 static bool cursor_visible = true;
 static Notifier mouse_mode_notifier;
-
-static void win32_update_caption(struct win32_console *wcon);
-static void win32_grab_start(struct win32_console *wcon);
-static void win32_grab_end(struct win32_console *wcon);
 
 #ifdef CONFIG_OPENGL
 static void win32_gl_init(struct win32_console *wcon);
@@ -120,49 +95,53 @@ static void win32_gl_fini(struct win32_console *wcon);
 static void win32_gl_redraw(struct win32_console *wcon);
 #endif
 
-static struct win32_console *win32_console_from_hwnd(HWND hwnd)
-{
-    return (struct win32_console *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-}
-
 /* ------------------------------------------------------------------ */
-/* window management                                                    */
+/* render windows                                                       */
 
-/*
- * Size the window so that its *client* area matches the guest surface;
- * AdjustWindowRect() accounts for the frame and caption.
- */
-static void win32_window_set_client_size(struct win32_console *wcon,
-                                         int w, int h)
+void win32_console_size(struct win32_console *wcon, int *w, int *h)
 {
-    RECT r = { 0, 0, w, h };
-    LONG_PTR style = GetWindowLongPtr(wcon->hwnd, GWL_STYLE);
-
-    if (gui_fullscreen) {
+    if (!wcon || !wcon->surface) {
+        *w = 0;
+        *h = 0;
         return;
     }
+    *w = surface_width(wcon->surface) * wcon->scale_x;
+    *h = surface_height(wcon->surface) * wcon->scale_y;
+}
 
-    AdjustWindowRect(&r, style, FALSE);
-    SetWindowPos(wcon->hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+void win32_console_redraw(struct win32_console *wcon)
+{
+    if (!wcon || !wcon->hwnd) {
+        return;
+    }
+#ifdef CONFIG_OPENGL
+    if (wcon->opengl) {
+        win32_gl_redraw(wcon);
+        return;
+    }
+#endif
+    InvalidateRect(wcon->hwnd, NULL, FALSE);
 }
 
 static void win32_window_create(struct win32_console *wcon)
 {
-    int w, h;
-
     if (!wcon->surface) {
         return;
     }
     assert(!wcon->hwnd);
+    assert(win32_frame);
 
-    w = surface_width(wcon->surface);
-    h = surface_height(wcon->surface);
-
-    wcon->hwnd = CreateWindowEx(0, WIN32_WINDOW_CLASS, QEMU_UI_NAME,
-                                WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, w, h,
-                                NULL, NULL, GetModuleHandle(NULL), NULL);
+    /*
+     * A child window, never a top-level one: the frame decides where it goes
+     * and whether it is visible, and its HWND -- and with it the EGL surface
+     * bound to that HWND -- then stays put for as long as the console has a
+     * surface.
+     */
+    wcon->hwnd = CreateWindowEx(0, WIN32_WINDOW_CLASS, NULL,
+                                WS_CHILD | WS_CLIPSIBLINGS,
+                                0, 0, 1, 1,
+                                win32_frame, NULL,
+                                GetModuleHandle(NULL), NULL);
     if (!wcon->hwnd) {
         error_report("win32: could not create window (error %lu)",
                      GetLastError());
@@ -170,7 +149,6 @@ static void win32_window_create(struct win32_console *wcon)
     }
 
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, (LONG_PTR)wcon);
-    win32_window_set_client_size(wcon, w, h);
 
 #ifdef CONFIG_OPENGL
     /*
@@ -182,10 +160,7 @@ static void win32_window_create(struct win32_console *wcon)
     }
 #endif
 
-    if (!wcon->hidden) {
-        ShowWindow(wcon->hwnd, SW_SHOW);
-    }
-    win32_update_caption(wcon);
+    win32_frame_add_console(wcon);
 }
 
 static void win32_window_destroy(struct win32_console *wcon)
@@ -201,84 +176,20 @@ static void win32_window_destroy(struct win32_console *wcon)
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, 0);
     DestroyWindow(wcon->hwnd);
     wcon->hwnd = NULL;
-}
+    wcon->tab = -1;
+    wcon->hover_tracked = false;
 
-static void win32_update_caption(struct win32_console *wcon)
-{
-    char title[1024];
-    const char *status = "";
-
-    if (!wcon->hwnd) {
-        return;
+    if (win32_frame) {
+        win32_frame_del_console(wcon);
     }
-
-    if (!runstate_is_running()) {
-        status = " [Stopped]";
-    } else if (gui_grab) {
-        if (alt_grab) {
-            status = " - Press Ctrl-Alt-Shift-G to exit grab";
-        } else if (ctrl_grab) {
-            status = " - Press Right-Ctrl-G to exit grab";
-        } else {
-            status = " - Press Ctrl-Alt-G to exit grab";
-        }
-    }
-
-    if (qemu_name) {
-        snprintf(title, sizeof(title), QEMU_UI_NAME " (%s-%d)%s",
-                 qemu_name, wcon->idx, status);
-    } else {
-        snprintf(title, sizeof(title), QEMU_UI_NAME "%s", status);
-    }
-    SetWindowText(wcon->hwnd, title);
-}
-
-static void win32_toggle_fullscreen(struct win32_console *wcon)
-{
-    HMONITOR mon;
-    MONITORINFO mi = { .cbSize = sizeof(mi) };
-
-    if (!wcon->hwnd) {
-        return;
-    }
-
-    gui_fullscreen = !gui_fullscreen;
-
-    if (gui_fullscreen) {
-        wcon->saved_placement.length = sizeof(wcon->saved_placement);
-        GetWindowPlacement(wcon->hwnd, &wcon->saved_placement);
-        wcon->saved_style = GetWindowLongPtr(wcon->hwnd, GWL_STYLE);
-
-        mon = MonitorFromWindow(wcon->hwnd, MONITOR_DEFAULTTONEAREST);
-        GetMonitorInfo(mon, &mi);
-
-        SetWindowLongPtr(wcon->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-        SetWindowPos(wcon->hwnd, HWND_TOP,
-                     mi.rcMonitor.left, mi.rcMonitor.top,
-                     mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top,
-                     SWP_FRAMECHANGED);
-
-        gui_saved_grab = gui_grab;
-        win32_grab_start(wcon);
-    } else {
-        if (!gui_saved_grab) {
-            win32_grab_end(wcon);
-        }
-        SetWindowLongPtr(wcon->hwnd, GWL_STYLE, wcon->saved_style);
-        SetWindowPlacement(wcon->hwnd, &wcon->saved_placement);
-        SetWindowPos(wcon->hwnd, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-    }
-    InvalidateRect(wcon->hwnd, NULL, FALSE);
 }
 
 /* ------------------------------------------------------------------ */
 /* cursor and input grab                                                */
 
-static void win32_show_cursor(struct win32_console *wcon, bool show)
+void win32_show_cursor(bool show)
 {
-    if (wcon->opts->has_show_cursor && wcon->opts->show_cursor) {
+    if (win32_opts->has_show_cursor && win32_opts->show_cursor) {
         show = true;
     }
     if (show == cursor_visible) {
@@ -292,49 +203,51 @@ static void win32_show_cursor(struct win32_console *wcon, bool show)
     cursor_visible = show;
 }
 
-static void win32_clip_cursor(struct win32_console *wcon, bool clip)
+void win32_clip_cursor(bool clip)
 {
+    HWND hwnd = win32_active ? win32_active->hwnd : NULL;
     RECT r;
 
-    if (!clip) {
+    if (!clip || !hwnd) {
         ClipCursor(NULL);
         return;
     }
-    if (GetClientRect(wcon->hwnd, &r)) {
-        MapWindowPoints(wcon->hwnd, NULL, (POINT *)&r, 2);
+    if (GetClientRect(hwnd, &r)) {
+        MapWindowPoints(hwnd, NULL, (POINT *)&r, 2);
         ClipCursor(&r);
     }
 }
 
-static void win32_grab_start(struct win32_console *wcon)
+void win32_grab_start(void)
 {
+    struct win32_console *wcon = win32_active;
     QemuConsole *con = wcon ? wcon->dcl.con : NULL;
 
     if (!con || !qemu_console_is_graphic(con) || !wcon->hwnd) {
         return;
     }
-    if (GetForegroundWindow() != wcon->hwnd) {
+    if (GetForegroundWindow() != win32_frame) {
         return;
     }
 
     if (guest_cursor) {
         SetCursor(guest_sprite);
     } else {
-        win32_show_cursor(wcon, false);
+        win32_show_cursor(false);
     }
-    win32_clip_cursor(wcon, true);
+    win32_clip_cursor(true);
     win32_kbd_set_grab(true);
     gui_grab = true;
-    win32_update_caption(wcon);
+    win32_update_caption();
 }
 
-static void win32_grab_end(struct win32_console *wcon)
+void win32_grab_end(void)
 {
-    win32_clip_cursor(wcon, false);
+    win32_clip_cursor(false);
     win32_kbd_set_grab(false);
     gui_grab = false;
-    win32_show_cursor(wcon, true);
-    win32_update_caption(wcon);
+    win32_show_cursor(true);
+    win32_update_caption();
 }
 
 static void win32_mouse_mode_change(Notifier *notify, void *data)
@@ -346,7 +259,7 @@ static void win32_mouse_mode_change(Notifier *notify, void *data)
         absolute_enabled = true;
     } else if (absolute_enabled) {
         if (!gui_fullscreen) {
-            win32_grab_end(&win32_consoles[0]);
+            win32_grab_end();
         }
         absolute_enabled = false;
     }
@@ -371,7 +284,8 @@ static void win32_send_mouse_motion(struct win32_console *wcon,
         /*
          * The window is free to be any size; scale the pointer back into
          * surface coordinates so that the guest sees the position the user
-         * is actually pointing at.
+         * is actually pointing at.  This is also what makes zooming work for
+         * the pointer as well as the image.
          */
         qemu_input_queue_abs(wcon->dcl.con, INPUT_AXIS_X,
                              x * surface_width(wcon->surface) / r.right,
@@ -424,6 +338,28 @@ static void win32_send_wheel(struct win32_console *wcon, InputButton btn)
     qemu_input_event_sync();
 }
 
+/*
+ * "Grab on hover" needs to know when the pointer comes to rest inside the
+ * guest image, which Win32 only reports if it is asked to: one request per
+ * entry into the window, re-armed once the pointer leaves again.
+ */
+static void win32_track_hover(struct win32_console *wcon)
+{
+    TRACKMOUSEEVENT tme = {
+        .cbSize      = sizeof(tme),
+        .dwFlags     = TME_HOVER | TME_LEAVE,
+        .hwndTrack   = wcon->hwnd,
+        .dwHoverTime = HOVER_DEFAULT,
+    };
+
+    if (wcon->hover_tracked || !gui_grab_on_hover || gui_grab) {
+        return;
+    }
+    if (TrackMouseEvent(&tme)) {
+        wcon->hover_tracked = true;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* keyboard                                                             */
 
@@ -470,7 +406,7 @@ static bool win32_grab_modifiers_down(void)
     return lctrl && lalt;
 }
 
-static void win32_release_modifiers(struct win32_console *wcon)
+void win32_release_modifiers(struct win32_console *wcon)
 {
     qkbd_state_lift_all_keys(wcon->kbd);
 }
@@ -486,40 +422,34 @@ static bool win32_handle_hotkey(struct win32_console *wcon, WPARAM wparam)
 
     switch (wparam) {
     case 'F':
-        win32_toggle_fullscreen(wcon);
+        win32_toggle_fullscreen();
         win32_release_modifiers(wcon);
         return true;
     case 'G':
         if (gui_grab) {
-            win32_grab_end(wcon);
+            win32_grab_end();
         } else {
-            win32_grab_start(wcon);
+            win32_grab_start();
         }
         win32_release_modifiers(wcon);
         return true;
     case 'U':
-        /* restore the window to the guest's own resolution */
-        if (wcon->surface && !gui_fullscreen) {
-            win32_window_set_client_size(wcon,
-                                         surface_width(wcon->surface),
-                                         surface_height(wcon->surface));
-            InvalidateRect(wcon->hwnd, NULL, FALSE);
-        }
+        /* restore the guest's own resolution, i.e. the View/Best Fit item */
+        win32_zoom_fixed();
         win32_release_modifiers(wcon);
         return true;
     case '1' ... '9':
+        /*
+         * The keyboard remains the primary way to reach a console: this now
+         * selects the console's tab instead of toggling a window, but it is
+         * still what the documented Ctrl-Alt-<n> does, and nothing here
+         * depends on the menu being usable.
+         */
         win = wparam - '1';
-        if (win >= win32_num_outputs) {
+        if (win >= win32_num_outputs || !win32_consoles[win].hwnd) {
             return false;
         }
-        if (gui_grab) {
-            win32_grab_end(wcon);
-        }
-        win32_consoles[win].hidden = !win32_consoles[win].hidden;
-        if (win32_consoles[win].hwnd) {
-            ShowWindow(win32_consoles[win].hwnd,
-                       win32_consoles[win].hidden ? SW_HIDE : SW_SHOW);
-        }
+        win32_frame_activate(&win32_consoles[win]);
         win32_release_modifiers(wcon);
         return true;
     default:
@@ -609,7 +539,7 @@ static void win32_paint(struct win32_console *wcon, HDC hdc)
 }
 
 /* ------------------------------------------------------------------ */
-/* window procedure                                                     */
+/* render window procedure                                              */
 
 static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
                                       WPARAM wparam, LPARAM lparam)
@@ -652,43 +582,8 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
 #endif
         InvalidateRect(hwnd, NULL, FALSE);
         if (gui_grab) {
-            win32_clip_cursor(wcon, true);
+            win32_clip_cursor(true);
         }
-        return 0;
-
-    case WM_MOVE:
-        if (gui_grab) {
-            win32_clip_cursor(wcon, true);
-        }
-        return 0;
-
-    case WM_CLOSE:
-        if (qemu_console_is_graphic(wcon->dcl.con)) {
-            if (wcon->opts->has_window_close && !wcon->opts->window_close) {
-                return 0;
-            }
-            shutdown_action = SHUTDOWN_ACTION_POWEROFF;
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
-        } else {
-            ShowWindow(hwnd, SW_HIDE);
-            wcon->hidden = true;
-        }
-        return 0;
-
-    case WM_SETFOCUS:
-        win32_kbd_set_window(hwnd);
-        return 0;
-
-    case WM_KILLFOCUS:
-        /*
-         * Keys held when focus is lost would otherwise stay stuck down in
-         * the guest; this also covers Ctrl-Alt-Del, which cannot be hooked.
-         */
-        win32_release_modifiers(wcon);
-        if (gui_grab) {
-            win32_grab_end(wcon);
-        }
-        win32_kbd_set_window(NULL);
         return 0;
 
     case WM_KEYDOWN:
@@ -702,9 +597,21 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
         return 0;
 
     case WM_MOUSEMOVE:
+        win32_track_hover(wcon);
         win32_send_mouse_motion(wcon, GET_X_LPARAM(lparam),
                                 GET_Y_LPARAM(lparam), 0, 0, false);
         win32_send_mouse_buttons(wcon, wparam);
+        return 0;
+
+    case WM_MOUSEHOVER:
+        wcon->hover_tracked = false;
+        if (gui_grab_on_hover && !gui_grab) {
+            win32_grab_start();
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        wcon->hover_tracked = false;
         return 0;
 
     case WM_LBUTTONDOWN:
@@ -715,8 +622,9 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
          * Clicking into an ungrabbed window with a relative-mode guest is
          * how the user asks for the pointer, matching the SDL behaviour.
          */
+        SetFocus(hwnd);
         if (!gui_grab && !qemu_input_is_absolute(wcon->dcl.con)) {
-            win32_grab_start(wcon);
+            win32_grab_start();
         } else {
             SetCapture(hwnd);
             win32_send_mouse_buttons(wcon, wparam);
@@ -791,7 +699,7 @@ static void win32_2d_update(DisplayChangeListener *dcl,
         container_of(dcl, struct win32_console, dcl);
     RECT client, dirty;
 
-    if (!wcon->hwnd || !wcon->surface) {
+    if (!wcon->hwnd || !wcon->surface || wcon != win32_active) {
         return;
     }
     if (!GetClientRect(wcon->hwnd, &client) ||
@@ -812,6 +720,37 @@ static void win32_2d_update(DisplayChangeListener *dcl,
     InvalidateRect(wcon->hwnd, &dirty, FALSE);
 }
 
+/*
+ * Common to both paths: decide whether this console still deserves a window,
+ * create or drop it, and re-fit the frame if it is the visible one.
+ */
+static void win32_switch_common(struct win32_console *wcon,
+                                DisplaySurface *old_surface)
+{
+    DisplaySurface *new_surface = wcon->surface;
+
+    if (!new_surface ||
+        (surface_is_placeholder(new_surface) &&
+         qemu_console_get_index(wcon->dcl.con))) {
+        win32_window_destroy(wcon);
+        return;
+    }
+
+    if (!wcon->hwnd) {
+        /* under gl=on this also brings up the EGL surface and shader */
+        win32_window_create(wcon);
+    } else if (old_surface &&
+               (surface_width(old_surface) != surface_width(new_surface) ||
+                surface_height(old_surface) != surface_height(new_surface)) &&
+               wcon == win32_active) {
+        win32_frame_fit();
+    }
+
+    if (wcon->hwnd && wcon == win32_active) {
+        InvalidateRect(wcon->hwnd, NULL, FALSE);
+    }
+}
+
 static void win32_2d_switch(DisplayChangeListener *dcl,
                             DisplaySurface *new_surface)
 {
@@ -820,31 +759,7 @@ static void win32_2d_switch(DisplayChangeListener *dcl,
     DisplaySurface *old_surface = wcon->surface;
 
     wcon->surface = new_surface;
-
-    if (!new_surface) {
-        win32_window_destroy(wcon);
-        return;
-    }
-
-    if (surface_is_placeholder(new_surface) &&
-        qemu_console_get_index(dcl->con)) {
-        win32_window_destroy(wcon);
-        return;
-    }
-
-    if (!wcon->hwnd) {
-        win32_window_create(wcon);
-    } else if (old_surface &&
-               (surface_width(old_surface) != surface_width(new_surface) ||
-                surface_height(old_surface) != surface_height(new_surface))) {
-        win32_window_set_client_size(wcon,
-                                     surface_width(new_surface),
-                                     surface_height(new_surface));
-    }
-
-    if (wcon->hwnd) {
-        InvalidateRect(wcon->hwnd, NULL, FALSE);
-    }
+    win32_switch_common(wcon, old_surface);
 }
 
 static bool win32_2d_check_format(DisplayChangeListener *dcl,
@@ -893,7 +808,7 @@ static void win32_2d_refresh(DisplayChangeListener *dcl)
 
     if (running != was_running) {
         was_running = running;
-        win32_update_caption(wcon);
+        win32_update_caption();
     }
 
     win32_poll_events(wcon);
@@ -911,13 +826,13 @@ static void win32_mouse_warp(DisplayChangeListener *dcl,
 
     if (on) {
         if (!guest_cursor) {
-            win32_show_cursor(wcon, true);
+            win32_show_cursor(true);
         }
         if (gui_grab || qemu_input_is_absolute(dcl->con) || absolute_enabled) {
             SetCursor(guest_sprite);
         }
     } else if (gui_grab) {
-        win32_show_cursor(wcon, false);
+        win32_show_cursor(false);
     }
     guest_cursor = on;
     guest_x = x;
@@ -1032,7 +947,9 @@ static void win32_gl_init(struct win32_console *wcon)
     /*
      * Despite its name this helper is platform independent -- it is just
      * eglCreateWindowSurface() plus eglMakeCurrent() -- and on Windows the
-     * EGLNativeWindowType is an HWND.
+     * EGLNativeWindowType is an HWND.  A child HWND works exactly as well as
+     * a top-level one, and since the child is never reparented the surface
+     * stays valid across every tab switch.
      */
     wcon->esurface = qemu_egl_init_surface_x11(wcon->ectx,
                                                (EGLNativeWindowType)wcon->hwnd);
@@ -1091,6 +1008,11 @@ static void win32_gl_set_scanout_mode(struct win32_console *wcon, bool scanout)
     }
 }
 
+/*
+ * The client area of the render window is the whole of the area the guest
+ * image occupies, so this is also where the zoom factor is honoured: it has
+ * already been applied to the window size by the frame.
+ */
 static bool win32_gl_client_size(struct win32_console *wcon, int *w, int *h)
 {
     RECT client;
@@ -1190,24 +1112,7 @@ static void win32_gl_switch(DisplayChangeListener *dcl,
     }
 
     wcon->surface = new_surface;
-
-    if (!new_surface ||
-        (surface_is_placeholder(new_surface) &&
-         qemu_console_get_index(dcl->con))) {
-        win32_window_destroy(wcon);
-        return;
-    }
-
-    if (!wcon->hwnd) {
-        /* this also brings up the EGL surface, context and shader */
-        win32_window_create(wcon);
-    } else if (old_surface &&
-               (surface_width(old_surface) != surface_width(new_surface) ||
-                surface_height(old_surface) != surface_height(new_surface))) {
-        win32_window_set_client_size(wcon,
-                                     surface_width(new_surface),
-                                     surface_height(new_surface));
-    }
+    win32_switch_common(wcon, old_surface);
 
     if (wcon->gls && win32_gl_make_current(wcon)) {
         surface_gl_create_texture(wcon->gls, new_surface);
@@ -1226,10 +1131,10 @@ static void win32_gl_refresh(DisplayChangeListener *dcl)
 
     if (running != was_running) {
         was_running = running;
-        win32_update_caption(wcon);
+        win32_update_caption();
     }
 
-    if (wcon->updates && wcon->hwnd) {
+    if (wcon->updates && wcon->hwnd && wcon == win32_active) {
         wcon->updates = 0;
         win32_gl_render_surface(wcon);
     }
@@ -1346,13 +1251,15 @@ static void win32_display_cleanup(void)
     win32_kbd_set_grab(false);
     win32_kbd_set_window(NULL);
     ClipCursor(NULL);
-    win32_show_cursor(&win32_consoles[0], true);
+    win32_show_cursor(true);
 
     for (i = 0; i < win32_num_outputs; i++) {
         qemu_console_unregister_listener(&win32_consoles[i].dcl);
         qkbd_state_free(win32_consoles[i].kbd);
         win32_window_destroy(&win32_consoles[i]);
     }
+    win32_frame_fini();
+    win32_active = NULL;
     g_clear_pointer(&win32_consoles, g_free);
     win32_num_outputs = 0;
 
@@ -1413,8 +1320,8 @@ static void win32_register_class(void)
         .style         = CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
         .lpfnWndProc   = win32_wndproc,
         .hInstance     = GetModuleHandle(NULL),
-        .hIcon         = LoadIcon(GetModuleHandle(NULL), "QEMU_ICON"),
-        .hCursor       = NULL, /* handled in WM_SETCURSOR */
+        .hIcon         = NULL,   /* the frame carries the icon */
+        .hCursor       = NULL,   /* handled in WM_SETCURSOR */
         .hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH),
         .lpszClassName = WIN32_WINDOW_CLASS,
     };
@@ -1454,6 +1361,8 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
 
     assert(o->type == DISPLAY_TYPE_WIN32);
 
+    win32_opts = o;
+
     if (o->u.win32.has_grab_mod) {
         if (o->u.win32.grab_mod == HOT_KEY_MOD_LSHIFT_LCTRL_LALT) {
             alt_grab = true;
@@ -1474,18 +1383,26 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
         return;
     }
 
+    /*
+     * Fill in the console array before the frame exists: the frame lays
+     * itself out as soon as it is created, and that walks this array.
+     */
     win32_consoles = g_new0(struct win32_console, win32_num_outputs);
+    for (i = 0; i < win32_num_outputs; i++) {
+        win32_consoles[i].idx = i;
+        win32_consoles[i].tab = -1;
+        win32_consoles[i].scale_x = 1.0;
+        win32_consoles[i].scale_y = 1.0;
+    }
+
+    /* the frame has to exist before anything can become a child of it */
+    win32_frame_init();
+
     for (i = 0; i < win32_num_outputs; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
         const DisplayChangeListenerOps *ops = &dcl_2d_ops;
 
         assert(con != NULL);
-        if (!qemu_console_is_graphic(con) &&
-            qemu_console_get_index(con) != 0) {
-            win32_consoles[i].hidden = true;
-        }
-        win32_consoles[i].idx = i;
-        win32_consoles[i].opts = o;
         win32_consoles[i].kbd = qkbd_state_init(con);
 #ifdef CONFIG_OPENGL
         win32_consoles[i].opengl = display_opengl;
@@ -1502,7 +1419,7 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
 
     if (o->has_full_screen && o->full_screen) {
-        win32_toggle_fullscreen(&win32_consoles[0]);
+        win32_toggle_fullscreen();
     }
 
     /*

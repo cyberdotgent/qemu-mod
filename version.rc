@@ -28,3 +28,16 @@ FILESUBTYPE VFT2_UNKNOWN
 }
 
 IDI_ICON1 ICON "pc-bios/qemu-nsis.ico"
+
+/*
+ * Common Controls v6 (and the compatibility settings that have to accompany
+ * a manifest).  ui/win32-tabs.c's tab strip is unthemed without it.
+ */
+#ifndef CREATEPROCESS_MANIFEST_RESOURCE_ID
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#endif
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "qemu.manifest"

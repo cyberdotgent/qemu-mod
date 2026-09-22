@@ -75,8 +75,13 @@ endif
 system_ss.add(when: cocoa, if_true: files('cocoa.m'))
 if win32_ui
   # win32_ui is a plain bool rather than a dependency object, so a source-set
-  # 'when:' clause would not resolve it; add the file directly instead.
-  system_ss.add(files('win32-display.c'))
+  # 'when:' clause would not resolve it; add the files directly instead.
+  # comctl32 is what provides InitCommonControlsEx() and SysTabControl32;
+  # get_compiler() rather than the 'cc' variable, which subdir('tests')
+  # rebinds to the native compiler before this point.
+  system_ss.add(files('win32-display.c', 'win32-tabs.c'),
+                meson.get_compiler('c').find_library('comctl32',
+                                                     required: true))
 endif
 
 vnc_ss = ss.source_set()

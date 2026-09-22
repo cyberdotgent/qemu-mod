@@ -850,7 +850,7 @@ if host_os == 'windows'
 
   win = import('windows')
   version_res = win.compile_resources('version.rc',
-                                      depend_files: files('pc-bios/qemu-nsis.ico'),
+                                      depend_files: files('pc-bios/qemu-nsis.ico', 'qemu.manifest'),
                                       include_directories: include_directories('.'))
   host_dsosuf = '.dll'
 elif host_os == 'darwin'
