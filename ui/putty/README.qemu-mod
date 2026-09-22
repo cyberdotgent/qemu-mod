@@ -1,0 +1,78 @@
+Vendored PuTTY terminal emulator
+================================
+
+This directory contains a subset of the PuTTY source distribution, used by
+QEMU-mod's native Win32 UI to provide a real VT100/VT220/xterm terminal
+emulator for serial ports and the HMP monitor, in place of QEMU's own
+minimal ui/vt100.c.
+
+Upstream
+--------
+
+    Project:  PuTTY
+    Version:  0.85
+    Source:   https://the.earth.li/~sgtatham/putty/0.85/putty-0.85.tar.gz
+    Author:   Simon Tatham and others (see LICENCE)
+
+Licence
+-------
+
+PuTTY is distributed under the MIT licence, which is GPL-compatible.  The
+full copyright notice and permission text are reproduced verbatim in the
+file `LICENCE` in this directory, copied unaltered from the upstream
+distribution.  Every source file here keeps its original header comment.
+
+Nothing in this directory is relicensed.  QEMU-mod as a whole remains
+GPL-2.0-or-later; the MIT terms of these files permit that combination, and
+`LICENCE` is what satisfies MIT's requirement that the copyright notice and
+permission notice accompany substantial portions of the software.
+
+What is here, and what was changed
+----------------------------------
+
+Everything in this directory is verbatim upstream PuTTY, with exactly two
+exceptions, both noted below.
+
+    terminal/terminal.c      the terminal emulator itself
+    terminal/terminal.h
+    terminal/bidi.c          bidirectional text and Arabic shaping
+    terminal/bidi.h
+    terminal/lineedit.c      the terminal-side line editor
+    callback.c               PuTTY's toplevel-callback queue
+    timing.c                 PuTTY's timer wheel
+    utils/                   the general-purpose utilities the above need
+                             (memory, strings, tree234, bufchain, marshal,
+                             UTF-8, wcwidth, and the Conf container)
+    windows/unicode.c        Windows codepage and line-drawing tables
+    windows/blink_time.c     GetCaretBlinkTime() wrapper
+    windows/filename.c       Filename, needed by Conf
+    windows/fontspec.c       FontSpec, needed by Conf
+    unicode/*.h              generated Unicode character property tables
+    *.h                      PuTTY's headers, unmodified; platform.h is
+                             upstream's windows/platform.h and help.h is
+                             upstream's windows/help.h
+
+The two files that are NOT upstream:
+
+    cmake.h                  written for QEMU-mod.  Upstream generates this
+                             from cmake/cmake.h.in using CMake feature
+                             probes; we do not run PuTTY's build system, so
+                             the handful of macros the vendored subset
+                             actually tests are hardcoded for
+                             x86_64-w64-mingw32.  Marked SPDX MIT to match
+                             the code it configures.
+
+    README.qemu-mod          this file.
+
+No upstream .c or .h file in this directory has been edited.  The pieces of
+PuTTY that we do *not* vendor -- its line discipline, session logging,
+printing and configuration loading -- are replaced by original QEMU-mod code
+in ../win32-term-shim.c, which is GPL-2.0-or-later and not part of PuTTY.
+
+Updating
+--------
+
+Re-copy the file list above from a newer PuTTY tarball, re-run the build,
+and fix up ../win32-term.c (the TermWin implementation) against any change
+to `struct TermWinVtable` in putty.h.  Do not reformat or restyle anything
+here: QEMU's checkpatch.pl will reject these files, and that is correct.

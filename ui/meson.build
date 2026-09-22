@@ -79,9 +79,95 @@ if win32_ui
   # comctl32 is what provides InitCommonControlsEx() and SysTabControl32;
   # get_compiler() rather than the 'cc' variable, which subdir('tests')
   # rebinds to the native compiler before this point.
+  win32_ui_cc = meson.get_compiler('c')
+
+  # The vendored PuTTY terminal emulator (ui/putty/, MIT, see its LICENCE)
+  # plus the two files of ours that are written against putty.h.  This is a
+  # library of its own and not part of system_ss because putty.h and
+  # qemu/osdep.h are not co-installable: they define many of the same
+  # generic names, so nothing here may see a QEMU header, and nothing in
+  # system_ss may see a PuTTY one.  ui/win32-term.h is the only thing both
+  # sides include.
+  #
+  # HAVE_CMAKE_H makes PuTTY read ui/putty/cmake.h, which stands in for the
+  # header its own CMake build would generate.
+  #
+  # The warning suppressions are scoped to this library alone and exist only
+  # because QEMU's warning set is stricter than PuTTY's; third-party code is
+  # not reformatted to fit it.
+  libputtyterm = static_library(
+    'puttyterm',
+    files(
+      'putty/terminal/terminal.c',
+      'putty/terminal/bidi.c',
+      'putty/terminal/lineedit.c',
+      'putty/callback.c',
+      'putty/timing.c',
+      'putty/utils/bufchain.c',
+      'putty/utils/burnstr.c',
+      'putty/utils/burnwcs.c',
+      'putty/utils/chomp.c',
+      'putty/utils/conf.c',
+      'putty/utils/conf_data.c',
+      'putty/utils/ctrlparse.c',
+      'putty/utils/decode_utf8.c',
+      'putty/utils/decode_utf8_to_wchar.c',
+      'putty/utils/decode_utf8_to_wide_string.c',
+      'putty/utils/dup_mb_to_wc.c',
+      'putty/utils/dup_wc_to_mb.c',
+      'putty/utils/dupcat.c',
+      'putty/utils/dupprintf.c',
+      'putty/utils/dupstr.c',
+      'putty/utils/dupwcs.c',
+      'putty/utils/encode_utf8.c',
+      'putty/utils/encode_wide_string_as_utf8.c',
+      'putty/utils/make_spr_sw_abort_static.c',
+      'putty/utils/marshal.c',
+      'putty/utils/memory.c',
+      'putty/utils/nullstrcmp.c',
+      'putty/utils/out_of_memory.c',
+      'putty/utils/prompts.c',
+      'putty/utils/ptrlen.c',
+      'putty/utils/smemclr.c',
+      'putty/utils/spr_get_error_message.c',
+      'putty/utils/strbuf.c',
+      'putty/utils/tree234.c',
+      'putty/utils/wcwidth.c',
+      'putty/windows/blink_time.c',
+      'putty/windows/filename.c',
+      'putty/windows/fontspec.c',
+      'putty/windows/unicode.c',
+      'win32-term-shim.c',
+    ),
+    c_args: [
+      '-DHAVE_CMAKE_H=1',
+      '-Wno-missing-prototypes',
+      '-Wno-strict-prototypes',
+      '-Wno-old-style-definition',
+      '-Wno-redundant-decls',
+      '-Wno-shadow',
+      '-Wno-shadow=local',
+      '-Wno-old-style-declaration',
+      '-Wno-sign-compare',
+      '-Wno-unused-parameter',
+      '-Wno-unused-but-set-variable',
+      '-Wno-implicit-fallthrough',
+      '-Wno-format-nonliteral',
+      '-Wno-format-truncation',
+      '-Wno-undef',
+      '-Wno-cast-function-type',
+      '-Wno-nested-externs',
+      '-Wno-discarded-qualifiers',
+      '-Wno-suggest-attribute=format',
+    ],
+    include_directories: include_directories(
+      'putty', 'putty/terminal', '.'),
+    build_by_default: false,
+  )
+
   system_ss.add(files('win32-display.c', 'win32-tabs.c'),
-                meson.get_compiler('c').find_library('comctl32',
-                                                     required: true))
+                win32_ui_cc.find_library('comctl32', required: true),
+                declare_dependency(link_with: libputtyterm))
 endif
 
 vnc_ss = ss.source_set()
