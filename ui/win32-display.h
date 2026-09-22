@@ -118,5 +118,6 @@ void win32_toggle_fullscreen(void);
 void win32_zoom_step(double delta);
 void win32_zoom_fixed(void);
 void win32_toggle_free_scale(void);
+bool win32_dialog_filter(MSG *msg);
 
 #endif /* UI_WIN32_DISPLAY_H */

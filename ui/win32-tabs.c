@@ -20,13 +20,17 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 
 #include "qapi/error.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-misc.h"
+#include "qemu-version.h"
+#include "qemu/accel.h"
 #include "qemu/error-report.h"
 #include "qemu/help-texts.h"
+#include "qemu/target-info.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
 #include "system/system.h"
@@ -41,6 +45,20 @@
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((HANDLE)(LONG_PTR)(-4))
 #endif
+
+/*
+ * version.rc declares the icon as "IDI_ICON1", and windres turns an
+ * identifier that is not a number into a resource *name*, so that string is
+ * what LoadIcon() has to be given.
+ */
+#define WIN32_ICON_NAME "IDI_ICON1"
+
+static HICON win32_app_icon(void)
+{
+    HICON icon = LoadIcon(GetModuleHandle(NULL), WIN32_ICON_NAME);
+
+    return icon ? icon : LoadIcon(NULL, IDI_APPLICATION);
+}
 #ifndef USER_DEFAULT_SCREEN_DPI
 #define USER_DEFAULT_SCREEN_DPI 96
 #endif
@@ -59,6 +77,8 @@ enum {
     IDM_ZOOM_FIXED,
     IDM_ZOOM_FIT,
     IDM_SHOW_TABS,
+
+    IDM_ABOUT,
 };
 
 #define WIN32_TABCTL_ID 1
@@ -74,6 +94,7 @@ bool gui_show_tabs = true;
 
 static HMENU win32_menu;
 static ATOM win32_frame_atom;
+static ATOM win32_about_atom;
 static WNDPROC win32_tabctl_oldproc;
 static bool gui_saved_grab;
 static WINDOWPLACEMENT saved_placement;
@@ -221,6 +242,542 @@ double win32_dpi_scale(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* about dialog                                                         */
+
+/*
+ * The box is a hand-built top-level window rather than a DialogBox() over a
+ * resource template, for two reasons.  DialogBox() runs its own modal
+ * message loop, and this backend's pump is win32_poll_events(), called from
+ * dpy_refresh on the main thread -- a nested loop would stop the guest's
+ * display updating for as long as the box was open.  And the contents are
+ * almost entirely computed (version, target, build options), so a template
+ * would describe little more than an empty frame for the code to fill in.
+ * The rest of this backend builds its windows by hand too.
+ *
+ * Modality is done the way a modeless dialog does it: the frame is disabled
+ * while the box is up and re-enabled when it goes away, so it cannot be
+ * driven from behind, while the ordinary pump keeps running.
+ * win32_dialog_filter() hands messages to IsDialogMessage(), which works on
+ * any window and is what gives Tab navigation, Esc to close and Enter to
+ * press the default button.
+ *
+ * Nothing here touches the grab or the keyboard hook.  Showing the box
+ * deactivates the frame, whose WM_ACTIVATE handler already ends the grab and
+ * lifts every held key, and the low-level hook only forwards keys while the
+ * window it was given holds the focus -- which it does not while the box
+ * has it.
+ */
+
+#define WIN32_ABOUT_CLASS  "QemuWin32About"
+#define WIN32_FORK_URL     "https://github.com/cyberdotgent/qemu-mod"
+#define WIN32_UPSTREAM_URL "https://gitlab.com/qemu-project/qemu"
+
+enum {
+    IDC_ABOUT_FORK = 0x200,
+    IDC_ABOUT_UPSTREAM,
+    IDC_ABOUT_DETAILS,
+};
+
+static HWND win32_about;
+static HFONT win32_about_font;
+static HFONT win32_about_title_font;
+static HFONT win32_about_mono_font;
+
+static void win32_about_opt(GString *s, const char *name, bool present)
+{
+    g_string_append_printf(s, "  %-22s %s\r\n", name, present ? "yes" : "no");
+}
+
+/*
+ * What this binary can do is decided in two different places, so it is read
+ * from two different places.  The target and the accelerators belong to
+ * *this* emulator and are only knowable at run time: ui/ is built once as
+ * common code (system_ss in ui/meson.build), so TARGET_NAME and CONFIG_WHPX
+ * are not merely unset here, they are poisoned.  Everything else is a
+ * host-wide build decision recorded in config-host.h, which common code may
+ * read.
+ */
+static char *win32_about_details(void)
+{
+    GString *s = g_string_new(NULL);
+    GSList *el, *accels;
+    bool first = true;
+
+    g_string_append_printf(s, "Emulated target       %s (%u-bit)\r\n",
+                           target_name(), target_long_bits());
+
+    g_string_append(s, "Accelerators built in ");
+    accels = object_class_get_list(TYPE_ACCEL, false);
+    for (el = accels; el; el = el->next) {
+        const char *type = object_class_get_name(OBJECT_CLASS(el->data));
+        g_autofree char *name = NULL;
+
+        /* qtest exists for the test suite, not for users */
+        if (!g_str_has_suffix(type, ACCEL_CLASS_SUFFIX) ||
+            g_str_equal(type, ACCEL_CLASS_NAME("qtest"))) {
+            continue;
+        }
+        name = g_strndup(type, strlen(type) - strlen(ACCEL_CLASS_SUFFIX));
+        g_string_append_printf(s, "%s%s", first ? "" : ", ", name);
+        first = false;
+    }
+    g_slist_free(accels);
+    g_string_append(s, first ? "none\r\n" : "\r\n");
+
+    if (current_accel()) {
+        g_string_append_printf(s, "Accelerator in use    %s\r\n",
+                               current_accel_name());
+    }
+
+    g_string_append(s, "\r\nUser interface\r\n");
+#ifdef CONFIG_WIN32_UI
+    win32_about_opt(s, "native Win32 (this)", true);
+#else
+    win32_about_opt(s, "native Win32 (this)", false);
+#endif
+#ifdef CONFIG_SDL
+    win32_about_opt(s, "SDL", true);
+#else
+    win32_about_opt(s, "SDL", false);
+#endif
+#ifdef CONFIG_GTK
+    win32_about_opt(s, "GTK", true);
+#else
+    win32_about_opt(s, "GTK", false);
+#endif
+#ifdef CONFIG_CURSES
+    win32_about_opt(s, "curses", true);
+#else
+    win32_about_opt(s, "curses", false);
+#endif
+
+    g_string_append(s, "\r\nRemote display\r\n");
+#ifdef CONFIG_VNC
+    g_string_append_printf(s, "  %-22s yes (JPEG: %s, SASL: %s)\r\n", "VNC",
+#ifdef CONFIG_VNC_JPEG
+                           "yes",
+#else
+                           "no",
+#endif
+#ifdef CONFIG_VNC_SASL
+                           "yes");
+#else
+                           "no");
+#endif
+#else
+    win32_about_opt(s, "VNC", false);
+#endif
+#ifdef CONFIG_SPICE
+    win32_about_opt(s, "SPICE", true);
+#else
+    win32_about_opt(s, "SPICE", false);
+#endif
+#ifdef CONFIG_DBUS_DISPLAY
+    win32_about_opt(s, "D-Bus display", true);
+#else
+    win32_about_opt(s, "D-Bus display", false);
+#endif
+
+    g_string_append(s, "\r\nGraphics\r\n");
+#ifdef CONFIG_OPENGL
+    win32_about_opt(s, "OpenGL (EGL/ANGLE)", true);
+#else
+    win32_about_opt(s, "OpenGL (EGL/ANGLE)", false);
+#endif
+#ifdef VIRGL_VERSION_MAJOR
+    g_string_append_printf(s, "  %-22s %d.%d.%d\r\n", "virglrenderer",
+                           VIRGL_VERSION_MAJOR, VIRGL_VERSION_MINOR,
+                           VIRGL_VERSION_MICRO);
+#else
+    win32_about_opt(s, "virglrenderer", false);
+#endif
+#ifdef CONFIG_PIXMAN
+    g_string_append_printf(s, "  %-22s %s\r\n", "pixman",
+                           PIXMAN_VERSION_STRING);
+#else
+    win32_about_opt(s, "pixman", false);
+#endif
+#ifdef CONFIG_PNG
+    win32_about_opt(s, "PNG", true);
+#else
+    win32_about_opt(s, "PNG", false);
+#endif
+
+    g_string_append(s, "\r\nOther build options\r\n");
+#ifdef CONFIG_TCG
+    win32_about_opt(s, "TCG", true);
+#else
+    win32_about_opt(s, "TCG", false);
+#endif
+#ifdef CONFIG_SLIRP
+    win32_about_opt(s, "user-mode net (slirp)", true);
+#else
+    win32_about_opt(s, "user-mode net (slirp)", false);
+#endif
+#ifdef CONFIG_FDT
+    win32_about_opt(s, "device tree (FDT)", true);
+#else
+    win32_about_opt(s, "device tree (FDT)", false);
+#endif
+#ifdef CONFIG_ZSTD
+    win32_about_opt(s, "zstd", true);
+#else
+    win32_about_opt(s, "zstd", false);
+#endif
+#ifdef CONFIG_GNUTLS
+    win32_about_opt(s, "TLS (gnutls)", true);
+#else
+    win32_about_opt(s, "TLS (gnutls)", false);
+#endif
+#ifdef CONFIG_CAPSTONE
+    win32_about_opt(s, "disassembly (capstone)", true);
+#else
+    win32_about_opt(s, "disassembly (capstone)", false);
+#endif
+    g_string_append_printf(s, "  %-22s %d.%d.%d\r\n", "glib",
+                           GLIB_MAJOR_VERSION, GLIB_MINOR_VERSION,
+                           GLIB_MICRO_VERSION);
+
+    return g_string_free(s, FALSE);
+}
+
+/*
+ * Dismissal has to re-enable the frame *before* the box is destroyed.  A
+ * disabled window is not a candidate for activation, so tearing the box down
+ * first leaves the process with no active window at all -- re-enabling the
+ * frame afterwards does not bring the activation back, and the frame is left
+ * looking alive while ignoring every click.
+ */
+static void win32_about_close(void)
+{
+    HWND about = win32_about;
+
+    if (!about) {
+        return;
+    }
+    win32_about = NULL;
+    if (win32_frame) {
+        EnableWindow(win32_frame, TRUE);
+        SetActiveWindow(win32_frame);
+    }
+    DestroyWindow(about);
+}
+
+static LRESULT CALLBACK win32_aboutproc(HWND hwnd, UINT msg,
+                                        WPARAM wparam, LPARAM lparam)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        switch (LOWORD(wparam)) {
+        case IDOK:
+        case IDCANCEL:
+            win32_about_close();
+            return 0;
+        default:
+            break;
+        }
+        break;
+
+    case WM_NOTIFY: {
+        const NMHDR *hdr = (const NMHDR *)lparam;
+
+        if (hdr->code == NM_CLICK || hdr->code == NM_RETURN) {
+            const char *url = NULL;
+
+            if (hdr->idFrom == IDC_ABOUT_FORK) {
+                url = WIN32_FORK_URL;
+            } else if (hdr->idFrom == IDC_ABOUT_UPSTREAM) {
+                url = WIN32_UPSTREAM_URL;
+            }
+            if (url) {
+                ShellExecute(hwnd, "open", url, NULL, NULL, SW_SHOWNORMAL);
+                return 0;
+            }
+        }
+        break;
+    }
+
+    case DM_GETDEFID:
+        /*
+         * IsDialogMessage() asks the window which button is the default one
+         * before it turns Enter into a command; unanswered, Enter does
+         * nothing.
+         */
+        return MAKELONG(IDOK, DC_HASDEFID);
+
+    case WM_CLOSE:
+        win32_about_close();
+        return 0;
+
+    case WM_DESTROY:
+        /*
+         * Also reached when the frame is destroyed with the box still up, so
+         * the enable is repeated here rather than only in win32_about_close().
+         */
+        win32_about = NULL;
+        if (win32_frame && IsWindow(win32_frame)) {
+            EnableWindow(win32_frame, TRUE);
+        }
+        if (win32_about_font) {
+            DeleteObject(win32_about_font);
+            win32_about_font = NULL;
+        }
+        if (win32_about_title_font) {
+            DeleteObject(win32_about_title_font);
+            win32_about_title_font = NULL;
+        }
+        /* a stock font is never stored here, so this only frees our own */
+        if (win32_about_mono_font) {
+            DeleteObject(win32_about_mono_font);
+            win32_about_mono_font = NULL;
+        }
+        return 0;
+
+    default:
+        break;
+    }
+
+    return DefWindowProc(hwnd, msg, wparam, lparam);
+}
+
+static HWND win32_about_control(const char *cls, const char *text,
+                                DWORD style, int x, int y, int w, int h,
+                                int id, HFONT font)
+{
+    HWND ctl = CreateWindowEx(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                              x, y, w, h, win32_about,
+                              (HMENU)(UINT_PTR)id, GetModuleHandle(NULL),
+                              NULL);
+
+    if (ctl) {
+        SendMessage(ctl, WM_SETFONT, (WPARAM)font, TRUE);
+    }
+    return ctl;
+}
+
+/*
+ * The details are laid out in columns padded with spaces, so they only line
+ * up in a fixed-pitch face.  CreateFont() never fails over a face name the
+ * system does not have -- it substitutes silently, and the substitute can be
+ * proportional -- so each candidate is created, measured and kept only if
+ * what came back really is the face that was asked for and really is fixed
+ * pitch.  (TMPF_FIXED_PITCH is set for *variable* pitch fonts; the name is a
+ * long-standing wart in the Win32 API.)  NULL means the caller should fall
+ * back to a stock fixed font, which is always there.
+ */
+static HFONT win32_about_mono(int dpi)
+{
+    static const char *const faces[] = {
+        "Consolas",         /* Vista and later */
+        "Lucida Console",   /* NT 4 and later */
+        "Courier New",
+    };
+    HDC hdc = GetDC(NULL);
+    size_t i;
+
+    if (!hdc) {
+        return NULL;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(faces); i++) {
+        LOGFONT lf = {
+            .lfHeight         = -MulDiv(9, dpi, 72),
+            .lfCharSet        = DEFAULT_CHARSET,
+            .lfOutPrecision   = OUT_TT_PRECIS,
+            .lfQuality        = CLEARTYPE_QUALITY,
+            .lfPitchAndFamily = FIXED_PITCH | FF_MODERN,
+        };
+        char face[LF_FACESIZE] = "";
+        TEXTMETRIC tm;
+        HFONT font, old;
+
+        g_strlcpy(lf.lfFaceName, faces[i], sizeof(lf.lfFaceName));
+        font = CreateFontIndirect(&lf);
+        if (!font) {
+            continue;
+        }
+
+        old = SelectObject(hdc, font);
+        GetTextFace(hdc, sizeof(face), face);
+        GetTextMetrics(hdc, &tm);
+        SelectObject(hdc, old);
+
+        if (!g_ascii_strcasecmp(face, faces[i]) &&
+            !(tm.tmPitchAndFamily & TMPF_FIXED_PITCH)) {
+            ReleaseDC(NULL, hdc);
+            return font;
+        }
+        DeleteObject(font);
+    }
+
+    ReleaseDC(NULL, hdc);
+    return NULL;
+}
+
+static void win32_about_fonts(int dpi)
+{
+    NONCLIENTMETRICS ncm = { .cbSize = sizeof(ncm) };
+    LOGFONT lf;
+
+    if (SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        lf = ncm.lfMessageFont;
+    } else {
+        GetObject(GetStockObject(DEFAULT_GUI_FONT), sizeof(lf), &lf);
+    }
+
+    lf.lfHeight = -MulDiv(9, dpi, 72);
+    win32_about_font = CreateFontIndirect(&lf);
+
+    lf.lfHeight = -MulDiv(14, dpi, 72);
+    lf.lfWeight = FW_BOLD;
+    win32_about_title_font = CreateFontIndirect(&lf);
+
+    win32_about_mono_font = win32_about_mono(dpi);
+}
+
+/* the font the details box is drawn in, never a proportional one */
+static HFONT win32_about_details_font(void)
+{
+    if (win32_about_mono_font) {
+        return win32_about_mono_font;
+    }
+    return (HFONT)GetStockObject(ANSI_FIXED_FONT);
+}
+
+static void win32_about_show(void)
+{
+    const int base = USER_DEFAULT_SCREEN_DPI;
+    int dpi;
+    g_autofree char *details = NULL;
+    g_autofree char *version = NULL;
+    g_autofree char *fork_link = NULL;
+    g_autofree char *upstream_link = NULL;
+    HWND ctl;
+    RECT r;
+    int y, cw, ch, pad, hline;
+
+    if (win32_about) {
+        SetForegroundWindow(win32_about);
+        return;
+    }
+
+    /*
+     * The frame's current DPI, kept up to date by WM_DPICHANGED.  The box is
+     * owned by the frame and so comes up on the same monitor; everything
+     * below is written for 96 DPI and scaled from there, because the process
+     * is per-monitor-DPI-aware and Windows therefore scales nothing it does
+     * not draw itself.
+     */
+    dpi = win32_dpi;
+
+#define SC(v) MulDiv((v), dpi, base)
+
+    pad = SC(14);
+    hline = SC(18);
+    cw = SC(470);
+    ch = SC(530);
+
+    win32_about = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                                 WIN32_ABOUT_CLASS, "About " QEMU_UI_NAME,
+                                 WS_POPUPWINDOW | WS_CAPTION | WS_CLIPCHILDREN,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, cw, ch,
+                                 win32_frame, NULL, GetModuleHandle(NULL),
+                                 NULL);
+    if (!win32_about) {
+        error_report("win32: could not create the about window (error %lu)",
+                     GetLastError());
+        return;
+    }
+
+    /* grow the window so the *client* area is the cw x ch laid out below */
+    GetClientRect(win32_about, &r);
+    SetWindowPos(win32_about, NULL, 0, 0,
+                 cw + cw - (r.right - r.left),
+                 ch + ch - (r.bottom - r.top),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    win32_about_fonts(dpi);
+
+    y = pad;
+    ctl = win32_about_control("Static", NULL, SS_ICON | SS_REALSIZECONTROL,
+                              pad, y, SC(32), SC(32), -1, win32_about_font);
+    if (ctl) {
+        SendMessage(ctl, STM_SETICON, (WPARAM)win32_app_icon(), 0);
+    }
+
+    win32_about_control("Static", QEMU_UI_NAME, SS_LEFT,
+                        pad + SC(44), y, cw - pad * 2 - SC(44), SC(24), -1,
+                        win32_about_title_font);
+    version = g_strdup_printf("Version %s", QEMU_FULL_VERSION);
+    win32_about_control("Static", version, SS_LEFT | SS_ENDELLIPSIS,
+                        pad + SC(44), y + SC(24),
+                        cw - pad * 2 - SC(44), hline, -1, win32_about_font);
+
+    y += SC(50);
+    win32_about_control("Static", QEMU_COPYRIGHT, SS_LEFT,
+                        pad, y, cw - pad * 2, hline * 2, -1,
+                        win32_about_font);
+    y += hline * 2 + SC(4);
+    win32_about_control("Static",
+                        "QEMU is a trademark of Fabrice Bellard.  "
+                        QEMU_UI_NAME " is an unofficial derivative of QEMU "
+                        "and is not endorsed by the QEMU project.",
+                        SS_LEFT, pad, y, cw - pad * 2, hline * 2, -1,
+                        win32_about_font);
+
+    y += hline * 2 + SC(8);
+    fork_link = g_strdup_printf("This fork's sources: <a href=\"%s\">%s</a>",
+                                WIN32_FORK_URL, WIN32_FORK_URL);
+    win32_about_control("SysLink", fork_link, WS_TABSTOP,
+                        pad, y, cw - pad * 2, hline,
+                        IDC_ABOUT_FORK, win32_about_font);
+    y += hline + SC(2);
+    upstream_link = g_strdup_printf(
+        "Upstream QEMU sources: <a href=\"%s\">%s</a>",
+        WIN32_UPSTREAM_URL, WIN32_UPSTREAM_URL);
+    win32_about_control("SysLink", upstream_link, WS_TABSTOP,
+                        pad, y, cw - pad * 2, hline,
+                        IDC_ABOUT_UPSTREAM, win32_about_font);
+
+    y += hline + SC(10);
+    win32_about_control("Static", "This binary:", SS_LEFT,
+                        pad, y, cw - pad * 2, hline, -1, win32_about_font);
+    y += hline + SC(2);
+
+    /*
+     * A read-only multi-line edit rather than a static: the point of the
+     * details is that they can be selected and pasted into a bug report.
+     */
+    details = win32_about_details();
+    win32_about_control("Edit", details,
+                        WS_BORDER | WS_VSCROLL | WS_TABSTOP | ES_LEFT |
+                        ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                        pad, y, cw - pad * 2, ch - y - SC(30) - pad * 2,
+                        IDC_ABOUT_DETAILS, win32_about_details_font());
+
+    ctl = win32_about_control("Button", "Close",
+                              WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              cw - pad - SC(90), ch - pad - SC(26),
+                              SC(90), SC(26), IDOK, win32_about_font);
+
+    EnableWindow(win32_frame, FALSE);
+    ShowWindow(win32_about, SW_SHOW);
+    SetFocus(ctl);
+
+#undef SC
+}
+
+/*
+ * Called from the backend's message pump.  IsDialogMessage() is what turns a
+ * plain window into one with dialog keyboard behaviour, and it has to see
+ * the messages before TranslateMessage()/DispatchMessage() do.
+ */
+bool win32_dialog_filter(MSG *msg)
+{
+    return win32_about && IsDialogMessage(win32_about, msg);
+}
+
+/* ------------------------------------------------------------------ */
 /* menu bar                                                             */
 
 static HMENU win32_build_menu(void)
@@ -228,6 +785,7 @@ static HMENU win32_build_menu(void)
     HMENU bar = CreateMenu();
     HMENU machine = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
+    HMENU help = CreatePopupMenu();
 
     AppendMenu(machine, MF_STRING, IDM_PAUSE, "Pause");
     AppendMenu(machine, MF_SEPARATOR, 0, NULL);
@@ -248,8 +806,11 @@ static HMENU win32_build_menu(void)
     AppendMenu(view, MF_SEPARATOR, 0, NULL);
     AppendMenu(view, MF_STRING, IDM_SHOW_TABS, "Show Tabs");
 
+    AppendMenu(help, MF_STRING, IDM_ABOUT, "About...");
+
     AppendMenu(bar, MF_POPUP, (UINT_PTR)machine, "Machine");
     AppendMenu(bar, MF_POPUP, (UINT_PTR)view, "View");
+    AppendMenu(bar, MF_POPUP, (UINT_PTR)help, "Help");
 
     return bar;
 }
@@ -331,6 +892,10 @@ static void win32_menu_command(UINT id)
         gui_show_tabs = !gui_show_tabs;
         ShowWindow(win32_tabctl, gui_show_tabs ? SW_SHOW : SW_HIDE);
         win32_frame_fit();
+        break;
+
+    case IDM_ABOUT:
+        win32_about_show();
         break;
     default:
         break;
@@ -859,14 +1424,14 @@ void win32_frame_init(void)
 {
     INITCOMMONCONTROLSEX icc = {
         .dwSize = sizeof(icc),
-        .dwICC  = ICC_TAB_CLASSES,
+        .dwICC  = ICC_TAB_CLASSES | ICC_LINK_CLASS,
     };
     WNDCLASSEX wc = {
         .cbSize        = sizeof(wc),
         .style         = 0,
         .lpfnWndProc   = win32_frameproc,
         .hInstance     = GetModuleHandle(NULL),
-        .hIcon         = LoadIcon(GetModuleHandle(NULL), "QEMU_ICON"),
+        .hIcon         = win32_app_icon(),
         .hCursor       = LoadCursor(NULL, IDC_ARROW),
         .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1),
         .lpszClassName = WIN32_FRAME_CLASS,
@@ -887,6 +1452,15 @@ void win32_frame_init(void)
     win32_frame_atom = RegisterClassEx(&wc);
     if (!win32_frame_atom) {
         error_report("win32: could not register the frame window class "
+                     "(error %lu)", GetLastError());
+        exit(1);
+    }
+
+    wc.lpfnWndProc   = win32_aboutproc;
+    wc.lpszClassName = WIN32_ABOUT_CLASS;
+    win32_about_atom = RegisterClassEx(&wc);
+    if (!win32_about_atom) {
+        error_report("win32: could not register the about window class "
                      "(error %lu)", GetLastError());
         exit(1);
     }
@@ -932,6 +1506,8 @@ void win32_frame_init(void)
 
 void win32_frame_fini(void)
 {
+    /* owned by the frame, so tear it down before its owner goes away */
+    win32_about_close();
     if (win32_tabctl && win32_tabctl_oldproc) {
         SetWindowLongPtr(win32_tabctl, GWLP_WNDPROC,
                          (LONG_PTR)win32_tabctl_oldproc);
@@ -954,5 +1530,9 @@ void win32_frame_fini(void)
     if (win32_frame_atom) {
         UnregisterClass(WIN32_FRAME_CLASS, GetModuleHandle(NULL));
         win32_frame_atom = 0;
+    }
+    if (win32_about_atom) {
+        UnregisterClass(WIN32_ABOUT_CLASS, GetModuleHandle(NULL));
+        win32_about_atom = 0;
     }
 }

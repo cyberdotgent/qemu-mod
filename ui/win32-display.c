@@ -901,9 +901,17 @@ static void win32_poll_events(struct win32_console *wcon)
     bool idle = true;
 
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        idle = false;
+        /*
+         * A dialog owned by the frame needs IsDialogMessage() to see its
+         * input before it is translated and dispatched, or it has no Tab
+         * navigation and neither Esc nor Enter reaches it.
+         */
+        if (win32_dialog_filter(&msg)) {
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-        idle = false;
     }
 
     if (idle) {
