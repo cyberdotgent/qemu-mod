@@ -61,4 +61,72 @@ Conf *win32_term_conf_new(void);
  */
 bool win32_term_pump(unsigned long *next);
 
+/*
+ * The terminal itself.  The field names that ui/win32-term-keys.c touches
+ * are spelled exactly as PuTTY's WinGuiSeat spells them, so that the
+ * TranslateKey() body copied from window.c needs no edits at all.
+ */
+struct Win32Term {
+    TermWin termwin;
+
+    Terminal *term;
+    Conf *conf;
+    Ldisc *ldisc;
+    struct unicode_data ucsdata;
+
+    HWND parent;
+    HWND term_hwnd;
+
+    Win32TermCallbacks cb;
+    void *opaque;
+
+    /* Keyboard state, owned by ui/win32-term-keys.c. */
+    int compose_state;
+    int compose_keycode;
+    int compose_char;
+    int alt_numberpad_accumulator;
+
+    /* Font, and the cell metrics that follow from it. */
+    HFONT fonts[4];                    /* [bold][underline] */
+    int font_width, font_height, font_descent;
+
+    /* Character grid, and the padding left over in the window. */
+    int cols, rows;
+    int offset_width, offset_height;
+
+    /* OSC 4 palette: 256 xterm colours plus PuTTY's six special ones. */
+    COLORREF colours[OSC4_NCOLOURS];
+
+    /*
+     * The drawing context, valid only between setup_draw_ctx() and
+     * free_draw_ctx().  During WM_PAINT it is BeginPaint()'s HDC, which we
+     * must not release; paint_hdc says so.
+     */
+    HDC hdc;
+    bool paint_hdc;
+
+    bool has_focus;
+    bool raw_mouse;                    /* the guest asked for mouse events */
+    bool mouseptr_visible;
+    bool caret_created;
+    int caret_x, caret_y;
+    int cursor_type;                   /* CURSOR_BLOCK/UNDERLINE/VERTICAL */
+
+    char *title;                       /* last OSC 0/2 title, UTF-8 */
+
+    /* Mouse selection state. */
+    Mouse_Button last_mouse_button;
+    int last_mouse_x, last_mouse_y;
+};
+
+#define WIN32_TERM_SAVELINES 10000
+
+/* ui/win32-term-keys.c */
+int win32_term_translate_key(Win32Term *wt, UINT message, WPARAM wParam,
+                             LPARAM lParam, unsigned char *output);
+
+/* ui/win32-term.c, called from the above */
+void win32_term_show_mouseptr(Win32Term *wt, bool show);
+void win32_term_send_break(Win32Term *wt);
+
 #endif /* UI_WIN32_TERM_INTERNAL_H */

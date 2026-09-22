@@ -40,6 +40,11 @@ typedef struct Win32TermCallbacks {
     void (*title)(void *opaque, const char *title);
     void (*bell)(void *opaque);
     void (*resized)(void *opaque, int cols, int rows);
+    /*
+     * The user asked for a serial BREAK (Ctrl-Break).  May be NULL, in
+     * which case the keystroke is swallowed.
+     */
+    void (*send_break)(void *opaque);
 } Win32TermCallbacks;
 
 /*

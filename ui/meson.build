@@ -137,7 +137,6 @@ if win32_ui
       'putty/windows/filename.c',
       'putty/windows/fontspec.c',
       'putty/windows/unicode.c',
-      'win32-term-shim.c',
     ),
     c_args: [
       '-DHAVE_CMAKE_H=1',
@@ -165,9 +164,35 @@ if win32_ui
     build_by_default: false,
   )
 
+  # Our own code that is written against putty.h: the TermWin front end,
+  # the shims, and the key translation derived from PuTTY's window.c.  A
+  # library of its own so that it builds under QEMU's ordinary warning set.
+  # The suppressions are the minimum that including putty.h forces (its
+  # headers redeclare things and declare externs inside functions), plus
+  # -Wimplicit-fallthrough, which win32-term-keys.c needs because its body
+  # is PuTTY's and is not restyled.
+  libwin32term = static_library(
+    'win32term',
+    files(
+      'win32-term.c',
+      'win32-term-keys.c',
+      'win32-term-shim.c',
+    ),
+    c_args: [
+      '-DHAVE_CMAKE_H=1',
+      '-Wno-nested-externs',
+      '-Wno-redundant-decls',
+      '-Wno-implicit-fallthrough',
+      '-Wno-shadow=local',
+    ],
+    include_directories: include_directories(
+      'putty', 'putty/terminal', '.'),
+    build_by_default: false,
+  )
+
   system_ss.add(files('win32-display.c', 'win32-tabs.c'),
                 win32_ui_cc.find_library('comctl32', required: true),
-                declare_dependency(link_with: libputtyterm))
+                declare_dependency(link_with: [libwin32term, libputtyterm]))
 endif
 
 vnc_ss = ss.source_set()

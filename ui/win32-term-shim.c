@@ -44,7 +44,8 @@
 const char *const appname = "QEMU-mod";
 const char commitid[] = "qemu-mod";
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Fatal errors.
  *
  * PuTTY calls this from places where it has detected an internal
@@ -66,7 +67,8 @@ NORETURN void modalfatalbox(const char *fmt, ...)
     exit(1);
 }
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Session logging: not offered.
  */
 void logtraffic(LogContext *logctx, unsigned char c, int logmode)
@@ -77,7 +79,8 @@ void logflush(LogContext *logctx)
 {
 }
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Printing: the VT100 printer escapes are swallowed.
  */
 printer_job *printer_start_job(char *printer)
@@ -93,7 +96,8 @@ void printer_finish_job(printer_job *pj)
 {
 }
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Line discipline.
  */
 Ldisc *win32_term_ldisc_new(Terminal *term,
@@ -146,7 +150,8 @@ void ldisc_provide_userpass_le(Ldisc *ldisc, TermLineEditor *le)
      */
 }
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Timers.
  *
  * PuTTY's timing.c keeps the wheel; the front end only has to notice when
@@ -190,7 +195,8 @@ bool win32_term_pump(unsigned long *next)
     return timer_pending;
 }
 
-/* ------------------------------------------------------------------
+/*
+ * ----------------------------------------------------------------
  * Configuration.
  */
 
