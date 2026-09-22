@@ -1,6 +1,6 @@
 ;!/usr/bin/makensis
 
-; This NSIS script creates an installer for QEMU on Windows.
+; This NSIS script creates an installer for QEMU-mod (based on QEMU) on Windows.
 
 ; Copyright (C) 2006-2012 Stefan Weil
 ;
@@ -21,7 +21,7 @@
 
 ; NSIS_WIN32_MAKENSIS
 
-!define PRODUCT "QEMU"
+!define PRODUCT "QEMU-mod"
 !define URL     "https://www.qemu.org/"
 
 !define UNINST_EXE "$INSTDIR\qemu-uninstall.exe"
@@ -46,7 +46,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 ; The name of the installer.
-Name "QEMU"
+Name "${PRODUCT}"
 
 ; The file to write
 OutFile "${OUTFILE}"
@@ -132,7 +132,7 @@ Section "${PRODUCT} (required)"
     WriteRegStr HKLM SOFTWARE\${PRODUCT} "Install_Dir" "$INSTDIR"
 
     ; Write the uninstall keys for Windows
-    WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "QEMU"
+    WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${PRODUCT}"
 !ifdef DISPLAYVERSION
     WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${DISPLAYVERSION}"
 !endif
@@ -229,7 +229,7 @@ SectionEnd
 
 ; Descriptions (mouse-over).
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-    !insertmacro MUI_DESCRIPTION_TEXT ${SectionSystem}  "System emulation."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SectionSystem}  "${PRODUCT} system emulation, based on QEMU."
 !include "${BINDIR}\system-mui-text.nsh"
     !insertmacro MUI_DESCRIPTION_TEXT ${SectionTools} "Tools."
 !ifdef DLLDIR

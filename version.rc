@@ -14,11 +14,11 @@ FILESUBTYPE VFT2_UNKNOWN
     BLOCK "040904E4"
     {
       VALUE "CompanyName", "https://www.qemu.org"
-      VALUE "FileDescription", "QEMU machine emulators and tools"
+      VALUE "FileDescription", "QEMU-mod machine emulators and tools, based on QEMU"
       VALUE "FileVersion", QEMU_VERSION
       VALUE "LegalCopyright", "Copyright various authors. Released under the GNU General Public License."
       VALUE "LegalTrademarks", "QEMU is a trademark of Fabrice Bellard."
-      VALUE "ProductName", "QEMU"
+      VALUE "ProductName", "QEMU-mod"
     }
   }
   BLOCK "VarFileInfo"
