@@ -24,6 +24,7 @@
 /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
 
 #include "qemu/osdep.h"
+#include "qemu/help-texts.h"
 #include "qemu/module.h"
 #include "qemu/cutils.h"
 #include "ui/console.h"
@@ -201,12 +202,13 @@ static void sdl_update_caption(struct sdl2_console *scon)
     }
 
     if (qemu_name) {
-        snprintf(win_title, sizeof(win_title), "QEMU (%s-%d)%s", qemu_name,
-                 scon->idx, status);
-        snprintf(icon_title, sizeof(icon_title), "QEMU (%s)", qemu_name);
+        snprintf(win_title, sizeof(win_title), QEMU_UI_NAME " (%s-%d)%s",
+                 qemu_name, scon->idx, status);
+        snprintf(icon_title, sizeof(icon_title), QEMU_UI_NAME " (%s)",
+                 qemu_name);
     } else {
-        snprintf(win_title, sizeof(win_title), "QEMU%s", status);
-        snprintf(icon_title, sizeof(icon_title), "QEMU");
+        snprintf(win_title, sizeof(win_title), QEMU_UI_NAME "%s", status);
+        snprintf(icon_title, sizeof(icon_title), QEMU_UI_NAME);
     }
 
     if (scon->real_window) {

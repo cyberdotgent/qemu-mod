@@ -23,6 +23,7 @@
 #include <windowsx.h>   /* GET_X_LPARAM / GET_Y_LPARAM */
 
 #include "qemu/error-report.h"
+#include "qemu/help-texts.h"
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
 #include "qemu-main.h"
@@ -121,7 +122,7 @@ static void win32_window_create(struct win32_console *wcon)
     w = surface_width(wcon->surface);
     h = surface_height(wcon->surface);
 
-    wcon->hwnd = CreateWindowEx(0, WIN32_WINDOW_CLASS, "QEMU",
+    wcon->hwnd = CreateWindowEx(0, WIN32_WINDOW_CLASS, QEMU_UI_NAME,
                                 WS_OVERLAPPEDWINDOW,
                                 CW_USEDEFAULT, CW_USEDEFAULT, w, h,
                                 NULL, NULL, GetModuleHandle(NULL), NULL);
@@ -172,10 +173,10 @@ static void win32_update_caption(struct win32_console *wcon)
     }
 
     if (qemu_name) {
-        snprintf(title, sizeof(title), "QEMU (%s-%d)%s",
+        snprintf(title, sizeof(title), QEMU_UI_NAME " (%s-%d)%s",
                  qemu_name, wcon->idx, status);
     } else {
-        snprintf(title, sizeof(title), "QEMU%s", status);
+        snprintf(title, sizeof(title), QEMU_UI_NAME "%s", status);
     }
     SetWindowText(wcon->hwnd, title);
 }

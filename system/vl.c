@@ -984,8 +984,8 @@ static MachineClass *find_default_machine(GSList *machines)
 
 static void version(void)
 {
-    printf("QEMU emulator version " QEMU_FULL_VERSION "\n"
-           QEMU_COPYRIGHT "\n");
+    printf(QEMU_UI_NAME " emulator version " QEMU_FULL_VERSION
+           " (based on QEMU)\n" QEMU_COPYRIGHT "\n");
 }
 
 static void help(int exitcode)

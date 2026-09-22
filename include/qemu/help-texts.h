@@ -1,6 +1,9 @@
 #ifndef QEMU_HELP_TEXTS_H
 #define QEMU_HELP_TEXTS_H
 
+/* Product name shown in window titles, VNC desktop names, etc */
+#define QEMU_UI_NAME "QEMU-mod"
+
 /* Copyright string for -version arguments, About dialogs, etc */
 #define QEMU_COPYRIGHT "Copyright (c) 2003-2026 " \
     "Fabrice Bellard and the QEMU Project developers"

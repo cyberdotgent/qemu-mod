@@ -25,6 +25,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/help-texts.h"
 #include "vnc.h"
 #include "vnc-jobs.h"
 #include "trace.h"
@@ -2739,12 +2740,12 @@ static int protocol_client_init(VncState *vs, uint8_t *data, size_t len)
     pixel_format_message(vs);
 
     if (qemu_name) {
-        size = snprintf(buf, sizeof(buf), "QEMU (%s)", qemu_name);
+        size = snprintf(buf, sizeof(buf), QEMU_UI_NAME " (%s)", qemu_name);
         if (size > sizeof(buf)) {
             size = sizeof(buf);
         }
     } else {
-        size = snprintf(buf, sizeof(buf), "QEMU");
+        size = snprintf(buf, sizeof(buf), QEMU_UI_NAME);
     }
 
     vnc_write_u32(vs, size);

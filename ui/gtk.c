@@ -37,6 +37,7 @@
 #include "qapi/qapi-commands-misc.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/help-texts.h"
 #include "qemu/main-loop.h"
 #include "qemu-main.h"
 
@@ -234,9 +235,9 @@ static void gd_update_caption(GtkDisplayState *s)
     int i;
 
     if (qemu_name) {
-        prefix = g_strdup_printf("QEMU (%s)", qemu_name);
+        prefix = g_strdup_printf(QEMU_UI_NAME " (%s)", qemu_name);
     } else {
-        prefix = g_strdup_printf("QEMU");
+        prefix = g_strdup_printf(QEMU_UI_NAME);
     }
 
     if (s->ptr_owner != NULL &&
