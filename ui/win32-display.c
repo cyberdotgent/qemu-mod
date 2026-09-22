@@ -41,6 +41,7 @@
 
 #include <windows.h>
 #include <windowsx.h>   /* GET_X_LPARAM / GET_Y_LPARAM */
+#include <math.h>
 
 #include "qemu/error-report.h"
 #include "qemu/help-texts.h"
@@ -99,15 +100,38 @@ static void win32_gl_redraw(struct win32_console *wcon);
 /* ------------------------------------------------------------------ */
 /* render windows                                                       */
 
+/*
+ * How many physical pixels the guest image wants, which is the only place the
+ * two scale factors meet:
+ *
+ *   - wcon->scale_x/scale_y is the user's zoom, in guest pixels per guest
+ *     pixel.  View->Zoom In/Out steps it, Zoom 100% resets it to 1.0.
+ *   - win32_dpi_scale() is the monitor's DPI factor, in physical pixels per
+ *     logical pixel.  The process is per-monitor-DPI-aware, so Windows does
+ *     not apply this for us and nothing else in the backend applies it either.
+ *
+ * They multiply: zoom is relative to whatever "100%" means on this monitor, so
+ * at 150% DPI a 1:1 guest pixel is 1.5 physical pixels and a 2x zoom of it is
+ * 3.  Best Fit (win32_frame_fit()) and the minimum track size therefore get
+ * correctly sized windows at any DPI, and the zoom steps stay relative.
+ *
+ * This is the *only* place the DPI factor is applied.  The blit stretches the
+ * guest surface into the render window's client rectangle -- StretchDIBits()
+ * in the 2D path, surface_gl_setup_viewport() in the GL path -- so both scale
+ * to whatever window size comes out of here, and applying the factor again
+ * inside either of them would square it.
+ */
 void win32_console_size(struct win32_console *wcon, int *w, int *h)
 {
+    double dpi = win32_dpi_scale();
+
     if (!wcon || !wcon->surface) {
         *w = 0;
         *h = 0;
         return;
     }
-    *w = surface_width(wcon->surface) * wcon->scale_x;
-    *h = surface_height(wcon->surface) * wcon->scale_y;
+    *w = lround(surface_width(wcon->surface) * wcon->scale_x * dpi);
+    *h = lround(surface_height(wcon->surface) * wcon->scale_y * dpi);
 }
 
 void win32_console_redraw(struct win32_console *wcon)

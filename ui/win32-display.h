@@ -111,6 +111,7 @@ void win32_frame_add_console(struct win32_console *wcon);
 void win32_frame_del_console(struct win32_console *wcon);
 void win32_frame_activate(struct win32_console *wcon);
 void win32_frame_layout(void);
+double win32_dpi_scale(void);
 void win32_frame_fit(void);
 void win32_update_caption(void);
 void win32_toggle_fullscreen(void);

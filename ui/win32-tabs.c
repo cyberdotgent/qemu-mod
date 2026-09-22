@@ -41,6 +41,9 @@
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((HANDLE)(LONG_PTR)(-4))
 #endif
+#ifndef USER_DEFAULT_SCREEN_DPI
+#define USER_DEFAULT_SCREEN_DPI 96
+#endif
 
 enum {
     IDM_PAUSE = 0x100,
@@ -76,6 +79,10 @@ static bool gui_saved_grab;
 static WINDOWPLACEMENT saved_placement;
 static LONG_PTR saved_style;
 
+/* DPI of the monitor the frame is on; 96 is Windows' unscaled baseline */
+static UINT win32_dpi = USER_DEFAULT_SCREEN_DPI;
+static HFONT win32_tab_font;
+
 /* ------------------------------------------------------------------ */
 /* DPI awareness                                                        */
 
@@ -102,6 +109,115 @@ static void win32_set_dpi_awareness(void)
         }
     }
     SetProcessDPIAware();
+}
+
+/*
+ * Having declared the process DPI-aware above, Windows stops bitmap-scaling
+ * anything this process draws for itself.  It keeps scaling what *it* draws
+ * -- the menu bar, the non-client frame -- so that chrome comes out the right
+ * physical size on its own, but the guest image does not: it is drawn by us,
+ * into a window we size, and unless the DPI is folded into that size a 720x400
+ * guest occupies 720x400 physical pixels next to chrome that is 1.5x bigger.
+ * So the factor is obtained here and applied to the *window geometry* only.
+ */
+static UINT win32_query_dpi(HWND hwnd)
+{
+    typedef UINT(WINAPI * get_dpi_fn)(HWND);
+    HMODULE user32 = GetModuleHandle("user32.dll");
+    get_dpi_fn get_dpi = NULL;
+    UINT dpi = 0;
+    HDC hdc;
+
+    if (user32) {
+        get_dpi = (get_dpi_fn)(void *)GetProcAddress(user32,
+                                                     "GetDpiForWindow");
+    }
+    if (get_dpi && hwnd) {
+        dpi = get_dpi(hwnd);
+        if (dpi) {
+            return dpi;
+        }
+    }
+
+    /*
+     * Windows 10 1607 and older: there is no per-monitor DPI to ask for, and
+     * the process is only system-DPI-aware anyway, so the screen DC's
+     * LOGPIXELSX is exactly the factor that applies.
+     */
+    hdc = GetDC(NULL);
+    if (hdc) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+        ReleaseDC(NULL, hdc);
+    }
+    return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
+}
+
+/*
+ * The tab control labels itself with whatever font it is given, and nothing
+ * rescales that font for us: a stock font would leave the strip a fixed number
+ * of physical pixels tall at any DPI, which also feeds back into the geometry
+ * through TabCtrl_AdjustRect().  Ask for the shell's message font at the
+ * frame's current DPI instead, and re-ask whenever the DPI changes.
+ */
+static void win32_update_tab_font(void)
+{
+    typedef BOOL(WINAPI * spi_dpi_fn)(UINT, UINT, PVOID, UINT, UINT);
+    HMODULE user32 = GetModuleHandle("user32.dll");
+    spi_dpi_fn spi_dpi = NULL;
+    NONCLIENTMETRICSW ncm;
+    HFONT font;
+
+    if (!win32_tabctl) {
+        return;
+    }
+    if (user32) {
+        spi_dpi = (spi_dpi_fn)(void *)GetProcAddress(
+            user32, "SystemParametersInfoForDpi");
+    }
+
+    /*
+     * Explicitly the wide structure: SystemParametersInfoForDpi() has no ANSI
+     * counterpart, so it fills a NONCLIENTMETRICSW whatever the rest of this
+     * file is compiled as, and handing it the (smaller) ANSI one overruns the
+     * stack.  SystemParametersInfoW() is used for the same reason below.
+     */
+    memset(&ncm, 0, sizeof(ncm));
+    ncm.cbSize = sizeof(ncm);
+    /*
+     * Without the ForDpi variant the process is at most system-DPI-aware, so
+     * the plain call already reports metrics in the units we draw in.
+     */
+    if (spi_dpi) {
+        if (!spi_dpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0,
+                     win32_dpi)) {
+            return;
+        }
+    } else if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm),
+                                      &ncm, 0)) {
+        return;
+    }
+
+    font = CreateFontIndirectW(&ncm.lfMessageFont);
+    if (!font) {
+        return;
+    }
+    SendMessage(win32_tabctl, WM_SETFONT, (WPARAM)font, TRUE);
+    if (win32_tab_font) {
+        DeleteObject(win32_tab_font);
+    }
+    win32_tab_font = font;
+}
+
+/* adopt a new DPI: the geometry factor and everything sized in points */
+static void win32_set_dpi(UINT dpi)
+{
+    win32_dpi = dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
+    win32_update_tab_font();
+}
+
+double win32_dpi_scale(void)
+{
+    return (double)win32_dpi / USER_DEFAULT_SCREEN_DPI;
 }
 
 /* ------------------------------------------------------------------ */
@@ -702,10 +818,22 @@ static LRESULT CALLBACK win32_frameproc(HWND hwnd, UINT msg,
     case WM_DPICHANGED: {
         const RECT *r = (const RECT *)lparam;
 
+        /* the new factor first, so anything sized below uses it */
+        win32_set_dpi(HIWORD(wparam));
+
+        /*
+         * Windows' suggested rectangle puts the frame on the new monitor at
+         * the right place, but it only rescales the window as a whole.  The
+         * content size is ours, so re-fit it: without this, dragging between
+         * a 96 and a 144 DPI monitor would keep the guest image at the old
+         * physical size.  win32_frame_fit() resizes with SWP_NOMOVE, so the
+         * position chosen here survives; when the user is free-scaling or
+         * fullscreen it only re-lays out, which is what we want.
+         */
         SetWindowPos(hwnd, NULL, r->left, r->top,
                      r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        win32_frame_layout();
+        win32_frame_fit();
         return 0;
     }
 
@@ -788,12 +916,12 @@ void win32_frame_init(void)
     }
 
     /*
-     * The tab control draws its labels with the system font unless it is
+     * The tab control draws its labels with a stock bitmap font unless it is
      * told otherwise, which at any non-default DPI looks nothing like the
-     * rest of the window chrome.
+     * rest of the window chrome.  This also establishes the DPI factor the
+     * guest image is sized with, now that there is a window to ask about.
      */
-    SendMessage(win32_tabctl, WM_SETFONT,
-                (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    win32_set_dpi(win32_query_dpi(win32_frame));
 
     win32_tabctl_oldproc = (WNDPROC)(void *)SetWindowLongPtr(
         win32_tabctl, GWLP_WNDPROC, (LONG_PTR)win32_tabproc);
@@ -814,6 +942,10 @@ void win32_frame_fini(void)
         DestroyWindow(win32_frame);
         win32_frame = NULL;
         win32_tabctl = NULL;
+    }
+    if (win32_tab_font) {
+        DeleteObject(win32_tab_font);
+        win32_tab_font = NULL;
     }
     if (win32_menu) {
         DestroyMenu(win32_menu);
