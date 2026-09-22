@@ -73,6 +73,11 @@ if host_os == 'linux'
   system_ss.add(files('input-linux.c', 'udmabuf.c'))
 endif
 system_ss.add(when: cocoa, if_true: files('cocoa.m'))
+if win32_ui
+  # win32_ui is a plain bool rather than a dependency object, so a source-set
+  # 'when:' clause would not resolve it; add the file directly instead.
+  system_ss.add(files('win32-display.c'))
+endif
 
 vnc_ss = ss.source_set()
 vnc_ss.add(files(

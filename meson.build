@@ -1945,6 +1945,18 @@ endif
 
 x11 = dependency('x11', method: 'pkg-config', required: gtkx11.found())
 
+# Native Win32 display backend (ui/win32-display.c).  It has no external
+# dependencies at all -- it needs only the Win32 API that the mingw toolchain
+# already provides -- so there is nothing to look up here beyond the host
+# check.
+win32_ui = get_option('win32_ui') \
+    .require(host_os == 'windows',
+             error_message: 'the Win32 UI is only available on Windows hosts') \
+    .require(pixman.found(),
+             error_message: 'cannot enable the Win32 UI if pixman is not available') \
+    .disable_auto_if(not have_system) \
+    .allowed()
+
 png = not_found
 if get_option('png').allowed() and have_system
    png = dependency('libpng', version: '>=1.6.34', required: get_option('png'),
@@ -2274,6 +2286,7 @@ endif
 config_host_data = configuration_data()
 
 config_host_data.set('CONFIG_HMP', have_hmp)
+config_host_data.set('CONFIG_WIN32_UI', win32_ui)
 config_host_data.set('CONFIG_HAVE_RUST', have_rust)
 audio_drivers_selected = []
 if have_system
@@ -4428,7 +4441,7 @@ foreach target : target_dirs
       'sources': [main_rs, files('system/main.c')],
       'dependencies': [sdl, target_stubs],
     }]
-    if host_os == 'windows' and (sdl.found() or gtk.found())
+    if host_os == 'windows' and (sdl.found() or gtk.found() or win32_ui)
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
         'win_subsystem': 'windows',
@@ -4910,6 +4923,7 @@ if host_os == 'darwin'
   summary_info += {'Cocoa support':           cocoa}
 endif
 summary_info += {'D-Bus display':     dbus_display}
+summary_info += {'Win32 UI support':  win32_ui}
 summary_info += {'SDL support':       sdl}
 summary_info += {'SDL image support': sdl_image}
 summary_info += {'GTK support':       gtk}

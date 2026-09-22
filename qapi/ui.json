@@ -1483,6 +1483,19 @@
   'data'    : { '*grab-mod'   : 'HotKeyMod' } }
 
 ##
+# @DisplayWin32:
+#
+# Native Win32 display options.
+#
+# @grab-mod: Modifier keys that should be pressed together with the
+#     "G" key to release the mouse grab.
+#
+# Since: 10.2
+##
+{ 'struct'  : 'DisplayWin32',
+  'data'    : { '*grab-mod'   : 'HotKeyMod' } }
+
+##
 # @DisplayType:
 #
 # Display (user interface) type.
@@ -1497,6 +1510,8 @@
 # @gtk: The GTK user interface.
 #
 # @sdl: The SDL user interface.
+#
+# @win32: The native Win32 user interface.  (Since 10.2)
 #
 # @egl-headless: No user interface, offload GL operations to a local
 #     DRI device.  Graphical display need to be paired with VNC or
@@ -1525,6 +1540,7 @@
     { 'name': 'none' },
     { 'name': 'gtk', 'if': 'CONFIG_GTK' },
     { 'name': 'sdl', 'if': 'CONFIG_SDL' },
+    { 'name': 'win32', 'if': 'CONFIG_WIN32_UI' },
     { 'name': 'egl-headless', 'if': 'CONFIG_OPENGL' },
     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
@@ -1567,7 +1583,8 @@
       'egl-headless': { 'type': 'DisplayEGLHeadless',
                         'if': 'CONFIG_OPENGL' },
       'dbus': { 'type': 'DisplayDBus', 'if': 'CONFIG_DBUS_DISPLAY' },
-      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' }
+      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' },
+      'win32': { 'type': 'DisplayWin32', 'if': 'CONFIG_WIN32_UI' }
   }
 }
 

@@ -234,6 +234,7 @@ meson_options_help() {
   printf "%s\n" '  vvfat           vvfat image format support'
   printf "%s\n" '  werror          Treat warnings as errors'
   printf "%s\n" '  whpx            WHPX acceleration support'
+  printf "%s\n" '  win32-ui        native Win32 user interface'
   printf "%s\n" '  xen             Xen backend support'
   printf "%s\n" '  xen-pci-passthrough'
   printf "%s\n" '                  Xen PCI passthrough support'
@@ -639,6 +640,8 @@ _meson_option_parse() {
     --disable-werror) printf "%s" -Dwerror=false ;;
     --enable-whpx) printf "%s" -Dwhpx=enabled ;;
     --disable-whpx) printf "%s" -Dwhpx=disabled ;;
+    --enable-win32-ui) printf "%s" -Dwin32_ui=enabled ;;
+    --disable-win32-ui) printf "%s" -Dwin32_ui=disabled ;;
     --x86-version=*) quote_sh "-Dx86_version=$2" ;;
     --enable-xen) printf "%s" -Dxen=enabled ;;
     --disable-xen) printf "%s" -Dxen=disabled ;;
