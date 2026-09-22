@@ -85,6 +85,7 @@ HCURSOR guest_sprite;
 HCURSOR cursor_arrow;
 
 static ATOM win32_class_atom;
+static bool swallow_next_char;
 static int guest_x, guest_y;
 static bool cursor_visible = true;
 static Notifier mouse_mode_notifier;
@@ -464,8 +465,19 @@ static void win32_handle_key(struct win32_console *wcon,
     unsigned int lnx;
     int atset1;
 
-    if (down && win32_handle_hotkey(wcon, wparam)) {
-        return;
+    if (down) {
+        /*
+         * TranslateMessage() has already queued the WM_CHAR belonging to
+         * this WM_KEYDOWN, so a hotkey that is consumed here has to mark
+         * that character for the character handler to drop -- otherwise a
+         * layout where the combination also produces a character (AltGr is
+         * Ctrl-Alt as far as the keyboard is concerned) would both switch
+         * tab and type into the console.
+         */
+        swallow_next_char = win32_handle_hotkey(wcon, wparam);
+        if (swallow_next_char) {
+            return;
+        }
     }
 
     /*
@@ -495,6 +507,88 @@ static void win32_handle_key(struct win32_console *wcon,
             qemu_text_console_put_linux(s, lnx, ctrl);
         }
     }
+}
+
+/*
+ * Text consoles need characters, not keycodes.
+ *
+ * qemu_text_console_put_linux() can only deliver what ui/console.c's
+ * linux_to_keysym[] describes, and that table holds the eleven navigation
+ * keys and nothing else -- it has no entry for a single printable
+ * character, so letters, digits and punctuation routed through it are
+ * dropped without a trace.  ui/sdl2.c and ui/gtk.c sidestep the table by
+ * feeding the *translated* character to qemu_text_console_put_string()
+ * (SDL_TEXTINPUT and GdkEventKey::string respectively); WM_CHAR, produced
+ * by the TranslateMessage() in win32_poll_events(), is the same thing on
+ * Windows, and this is the only way a monitor command can be typed.
+ *
+ * The keycode path above keeps ownership of every key it can already
+ * handle -- Enter, Tab and Backspace, which do generate a WM_CHAR, as well
+ * as the arrows, Home/End, PageUp/PageDown and Delete, which do not -- so
+ * those control codes are discarded here rather than delivered twice.
+ * Everything else, control characters from Ctrl combinations included
+ * (Ctrl-C arrives as 0x03, and linux_to_keysym[] has no Ctrl-letter entry
+ * to collide with), is passed on.
+ */
+static void win32_handle_char(struct win32_console *wcon, WPARAM wparam)
+{
+    /*
+     * The window class is registered with the ANSI RegisterClassEx(), and
+     * neither UNICODE nor _UNICODE is defined for this build, so the window
+     * is an ANSI one and wparam is a byte in the host's ANSI code page --
+     * not a UTF-16 unit, and hence never a surrogate.  It can still be the
+     * lead byte of a double-byte sequence on a CJK code page, which arrives
+     * as its own WM_CHAR and is held back until the trail byte follows.
+     */
+    static BYTE dbcs_lead;
+    QemuConsole *con = wcon->dcl.con;
+    char mb[2], utf8[8];
+    WCHAR wide[2];
+    int mblen, wlen, u8len;
+
+    if (swallow_next_char) {
+        swallow_next_char = false;
+        return;
+    }
+
+    /* a graphics console gets its input from the scancode path only */
+    if (!QEMU_IS_TEXT_CONSOLE(con)) {
+        dbcs_lead = 0;
+        return;
+    }
+
+    if (dbcs_lead) {
+        mb[0] = (char)dbcs_lead;
+        mb[1] = (char)wparam;
+        mblen = 2;
+        dbcs_lead = 0;
+    } else if (wparam == '\b' || wparam == '\t' ||
+               wparam == '\n' || wparam == '\r') {
+        return;                          /* owned by win32_handle_key() */
+    } else if (IsDBCSLeadByteEx(CP_ACP, (BYTE)wparam)) {
+        dbcs_lead = (BYTE)wparam;
+        return;
+    } else {
+        mb[0] = (char)wparam;
+        mblen = 1;
+    }
+
+    /*
+     * qemu_text_console_put_string() hands each byte to the terminal
+     * emulator, which -- as with the UTF-8 strings ui/gtk.c passes it --
+     * expects UTF-8 for anything outside ASCII.
+     */
+    wlen = MultiByteToWideChar(CP_ACP, 0, mb, mblen, wide, ARRAY_SIZE(wide));
+    if (wlen <= 0) {
+        return;
+    }
+    u8len = WideCharToMultiByte(CP_UTF8, 0, wide, wlen, utf8, sizeof(utf8),
+                                NULL, NULL);
+    if (u8len <= 0) {
+        return;
+    }
+
+    qemu_text_console_put_string(QEMU_TEXT_CONSOLE(con), utf8, u8len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -594,6 +688,10 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
     case WM_KEYUP:
     case WM_SYSKEYUP:
         win32_handle_key(wcon, wparam, lparam, false);
+        return 0;
+
+    case WM_CHAR:
+        win32_handle_char(wcon, wparam);
         return 0;
 
     case WM_MOUSEMOVE:
