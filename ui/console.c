@@ -1402,6 +1402,9 @@ bool qemu_display_find_default(DisplayOptions *opts)
 #if defined(CONFIG_SDL)
         DISPLAY_TYPE_SDL,
 #endif
+#if defined(CONFIG_WIN32_UI)
+        DISPLAY_TYPE_WIN32,
+#endif
 #if defined(CONFIG_COCOA)
         DISPLAY_TYPE_COCOA
 #endif
