@@ -46,10 +46,12 @@
  * 256 default foreground, 257 bold foreground, 258 default background,
  * 259 bold background, 260 cursor text, 261 cursor.
  */
+#define COLOUR_BG     258
 #define COLOUR_CURSOR 261
 
 static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
                                            WPARAM wp, LPARAM lp);
+static void win32_term_kick_timer(Win32Term *wt);
 
 static inline Win32Term *win32_term_from_hwnd(HWND hwnd)
 {
@@ -457,7 +459,7 @@ static void wintw_draw_trust_sigil(TermWin *tw, int x, int y)
     r.top = y * wt->font_height + wt->offset_height;
     r.right = r.left + wt->font_width * 2;
     r.bottom = r.top + wt->font_height;
-    SetBkColor(wt->hdc, wt->colours[258]);
+    SetBkColor(wt->hdc, wt->colours[COLOUR_BG]);
     ExtTextOutW(wt->hdc, r.left, r.top, ETO_OPAQUE, &r, L"", 0, NULL);
 }
 
@@ -784,6 +786,28 @@ static const TermWinVtable win32_termwin_vt = {
  * Geometry.
  */
 
+/*
+ * Resizing policy: the character grid follows the window.
+ *
+ * The alternative would be to keep the chardev's configured size (80x24,
+ * or 132x43 for the monitor) and letterbox it in a larger window.  That is
+ * not what a terminal does -- not PuTTY, not xterm, not VTE -- and it would
+ * make the monitor tab, which has no guest at all, permanently unable to
+ * use the space it has been given.
+ *
+ * The objection to reflowing is that a serial line has no SIGWINCH, so a
+ * guest goes on believing whatever its stty says.  That is true, but it is
+ * equally true of a physical VT220 and it is not a corruption: a guest that
+ * thinks it has 80 columns inside a 137-column terminal simply wraps early
+ * and paints its full-screen apps into the left-hand 80 columns.  Only
+ * shrinking below what the guest believes causes double wrapping, and the
+ * user asked for that by dragging the window.  The loop is closed the
+ * normal Unix way -- DSR/CPR is implemented, so resize(1) or `stty` picks
+ * up the new size on request.
+ *
+ * The initial size is still the documented default, so nothing changes for
+ * anyone who does not resize the window.
+ */
 static void win32_term_resized(Win32Term *wt)
 {
     RECT r;
@@ -803,23 +827,36 @@ static void win32_term_resized(Win32Term *wt)
         rows = 1;
     }
 
-    /* Centre the grid in whatever the tab gave us. */
+    /*
+     * Whatever is left over -- always less than one cell in each direction,
+     * because the grid is recomputed to fit -- is split either side of the
+     * grid.  WM_ERASEBKGND paints it.
+     */
     wt->offset_width = ((r.right - r.left) - cols * wt->font_width) / 2;
     wt->offset_height = ((r.bottom - r.top) - rows * wt->font_height) / 2;
 
-    if (cols == wt->cols && rows == wt->rows) {
-        InvalidateRect(wt->term_hwnd, NULL, TRUE);
-        return;
-    }
-    wt->cols = cols;
-    wt->rows = rows;
+    if (cols != wt->cols || rows != wt->rows) {
+        wt->cols = cols;
+        wt->rows = rows;
+        term_size(wt->term, rows, cols, WIN32_TERM_SAVELINES);
 
-    term_size(wt->term, rows, cols, WIN32_TERM_SAVELINES);
+        if (wt->cb.resized) {
+            wt->cb.resized(wt->opaque, cols, rows);
+        }
+    }
+
+    /*
+     * term_size() does not redraw; it queues the work and expects the front
+     * end's main loop to come back for it.  We are not a main loop -- our
+     * only pump is the window procedure -- so if we left it queued here the
+     * window would keep the pixels from before the drag until the user
+     * happened to press a key.  That is exactly what a resize looked like
+     * before this call was added.  Flush it now, and erase first so that no
+     * part of the client area is left showing what used to be there.
+     */
     InvalidateRect(wt->term_hwnd, NULL, TRUE);
-
-    if (wt->cb.resized) {
-        wt->cb.resized(wt->opaque, cols, rows);
-    }
+    term_update(wt->term);
+    win32_term_kick_timer(wt);
 }
 
 /*
@@ -949,7 +986,7 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
         /* Fill the padding around the grid. */
         if (wt->offset_width || wt->offset_height) {
             RECT r;
-            HBRUSH brush = CreateSolidBrush(wt->colours[258]);
+            HBRUSH brush = CreateSolidBrush(wt->colours[COLOUR_BG]);
             GetClientRect(hwnd, &r);
             ExcludeClipRect(hdc, wt->offset_width, wt->offset_height,
                             wt->offset_width + wt->cols * wt->font_width,
@@ -1162,9 +1199,26 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
         }
         break;
 
-    case WM_ERASEBKGND:
-        /* WM_PAINT paints every pixel; erasing first only flickers. */
+    case WM_ERASEBKGND: {
+        /*
+         * WM_PAINT paints the character grid and the sliver of margin left
+         * over from dividing the window by the cell size -- but only cells
+         * the terminal believes are invalid, and only the margin as it was
+         * when the grid was last measured.  Neither is true of a window
+         * that has just been dragged to a new size, so the background does
+         * have to be erased.  It is cheap: WM_ERASEBKGND only arrives when
+         * something invalidates with bErase, which here means a resize or a
+         * DPI change, never ordinary terminal output.
+         */
+        HDC hdc = (HDC)wp;
+        HBRUSH brush = CreateSolidBrush(wt->colours[COLOUR_BG]);
+        RECT r;
+
+        GetClientRect(hwnd, &r);
+        FillRect(hdc, &r, brush);
+        DeleteObject(brush);
         return 1;
+    }
 
     case WM_GETDLGCODE:
         /* We want every key, including Tab and the arrows. */
