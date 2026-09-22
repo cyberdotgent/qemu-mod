@@ -4644,8 +4644,37 @@ if gtk.found()
 endif
 
 if host_machine.system() == 'windows'
+  # scripts/nsis.py installs the build tree into a temporary DESTDIR with
+  # 'meson install --no-rebuild'; find_program('meson') resolves to the very
+  # meson that configured this build directory, which is the only one that may
+  # act on it.
   nsis_cmd = [
     find_program('scripts/nsis.py'),
+    '--meson=@0@'.format(find_program('meson').full_path()),
+  ]
+
+  # Directories to resolve the binaries' imported DLLs in.  glib's bindir is
+  # where a distro-style mingw sysroot keeps its DLLs, but a sysroot built
+  # static has none, and the compiler's own runtime libraries (libssp-0.dll,
+  # libwinpthread-1.dll, libgcc_s_seh-1.dll, ...) never live there anyway.  Ask
+  # the compiler for its library search path instead of guessing.
+  # NB: 'cc' cannot be used here -- tests/meson.build rebinds it to the TCG
+  # tests' compiler, and subdir('tests') has already run by this point.
+  foreach line : run_command(meson.get_compiler('c').cmd_array(),
+                             '-print-search-dirs',
+                             check: false).stdout().split('\n')
+    if line.startswith('libraries:')
+      dirs = line.substring(10).strip()
+      if dirs.startswith('=')
+        dirs = dirs.substring(1)
+      endif
+      foreach dir : dirs.split(build_machine.system() == 'windows' ? ';' : ':')
+        nsis_cmd += '--dll-search-dir=' + dir
+      endforeach
+    endif
+  endforeach
+
+  nsis_cmd += [
     '@OUTPUT@',
     get_option('prefix'),
     meson.current_source_dir(),
