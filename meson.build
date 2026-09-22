@@ -4651,6 +4651,12 @@ if host_machine.system() == 'windows'
   nsis_cmd = [
     find_program('scripts/nsis.py'),
     '--meson=@0@'.format(find_program('meson').full_path()),
+    # DLLs that are opened with LoadLibrary() (ANGLE, reached through libepoxy's
+    # lazy EGL dispatch) appear in no import table, so nsis.py cannot discover
+    # them the way it discovers everything else; they are declared in this list,
+    # which scripts/win64-dist.sh consumes as well.
+    '--runtime-dll-list=@0@'.format(
+      meson.current_source_dir() / 'scripts/runtime-loaded-dlls.txt'),
   ]
 
   # Directories to resolve the binaries' imported DLLs in.  glib's bindir is

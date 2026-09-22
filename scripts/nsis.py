@@ -47,6 +47,28 @@ def find_deps(exe_or_dll, search_path, analyzed_deps):
 
     return analyzed_deps, deps
 
+
+def read_runtime_dll_list(path):
+    """Names of DLLs that are LoadLibrary()d instead of imported.
+
+    find_deps() discovers DLLs by walking the PE import table, which by
+    construction cannot see a library that is only ever opened at run time --
+    libepoxy dispatches EGL through LoadLibrary("libEGL.dll"), so ANGLE appears
+    in no import table at all.  Those names are declared in a shared list file
+    (scripts/runtime-loaded-dlls.txt) that scripts/win64-dist.sh reads too.
+    """
+    if not path or not os.path.exists(path):
+        return []
+
+    names = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if line:
+                names.append(line)
+    return names
+
+
 def main():
     parser = argparse.ArgumentParser(description="QEMU NSIS build helper.")
     parser.add_argument(
@@ -63,6 +85,12 @@ def main():
         dest="dll_search_dirs",
         help="extra directory to look for imported DLLs in "
         "(repeatable, searched after the positional dlldir)",
+    )
+    parser.add_argument(
+        "--runtime-dll-list",
+        default=None,
+        help="file listing DLLs that are loaded with LoadLibrary() instead of "
+        "being imported, and so cannot be found by walking import tables",
     )
     parser.add_argument("outfile")
     parser.add_argument("prefix")
@@ -131,6 +159,13 @@ def main():
         os.mkdir(dlldir)
 
         analyzed_deps = set()
+
+        def copy_deps(deps):
+            for dep in deps:
+                dllfile = os.path.join(dlldir, os.path.basename(dep))
+                print("Copying '%s' to '%s'" % (dep, dllfile))
+                shutil.copy(dep, dllfile)
+
         for exe in glob.glob(os.path.join(destdir + prefix, "*.exe")):
             signcode(exe)
 
@@ -140,10 +175,30 @@ def main():
             deps.remove(exe)
 
             # copy all dlls to the DLLDIR
-            for dep in deps:
-                dllfile = os.path.join(dlldir, os.path.basename(dep))
-                print("Copying '%s' to '%s'" % (dep, dllfile))
-                shutil.copy(dep, dllfile)
+            copy_deps(deps)
+
+        # Runtime-loaded DLLs are invisible to the import-table walk above, so
+        # they have to be named explicitly; what *they* import is then resolved
+        # the ordinary way.  A name that is nowhere to be found is skipped with
+        # a warning rather than being fatal: a sysroot without ANGLE is a
+        # legitimate build, it just has no GL display path.
+        for name in read_runtime_dll_list(args.runtime_dll_list):
+            if name in analyzed_deps:
+                continue
+            for directory in search_path:
+                candidate = os.path.join(directory, name)
+                if os.path.exists(candidate):
+                    analyzed_deps.add(name)
+                    analyzed_deps, deps = find_deps(
+                        candidate, search_path, analyzed_deps
+                    )
+                    copy_deps(set(deps))
+                    break
+            else:
+                print(
+                    "Warning: runtime-loaded DLL '%s' not found in %s -- "
+                    "not packaged" % (name, ", ".join(search_path))
+                )
 
         makensis = [
             "makensis",

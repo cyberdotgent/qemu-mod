@@ -12,7 +12,9 @@
 #     win64-dist/share/keymaps/...
 #
 # so the emulators find their firmware with no -L argument.  Any non-system DLLs
-# the binaries import are resolved and copied in beside them.
+# the binaries import are resolved and copied in beside them, as are the ones
+# listed in scripts/runtime-loaded-dlls.txt, which are opened with LoadLibrary()
+# and therefore never show up in an import table.
 #
 # Usage: scripts/win64-dist.sh [-b BUILDDIR] [-o OUTDIR] [--no-strip] [--zip]
 #
@@ -99,18 +101,29 @@ if [ -n "$(find "$out_dir" -type l -print -quit)" ]; then
     die "symlinks present in '$out_dir' -- refusing to ship a tree Windows cannot read"
 fi
 
-# Resolve imported DLLs.  Search paths cover the gcc runtime, the distro's mingw
-# sysroot and the hand-built sysroot; DLLs that resolve nowhere are Windows's own
-# (kernel32, user32, ...) and are correctly left alone.
+# Resolve imported DLLs.  Search paths cover the hand-built sysroot, the gcc
+# runtime and the distro's mingw sysroot; DLLs that resolve nowhere are
+# Windows's own (kernel32, user32, ...) and are correctly left alone.
+#
+# The ORDER matters, and the sysroot deliberately comes first.  Several names
+# exist in more than one of these directories -- libwinpthread-1.dll,
+# libstdc++-6.dll, libgcc_s_seh-1.dll -- and only one file of a given name can
+# sit next to the .exe.  The sysroot's ANGLE is an MSYS2 gcc-16 build, and the
+# distro's gcc-13 runtime does not export everything it imports
+# (__cxa_call_terminate from libstdc++, nanosleep64 and
+# pthread_cond_timedwait64 from libwinpthread), so picking the distro copy
+# would leave libGLESv2.dll unloadable.  The reverse is safe: QEMU itself needs
+# only clock_gettime out of libwinpthread and nothing at all out of the C++
+# runtime, and the sysroot copies export those.  Hence: newest first.
 : "${MINGW_PREFIX:=$HOME/mingw}"
 gcc_lib_dir=$(${cross_prefix}gcc -print-search-dirs 2>/dev/null |
               sed -n 's/^install: //p') || true
 search_dirs=(
+    "$MINGW_PREFIX/bin"
+    "$MINGW_PREFIX/lib"
     "$gcc_lib_dir"
     "/usr/${cross_prefix%-}/lib"
     "/usr/${cross_prefix%-}/bin"
-    "$MINGW_PREFIX/bin"
-    "$MINGW_PREFIX/lib"
 )
 
 find_dll() {
@@ -121,9 +134,32 @@ find_dll() {
     return 1
 }
 
+# DLLs that are loaded with LoadLibrary() rather than imported are invisible to
+# the objdump walk below, so they are named explicitly in a list both packagers
+# share (see that file for why).  Copy them first: once they sit in $out_dir the
+# fixed-point loop below picks up everything *they* import.
+runtime_dll_list=$src_dir/scripts/runtime-loaded-dlls.txt
+copied=0
+if [ -f "$runtime_dll_list" ]; then
+    info "Copying runtime-loaded DLLs"
+    while read -r dll; do
+        dll=${dll%%#*}
+        dll=$(printf '%s' "$dll" | tr -d '[:space:]')
+        [ -n "$dll" ] || continue
+        [ -e "$out_dir/$dll" ] && continue
+        if path=$(find_dll "$dll"); then
+            cp -L -- "$path" "$out_dir/$dll"
+            printf '    %s <- %s\n' "$dll" "$path"
+            copied=$((copied + 1))
+        else
+            # Not an error: a sysroot without ANGLE just has no GL display path.
+            printf '    %s not found -- skipping (no GL display path)\n' "$dll" >&2
+        fi
+    done < "$runtime_dll_list"
+fi
+
 info "Resolving imported DLLs"
 # Iterate to a fixed point: a copied DLL may itself import another one.
-copied=0
 while :; do
     new=0
     while IFS= read -r -d '' binary; do

@@ -12,9 +12,21 @@
  *
  * The 2D path blits the guest surface straight from pixman memory with
  * StretchDIBits(), so there is no intermediate copy and no texture to keep in
- * sync.  There is no GL path: QEMU's blit shaders are '#version 300 es' and
- * plain WGL cannot be relied upon to provide an ES context, so -display
- * win32,gl=on is rejected outright rather than silently downgraded.
+ * sync.  It is the default and needs nothing beyond the Win32 API.
+ *
+ * The GL path (-display win32,gl=on) goes through EGL rather than WGL.  That
+ * is deliberate: QEMU's blit shaders are '#version 300 es', and the GL context
+ * virtio-gpu-gl/virgl needs must come from the same stack, so an ES-capable
+ * implementation is required.  On Windows that means ANGLE, which is an EGL
+ * implementation, and ui/egl-helpers.c already knows how to drive it
+ * (qemu_egl_init_dpy_win32() even prefers ES for exactly this reason).  WGL
+ * would give a desktop-GL context that neither the shaders nor virgl can use.
+ *
+ * The GL code below is structured like ui/gtk-egl.c and ui/sdl2-gl.c -- one
+ * EGL context and one window surface per console, a QemuGLShader for the
+ * surface blit, and a scanout mode for guest-supplied textures -- so that
+ * upstream changes to the shared helpers stay easy to absorb.  dma-buf is
+ * deliberately absent: it is a Linux concept and CONFIG_GBM is off here.
  */
 
 #include "qemu/osdep.h"
@@ -35,6 +47,12 @@
 #include "ui/kbd-state.h"
 #include "ui/win32-kbd-hook.h"
 #include "standard-headers/linux/input-event-codes.h"
+
+#ifdef CONFIG_OPENGL
+#include "ui/egl-helpers.h"
+#include "ui/egl-context.h"
+#include "ui/shader.h"
+#endif
 
 #define WIN32_WINDOW_CLASS  "QemuWin32Display"
 
@@ -59,6 +77,19 @@ struct win32_console {
     /* saved geometry, for leaving fullscreen again */
     WINDOWPLACEMENT saved_placement;
     LONG_PTR saved_style;
+
+#ifdef CONFIG_OPENGL
+    bool opengl;
+    DisplayGLCtx dgc;
+    EGLSurface esurface;
+    EGLContext ectx;
+    QemuGLShader *gls;
+    int updates;
+    bool scanout_mode;
+    bool y0_top;
+    egl_fb guest_fb;
+    egl_fb win_fb;
+#endif
 };
 
 static int win32_num_outputs;
@@ -82,6 +113,12 @@ static Notifier mouse_mode_notifier;
 static void win32_update_caption(struct win32_console *wcon);
 static void win32_grab_start(struct win32_console *wcon);
 static void win32_grab_end(struct win32_console *wcon);
+
+#ifdef CONFIG_OPENGL
+static void win32_gl_init(struct win32_console *wcon);
+static void win32_gl_fini(struct win32_console *wcon);
+static void win32_gl_redraw(struct win32_console *wcon);
+#endif
 
 static struct win32_console *win32_console_from_hwnd(HWND hwnd)
 {
@@ -135,6 +172,16 @@ static void win32_window_create(struct win32_console *wcon)
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, (LONG_PTR)wcon);
     win32_window_set_client_size(wcon, w, h);
 
+#ifdef CONFIG_OPENGL
+    /*
+     * The EGL window surface is tied to this HWND, so it is created and
+     * destroyed in step with it rather than once at init time.
+     */
+    if (wcon->opengl) {
+        win32_gl_init(wcon);
+    }
+#endif
+
     if (!wcon->hidden) {
         ShowWindow(wcon->hwnd, SW_SHOW);
     }
@@ -146,6 +193,11 @@ static void win32_window_destroy(struct win32_console *wcon)
     if (!wcon->hwnd) {
         return;
     }
+#ifdef CONFIG_OPENGL
+    if (wcon->opengl) {
+        win32_gl_fini(wcon);
+    }
+#endif
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, 0);
     DestroyWindow(wcon->hwnd);
     wcon->hwnd = NULL;
@@ -573,7 +625,14 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
     switch (msg) {
     case WM_PAINT:
         hdc = BeginPaint(hwnd, &ps);
-        win32_paint(wcon, hdc);
+#ifdef CONFIG_OPENGL
+        if (wcon->opengl) {
+            win32_gl_redraw(wcon);
+        } else
+#endif
+        {
+            win32_paint(wcon, hdc);
+        }
         EndPaint(hwnd, &ps);
         return 0;
 
@@ -582,6 +641,15 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
         return 1;
 
     case WM_SIZE:
+#ifdef CONFIG_OPENGL
+        /*
+         * The EGL surface follows the HWND, but nothing repaints it by
+         * itself; redraw here so a resize does not leave a stale image.
+         */
+        if (wcon->opengl) {
+            win32_gl_redraw(wcon);
+        }
+#endif
         InvalidateRect(hwnd, NULL, FALSE);
         if (gui_grab) {
             win32_clip_cursor(wcon, true);
@@ -927,6 +995,343 @@ static const DisplayChangeListenerOps dcl_2d_ops = {
 };
 
 /* ------------------------------------------------------------------ */
+/* OpenGL (EGL/ANGLE) path                                              */
+
+#ifdef CONFIG_OPENGL
+
+/*
+ * Bind this console's context together with its own window surface, the way
+ * gd_egl_make_current() does: every console draws into its own HWND, so the
+ * surface must be re-bound and not left wherever the previous console put it.
+ */
+static bool win32_gl_make_current(struct win32_console *wcon)
+{
+    if (!wcon->esurface || !wcon->ectx) {
+        return false;
+    }
+    if (!eglMakeCurrent(qemu_egl_display, wcon->esurface,
+                        wcon->esurface, wcon->ectx)) {
+        error_report("win32: eglMakeCurrent failed: %s",
+                     qemu_egl_get_error_string());
+        return false;
+    }
+    return true;
+}
+
+static void win32_gl_init(struct win32_console *wcon)
+{
+    assert(wcon->hwnd);
+    assert(!wcon->esurface);
+
+    wcon->ectx = qemu_egl_init_ctx();
+    if (!wcon->ectx) {
+        error_report("win32: could not create an EGL context");
+        exit(1);
+    }
+
+    /*
+     * Despite its name this helper is platform independent -- it is just
+     * eglCreateWindowSurface() plus eglMakeCurrent() -- and on Windows the
+     * EGLNativeWindowType is an HWND.
+     */
+    wcon->esurface = qemu_egl_init_surface_x11(wcon->ectx,
+                                               (EGLNativeWindowType)wcon->hwnd);
+    if (!wcon->esurface) {
+        error_report("win32: could not create an EGL surface for the window");
+        exit(1);
+    }
+
+    wcon->gls = qemu_gl_init_shader();
+}
+
+static void win32_gl_fini(struct win32_console *wcon)
+{
+    if (wcon->esurface) {
+        eglMakeCurrent(qemu_egl_display, wcon->esurface,
+                       wcon->esurface, wcon->ectx);
+    }
+
+    if (wcon->gls) {
+        surface_gl_destroy_texture(wcon->gls, wcon->surface);
+        egl_fb_destroy(&wcon->guest_fb);
+        egl_fb_destroy(&wcon->win_fb);
+        qemu_gl_fini_shader(wcon->gls);
+        wcon->gls = NULL;
+    }
+    wcon->scanout_mode = false;
+    wcon->updates = 0;
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+
+    if (wcon->esurface) {
+        eglDestroySurface(qemu_egl_display, wcon->esurface);
+        wcon->esurface = NULL;
+    }
+    if (wcon->ectx) {
+        eglDestroyContext(qemu_egl_display, wcon->ectx);
+        wcon->ectx = NULL;
+    }
+}
+
+/* mirrors sdl2_set_scanout_mode() / gtk_egl_set_scanout_mode() */
+static void win32_gl_set_scanout_mode(struct win32_console *wcon, bool scanout)
+{
+    if (wcon->scanout_mode == scanout) {
+        return;
+    }
+
+    wcon->scanout_mode = scanout;
+    if (!wcon->scanout_mode) {
+        egl_fb_destroy(&wcon->guest_fb);
+        if (wcon->surface && wcon->gls) {
+            surface_gl_destroy_texture(wcon->gls, wcon->surface);
+            surface_gl_create_texture(wcon->gls, wcon->surface);
+        }
+    }
+}
+
+static bool win32_gl_client_size(struct win32_console *wcon, int *w, int *h)
+{
+    RECT client;
+
+    if (!wcon->hwnd || !GetClientRect(wcon->hwnd, &client)) {
+        return false;
+    }
+    if (client.right <= 0 || client.bottom <= 0) {
+        return false;
+    }
+    *w = client.right;
+    *h = client.bottom;
+    return true;
+}
+
+static void win32_gl_render_surface(struct win32_console *wcon)
+{
+    int ww, wh;
+
+    if (!wcon->gls || !wcon->surface) {
+        return;
+    }
+    if (!win32_gl_client_size(wcon, &ww, &wh)) {
+        return;
+    }
+    if (!win32_gl_make_current(wcon)) {
+        return;
+    }
+
+    surface_gl_setup_viewport(wcon->gls, wcon->surface, ww, wh);
+    surface_gl_render_texture(wcon->gls, wcon->surface);
+    eglSwapBuffers(qemu_egl_display, wcon->esurface);
+}
+
+static void win32_gl_scanout_flush(DisplayChangeListener *dcl,
+                                   uint32_t x, uint32_t y,
+                                   uint32_t w, uint32_t h)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+    int ww, wh;
+
+    if (!wcon->scanout_mode || !wcon->guest_fb.framebuffer) {
+        return;
+    }
+    if (!win32_gl_client_size(wcon, &ww, &wh)) {
+        return;
+    }
+    if (!win32_gl_make_current(wcon)) {
+        return;
+    }
+
+    egl_fb_setup_default(&wcon->win_fb, ww, wh, 0, 0);
+    egl_fb_blit(&wcon->win_fb, &wcon->guest_fb, !wcon->y0_top);
+    eglSwapBuffers(qemu_egl_display, wcon->esurface);
+}
+
+/* repaint the window from whatever the current source is */
+static void win32_gl_redraw(struct win32_console *wcon)
+{
+    if (!wcon->hwnd) {
+        return;
+    }
+    if (wcon->scanout_mode) {
+        /* only the dcl argument of the flush is used */
+        win32_gl_scanout_flush(&wcon->dcl, 0, 0, 0, 0);
+        return;
+    }
+    win32_gl_render_surface(wcon);
+}
+
+static void win32_gl_update(DisplayChangeListener *dcl,
+                            int x, int y, int w, int h)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+
+    if (!wcon->gls || !wcon->surface) {
+        return;
+    }
+    if (!win32_gl_make_current(wcon)) {
+        return;
+    }
+    surface_gl_update_texture(wcon->gls, wcon->surface, x, y, w, h);
+    wcon->updates++;
+}
+
+static void win32_gl_switch(DisplayChangeListener *dcl,
+                            DisplaySurface *new_surface)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+    DisplaySurface *old_surface = wcon->surface;
+
+    if (wcon->gls && win32_gl_make_current(wcon)) {
+        surface_gl_destroy_texture(wcon->gls, wcon->surface);
+    }
+
+    wcon->surface = new_surface;
+
+    if (!new_surface ||
+        (surface_is_placeholder(new_surface) &&
+         qemu_console_get_index(dcl->con))) {
+        win32_window_destroy(wcon);
+        return;
+    }
+
+    if (!wcon->hwnd) {
+        /* this also brings up the EGL surface, context and shader */
+        win32_window_create(wcon);
+    } else if (old_surface &&
+               (surface_width(old_surface) != surface_width(new_surface) ||
+                surface_height(old_surface) != surface_height(new_surface))) {
+        win32_window_set_client_size(wcon,
+                                     surface_width(new_surface),
+                                     surface_height(new_surface));
+    }
+
+    if (wcon->gls && win32_gl_make_current(wcon)) {
+        surface_gl_create_texture(wcon->gls, new_surface);
+        wcon->updates++;
+    }
+}
+
+static void win32_gl_refresh(DisplayChangeListener *dcl)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+    static bool was_running;
+    bool running = runstate_is_running();
+
+    qemu_console_hw_update(dcl->con);
+
+    if (running != was_running) {
+        was_running = running;
+        win32_update_caption(wcon);
+    }
+
+    if (wcon->updates && wcon->hwnd) {
+        wcon->updates = 0;
+        win32_gl_render_surface(wcon);
+    }
+
+    win32_poll_events(wcon);
+}
+
+static void win32_gl_scanout_disable(DisplayChangeListener *dcl)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+
+    if (!win32_gl_make_current(wcon)) {
+        /* no context to delete objects with; just drop out of scanout mode */
+        wcon->scanout_mode = false;
+        return;
+    }
+    win32_gl_set_scanout_mode(wcon, false);
+}
+
+static void win32_gl_scanout_texture(DisplayChangeListener *dcl,
+                                     uint32_t backing_id,
+                                     bool backing_y_0_top,
+                                     uint32_t backing_width,
+                                     uint32_t backing_height,
+                                     uint32_t x, uint32_t y,
+                                     uint32_t w, uint32_t h,
+                                     void *d3d_tex2d)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+
+    wcon->y0_top = backing_y_0_top;
+
+    if (!win32_gl_make_current(wcon)) {
+        return;
+    }
+
+    win32_gl_set_scanout_mode(wcon, true);
+    egl_fb_setup_for_tex(&wcon->guest_fb, backing_width, backing_height,
+                         backing_id, false);
+}
+
+static const DisplayChangeListenerOps dcl_gl_ops = {
+    .dpy_name               = "win32-gl",
+    .dpy_gfx_update         = win32_gl_update,
+    .dpy_gfx_switch         = win32_gl_switch,
+    .dpy_gfx_check_format   = console_gl_check_format,
+    .dpy_refresh            = win32_gl_refresh,
+    .dpy_mouse_set          = win32_mouse_warp,
+    .dpy_cursor_define      = win32_mouse_define,
+
+    .dpy_gl_scanout_disable = win32_gl_scanout_disable,
+    .dpy_gl_scanout_texture = win32_gl_scanout_texture,
+    .dpy_gl_update          = win32_gl_scanout_flush,
+};
+
+static bool win32_gl_is_compatible_dcl(DisplayGLCtx *dgc,
+                                       DisplayChangeListener *dcl)
+{
+    return dcl->ops == &dcl_gl_ops;
+}
+
+/*
+ * Contexts handed to the guest device (virtio-gpu-gl) share ours, so the
+ * textures it renders into can be blitted by the scanout path above.
+ */
+static QEMUGLContext win32_gl_create_context(DisplayGLCtx *dgc,
+                                             QEMUGLParams *params)
+{
+    struct win32_console *wcon =
+        container_of(dgc, struct win32_console, dgc);
+
+    win32_gl_make_current(wcon);
+    return qemu_egl_create_context(dgc, params, wcon->ectx);
+}
+
+static int win32_gl_make_context_current(DisplayGLCtx *dgc,
+                                         QEMUGLContext ctx)
+{
+    struct win32_console *wcon =
+        container_of(dgc, struct win32_console, dgc);
+
+    if (!eglMakeCurrent(qemu_egl_display, wcon->esurface,
+                        wcon->esurface, ctx)) {
+        error_report("win32: eglMakeCurrent failed: %s",
+                     qemu_egl_get_error_string());
+        return -1;
+    }
+    return 0;
+}
+
+static const DisplayGLCtxOps gl_ctx_ops = {
+    .dpy_gl_ctx_is_compatible_dcl = win32_gl_is_compatible_dcl,
+    .dpy_gl_ctx_create            = win32_gl_create_context,
+    .dpy_gl_ctx_destroy           = qemu_egl_destroy_context,
+    .dpy_gl_ctx_make_current      = win32_gl_make_context_current,
+};
+
+#endif /* CONFIG_OPENGL */
+
+/* ------------------------------------------------------------------ */
 /* init / cleanup                                                       */
 
 static void win32_display_cleanup(void)
@@ -965,10 +1370,40 @@ static void win32_display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_WIN32);
 
-    if (o->has_gl && o->gl != DISPLAY_GL_MODE_OFF) {
-        error_report("win32: OpenGL is not supported by this display backend");
+    if (!o->has_gl || o->gl == DISPLAY_GL_MODE_OFF) {
+        return;
+    }
+
+#ifndef CONFIG_OPENGL
+    error_report("win32: this QEMU was built without OpenGL support, "
+                 "so -display win32,gl=on is not available");
+    exit(1);
+#else
+    /*
+     * epoxy resolves the EGL entry points lazily with LoadLibrary(), and
+     * aborts the process if it cannot; ask it first so that a host without
+     * ANGLE gets a diagnostic instead of a crash.
+     */
+    if (!epoxy_has_egl()) {
+        error_report("win32: no EGL implementation could be loaded; "
+                     "-display win32,gl=on requires ANGLE -- put libEGL.dll "
+                     "and libGLESv2.dll next to the QEMU executable");
         exit(1);
     }
+
+    /*
+     * Do this here rather than in init(): display_opengl has to be set
+     * before the guest devices are created, and a GL-capable device such as
+     * virtio-gpu-gl picks up qemu_egl_display at realize time.
+     */
+    if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, o->gl) < 0) {
+        error_report("win32: could not initialise EGL; "
+                     "-display win32,gl=on is not usable on this host");
+        exit(1);
+    }
+
+    display_opengl = 1;
+#endif
 }
 
 static void win32_register_class(void)
@@ -1042,6 +1477,7 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     win32_consoles = g_new0(struct win32_console, win32_num_outputs);
     for (i = 0; i < win32_num_outputs; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
+        const DisplayChangeListenerOps *ops = &dcl_2d_ops;
 
         assert(con != NULL);
         if (!qemu_console_is_graphic(con) &&
@@ -1051,8 +1487,15 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
         win32_consoles[i].idx = i;
         win32_consoles[i].opts = o;
         win32_consoles[i].kbd = qkbd_state_init(con);
-        qemu_console_register_listener(con, &win32_consoles[i].dcl,
-                                       &dcl_2d_ops);
+#ifdef CONFIG_OPENGL
+        win32_consoles[i].opengl = display_opengl;
+        if (display_opengl) {
+            ops = &dcl_gl_ops;
+            win32_consoles[i].dgc.ops = &gl_ctx_ops;
+            qemu_console_set_display_gl_ctx(con, &win32_consoles[i].dgc);
+        }
+#endif
+        qemu_console_register_listener(con, &win32_consoles[i].dcl, ops);
     }
 
     mouse_mode_notifier.notify = win32_mouse_mode_change;

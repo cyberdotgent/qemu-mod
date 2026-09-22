@@ -1,0 +1,27 @@
+# DLLs that QEMU opens with LoadLibrary() at run time instead of importing.
+#
+# Both Windows packagers -- scripts/win64-dist.sh and scripts/nsis.py -- find
+# the DLLs they have to ship by walking the PE import table ("objdump -p", the
+# "DLL Name:" lines).  A library that is never imported, only dlopen()ed, does
+# not appear there at all, so an import-table walk is structurally incapable of
+# finding it: it has to be named here instead.
+#
+# The case that matters today is ANGLE.  libepoxy resolves the EGL entry points
+# lazily through LoadLibrary("libEGL.dll") -- that lazy dispatch is the whole
+# point of its design -- and libEGL.dll in turn loads libGLESv2.dll the same
+# way, so neither shows up in any qemu-system-*.exe (or in each other's) import
+# table, even though "-display win32,gl=on" cannot work without both.
+#
+# Only the runtime-loaded DLLs themselves belong here.  Whatever they *import*
+# (their C++ runtime, zlib, ...) is resolved by the ordinary recursive import
+# walk once the file has been copied.
+#
+# Entries are searched for in the same directories as imported DLLs.  A name
+# that is found nowhere is skipped with a warning and is not an error: a build
+# whose sysroot has no ANGLE is perfectly legitimate, it simply has no GL
+# display path.
+#
+# Blank lines and '#' comments are ignored.
+
+libEGL.dll
+libGLESv2.dll
