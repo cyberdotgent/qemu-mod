@@ -4654,6 +4654,15 @@ if host_machine.system() == 'windows'
                        build_always_stale: true,
                        command: nsis_cmd + ['@INPUT@'])
   alias_target('installer', nsis)
+
+  # qemu-mod: 'ninja win64-dist' assembles a tree of real files under
+  # win64-dist/, as opposed to the qemu-bundle/ symlink farm, which cannot be
+  # read from Windows over a UNC path.  Deliberately not wired to 'all': it
+  # installs whatever is already built, so that a tree with unbuildable test
+  # binaries can still be packaged.
+  run_target('win64-dist',
+             command: [find_program('scripts/win64-dist.sh'),
+                       '--build-dir', meson.current_build_dir()])
 endif
 
 #########################
