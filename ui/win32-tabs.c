@@ -87,6 +87,21 @@ HWND win32_frame;
 HWND win32_tabctl;
 struct win32_console *win32_active;
 
+/*
+ * True once the user has picked a tab, by clicking one or by pressing
+ * Ctrl-Alt-<n>.  Until then the selection is only this code's best guess,
+ * and win32_frame_add_console() is free to revise it -- see there.
+ */
+static bool win32_tab_user_selected;
+
+/*
+ * Set while win32_tabs_rebuild() is deleting and re-inserting the tab
+ * items.  comctl32 changes the current selection as it does so, and sends
+ * TCN_SELCHANGE for it -- which is not a choice by the user and must not be
+ * mistaken for one, or adding a second tab silently switches to it.
+ */
+static bool win32_tabs_rebuilding;
+
 bool gui_fullscreen;
 bool gui_free_scale;
 bool gui_grab_on_hover;
@@ -234,6 +249,11 @@ static void win32_set_dpi(UINT dpi)
 {
     win32_dpi = dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
     win32_update_tab_font();
+    /*
+     * The terminal tabs size their font in points too, so they have to
+     * re-measure; their whole character grid follows from the cell size.
+     */
+    win32_term_consoles_set_dpi(win32_dpi);
 }
 
 double win32_dpi_scale(void)
@@ -827,7 +847,7 @@ static void win32_check_item(HMENU menu, UINT id, bool checked)
  */
 static void win32_refresh_menu(HMENU menu)
 {
-    bool graphic = win32_active &&
+    bool graphic = win32_active && !win32_console_is_term(win32_active) &&
                    qemu_console_is_graphic(win32_active->dcl.con);
 
     win32_check_item(menu, IDM_PAUSE, !runstate_is_running());
@@ -841,6 +861,21 @@ static void win32_refresh_menu(HMENU menu)
                    MF_BYCOMMAND | (graphic ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, IDM_GRAB_HOVER,
                    MF_BYCOMMAND | (graphic ? MF_ENABLED : MF_GRAYED));
+
+    /*
+     * Zoom stretches a pixel buffer, and a terminal tab has none -- its
+     * size is a character grid, set by the font.  Grey the items rather
+     * than leave them looking as though they do nothing.
+     */
+    for (int i = 0; i < 4; i++) {
+        static const int zoom_items[] = {
+            IDM_ZOOM_IN, IDM_ZOOM_OUT, IDM_ZOOM_FIXED, IDM_ZOOM_FIT
+        };
+        EnableMenuItem(menu, zoom_items[i],
+                       MF_BYCOMMAND |
+                       (win32_console_is_term(win32_active) ? MF_GRAYED
+                                                            : MF_ENABLED));
+    }
 }
 
 static void win32_menu_command(UINT id)
@@ -968,6 +1003,7 @@ static void win32_frame_outer_size(int w, int h, int *ow, int *oh)
     RECT r = { 0, 0, w, h };
     LONG_PTR style = GetWindowLongPtr(win32_frame, GWL_STYLE);
     LONG_PTR ex = GetWindowLongPtr(win32_frame, GWL_EXSTYLE);
+    RECT work;
 
     if (win32_tabs_visible()) {
         TabCtrl_AdjustRect(win32_tabctl, TRUE, &r);
@@ -975,6 +1011,26 @@ static void win32_frame_outer_size(int w, int h, int *ow, int *oh)
     AdjustWindowRectEx(&r, style, GetMenu(win32_frame) != NULL, ex);
     *ow = r.right - r.left;
     *oh = r.bottom - r.top;
+
+    /*
+     * Never ask for a window bigger than the desktop.  A wide terminal --
+     * the monitor comes up 132x43 -- can easily want more than a small
+     * screen has, and a window that opens with its edges past the taskbar
+     * cannot be resized back by the user.  Whatever is clipped off here
+     * simply becomes a smaller character grid, which the terminal notices
+     * on WM_SIZE.
+     */
+    if (SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0)) {
+        int maxw = work.right - work.left;
+        int maxh = work.bottom - work.top;
+
+        if (maxw > 0 && *ow > maxw) {
+            *ow = maxw;
+        }
+        if (maxh > 0 && *oh > maxh) {
+            *oh = maxh;
+        }
+    }
 }
 
 void win32_frame_layout(void)
@@ -1093,7 +1149,9 @@ void win32_update_caption(void)
         }
     }
 
-    if (win32_active) {
+    if (win32_console_is_term(win32_active)) {
+        label = g_strdup(win32_term_console_label(win32_active));
+    } else if (win32_active) {
         label = qemu_console_get_label(win32_active->dcl.con);
     }
 
@@ -1181,6 +1239,7 @@ static void win32_tabs_rebuild(void)
         return;
     }
 
+    win32_tabs_rebuilding = true;
     TabCtrl_DeleteAllItems(win32_tabctl);
 
     for (i = 0; win32_consoles && i < win32_num_outputs; i++) {
@@ -1193,7 +1252,11 @@ static void win32_tabs_rebuild(void)
             continue;
         }
 
-        label = qemu_console_get_label(wcon->dcl.con);
+        if (win32_console_is_term(wcon)) {
+            label = g_strdup(win32_term_console_label(wcon));
+        } else {
+            label = qemu_console_get_label(wcon->dcl.con);
+        }
         item.pszText = label;
         if (TabCtrl_InsertItem(win32_tabctl, pos, &item) < 0) {
             wcon->tab = -1;
@@ -1205,6 +1268,17 @@ static void win32_tabs_rebuild(void)
     if (win32_active && win32_active->tab >= 0) {
         TabCtrl_SetCurSel(win32_tabctl, win32_active->tab);
     }
+    win32_tabs_rebuilding = false;
+}
+
+/*
+ * A terminal tab's label follows the guest's window title (OSC 0/2), so it
+ * can change at any moment; ui/win32-term-chardev.c calls this when it
+ * does.
+ */
+void win32_frame_relabel(void)
+{
+    win32_tabs_rebuild();
 }
 
 /*
@@ -1260,7 +1334,12 @@ void win32_frame_activate(struct win32_console *wcon)
      * tab selection means it is re-pointed once per tab switch instead of on
      * every focus change, which is the only time it can really move.
      */
-    win32_kbd_set_window(wcon->hwnd);
+    /*
+     * The low-level keyboard hook steals system key combinations for the
+     * guest.  A terminal tab is not the guest: Alt-Tab and the Windows key
+     * must keep working there, so the hook is pointed at nothing.
+     */
+    win32_kbd_set_window(win32_console_is_term(wcon) ? NULL : wcon->hwnd);
 
     win32_frame_fit();
     SetFocus(wcon->hwnd);
@@ -1271,11 +1350,31 @@ void win32_frame_activate(struct win32_console *wcon)
 void win32_frame_add_console(struct win32_console *wcon)
 {
     win32_tabs_rebuild();
+
     if (!win32_active) {
         win32_frame_activate(wcon);
-    } else {
-        win32_frame_layout();
+        return;
     }
+
+    /*
+     * Tabs do not all arrive at once, and they do not arrive in the order a
+     * user would expect to see them in.  Chardevs are created early in
+     * startup, so a serial port or the monitor is registered long before
+     * any graphics QemuConsole exists -- which would leave QEMU opening on
+     * the monitor tab rather than on the machine's display.
+     *
+     * So while no tab has been chosen by the user, treat the current
+     * selection as provisional and let the first graphics console displace
+     * a terminal.  A configuration with no graphics console at all keeps
+     * whatever it has, and once the user has picked a tab nothing moves it.
+     */
+    if (!win32_tab_user_selected &&
+        win32_console_is_term(win32_active) && !win32_console_is_term(wcon)) {
+        win32_frame_activate(wcon);
+        return;
+    }
+
+    win32_frame_layout();
 }
 
 void win32_frame_del_console(struct win32_console *wcon)
@@ -1302,13 +1401,23 @@ void win32_frame_del_console(struct win32_console *wcon)
     }
 }
 
+void win32_frame_note_user_selection(void)
+{
+    win32_tab_user_selected = true;
+}
+
 static void win32_tab_selected(void)
 {
     int sel = TabCtrl_GetCurSel(win32_tabctl);
     int i;
 
+    if (win32_tabs_rebuilding) {
+        return;
+    }
+
     for (i = 0; i < win32_num_outputs; i++) {
         if (win32_consoles[i].hwnd && win32_consoles[i].tab == sel) {
+            win32_frame_note_user_selection();
             win32_frame_activate(&win32_consoles[i]);
             return;
         }
@@ -1372,6 +1481,13 @@ static LRESULT CALLBACK win32_frameproc(HWND hwnd, UINT msg,
         if (LOWORD(wparam) == WA_INACTIVE) {
             int i;
             for (i = 0; i < win32_num_outputs; i++) {
+                /*
+                 * Only a graphics tab has keys the guest believes are
+                 * held; a terminal tab has no QKbdState at all.
+                 */
+                if (win32_console_is_term(&win32_consoles[i])) {
+                    continue;
+                }
                 win32_release_modifiers(&win32_consoles[i]);
             }
             if (gui_grab) {

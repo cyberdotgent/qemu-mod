@@ -46,6 +46,7 @@
 #include "qemu/error-report.h"
 #include "qemu/help-texts.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu-main.h"
 #include "system/runstate.h"
@@ -124,6 +125,16 @@ static void win32_gl_redraw(struct win32_console *wcon);
 void win32_console_size(struct win32_console *wcon, int *w, int *h)
 {
     double dpi = win32_dpi_scale();
+
+    if (win32_console_is_term(wcon)) {
+        /*
+         * A terminal sizes itself in whole character cells, and its zoom
+         * is the font, not a stretch of a pixel buffer -- so no scale_x
+         * and no DPI factor here.
+         */
+        win32_term_size_hint(win32_term_console_term(wcon), 0, 0, w, h);
+        return;
+    }
 
     if (!wcon || !wcon->surface) {
         *w = 0;
@@ -275,12 +286,32 @@ void win32_grab_end(void)
     win32_update_caption();
 }
 
+/*
+ * The first QemuConsole-backed tab, or NULL if there is none.  Terminal
+ * tabs share the array but have no QemuConsole, no surface, no QKbdState
+ * and no GL context, so anything that wants those has to ask for a
+ * graphics tab by name rather than assuming index 0 is one.
+ */
+static struct win32_console *win32_first_gfx_console(void)
+{
+    int i;
+
+    for (i = 0; win32_consoles && i < win32_num_outputs; i++) {
+        if (!win32_console_is_term(&win32_consoles[i])) {
+            return &win32_consoles[i];
+        }
+    }
+    return NULL;
+}
+
 static void win32_mouse_mode_change(Notifier *notify, void *data)
 {
-    if (!win32_consoles) {
+    struct win32_console *gfx = win32_first_gfx_console();
+
+    if (!gfx) {
         return;
     }
-    if (qemu_input_is_absolute(win32_consoles[0].dcl.con)) {
+    if (qemu_input_is_absolute(gfx->dcl.con)) {
         absolute_enabled = true;
     } else if (absolute_enabled) {
         if (!gui_fullscreen) {
@@ -433,6 +464,15 @@ static bool win32_grab_modifiers_down(void)
 
 void win32_release_modifiers(struct win32_console *wcon)
 {
+    /*
+     * A terminal tab has no QKbdState: it is a chardev, not a QemuConsole,
+     * and nothing is tracking which of its keys the guest believes are
+     * held.  The tab-switch path calls this for whichever console is being
+     * left, so it must cope with that.
+     */
+    if (!wcon || !wcon->kbd) {
+        return;
+    }
     qkbd_state_lift_all_keys(wcon->kbd);
 }
 
@@ -474,6 +514,7 @@ static bool win32_handle_hotkey(struct win32_console *wcon, WPARAM wparam)
         if (win >= win32_num_outputs || !win32_consoles[win].hwnd) {
             return false;
         }
+        win32_frame_note_user_selection();
         win32_frame_activate(&win32_consoles[win]);
         win32_release_modifiers(wcon);
         return true;
@@ -488,6 +529,15 @@ static void win32_handle_key(struct win32_console *wcon,
     QemuConsole *con = wcon->dcl.con;
     unsigned int lnx;
     int atset1;
+
+    /*
+     * Terminal tabs have their own window and their own key translation;
+     * they have neither a QemuConsole nor a QKbdState, so nothing below
+     * applies to them.
+     */
+    if (!con || !wcon->kbd) {
+        return;
+    }
 
     if (down) {
         /*
@@ -914,6 +964,11 @@ static void win32_poll_events(struct win32_console *wcon)
         DispatchMessage(&msg);
     }
 
+    if (!wcon) {
+        /* driven by the standalone timer below, which has no console */
+        return;
+    }
+
     if (idle) {
         if (wcon->idle_counter < WIN32_MAX_IDLE_COUNT) {
             wcon->idle_counter++;
@@ -925,6 +980,24 @@ static void win32_poll_events(struct win32_console *wcon)
         wcon->idle_counter = 0;
         wcon->dcl.update_interval = WIN32_REFRESH_INTERVAL_BUSY;
     }
+}
+
+/*
+ * The message pump normally rides on a graphics console's refresh
+ * callback.  A machine with no graphics console at all -- "-vga none", or a
+ * target that has no display device -- still has terminal tabs, and they
+ * are ordinary windows that will not so much as repaint unless somebody
+ * dispatches their messages.  So in that case, and only in that case, drive
+ * the pump from a timer instead.
+ */
+static QEMUTimer *win32_pump_timer;
+
+static void win32_pump_tick(void *opaque)
+{
+    win32_poll_events(NULL);
+    timer_mod(win32_pump_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+              GUI_REFRESH_INTERVAL_DEFAULT);
 }
 
 static void win32_2d_refresh(DisplayChangeListener *dcl)
@@ -1377,6 +1450,11 @@ static void win32_display_cleanup(void)
         return;
     }
 
+    if (win32_pump_timer) {
+        timer_free(win32_pump_timer);
+        win32_pump_timer = NULL;
+    }
+
     qemu_remove_mouse_mode_change_notifier(&mouse_mode_notifier);
     win32_kbd_set_grab(false);
     win32_kbd_set_window(NULL);
@@ -1384,6 +1462,10 @@ static void win32_display_cleanup(void)
     win32_show_cursor(true);
 
     for (i = 0; i < win32_num_outputs; i++) {
+        if (win32_console_is_term(&win32_consoles[i])) {
+            win32_term_console_fini(&win32_consoles[i]);
+            continue;
+        }
         qemu_console_unregister_listener(&win32_consoles[i].dcl);
         qkbd_state_free(win32_consoles[i].kbd);
         win32_window_destroy(&win32_consoles[i]);
@@ -1406,6 +1488,14 @@ static void win32_display_cleanup(void)
 static void win32_display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_WIN32);
+
+    /*
+     * Claim TYPE_CHARDEV_VC before ui/console-vc.c can, so that serial
+     * ports and the monitor get the PuTTY terminal instead of QEMU's
+     * minimal built-in one.  First registrant wins and a display's
+     * early_init runs first; ui/gtk.c does exactly this for VTE.
+     */
+    win32_term_chardev_register();
 
     if (!o->has_gl || o->gl == DISPLAY_GL_MODE_OFF) {
         return;
@@ -1487,7 +1577,7 @@ static void win32_register_raw_input(void)
 
 static void win32_display_init(DisplayState *ds, DisplayOptions *o)
 {
-    int i;
+    int i, n_gfx, n_term;
 
     assert(o->type == DISPLAY_TYPE_WIN32);
 
@@ -1508,7 +1598,9 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     for (i = 0; qemu_console_lookup_by_index(i) != NULL; i++) {
         /* count the consoles */
     }
-    win32_num_outputs = i;
+    n_gfx = i;
+    n_term = win32_term_nb_vcs();
+    win32_num_outputs = n_gfx + n_term;
     if (win32_num_outputs == 0) {
         return;
     }
@@ -1528,7 +1620,16 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     /* the frame has to exist before anything can become a child of it */
     win32_frame_init();
 
-    for (i = 0; i < win32_num_outputs; i++) {
+    /*
+     * The terminal tabs go last, after every graphics console, so that
+     * Ctrl-Alt-<n> keeps addressing the graphics consoles by the numbers
+     * it always did.
+     */
+    for (i = 0; i < n_term; i++) {
+        win32_term_console_init(&win32_consoles[n_gfx + i], i);
+    }
+
+    for (i = 0; i < n_gfx; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
         const DisplayChangeListenerOps *ops = &dcl_2d_ops;
 
@@ -1543,6 +1644,14 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
         }
 #endif
         qemu_console_register_listener(con, &win32_consoles[i].dcl, ops);
+    }
+
+    if (n_gfx == 0) {
+        win32_pump_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                        win32_pump_tick, NULL);
+        timer_mod(win32_pump_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                  GUI_REFRESH_INTERVAL_DEFAULT);
     }
 
     mouse_mode_notifier.notify = win32_mouse_mode_change;
@@ -1562,6 +1671,12 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
 
 static QemuDisplay qemu_display_win32 = {
     .type       = DISPLAY_TYPE_WIN32,
+    /*
+     * Plain "vc", with no size: the default is "vc:80Cx24C", and a size
+     * only means anything to the built-in QemuConsole-backed chardev we
+     * have just displaced.  ui/gtk.c does the same for VTE.
+     */
+    .vc         = "vc",
     .early_init = win32_display_early_init,
     .init       = win32_display_init,
     .cleanup    = win32_display_cleanup,

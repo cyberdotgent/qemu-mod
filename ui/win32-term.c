@@ -76,14 +76,17 @@ static HFONT win32_term_make_font(const char *face, int height, bool bold,
                        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, face);
 }
 
+/*
+ * Nine points, the same size the About box uses for its fixed-pitch block,
+ * so that the two agree on screen.  A negative lfHeight asks GDI for
+ * character height rather than cell height, which is what a point size
+ * means.
+ */
+#define WIN32_TERM_FONT_POINTS 9
+
 static void win32_term_init_fonts(Win32Term *wt)
 {
-    /*
-     * A negative height asks GDI for that many pixels of character height
-     * rather than cell height, which is the more predictable of the two.
-     * 16 is about 12pt at 96dpi and is legible without being enormous.
-     */
-    const int height = -16;
+    const int height = -MulDiv(WIN32_TERM_FONT_POINTS, wt->dpi, 72);
     const char *face = font_faces[0];
     HDC hdc;
     TEXTMETRIC tm;
@@ -228,6 +231,29 @@ static void wintw_draw_text(TermWin *tw, int x, int y, wchar_t *text,
         attr &= ~(ATTR_REVERSE | ATTR_BLINK | ATTR_COLOURS | ATTR_DIM);
         attr |= (260 << ATTR_FGSHIFT) | (COLOUR_CURSOR << ATTR_BGSHIFT);
         is_cursor = true;
+    }
+
+    /*
+     * PuTTY's unicode tables map any character the host's ANSI or OEM
+     * codepage can represent into a DIRECT_FONT tag plus a byte, because
+     * PuTTY keeps a separate GDI font per charset and draws those bytes
+     * through it.  We have one Unicode font, so undo that mapping instead:
+     * the byte came from the codepage the tag names, so converting it back
+     * is exact.
+     */
+    for (int i = 0; i < len; i++) {
+        if (DIRECT_FONT(text[i])) {
+            UINT cp = ((text[i] & CSET_MASK) == CSET_OEMCP) ?
+                CP_OEMCP : CP_ACP;
+            char c = text[i] & 0xFF;
+            wchar_t w;
+
+            if (MultiByteToWideChar(cp, 0, &c, 1, &w, 1) == 1) {
+                text[i] = w;
+            } else {
+                text[i] = 0xFFFD;
+            }
+        }
     }
 
     /*
@@ -827,6 +853,29 @@ static void win32_term_kick_timer(Win32Term *wt)
  * Mouse translation.
  */
 
+/*
+ * terminal.c wants both the physical button and what it means.  PuTTY calls
+ * the second one "cooked": select, extend or paste.  Which physical button
+ * means paste depends on CONF_mouse_is_xterm -- in PuTTY's own ("Windows")
+ * mode the right button pastes and the middle one extends the selection,
+ * which is what a Windows user expects and what we leave configured.
+ */
+static Mouse_Button win32_term_cook_button(Win32Term *wt, Mouse_Button b)
+{
+    bool xterm = conf_get_int(wt->conf, CONF_mouse_is_xterm) == 1;
+
+    switch (b) {
+    case MBT_LEFT:
+        return MBT_SELECT;
+    case MBT_MIDDLE:
+        return xterm ? MBT_PASTE : MBT_EXTEND;
+    case MBT_RIGHT:
+        return xterm ? MBT_EXTEND : MBT_PASTE;
+    default:
+        return b;
+    }
+}
+
 static void win32_term_mouse(Win32Term *wt, Mouse_Button b, Mouse_Action a,
                              WPARAM wp, LPARAM lp)
 {
@@ -850,7 +899,8 @@ static void win32_term_mouse(Win32Term *wt, Mouse_Button b, Mouse_Action a,
     }
 
     win32_term_show_mouseptr(wt, true);
-    term_mouse(wt->term, b, b, a, x, y, shift, ctrl, alt);
+    term_mouse(wt->term, b, win32_term_cook_button(wt, b), a,
+               x, y, shift, ctrl, alt);
 }
 
 /*
@@ -949,8 +999,10 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
         }
         len = win32_term_translate_key(wt, msg, wp, lp, buf);
         if (len == -1) {
+            wt->key_handled = false;
             return DefWindowProc(hwnd, msg, wp, lp);
         }
+        wt->key_handled = true;
         if (len != 0) {
             term_seen_key_event(wt->term);
             term_keyinput(wt->term, -1, buf, len);
@@ -963,12 +1015,19 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
     case WM_CHAR:
     case WM_SYSCHAR: {
         /*
-         * Anything the key translation above did not swallow arrives here
-         * already converted by Windows.  UTF-16 surrogates arrive as two
-         * separate messages, which term_keyinputw() is happy to take one
-         * at a time.
+         * The key translation above has already turned ordinary typing
+         * into terminal input, so the WM_CHAR that TranslateMessage()
+         * makes from the same keystroke must be dropped.  What is left
+         * here is input with no WM_KEYDOWN of its own -- an IME commit, or
+         * a character posted to us by some other program -- which we do
+         * want.
          */
         wchar_t c = (wchar_t)wp;
+
+        if (wt->key_handled) {
+            wt->key_handled = false;
+            return 0;
+        }
         term_seen_key_event(wt->term);
         term_keyinputw(wt->term, &c, 1);
         win32_term_kick_timer(wt);
@@ -978,22 +1037,35 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_RBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_MBUTTONDBLCLK:
+    case WM_RBUTTONDBLCLK:
     case WM_LBUTTONUP:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP: {
         Mouse_Button b;
         Mouse_Action a;
-        bool down = (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN ||
-                     msg == WM_RBUTTONDOWN);
+        bool dbl = (msg == WM_LBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK ||
+                    msg == WM_RBUTTONDBLCLK);
+        bool down = dbl || (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+                            msg == WM_RBUTTONDOWN);
 
-        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) {
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+            msg == WM_LBUTTONDBLCLK) {
             b = MBT_LEFT;
-        } else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) {
+        } else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
+                   msg == WM_MBUTTONDBLCLK) {
             b = MBT_MIDDLE;
         } else {
             b = MBT_RIGHT;
         }
-        a = down ? MA_CLICK : MA_RELEASE;
+        /*
+         * A double click selects a word and a triple click a line.  The
+         * window class has CS_DBLCLKS, so Windows tells us about the
+         * second click; the third arrives as another WM_xBUTTONDBLCLK,
+         * which is how PuTTY's own front end detects it too.
+         */
+        a = down ? (dbl ? MA_2CLK : MA_CLICK) : MA_RELEASE;
 
         if (down) {
             SetFocus(hwnd);
@@ -1130,9 +1202,11 @@ void win32_term_global_init(void)
 }
 
 Win32Term *win32_term_new(HWND parent, const Win32TermCallbacks *cb,
-                          void *opaque)
+                          void *opaque, const Win32TermOptions *opts)
 {
     Win32Term *wt = snew(Win32Term);
+    int cols = opts->cols;
+    int rows = opts->rows;
 
     memset(wt, 0, sizeof(*wt));
     wt->termwin.vt = &win32_termwin_vt;
@@ -1142,10 +1216,24 @@ Win32Term *win32_term_new(HWND parent, const Win32TermCallbacks *cb,
     wt->mouseptr_visible = true;
     wt->compose_keycode = 0x100;
 
+    wt->dpi = opts->dpi ? opts->dpi : USER_DEFAULT_SCREEN_DPI;
+
     win32_term_global_init();
     win32_term_init_fonts(wt);
 
-    wt->conf = win32_term_conf_new();
+    /*
+     * A size given in pixels -- "-serial vc:640x480" -- can only be turned
+     * into a character grid once the font has been measured, which is why
+     * this is here rather than in the caller.
+     */
+    if (cols <= 0 && opts->width > 0) {
+        cols = opts->width / wt->font_width;
+    }
+    if (rows <= 0 && opts->height > 0) {
+        rows = opts->height / wt->font_height;
+    }
+
+    wt->conf = win32_term_conf_new(cols, rows, opts->line_codepage);
     wt->cursor_type = conf_get_int(wt->conf, CONF_cursor_type);
     init_ucs(wt->conf, &wt->ucsdata);
 
@@ -1164,6 +1252,30 @@ Win32Term *win32_term_new(HWND parent, const Win32TermCallbacks *cb,
     }
 
     wt->term = term_init(wt->conf, &wt->ucsdata, &wt->termwin);
+
+    /*
+     * Which clipboard the mouse and the copy/paste keys use.  terminal.c
+     * leaves this to the front end (PuTTY's window.c has the same function
+     * under the same name); without it mouse_paste_clipboard stays
+     * CLIP_NULL and right-click does nothing at all.
+     */
+    assert(wt->term->mouse_select_clipboards[0] == CLIP_LOCAL);
+    wt->term->n_mouse_select_clipboards = 1;
+    if (conf_get_bool(wt->conf, CONF_mouseautocopy)) {
+        wt->term->mouse_select_clipboards[
+            wt->term->n_mouse_select_clipboards++] = CLIP_SYSTEM;
+    }
+    switch (conf_get_int(wt->conf, CONF_mousepaste)) {
+    case CLIPUI_IMPLICIT:
+        wt->term->mouse_paste_clipboard = CLIP_LOCAL;
+        break;
+    case CLIPUI_EXPLICIT:
+        wt->term->mouse_paste_clipboard = CLIP_SYSTEM;
+        break;
+    default:
+        wt->term->mouse_paste_clipboard = CLIP_NULL;
+        break;
+    }
     wt->ldisc = win32_term_ldisc_new(wt->term, cb->send, opaque);
     wt->term->ldisc = wt->ldisc;
     term_size(wt->term, wt->rows, wt->cols, WIN32_TERM_SAVELINES);
@@ -1197,6 +1309,29 @@ void win32_term_free(Win32Term *wt)
     sfree(wt);
 }
 
+void win32_term_set_dpi(Win32Term *wt, unsigned dpi)
+{
+    if (!dpi) {
+        dpi = USER_DEFAULT_SCREEN_DPI;
+    }
+    if (dpi == wt->dpi) {
+        return;
+    }
+    wt->dpi = dpi;
+
+    win32_term_free_fonts(wt);
+    win32_term_init_fonts(wt);
+
+    /*
+     * The cell size has changed, so the grid that fits the window has too.
+     * Force the recount rather than letting win32_term_resized() short out
+     * on an unchanged window size.
+     */
+    wt->cols = 0;
+    wt->rows = 0;
+    win32_term_resized(wt);
+}
+
 HWND win32_term_hwnd(Win32Term *wt)
 {
     return wt->term_hwnd;
@@ -1222,6 +1357,12 @@ void win32_term_set_focus(Win32Term *wt, bool focus)
 void win32_term_size_hint(Win32Term *wt, int cols, int rows,
                           int *width, int *height)
 {
+    if (cols <= 0) {
+        cols = wt->cols;
+    }
+    if (rows <= 0) {
+        rows = wt->rows;
+    }
     *width = cols * wt->font_width + GetSystemMetrics(SM_CXVSCROLL);
     *height = rows * wt->font_height;
 }

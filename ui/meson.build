@@ -190,7 +190,8 @@ if win32_ui
     build_by_default: false,
   )
 
-  system_ss.add(files('win32-display.c', 'win32-tabs.c'),
+  system_ss.add(files('win32-display.c', 'win32-tabs.c',
+                      'win32-term-chardev.c'),
                 win32_ui_cc.find_library('comctl32', required: true),
                 declare_dependency(link_with: [libwin32term, libputtyterm]))
 endif

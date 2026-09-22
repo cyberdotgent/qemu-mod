@@ -25,10 +25,22 @@
 #include "ui/console.h"
 #include "ui/kbd-state.h"
 
+#include "win32-term.h"
+
 #ifdef CONFIG_OPENGL
 #include "ui/egl-helpers.h"
 #include "ui/shader.h"
 #endif
+
+/*
+ * A tab is one of two things: a QemuConsole-backed graphics console, or a
+ * chardev-backed terminal (a serial port or the HMP monitor) running the
+ * vendored PuTTY terminal emulator.  struct win32_console covers both; a
+ * terminal tab has tcon set and dcl.con NULL, a graphics tab the reverse.
+ * See ui/win32-term-chardev.c for why serial and monitor consoles stop
+ * being QemuConsoles at all when this backend is in use.
+ */
+struct win32_term_console;
 
 #define WIN32_FRAME_CLASS   "QemuWin32Frame"
 #define WIN32_WINDOW_CLASS  "QemuWin32Display"
@@ -45,6 +57,9 @@ struct win32_console {
     QKbdState *kbd;
     int idx;
     int tab;                /* index in the tab control, -1 when absent */
+
+    /* non-NULL for a terminal tab; then dcl is never registered */
+    struct win32_term_console *tcon;
     int idle_counter;
 
     /* zoom, applied by stretching the blit into the child window */
@@ -118,6 +133,22 @@ void win32_toggle_fullscreen(void);
 void win32_zoom_step(double delta);
 void win32_zoom_fixed(void);
 void win32_toggle_free_scale(void);
+void win32_frame_relabel(void);
+void win32_frame_note_user_selection(void);
+
+/* ui/win32-term-chardev.c */
+void win32_term_chardev_register(void);
+int win32_term_nb_vcs(void);
+void win32_term_console_init(struct win32_console *wcon, int vc_index);
+void win32_term_console_fini(struct win32_console *wcon);
+const char *win32_term_console_label(struct win32_console *wcon);
+void win32_term_consoles_set_dpi(unsigned dpi);
+Win32Term *win32_term_console_term(struct win32_console *wcon);
+
+static inline bool win32_console_is_term(const struct win32_console *wcon)
+{
+    return wcon && wcon->tcon != NULL;
+}
 bool win32_dialog_filter(MSG *msg);
 
 #endif /* UI_WIN32_DISPLAY_H */

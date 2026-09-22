@@ -247,7 +247,7 @@ static const unsigned char default_wordness[256] = {
     2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2,
 };
 
-Conf *win32_term_conf_new(void)
+Conf *win32_term_conf_new(int cols, int rows, const char *line_codepage)
 {
     Conf *conf = conf_new();
     Filename *empty_filename;
@@ -340,8 +340,25 @@ Conf *win32_term_conf_new(void)
     conf_set_bool(conf, CONF_no_remote_wintitle, false);
     conf_set_int(conf, CONF_remote_qtitle_action, TITLE_NONE);
 
-    /* We are a Unicode terminal; UTF-8 line drawing rather than SCO ACS. */
-    conf_set_str(conf, CONF_line_codepage, "UTF-8");
+    /*
+     * The terminal's own size.  PuTTY reads this once, at term_init(); the
+     * window then resizes it to whatever actually fits.
+     */
+    if (cols > 0) {
+        conf_set_int(conf, CONF_width, cols);
+    }
+    if (rows > 0) {
+        conf_set_int(conf, CONF_height, rows);
+    }
+
+    /*
+     * A Unicode terminal by default, with UTF-8 line drawing rather than
+     * SCO ACS.  A caller that knows the far end speaks something else --
+     * "-chardev vc,encoding=cp437" -- names the codepage instead, and
+     * PuTTY's own tables do the translation.
+     */
+    conf_set_str(conf, CONF_line_codepage,
+                 line_codepage ? line_codepage : "UTF-8");
     conf_set_bool(conf, CONF_utf8linedraw, true);
     conf_set_bool(conf, CONF_true_colour, true);
     conf_set_bool(conf, CONF_xterm_256_colour, true);
@@ -386,6 +403,34 @@ Conf *win32_term_conf_new(void)
 
     /* The bell is a visual flash; a console beeping in a VM tab is rude. */
     conf_set_int(conf, CONF_beep, BELL_VISUAL);
+
+    /*
+     * Bell overload: if the far end rings the bell more than bellovl_n
+     * times in bellovl_t, shut it up until bellovl_s of quiet.  These two
+     * are LOAD_CUSTOM in conf.h, so they carry no DEFAULT_INT and the
+     * seeding loop above left them at zero, which would make the overload
+     * logic nonsense.  The figures are settings.c's, converted the way its
+     * Windows branch converts them (TICKSPERSEC is milliseconds here).
+     */
+    conf_set_int(conf, CONF_bellovl_t, 2 * TICKSPERSEC);
+    conf_set_int(conf, CONF_bellovl_s, 5 * TICKSPERSEC);
+
+    /*
+     * Clipboard bindings.  Also LOAD_CUSTOM, so also zero -- and zero is
+     * CLIPUI_NONE, which would silently disable every copy and paste
+     * shortcut.  CLIPUI_EXPLICIT means "the system clipboard".
+     *
+     * mousepaste and ctrlshiftins get PuTTY's own Windows defaults, so
+     * right-click pastes and Ctrl-Ins / Shift-Ins copy and paste.
+     * ctrlshiftcv is a deliberate departure: PuTTY leaves Ctrl-Shift-C and
+     * Ctrl-Shift-V unbound, but every Linux terminal emulator the users of
+     * this fork also run binds them, and a guest cannot see those
+     * combinations anyway.
+     */
+    conf_set_int(conf, CONF_mousepaste, CLIPUI_EXPLICIT);
+    conf_set_int(conf, CONF_ctrlshiftins, CLIPUI_EXPLICIT);
+    conf_set_int(conf, CONF_ctrlshiftcv, CLIPUI_EXPLICIT);
+    conf_set_bool(conf, CONF_mouseautocopy, true);
 
     return conf;
 }

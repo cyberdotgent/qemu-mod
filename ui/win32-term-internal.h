@@ -48,7 +48,7 @@ void win32_term_ldisc_free(Ldisc *ldisc);
  * the settings that make sense for a QEMU serial/monitor console.  See
  * ui/win32-term-shim.c for the list of deliberate overrides.
  */
-Conf *win32_term_conf_new(void);
+Conf *win32_term_conf_new(int cols, int rows, const char *line_codepage);
 
 /*
  * PuTTY expects its front end to run a main loop that services toplevel
@@ -80,6 +80,16 @@ struct Win32Term {
     Win32TermCallbacks cb;
     void *opaque;
 
+    /*
+     * Set when the last WM_KEYDOWN was fully dealt with by the key
+     * translation, so that the WM_CHAR the pump's TranslateMessage()
+     * synthesises for it can be ignored instead of sending the character
+     * twice.  PuTTY itself sidesteps this by never calling
+     * TranslateMessage(); QEMU's shared message pump does call it, because
+     * the graphics consoles need it.
+     */
+    bool key_handled;
+
     /* Keyboard state, owned by ui/win32-term-keys.c. */
     int compose_state;
     int compose_keycode;
@@ -89,6 +99,7 @@ struct Win32Term {
     /* Font, and the cell metrics that follow from it. */
     HFONT fonts[4];                    /* [bold][underline] */
     int font_width, font_height, font_descent;
+    unsigned dpi;                      /* the monitor DPI it was sized for */
 
     /* Character grid, and the padding left over in the window. */
     int cols, rows;

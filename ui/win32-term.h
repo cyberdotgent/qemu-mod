@@ -48,11 +48,27 @@ typedef struct Win32TermCallbacks {
 } Win32TermCallbacks;
 
 /*
+ * How a terminal should come up.  Zero means "you choose".
+ */
+typedef struct Win32TermOptions {
+    unsigned dpi;               /* monitor DPI; the font is sized in points */
+    int cols, rows;             /* size in characters, if known */
+    int width, height;          /* size in pixels, if that is all we have */
+    const char *line_codepage;  /* PuTTY codepage name; NULL means UTF-8 */
+} Win32TermOptions;
+
+/*
  * Create a terminal as a child window of @parent.  The window is created
  * hidden; the caller positions and shows it.
  */
 Win32Term *win32_term_new(HWND parent, const Win32TermCallbacks *cb,
-                          void *opaque);
+                          void *opaque, const Win32TermOptions *opts);
+
+/*
+ * Adopt a new monitor DPI.  The font is specified in points, so the cell
+ * size -- and therefore the whole character grid -- is re-derived.
+ */
+void win32_term_set_dpi(Win32Term *term, unsigned dpi);
 void win32_term_free(Win32Term *term);
 
 HWND win32_term_hwnd(Win32Term *term);
