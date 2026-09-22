@@ -945,12 +945,28 @@ static bool win32_2d_check_format(DisplayChangeListener *dcl,
     return format == PIXMAN_x8r8g8b8 || format == PIXMAN_a8r8g8b8;
 }
 
+/*
+ * How many messages one call may dispatch before handing control back.
+ *
+ * Draining until PeekMessage() comes up empty is the obvious thing and it
+ * is wrong here: the terminal tabs arm short Windows timers to drive
+ * PuTTY's own timer wheel, and a WM_TIMER is regenerated as soon as its
+ * interval has passed.  If a batch of terminal output takes longer to
+ * process than that interval -- which, for a guest spewing a boot log, it
+ * does -- the queue refills exactly as fast as it drains and this loop
+ * never ends.  Control never returns to QEMU's main loop, so the guest
+ * stops as well as the window.  A budget makes that a slow frame instead
+ * of a hang.
+ */
+#define WIN32_MAX_DISPATCH_PER_POLL 256
+
 static void win32_poll_events(struct win32_console *wcon)
 {
     MSG msg;
     bool idle = true;
+    int budget = WIN32_MAX_DISPATCH_PER_POLL;
 
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+    while (budget-- > 0 && PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
         idle = false;
         /*
          * A dialog owned by the frame needs IsDialogMessage() to see its
@@ -994,10 +1010,21 @@ static QEMUTimer *win32_pump_timer;
 
 static void win32_pump_tick(void *opaque)
 {
-    win32_poll_events(NULL);
+    /*
+     * Re-arm *before* dispatching, never after.  A window procedure that
+     * does not return normally -- an access violation swallowed by a
+     * vectored handler, say -- would otherwise unwind past the re-arm and
+     * leave this timer dead for the rest of the session, taking the whole
+     * UI with it, because nothing else drives it.  That is not a
+     * theoretical worry: it is precisely the difference between this path
+     * and the one a graphics console uses, where QEMU's own display timer
+     * keeps calling us whatever happened last frame, so one bad dispatch
+     * costs a frame instead of the session.
+     */
     timer_mod(win32_pump_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
               GUI_REFRESH_INTERVAL_DEFAULT);
+    win32_poll_events(NULL);
 }
 
 static void win32_2d_refresh(DisplayChangeListener *dcl)

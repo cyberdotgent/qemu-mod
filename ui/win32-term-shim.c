@@ -167,32 +167,76 @@ void timer_change_notify(unsigned long next)
     timer_next = next;
 }
 
+/*
+ * How many queued callbacks one pump may run before giving the caller its
+ * thread back.  A callback is free to queue another -- term_out_cb() does
+ * exactly that when there is more output than it wants to process in one
+ * go -- so this loop needs a bound or a fast producer could hold the QEMU
+ * main loop indefinitely.
+ */
+#define WIN32_TERM_CALLBACK_BUDGET 64
+
 bool win32_term_pump(unsigned long *next)
 {
-    unsigned long now = GETTICKCOUNT();
+    static bool running;
+    unsigned long now;
+    int budget = WIN32_TERM_CALLBACK_BUDGET;
 
-    run_toplevel_callbacks();
+    /*
+     * A callback can reach back into us: a terminal query reply goes out
+     * through the ldisc to the chardev, whose far end may write straight
+     * back, and that write kicks the pump again.  PuTTY's queue is not
+     * re-entrant, and it does not need to be -- the outer call will pick up
+     * anything left behind.
+     */
+    if (running) {
+        return false;
+    }
+    running = true;
 
-    if (timer_pending) {
+    /*
+     * run_toplevel_callbacks() runs exactly one callback and says whether
+     * it found one.  Calling it once per pump, which is what this used to
+     * do, left the rest of the queue stranded until something happened to
+     * kick us again -- so a burst of terminal output was processed one
+     * fragment per keystroke.
+     */
+    while (budget-- > 0 && run_toplevel_callbacks()) {
+        /* nothing; the work is the callback */
+    }
+
+    now = GETTICKCOUNT();
+    if (timer_pending && (long)(now - timer_next) >= 0) {
         /*
          * run_timers() wants to be told the current time and gives back
          * the next deadline, if any.  Comparing tick counts by subtraction
          * is deliberate: GetTickCount() wraps every 49 days.
          */
         unsigned long then;
-        if ((long)(now - timer_next) >= 0) {
-            timer_pending = false;
-            if (run_timers(now, &then)) {
-                timer_pending = true;
-                timer_next = then;
-            }
+
+        timer_pending = false;
+        if (run_timers(now, &then)) {
+            timer_pending = true;
+            timer_next = then;
         }
     }
 
+    running = false;
+
+    /*
+     * Work left over -- either the budget ran out or a timer is due later.
+     * Either way the caller must arrange to come back, or the terminal
+     * stops dead until the next keystroke.
+     */
+    if (toplevel_callback_pending()) {
+        *next = GETTICKCOUNT();
+        return true;
+    }
     if (timer_pending) {
         *next = timer_next;
+        return true;
     }
-    return timer_pending;
+    return false;
 }
 
 /*

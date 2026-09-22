@@ -120,6 +120,7 @@ struct Win32Term {
     bool raw_mouse;                    /* the guest asked for mouse events */
     bool mouseptr_visible;
     bool caret_created;
+    bool flashing;                     /* a visual bell is on screen */
     int caret_x, caret_y;
     int cursor_type;                   /* CURSOR_BLOCK/UNDERLINE/VERTICAL */
 

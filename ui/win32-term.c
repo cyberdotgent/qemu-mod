@@ -37,6 +37,12 @@
 
 #define WIN32_TERM_CLASS "QemuWin32Term"
 
+/* Windows timer ids on the terminal window, and the intervals they use. */
+#define WIN32_TERM_TIMER_ID 1           /* drives PuTTY's own timer wheel */
+#define WIN32_TERM_FLASH_TIMER_ID 2     /* ends a visual bell */
+#define WIN32_TERM_FLASH_MS 40
+#define WIN32_TERM_MIN_TIMER_MS 10
+
 /* Indices into Win32Term::fonts. */
 #define FONTF_BOLD  1
 #define FONTF_UNDER 2
@@ -52,6 +58,47 @@
 static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
                                            WPARAM wp, LPARAM lp);
 static void win32_term_kick_timer(Win32Term *wt);
+
+/*
+ * Opt the window into the Explorer visual style.
+ *
+ * The scrollbar here is the non-client one that WS_VSCROLL gives us, and a
+ * non-client scrollbar on a class of our own does not pick up the modern
+ * theme by itself, even though the ComCtl32 v6 manifest is present and
+ * working (the About box's SysLink proves that).  Naming a theme class
+ * explicitly is what Explorer itself does.
+ *
+ * We keep the non-client scrollbar rather than putting a child SCROLLBAR
+ * control there.  A child control would look identical and would enter the
+ * same modal tracking loop on mouse-down -- that loop is DefWindowProc's,
+ * not the scrollbar's -- so it would buy nothing, and drawing and tracking
+ * one by hand would be a lot of new code to end up less native.  The modal
+ * loop stalling QEMU's main loop is a real problem, but it is not this
+ * window's to fix: dragging or resizing any QEMU window, or opening the
+ * menu, does the same thing.
+ *
+ * Failure is not interesting: a machine with no theme service, or a
+ * classic-appearance setting, simply keeps the old look.
+ */
+static void win32_term_apply_theme(HWND hwnd)
+{
+    typedef HRESULT(WINAPI * set_window_theme_fn)(HWND, LPCWSTR, LPCWSTR);
+    static set_window_theme_fn set_window_theme;
+    static bool looked_up;
+
+    if (!looked_up) {
+        HMODULE uxtheme = LoadLibraryA("uxtheme.dll");
+
+        looked_up = true;
+        if (uxtheme) {
+            set_window_theme = (set_window_theme_fn)(void *)
+                GetProcAddress(uxtheme, "SetWindowTheme");
+        }
+    }
+    if (set_window_theme) {
+        set_window_theme(hwnd, L"Explorer", NULL);
+    }
+}
 
 static inline Win32Term *win32_term_from_hwnd(HWND hwnd)
 {
@@ -563,18 +610,28 @@ static void wintw_bell(TermWin *tw, int mode)
 
     if (mode == BELL_VISUAL) {
         /*
-         * Invert the whole window briefly.  Done synchronously with two
-         * repaints rather than with a timer, because a terminal that is
-         * beeping is a terminal nobody is watching closely.
+         * Invert the window, and put it back on a timer.
+         *
+         * This used to Sleep(20) between the two inversions, which was a
+         * bad idea for a reason that has nothing to do with the bell: we
+         * are called from the chardev, on QEMU's main thread, inside its
+         * main loop.  Sleeping there stops the guest as well as the UI, and
+         * a guest that emits a run of BELs -- a boot log hitting an error
+         * path, say -- would stall the whole emulator 20ms at a time.
+         * Nothing here may block.
          */
-        HDC hdc = GetDC(wt->term_hwnd);
-        if (hdc) {
-            RECT r;
-            GetClientRect(wt->term_hwnd, &r);
-            InvertRect(hdc, &r);
-            Sleep(20);
-            InvertRect(hdc, &r);
-            ReleaseDC(wt->term_hwnd, hdc);
+        if (!wt->flashing && wt->term_hwnd) {
+            HDC hdc = GetDC(wt->term_hwnd);
+
+            if (hdc) {
+                RECT r;
+                GetClientRect(wt->term_hwnd, &r);
+                InvertRect(hdc, &r);
+                ReleaseDC(wt->term_hwnd, hdc);
+                wt->flashing = true;
+                SetTimer(wt->term_hwnd, WIN32_TERM_FLASH_TIMER_ID,
+                         WIN32_TERM_FLASH_MS, NULL);
+            }
         }
     } else if (mode != BELL_DISABLED) {
         MessageBeep(MB_OK);
@@ -866,7 +923,6 @@ static void win32_term_resized(Win32Term *wt)
  * callback queue.
  */
 
-#define WIN32_TERM_TIMER_ID 1
 
 static void win32_term_kick_timer(Win32Term *wt)
 {
@@ -875,8 +931,16 @@ static void win32_term_kick_timer(Win32Term *wt)
     if (win32_term_pump(&next)) {
         unsigned long now = GETTICKCOUNT();
         long delay = (long)(next - now);
-        if (delay < 1) {
-            delay = 1;
+        /*
+         * Never ask for a Windows timer faster than the shortest interval
+         * PuTTY actually wants (its display coalescing is 20ms and its
+         * cursor blink far longer).  A 1ms timer regenerates its WM_TIMER
+         * as fast as the message pump can drain it, which starves QEMU's
+         * main loop; see WIN32_MAX_DISPATCH_PER_POLL in ui/win32-display.c
+         * for the other half of that story.
+         */
+        if (delay < WIN32_TERM_MIN_TIMER_MS) {
+            delay = WIN32_TERM_MIN_TIMER_MS;
         }
         if (delay > 1000) {
             delay = 1000;
@@ -1197,7 +1261,18 @@ static LRESULT CALLBACK win32_term_wndproc(HWND hwnd, UINT msg,
             win32_term_kick_timer(wt);
             return 0;
         }
+        if (wp == WIN32_TERM_FLASH_TIMER_ID) {
+            KillTimer(hwnd, WIN32_TERM_FLASH_TIMER_ID);
+            wt->flashing = false;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         break;
+
+    case WM_THEMECHANGED:
+        win32_term_apply_theme(hwnd);
+        InvalidateRect(hwnd, NULL, TRUE);
+        return 0;
 
     case WM_ERASEBKGND: {
         /*
@@ -1298,6 +1373,9 @@ Win32Term *win32_term_new(HWND parent, const Win32TermCallbacks *cb,
         0, WIN32_TERM_CLASS, "", WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN,
         0, 0, wt->cols * wt->font_width, wt->rows * wt->font_height,
         parent, NULL, GetModuleHandle(NULL), wt);
+    if (wt->term_hwnd) {
+        win32_term_apply_theme(wt->term_hwnd);
+    }
     if (!wt->term_hwnd) {
         win32_term_free_fonts(wt);
         conf_free(wt->conf);
@@ -1346,6 +1424,7 @@ void win32_term_free(Win32Term *wt)
     }
     if (wt->term_hwnd) {
         KillTimer(wt->term_hwnd, WIN32_TERM_TIMER_ID);
+        KillTimer(wt->term_hwnd, WIN32_TERM_FLASH_TIMER_ID);
         SetWindowLongPtr(wt->term_hwnd, GWLP_USERDATA, 0);
         DestroyWindow(wt->term_hwnd);
         wt->term_hwnd = NULL;
