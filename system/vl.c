@@ -231,6 +231,7 @@ static const struct {
     { .driver = "virtio-vga-gl",        .flag = &default_vga       },
     { .driver = "virtio-vga-rutabaga",  .flag = &default_vga       },
     { .driver = "s3-trio",              .flag = &default_vga       },
+    { .driver = "s3-vision864",         .flag = &default_vga       },
 };
 
 static QemuOptsList qemu_rtc_opts = {
@@ -1108,6 +1109,11 @@ static const VGAInterfaceInfo vga_interfaces[VGA_TYPE_MAX] = {
         .opt_name = "s3",
         .name = "S3 Trio",
         .class_names = { "s3-trio" },
+    },
+    [VGA_S3_VISION864] = {
+        .opt_name = "vision864",
+        .name = "S3 Vision864",
+        .class_names = { "s3-vision864" },
     },
 };
 

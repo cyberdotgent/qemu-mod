@@ -486,7 +486,7 @@ static void ibm_40p_machine_init(MachineClass *mc)
     mc->block_default_type = IF_SCSI;
     mc->default_boot_order = "c";
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
-    mc->default_display = "s3";
+    mc->default_display = "vision864";
     mc->default_nic = "pcnet";
     compat_props_add(mc->compat_props, hw_compat_ibm_40p,
                      hw_compat_ibm_40p_len);

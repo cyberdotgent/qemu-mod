@@ -47,7 +47,83 @@
 #include "hw/display/i2c-ddc.h"
 #include "hw/display/edid.h"
 
-#define TYPE_S3_TRIO "s3-trio"
+#define TYPE_S3_VGA "s3-vga"
+
+/*
+ * ---- Chip variants -----------------------------------------------------
+ *
+ * This model covers two members of the S3 86C8xx family.  They share the
+ * VGA core, the extended CRTC set, the linear address window and the
+ * 8514/A-derived drawing engine; they differ in how they identify
+ * themselves and in where the pixel format comes from:
+ *
+ *   Trio64 (86C764/86C765, 5333:8811)
+ *      Integrated RAMDAC and clock synthesiser.  The pixel format is
+ *      selected by CR67 bits 7-4.
+ *
+ *   Vision864 (86C864, 5333:88c0)
+ *      No integrated RAMDAC.  Boards of the Paradise Bahamas64 / IBM E15
+ *      class pair it with an external S3 86C716 "SDAC", an ICS5342
+ *      derivative that is also the pixel clock synthesiser, and the pixel
+ *      format is selected by the SDAC command register.
+ *
+ * The register values follow 86Box's src/video/vid_s3.c: s3_in() for
+ * CR2D-CR30 and s3_init() for the per-card identification and the CR36 /
+ * CR37 / CR5A power-up values.
+ */
+typedef enum S3ChipKind {
+    S3_CHIP_TRIO64,
+    S3_CHIP_VISION864,
+} S3ChipKind;
+
+typedef struct S3ChipInfo {
+    S3ChipKind kind;
+    uint16_t pci_device_id;
+    uint8_t cr2d;        /* extended chip ID */
+    uint8_t cr2e;        /* new chip ID */
+    uint8_t cr2f;        /* revision level */
+    uint8_t cr30;        /* chip ID, readable once CR38/CR39 are unlocked */
+    uint8_t cr36_reset;  /* configuration 1, bits 4-0 (bus type) */
+    uint8_t cr37_reset;  /* configuration 2 */
+    uint8_t cr5a_reset;  /* linear address window position, bits 23-16 */
+    const char *desc;
+} S3ChipInfo;
+
+static const S3ChipInfo s3_chip_trio64 = {
+    .kind = S3_CHIP_TRIO64,
+    .pci_device_id = PCI_DEVICE_ID_S3_TRIO,
+    .cr2d = 0x88,
+    .cr2e = 0x11,   /* 86C764 */
+    .cr2f = 0x40,   /* Trio64V+ */
+    .cr30 = 0xe1,
+    /*
+     * CR36/CR37/CR5A are left at zero for the Trio64.  86Box has the video
+     * BIOS put the bus type in CR36 bits 4-0 and 0xe5 in CR37, but this
+     * model has been read by OpenBIOS and by AIX with those bits clear
+     * since it was written, so they stay that way rather than perturb a
+     * path that works.
+     */
+    .desc = "S3 Trio64 VGA",
+};
+
+static const S3ChipInfo s3_chip_vision864 = {
+    .kind = S3_CHIP_VISION864,
+    .pci_device_id = PCI_DEVICE_ID_S3_VISION864,
+    .cr2d = 0x88,
+    /*
+     * 86Box sets id, id_ext and id_ext_pci all to the stepping: 0xc0 for
+     * the Vision864 and 0xc1 for the Vision864P.  0xc0 is the one AIX has
+     * an X11 display driver for (devices.pci.3353c088, /usr/lpp/gai/
+     * pci3353c088), so that is the part this model presents.
+     */
+    .cr2e = 0xc0,
+    .cr2f = 0x00,   /* 86Box returns 0 for everything below Trio64V+ */
+    .cr30 = 0xc0,
+    .cr36_reset = 0x1e,  /* PCI: 2 | (3 << 2) | (1 << 4) */
+    .cr37_reset = 0xe5,  /* 1 | (7 << 5) | 0x04 for chips >= 86C928 */
+    .cr5a_reset = 0x0a,
+    .desc = "S3 Vision864 VGA",
+};
 
 /*
  * 8514/A-style graphics engine registers.  Ports are xxE8 in I/O space; the
@@ -213,6 +289,18 @@ typedef struct S3TrioState {
 
     uint8_t unlock_pll;
 
+    const S3ChipInfo *chip;
+
+    /* external S3 86C716 "SDAC", present on Vision864 boards only */
+    struct {
+        uint16_t regs[256];
+        uint8_t magic_count;
+        uint8_t windex;
+        uint8_t rindex;
+        uint8_t command;
+        bool reg_ff;
+    } sdac;
+
     /* hardware cursor (CR45-CR4F, CR55) */
     uint32_t hwc_fg_col;
     uint32_t hwc_bg_col;
@@ -228,7 +316,12 @@ typedef struct S3TrioState {
     MemoryRegion vga_mem;
 } S3TrioState;
 
-OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
+struct S3TrioClass {
+    PCIDeviceClass parent_class;
+    const S3ChipInfo *chip;
+};
+
+OBJECT_DECLARE_TYPE(S3TrioState, S3TrioClass, S3_VGA)
 
 static bool s3_enhanced_mode(S3TrioState *s);
 static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val);
@@ -1973,12 +2066,192 @@ static void s3_trio_enable_writeb(void *opaque, uint32_t addr, uint32_t val)
     trace_s3_vga_enable_writeb(addr, val);
 }
 
+/*
+ * ---- S3 86C716 "SDAC" --------------------------------------------------
+ *
+ * The Vision864 has no RAMDAC of its own; the board carries an external
+ * 86C716, an ICS5342 derivative that also contains the pixel clock
+ * synthesiser.  It sits in the DAC window (03C6-03C9, and the S3 alias at
+ * 02EA-02ED) and decodes one extra address bit, RS2, on top of the two
+ * from the port number.  RS2 comes from CR55 bit 0 or CR43 bit 1, and
+ * selects the PLL index/data and command registers instead of the plain
+ * VGA palette ports:
+ *
+ *   RS 0,1,3   pass through to the VGA palette registers
+ *   RS 2       pixel mask; four reads in a row arm it, after which the
+ *              fifth access reaches the command register.  The fourth
+ *              read returns 0x70, which is how software tells an S3 SDAC
+ *              from a plain VGA DAC.
+ *   RS 4/7     PLL write/read index          RS 5  PLL data (16 bit)
+ *   RS 6       command register
+ *
+ * Transcribed from 86Box's src/video/ramdac/vid_ramdac_sdac.c
+ * (sdac_ramdac_in/out, sdac_reg_read/write, sdac_control_write).
+ */
+static int s3_sdac_get_bpp(S3TrioState *s);
+
+static int s3_sdac_rs(S3TrioState *s, uint32_t addr)
+{
+    int rs = addr & 0x03;
+
+    if ((s->vga.cr[0x55] & 0x01) || (s->vga.cr[0x43] & 0x02)) {
+        rs |= 0x04;
+    }
+    return rs;
+}
+
+static uint8_t s3_sdac_reg_read(S3TrioState *s)
+{
+    uint16_t reg = s->sdac.regs[s->sdac.rindex];
+    uint8_t val = s->sdac.reg_ff ? (reg >> 8) : (reg & 0xff);
+
+    s->sdac.reg_ff = !s->sdac.reg_ff;
+    if (!s->sdac.reg_ff) {
+        s->sdac.rindex++;
+    }
+    return val;
+}
+
+static void s3_sdac_reg_write(S3TrioState *s, uint8_t val)
+{
+    uint8_t reg = s->sdac.windex;
+
+    /* only the PLL and control words are writable */
+    if ((reg >= 2 && reg <= 7) || reg == 0x0a || reg == 0x0e) {
+        if (!s->sdac.reg_ff) {
+            s->sdac.regs[reg] = (s->sdac.regs[reg] & 0xff00) | val;
+        } else {
+            s->sdac.regs[reg] = (s->sdac.regs[reg] & 0x00ff) | (val << 8);
+        }
+    }
+    s->sdac.reg_ff = !s->sdac.reg_ff;
+    if (!s->sdac.reg_ff) {
+        s->sdac.windex++;
+    }
+}
+
+/*
+ * vga_addr is the address the access would carry in the 03C6-03C9 window;
+ * the 02EA-02ED alias is folded onto it by the caller.
+ */
+static uint32_t s3_sdac_read(S3TrioState *s, uint32_t addr, uint32_t vga_addr)
+{
+    int rs = s3_sdac_rs(s, addr);
+    uint32_t val;
+
+    if (rs != 0x02) {
+        s->sdac.magic_count = 0;
+    }
+
+    switch (rs) {
+    case 0x02:
+        switch (s->sdac.magic_count) {
+        case 1:
+        case 2:
+            val = 0x00;
+            s->sdac.magic_count++;
+            break;
+        case 3:
+            val = 0x70; /* S3 SDAC signature */
+            s->sdac.magic_count++;
+            break;
+        case 4:
+            val = s->sdac.command;
+            s->sdac.magic_count = 0;
+            break;
+        default:
+            val = vga_ioport_read(&s->vga, vga_addr);
+            s->sdac.magic_count++;
+            break;
+        }
+        break;
+    case 0x04:
+        val = s->sdac.windex;
+        break;
+    case 0x05:
+        val = s3_sdac_reg_read(s);
+        break;
+    case 0x06:
+        val = s->sdac.command;
+        break;
+    case 0x07:
+        val = s->sdac.rindex;
+        break;
+    default:
+        val = vga_ioport_read(&s->vga, vga_addr);
+        break;
+    }
+    trace_s3_vga_sdac_read(addr, rs, val);
+    return val;
+}
+
+static void s3_sdac_write(S3TrioState *s, uint32_t addr, uint32_t vga_addr,
+                          uint32_t val)
+{
+    int rs = s3_sdac_rs(s, addr);
+
+    trace_s3_vga_sdac_write(addr, rs, val);
+
+    if (rs != 0x02) {
+        s->sdac.magic_count = 0;
+    }
+
+    switch (rs) {
+    case 0x02:
+        if (s->sdac.magic_count == 4) {
+            s->sdac.command = val;
+            s->sdac.magic_count = 0;
+            trace_s3_vga_sdac_command(val, s3_sdac_get_bpp(s));
+        } else {
+            vga_ioport_write(&s->vga, vga_addr, val);
+        }
+        break;
+    case 0x04:
+        s->sdac.windex = val;
+        s->sdac.reg_ff = false;
+        break;
+    case 0x05:
+        s3_sdac_reg_write(s, val);
+        break;
+    case 0x06:
+        s->sdac.command = val;
+        trace_s3_vga_sdac_command(val, s3_sdac_get_bpp(s));
+        break;
+    case 0x07:
+        s->sdac.rindex = val;
+        s->sdac.reg_ff = false;
+        break;
+    default:
+        vga_ioport_write(&s->vga, vga_addr, val);
+        break;
+    }
+}
+
+/* DAC window access, used for both 03C6-03C9 and the 02EA-02ED alias */
+static uint32_t s3_dac_read(S3TrioState *s, uint32_t addr, uint32_t vga_addr)
+{
+    if (s->chip->kind == S3_CHIP_VISION864) {
+        return s3_sdac_read(s, addr, vga_addr);
+    }
+    return vga_ioport_read(&s->vga, vga_addr);
+}
+
+static void s3_dac_write(S3TrioState *s, uint32_t addr, uint32_t vga_addr,
+                         uint32_t val)
+{
+    if (s->chip->kind == S3_CHIP_VISION864) {
+        s3_sdac_write(s, addr, vga_addr, val);
+        return;
+    }
+    vga_ioport_write(&s->vga, vga_addr, val);
+}
+
 static uint32_t s3_trio_dac_ioport_readb(void *opaque, uint32_t addr)
 {
     S3TrioState *s = opaque;
     uint32_t val;
 
-    val = vga_ioport_read(&s->vga, addr - 0x2ea + VGA_PEL_MSK);
+    val = s3_dac_read(s, addr, addr - 0x2ea + VGA_PEL_MSK);
     trace_s3_vga_dac_readb(addr, val);
     return val;
 }
@@ -1987,7 +2260,7 @@ static void s3_trio_dac_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
 {
     S3TrioState *s = opaque;
     trace_s3_vga_dac_writeb(addr, val);
-    vga_ioport_write(&s->vga, addr - 0x2ea + VGA_PEL_MSK, val);
+    s3_dac_write(s, addr, addr - 0x2ea + VGA_PEL_MSK, val);
 }
 
 /*
@@ -2028,12 +2301,43 @@ static bool s3_enhanced_mode(S3TrioState *s)
  * is what previous versions of this model always did and what the OpenBIOS
  * FCode for this card relies on.
  */
+/*
+ * Vision864 pixel format, from the SDAC command register bits 7-4
+ * (86Box sdac_control_write(), ICS_5342 case).
+ */
+static int s3_sdac_get_bpp(S3TrioState *s)
+{
+    switch (s->sdac.command >> 4) {
+    case 0x02:
+    case 0x03:
+    case 0x08:
+    case 0x0a:
+        return 15;
+    case 0x05:
+    case 0x06:
+    case 0x0c:
+        return 16;
+    case 0x04:
+    case 0x09:
+    case 0x0e:
+        return 24;
+    case 0x07:
+        return 32;
+    default:
+        /* 0x00 and 0x01 are both 8bpp; 0x01 reads two pixels at a time */
+        return 8;
+    }
+}
+
 static int s3_trio_get_bpp(VGACommonState *vga)
 {
     S3TrioState *s = container_of(vga, S3TrioState, vga);
 
     if (!s3_enhanced_mode(s)) {
         return 8;
+    }
+    if (s->chip->kind == S3_CHIP_VISION864) {
+        return s3_sdac_get_bpp(s);
     }
     switch (vga->cr[0x67] >> 4) {
     case 3:
@@ -2073,16 +2377,40 @@ static void s3_trio_get_resolution(VGACommonState *vga, int *pwidth,
     height += 1;
 
     if (s3_enhanced_mode(s)) {
-        switch (s3_trio_get_bpp(vga)) {
-        case 15:
-        case 16:
-            width /= 2;
-            break;
-        case 24:
-            width /= 3;
-            break;
-        default:
-            break;
+        int bpp = s3_trio_get_bpp(vga);
+
+        if (s->chip->kind == S3_CHIP_VISION864) {
+            /*
+             * 86Box s3_recalctimings(), S3_VISION864 cases: the CRTC counts
+             * two dots per pixel at 15/16bpp, three dots per two pixels at
+             * 24bpp and four dots per pixel at 32bpp.
+             */
+            switch (bpp) {
+            case 15:
+            case 16:
+                width /= 2;
+                break;
+            case 24:
+                width = (width * 2) / 3;
+                break;
+            case 32:
+                width /= 4;
+                break;
+            default:
+                break;
+            }
+        } else {
+            switch (bpp) {
+            case 15:
+            case 16:
+                width /= 2;
+                break;
+            case 24:
+                width /= 3;
+                break;
+            default:
+                break;
+            }
         }
     }
     *pwidth = width;
@@ -2401,15 +2729,15 @@ static uint32_t s3_crtc_read(S3TrioState *s, uint8_t index)
     uint8_t *cr = s->vga.cr;
 
     switch (index) {
-    case 0x2d: /* extended chip ID: 0x88 for Trio32/Trio64 */
-        return 0x88;
-    case 0x2e: /* new chip ID: 0x11 = Trio64 (86C764) */
-        return 0x11;
-    case 0x2f: /* revision level: 0x40 = Trio64V+ */
-        return 0x40;
-    case 0x30: /* chip ID: 0xE1 = Trio64, readable when unlocked */
+    case 0x2d: /* extended chip ID */
+        return s->chip->cr2d;
+    case 0x2e: /* new chip ID */
+        return s->chip->cr2e;
+    case 0x2f: /* revision level */
+        return s->chip->cr2f;
+    case 0x30: /* chip ID, readable only once CR38/CR39 are unlocked */
         return (((cr[0x38] & 0xcc) == 0x48) || ((cr[0x39] & 0xe0) == 0xa0))
-            ? 0xe1 : 0xff;
+            ? s->chip->cr30 : 0xff;
     case 0x36:
     {
         /* configuration 1: bits 7-5 encode the installed memory */
@@ -2552,6 +2880,12 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
     case VGA_CRT_DC:
         val = s3_crtc_read(s, s->vga.cr_index);
         break;
+    case VGA_PEL_MSK:
+    case VGA_PEL_IR:
+    case VGA_PEL_IW:
+    case VGA_PEL_D:
+        val = s3_dac_read(s, addr, addr);
+        break;
     case VGA_SEQ_D:
         switch (s->vga.sr_index) {
         case 0x17: /* CLKSYN */
@@ -2597,6 +2931,12 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     case VGA_CRT_DM:
     case VGA_CRT_DC:
         s3_crtc_write(s, addr, s->vga.cr_index, val);
+        break;
+    case VGA_PEL_MSK:
+    case VGA_PEL_IR:
+    case VGA_PEL_IW:
+    case VGA_PEL_D:
+        s3_dac_write(s, addr, addr, val);
         break;
     case VGA_SEQ_I:
         s->vga.sr_index = val;
@@ -2728,8 +3068,32 @@ static int s3_trio_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool s3_sdac_needed(void *opaque)
+{
+    S3TrioState *s = opaque;
+
+    return s->chip->kind == S3_CHIP_VISION864;
+}
+
+static const VMStateDescription vmstate_s3_sdac = {
+    .name = "s3-vga/sdac",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = s3_sdac_needed,
+    .fields = (VMStateField []) {
+        VMSTATE_UINT16_ARRAY(sdac.regs, S3TrioState, 256),
+        VMSTATE_UINT8(sdac.magic_count, S3TrioState),
+        VMSTATE_UINT8(sdac.windex, S3TrioState),
+        VMSTATE_UINT8(sdac.rindex, S3TrioState),
+        VMSTATE_UINT8(sdac.command, S3TrioState),
+        VMSTATE_BOOL(sdac.reg_ff, S3TrioState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static VMStateDescription vmstate_s3_trio = {
-    .name = TYPE_S3_TRIO,
+    /* kept as the historical name so existing s3-trio streams still load */
+    .name = "s3-trio",
     .version_id = 4,
     .minimum_version_id = 4,
     .post_load = s3_trio_post_load,
@@ -2800,6 +3164,10 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT8(serialport, S3TrioState),
         VMSTATE_END_OF_LIST()
     },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_s3_sdac,
+        NULL
+    },
 };
 
 static const Property s3_trio_properties[] = {
@@ -2816,7 +3184,7 @@ static const Property s3_trio_properties[] = {
 static void s3_trio_pci_write_config(PCIDevice *dev, uint32_t address,
                                      uint32_t val, int len)
 {
-    S3TrioState *s = S3_TRIO(dev);
+    S3TrioState *s = S3_VGA(dev);
 
     pci_default_write_config(dev, address, val, len);
 
@@ -2831,7 +3199,7 @@ static void s3_trio_pci_write_config(PCIDevice *dev, uint32_t address,
 
 static void s3_trio_reset(DeviceState *d)
 {
-    S3TrioState *s = S3_TRIO(d);
+    S3TrioState *s = S3_VGA(d);
 
     vga_common_reset(&s->vga);
 
@@ -2867,13 +3235,22 @@ static void s3_trio_reset(DeviceState *d)
     s->last_hwc_x = s->last_hwc_y = s->last_hwc_ysize = 0;
     s->vga.force_shadow = false;
     s->serialport = 0;
+    memset(&s->sdac, 0, sizeof(s->sdac));
+    /*
+     * Power-up values a video BIOS would leave behind on a PC.  There is no
+     * video BIOS here, so the model supplies them itself; the Trio64
+     * descriptor keeps them at zero (see s3_chip_trio64).
+     */
+    s->vga.cr[0x36] = s->chip->cr36_reset;
+    s->vga.cr[0x37] = s->chip->cr37_reset;
+    s->vga.cr[0x5a] = s->chip->cr5a_reset;
     s3_update_new_mmio(s);
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
 
 {
-    S3TrioState *s = S3_TRIO(dev);
+    S3TrioState *s = S3_VGA(dev);
     Object *o = OBJECT(dev);
 
     /* setup VGA */
@@ -2956,44 +3333,58 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
 
 static void s3_trio_instance_init(Object *o)
 {
-    S3TrioState *s = S3_TRIO(o);
+    S3TrioState *s = S3_VGA(o);
 
+    s->chip = S3_VGA_GET_CLASS(s)->chip;
     object_initialize_child(o, "edid", &s->i2cddc, TYPE_I2CDDC);
 }
 
-static void s3_trio_class_init(ObjectClass *klass, const void *data)
+static void s3_vga_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    S3TrioClass *sc = S3_VGA_CLASS(klass);
+    const S3ChipInfo *chip = data;
 
+    sc->chip = chip;
     k->realize = s3_trio_realize;
     k->config_write = s3_trio_pci_write_config;
     //k->romfile = "vgabios-s3.bin";
     k->vendor_id = PCI_VENDOR_ID_S3;
-    k->device_id = PCI_DEVICE_ID_S3_TRIO;
+    k->device_id = chip->pci_device_id;
     k->class_id = PCI_CLASS_DISPLAY_VGA;
     device_class_set_legacy_reset(dc, s3_trio_reset);
-    dc->desc = "S3 Trio 32 VGA";
+    dc->desc = chip->desc;
     dc->vmsd  = &vmstate_s3_trio;
     device_class_set_props(dc, s3_trio_properties);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 
-static const TypeInfo s3_trio_info = {
-    .name          = "s3-trio",
-    .parent        = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(S3TrioState),
-    .instance_init = s3_trio_instance_init,
-    .class_init    = s3_trio_class_init,
-    .interfaces = (const InterfaceInfo[]) {
-        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
-        { },
+static const TypeInfo s3_vga_types[] = {
+    {
+        .name          = TYPE_S3_VGA,
+        .parent        = TYPE_PCI_DEVICE,
+        .instance_size = sizeof(S3TrioState),
+        .class_size    = sizeof(S3TrioClass),
+        .instance_init = s3_trio_instance_init,
+        .abstract      = true,
+        .interfaces = (const InterfaceInfo[]) {
+            { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+            { },
+        },
+    },
+    {
+        .name       = "s3-trio",
+        .parent     = TYPE_S3_VGA,
+        .class_init = s3_vga_class_init,
+        .class_data = &s3_chip_trio64,
+    },
+    {
+        .name       = "s3-vision864",
+        .parent     = TYPE_S3_VGA,
+        .class_init = s3_vga_class_init,
+        .class_data = &s3_chip_vision864,
     },
 };
 
-static void s3_register_types(void)
-{
-    type_register_static(&s3_trio_info);
-}
-
-type_init(s3_register_types)
+DEFINE_TYPES(s3_vga_types)

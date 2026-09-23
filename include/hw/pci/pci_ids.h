@@ -282,6 +282,7 @@
 
 #define PCI_VENDOR_ID_S3                 0x5333
 #define PCI_DEVICE_ID_S3_TRIO            0x8811
+#define PCI_DEVICE_ID_S3_VISION864       0x88c0
 
 #define PCI_VENDOR_ID_XEN                0x5853
 #define PCI_DEVICE_ID_XEN_PLATFORM       0x0001
