@@ -20,6 +20,23 @@
  * terminal of their own, and the frame's tab strip therefore has two kinds
  * of tab: QemuConsole-backed graphics tabs, and these.  That is the same
  * shape ui/gtk.c has had for years (GD_VC_GFX vs GD_VC_VTE).
+ *
+ * Both directions cross a thread boundary here, because the terminal
+ * belongs to the UI thread and the chardev to QEMU's main loop:
+ *
+ *   QEMU -> UI.  chr_write arrives on the QEMU thread and may not touch
+ *   the PuTTY terminal at all.  The bytes go into in_fifo and the UI
+ *   thread is told to come and get them; win32_term_console_drain() is the
+ *   other end.
+ *
+ *   UI -> QEMU.  The user typing arrives on the UI thread, via PuTTY's
+ *   ldisc, and qemu_chr_be_write() needs the BQL.  out_fifo is the buffer
+ *   that was already there for the chardev's own flow control; it is now
+ *   also the handover, so it is taken under tcon->lock.
+ *
+ * Lock order is always BQL before tcon->lock.  Nothing takes them the
+ * other way round, and nothing holds either across a call into the other
+ * side.
  */
 
 #include "qemu/osdep.h"
@@ -29,7 +46,9 @@
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/fifo8.h"
+#include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qom/object.h"
 
@@ -51,11 +70,27 @@
 /* How much typed-but-not-yet-accepted input we are willing to hold. */
 #define WIN32_VC_FIFO_SIZE 4096
 
+/*
+ * How much guest output we are willing to hold for a UI thread that is not
+ * collecting it.  The only thing that stops it collecting is a Windows
+ * modal loop -- a held menu, a drag -- and ten seconds of that at the rate
+ * a 16550 can actually deliver is a couple of hundred kilobytes, so this is
+ * generous.  It is a bound rather than a budget: the point is that a UI
+ * thread that never comes back cannot turn into unbounded memory growth.
+ */
+#define WIN32_VC_IN_FIFO_MAX (4 * 1024 * 1024)
+
 struct win32_term_console {
     Chardev *chr;
     Win32Term *term;
+    /* covers out_fifo, in_fifo, write_posted and echo */
+    QemuMutex lock;
     Fifo8 out_fifo;
+    GByteArray *in_fifo;
+    bool write_posted;
     bool echo;
+    bool overflowed;
+    int idx;                    /* index into win32_consoles */
     char *label;
 };
 
@@ -80,6 +115,7 @@ static Chardev *vcs[WIN32_MAX_VCS];
  * Terminal -> chardev.
  */
 
+/* Called with the BQL held, from either thread. */
 static void win32_vc_send_chars(struct win32_term_console *tcon)
 {
     uint32_t len, avail;
@@ -88,6 +124,7 @@ static void win32_vc_send_chars(struct win32_term_console *tcon)
         return;
     }
 
+    qemu_mutex_lock(&tcon->lock);
     len = qemu_chr_be_can_write(tcon->chr);
     avail = fifo8_num_used(&tcon->out_fifo);
     while (len > 0 && avail > 0) {
@@ -95,27 +132,48 @@ static void win32_vc_send_chars(struct win32_term_console *tcon)
         uint32_t size;
 
         buf = fifo8_pop_bufptr(&tcon->out_fifo, MIN(len, avail), &size);
+        /*
+         * qemu_chr_be_write() runs the far end's read handler, which for
+         * the HMP monitor is a whole command and can write straight back
+         * to this same console.  Do not hold tcon->lock across it.
+         */
+        qemu_mutex_unlock(&tcon->lock);
         qemu_chr_be_write(tcon->chr, buf, size);
+        qemu_mutex_lock(&tcon->lock);
         len = qemu_chr_be_can_write(tcon->chr);
         avail -= size;
     }
+    qemu_mutex_unlock(&tcon->lock);
 }
 
+/*
+ * The user typed something.  UI thread, from PuTTY's ldisc, so this is one
+ * of the places the UI thread reaches into emulator state and has to take
+ * the BQL to do it.
+ */
 static void win32_vc_send(void *opaque, const char *buf, int len)
 {
     struct win32_term_console *tcon = opaque;
     uint32_t free_space;
+    bool echo;
 
     if (len <= 0) {
         return;
     }
 
+    BQL_LOCK_GUARD();
+
+    qemu_mutex_lock(&tcon->lock);
+    echo = tcon->echo;
+    qemu_mutex_unlock(&tcon->lock);
+
     /*
      * chr_set_echo(true) is how the HMP monitor asks us to echo a password
      * prompt's input back.  Feed it to our own terminal, the way ui/gtk.c
-     * feeds VTE, rather than expecting the far end to do it.
+     * feeds VTE, rather than expecting the far end to do it.  We are on the
+     * UI thread, so the terminal may be written to directly.
      */
-    if (tcon->echo) {
+    if (echo) {
         for (int i = 0; i < len; i++) {
             uint8_t c = buf[i];
 
@@ -130,17 +188,22 @@ static void win32_vc_send(void *opaque, const char *buf, int len)
         }
     }
 
+    qemu_mutex_lock(&tcon->lock);
     free_space = fifo8_num_free(&tcon->out_fifo);
     fifo8_push_all(&tcon->out_fifo, (const uint8_t *)buf,
                    MIN(free_space, (uint32_t)len));
+    qemu_mutex_unlock(&tcon->lock);
+
     win32_vc_send_chars(tcon);
 }
 
+/* UI thread */
 static void win32_vc_send_break(void *opaque)
 {
     struct win32_term_console *tcon = opaque;
 
     if (tcon->chr) {
+        BQL_LOCK_GUARD();
         qemu_chr_be_event(tcon->chr, CHR_EVENT_BREAK);
     }
 }
@@ -159,10 +222,18 @@ static void win32_vc_title(void *opaque, const char *title)
  * Chardev -> terminal.
  */
 
+/*
+ * Guest (or monitor) output.  QEMU thread: the terminal belongs to the UI
+ * thread, so all this does is queue the bytes and make sure the UI thread
+ * has been told to come and get them.  One message is in flight at a time,
+ * so a guest draining a UART FIFO a few bytes at a time costs one post per
+ * trip round the UI thread's message loop rather than one per write.
+ */
 static int win32_vc_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     VCChardev *vcd = WIN32_VC_CHARDEV(chr);
     struct win32_term_console *tcon = vcd->tcon;
+    bool post = false;
 
     if (!tcon || !tcon->term) {
         /*
@@ -172,8 +243,50 @@ static int win32_vc_chr_write(Chardev *chr, const uint8_t *buf, int len)
          */
         return len;
     }
-    win32_term_write(tcon->term, (const char *)buf, len);
+
+    qemu_mutex_lock(&tcon->lock);
+    if (tcon->in_fifo->len + len > WIN32_VC_IN_FIFO_MAX) {
+        if (!tcon->overflowed) {
+            tcon->overflowed = true;
+            warn_report("win32: the '%s' terminal is more than %d bytes "
+                        "behind and is dropping output; the UI thread has "
+                        "not run for a very long time",
+                        tcon->label, WIN32_VC_IN_FIFO_MAX);
+        }
+    } else {
+        g_byte_array_append(tcon->in_fifo, buf, len);
+        post = !tcon->write_posted;
+        tcon->write_posted = true;
+    }
+    qemu_mutex_unlock(&tcon->lock);
+
+    if (post) {
+        win32_ui_post(WIN32_UI_TERM_OUTPUT, tcon->idx, 0);
+    }
     return len;
+}
+
+/* UI thread: hand whatever has queued up to the terminal. */
+void win32_term_console_drain(struct win32_console *wcon)
+{
+    struct win32_term_console *tcon = wcon->tcon;
+    GByteArray *batch;
+
+    if (!tcon || !tcon->term) {
+        return;
+    }
+
+    qemu_mutex_lock(&tcon->lock);
+    batch = tcon->in_fifo;
+    tcon->in_fifo = g_byte_array_new();
+    tcon->write_posted = false;
+    tcon->overflowed = false;
+    qemu_mutex_unlock(&tcon->lock);
+
+    if (batch->len) {
+        win32_term_write(tcon->term, (const char *)batch->data, batch->len);
+    }
+    g_byte_array_unref(batch);
 }
 
 static void win32_vc_chr_accept_input(Chardev *chr)
@@ -190,7 +303,9 @@ static void win32_vc_chr_set_echo(Chardev *chr, bool echo)
     VCChardev *vcd = WIN32_VC_CHARDEV(chr);
 
     if (vcd->tcon) {
+        qemu_mutex_lock(&vcd->tcon->lock);
         vcd->tcon->echo = echo;
+        qemu_mutex_unlock(&vcd->tcon->lock);
     } else {
         vcd->echo = echo;
     }
@@ -379,7 +494,10 @@ void win32_term_console_init(struct win32_console *wcon, int vc_index)
     tcon = g_new0(struct win32_term_console, 1);
     tcon->chr = chr;
     tcon->echo = vcd->echo;
+    tcon->idx = wcon->idx;
     tcon->label = g_strdup(chr->label ?: "vc");
+    qemu_mutex_init(&tcon->lock);
+    tcon->in_fifo = g_byte_array_new();
     fifo8_create(&tcon->out_fifo, WIN32_VC_FIFO_SIZE);
 
     topts.dpi = lround(win32_dpi_scale() * USER_DEFAULT_SCREEN_DPI);
@@ -392,6 +510,8 @@ void win32_term_console_init(struct win32_console *wcon, int vc_index)
     tcon->term = win32_term_new(win32_frame, &cb, tcon, &topts);
     if (!tcon->term) {
         fifo8_destroy(&tcon->out_fifo);
+        g_byte_array_unref(tcon->in_fifo);
+        qemu_mutex_destroy(&tcon->lock);
         g_free(tcon->label);
         g_free(tcon);
         return;
@@ -424,6 +544,8 @@ void win32_term_console_fini(struct win32_console *wcon)
     }
     win32_term_free(tcon->term);
     fifo8_destroy(&tcon->out_fifo);
+    g_byte_array_unref(tcon->in_fifo);
+    qemu_mutex_destroy(&tcon->lock);
     g_free(tcon->label);
     g_free(tcon);
     wcon->tcon = NULL;

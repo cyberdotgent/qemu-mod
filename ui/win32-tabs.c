@@ -7,13 +7,19 @@
  * It carries a menu bar and a SysTabControl32 tab strip, and every console's
  * render window is a WS_CHILD of it, shown when its tab is selected and
  * hidden otherwise.  Keeping one child HWND per console rather than one
- * shared render window is deliberate: under -display win32,gl=on each child
- * owns an EGLSurface created from its HWND, and a child that is only ever
- * shown and hidden never invalidates that surface.
+ * shared render window keeps each console's window identity stable across
+ * every tab switch, so nothing bound to an HWND is ever invalidated by one.
  *
  * The shape mirrors ui/gtk.c -- a GtkNotebook of per-console drawing areas
  * under one GtkWindow -- so the two backends behave the same way and the
  * menu semantics can be lifted from there directly.
+ *
+ * Everything in this file runs on the UI thread; see the threading section
+ * at the top of ui/win32-display.c.  The handful of places that read or
+ * write emulator state -- the caption, the tab labels, the menu's checked
+ * state and the menu actions themselves -- therefore take the BQL, with
+ * BQL_LOCK_GUARD() so that the same functions stay correct when init and
+ * cleanup reach them with it already held.
  */
 
 #include "qemu/osdep.h"
@@ -30,6 +36,7 @@
 #include "qemu/accel.h"
 #include "qemu/error-report.h"
 #include "qemu/help-texts.h"
+#include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
@@ -267,12 +274,13 @@ double win32_dpi_scale(void)
 /*
  * The box is a hand-built top-level window rather than a DialogBox() over a
  * resource template, for two reasons.  DialogBox() runs its own modal
- * message loop, and this backend's pump is win32_poll_events(), called from
- * dpy_refresh on the main thread -- a nested loop would stop the guest's
- * display updating for as long as the box was open.  And the contents are
- * almost entirely computed (version, target, build options), so a template
- * would describe little more than an empty frame for the code to fill in.
- * The rest of this backend builds its windows by hand too.
+ * message loop, which would stop the display updating and input being
+ * delivered for as long as the box was open -- the same thing a held menu
+ * does, and the same thing this backend is otherwise at pains to avoid.
+ * And the contents are almost entirely computed (version, target, build
+ * options), so a template would describe little more than an empty frame
+ * for the code to fill in.  The rest of this backend builds its windows by
+ * hand too.
  *
  * Modality is done the way a modeless dialog does it: the frame is disabled
  * while the box is up and re-enabled when it goes away, so it cannot be
@@ -322,6 +330,9 @@ static char *win32_about_details(void)
     GString *s = g_string_new(NULL);
     GSList *el, *accels;
     bool first = true;
+
+    /* current_accel() and the accelerator list are emulator state */
+    BQL_LOCK_GUARD();
 
     g_string_append_printf(s, "Emulated target       %s (%u-bit)\r\n",
                            target_name(), target_long_bits());
@@ -399,18 +410,6 @@ static char *win32_about_details(void)
 #endif
 
     g_string_append(s, "\r\nGraphics\r\n");
-#ifdef CONFIG_OPENGL
-    win32_about_opt(s, "OpenGL (EGL/ANGLE)", true);
-#else
-    win32_about_opt(s, "OpenGL (EGL/ANGLE)", false);
-#endif
-#ifdef VIRGL_VERSION_MAJOR
-    g_string_append_printf(s, "  %-22s %d.%d.%d\r\n", "virglrenderer",
-                           VIRGL_VERSION_MAJOR, VIRGL_VERSION_MINOR,
-                           VIRGL_VERSION_MICRO);
-#else
-    win32_about_opt(s, "virglrenderer", false);
-#endif
 #ifdef CONFIG_PIXMAN
     g_string_append_printf(s, "  %-22s %s\r\n", "pixman",
                            PIXMAN_VERSION_STRING);
@@ -847,10 +846,22 @@ static void win32_check_item(HMENU menu, UINT id, bool checked)
  */
 static void win32_refresh_menu(HMENU menu)
 {
-    bool graphic = win32_active && !win32_console_is_term(win32_active) &&
-                   qemu_console_is_graphic(win32_active->dcl.con);
+    bool graphic, running;
 
-    win32_check_item(menu, IDM_PAUSE, !runstate_is_running());
+    /*
+     * WM_INITMENUPOPUP arrives as the menu's own modal loop is starting,
+     * so this is the single most delicate place the UI thread takes the
+     * BQL.  It is safe because the QEMU thread never waits for this one:
+     * every handover in the other direction is a PostMessage().
+     */
+    {
+        BQL_LOCK_GUARD();
+        graphic = win32_active && !win32_console_is_term(win32_active) &&
+                  qemu_console_is_graphic(win32_active->dcl.con);
+        running = runstate_is_running();
+    }
+
+    win32_check_item(menu, IDM_PAUSE, !running);
     win32_check_item(menu, IDM_FULLSCREEN, gui_fullscreen);
     win32_check_item(menu, IDM_GRAB_INPUT, gui_grab);
     win32_check_item(menu, IDM_GRAB_HOVER, gui_grab_on_hover);
@@ -881,22 +892,39 @@ static void win32_refresh_menu(HMENU menu)
 static void win32_menu_command(UINT id)
 {
     switch (id) {
+    /*
+     * The four emulator actions.  They are grouped so that the BQL is taken
+     * for them and for nothing else: the View items below are pure window
+     * management and have no business holding it while they resize things.
+     */
     case IDM_PAUSE:
-        if (runstate_is_running()) {
-            qmp_stop(NULL);
-        } else {
-            qmp_cont(NULL);
+    case IDM_RESET:
+    case IDM_POWERDOWN:
+    case IDM_QUIT: {
+        BQL_LOCK_GUARD();
+
+        switch (id) {
+        case IDM_PAUSE:
+            if (runstate_is_running()) {
+                qmp_stop(NULL);
+            } else {
+                qmp_cont(NULL);
+            }
+            break;
+        case IDM_RESET:
+            qmp_system_reset(NULL);
+            break;
+        case IDM_POWERDOWN:
+            qmp_system_powerdown(NULL);
+            break;
+        case IDM_QUIT:
+            qmp_quit(NULL);
+            break;
+        default:
+            g_assert_not_reached();
         }
         break;
-    case IDM_RESET:
-        qmp_system_reset(NULL);
-        break;
-    case IDM_POWERDOWN:
-        qmp_system_powerdown(NULL);
-        break;
-    case IDM_QUIT:
-        qmp_quit(NULL);
-        break;
+    }
 
     case IDM_FULLSCREEN:
         win32_toggle_fullscreen();
@@ -987,7 +1015,7 @@ static bool win32_tabs_visible(void)
  * sits on top of it, inside the display rectangle the control reports.  That
  * is the layout the common controls documentation describes, and it keeps the
  * render window's client area exactly equal to the area the guest image is
- * stretched into -- which is what both the 2D blit and the GL viewport use.
+ * stretched into, which is what the blit uses.
  */
 static void win32_frame_display_rect(RECT *r)
 {
@@ -1132,12 +1160,21 @@ void win32_update_caption(void)
     char title[1024];
     const char *status = "";
     g_autofree char *label = NULL;
+    bool running;
 
     if (!win32_frame) {
         return;
     }
 
-    if (!runstate_is_running()) {
+    {
+        BQL_LOCK_GUARD();
+        running = runstate_is_running();
+        if (win32_active && !win32_console_is_term(win32_active)) {
+            label = qemu_console_get_label(win32_active->dcl.con);
+        }
+    }
+
+    if (!running) {
         status = " [Stopped]";
     } else if (gui_grab) {
         if (alt_grab) {
@@ -1151,8 +1188,6 @@ void win32_update_caption(void)
 
     if (win32_console_is_term(win32_active)) {
         label = g_strdup(win32_term_console_label(win32_active));
-    } else if (win32_active) {
-        label = qemu_console_get_label(win32_active->dcl.con);
     }
 
     if (qemu_name && label) {
@@ -1255,6 +1290,7 @@ static void win32_tabs_rebuild(void)
         if (win32_console_is_term(wcon)) {
             label = g_strdup(win32_term_console_label(wcon));
         } else {
+            BQL_LOCK_GUARD();
             label = qemu_console_get_label(wcon->dcl.con);
         }
         item.pszText = label;
@@ -1522,8 +1558,11 @@ static LRESULT CALLBACK win32_frameproc(HWND hwnd, UINT msg,
         if (win32_opts->has_window_close && !win32_opts->window_close) {
             return 0;
         }
-        shutdown_action = SHUTDOWN_ACTION_POWEROFF;
-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        {
+            BQL_LOCK_GUARD();
+            shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        }
         return 0;
 
     default:

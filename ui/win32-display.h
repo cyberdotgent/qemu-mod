@@ -4,17 +4,30 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * The backend is split in two: ui/win32-display.c owns the per-console
- * rendering (the DisplayChangeListener ops, the 2D blit, the EGL path and
- * all guest input), while ui/win32-tabs.c owns the single frame window that
- * contains them -- its tab strip, its menu bar and everything that follows
- * from there being exactly one top-level window.
+ * rendering (the DisplayChangeListener ops, the 2D blit and all guest
+ * input), while ui/win32-tabs.c owns the single frame window that contains
+ * them -- its tab strip, its menu bar and everything that follows from
+ * there being exactly one top-level window.
  *
  * The split is along that line and not somewhere else because the frame is
- * the only part that has to know about all the consoles at once, and the
- * render windows are the only part that has to know about EGL.  A render
+ * the only part that has to know about all the consoles at once.  A render
  * window is created once, as a child of the frame, and is never reparented,
- * so the EGLSurface bound to its HWND outlives every tab switch, resize and
- * fullscreen transition.
+ * so it survives every tab switch, resize and fullscreen transition.
+ *
+ * Threading
+ * ---------
+ * The backend takes over the process's main thread and runs QEMU's main
+ * loop on a thread of its own, the way ui/cocoa.m does -- see the
+ * "threading" section at the top of ui/win32-display.c.  Everything in
+ * ui/win32-tabs.c, ui/win32-term*.c and every window procedure therefore
+ * runs on the *UI* thread, while the DisplayChangeListener ops and the
+ * chardev writes arrive on the *QEMU* thread and have to be marshalled
+ * across with win32_ui_post().
+ *
+ * Any call from the UI thread into emulator state must hold the BQL.  Use
+ * BQL_LOCK_GUARD() from "qemu/main-loop.h": it is the same conditional
+ * lock ui/cocoa.m's with_bql() is, re-entrancy check included, so it is
+ * also correct on the paths that already hold it.
  */
 
 #ifndef UI_WIN32_DISPLAY_H
@@ -22,15 +35,11 @@
 
 #include <windows.h>
 
+#include "qemu/thread.h"
 #include "ui/console.h"
 #include "ui/kbd-state.h"
 
 #include "win32-term.h"
-
-#ifdef CONFIG_OPENGL
-#include "ui/egl-helpers.h"
-#include "ui/shader.h"
-#endif
 
 /*
  * A tab is one of two things: a QemuConsole-backed graphics console, or a
@@ -52,34 +61,41 @@ struct win32_term_console;
 
 struct win32_console {
     DisplayChangeListener dcl;
+    /*
+     * The surface the UI thread paints from.  It is *not* the surface
+     * ui/console.c handed to dpy_gfx_switch: that one is freed the moment
+     * the callback returns.  This is a private DisplaySurface holding a
+     * reference of its own on the same pixman image -- see
+     * win32_2d_switch().  Touched only by the UI thread.
+     */
     DisplaySurface *surface;
     HWND hwnd;              /* child render window, owned by the frame */
     QKbdState *kbd;
     int idx;
+    int con_index;          /* qemu_console_get_index(), cached at init */
     int tab;                /* index in the tab control, -1 when absent */
+
+    /*
+     * Handover slots, written on the QEMU thread and drained on the UI
+     * thread; all of them are covered by win32_ui_mutex.  The *_posted
+     * flags coalesce: while one message is still in flight another is not
+     * sent, so a busy guest cannot outrun the UI thread's message queue.
+     */
+    DisplaySurface *pending_surface;
+    bool pending_switch;
+    bool switch_posted;
+    bool damage_posted;
+    bool damage_valid;
+    RECT damage;            /* accumulated dirty rectangle, guest pixels */
 
     /* non-NULL for a terminal tab; then dcl is never registered */
     struct win32_term_console *tcon;
-    int idle_counter;
 
     /* zoom, applied by stretching the blit into the child window */
     double scale_x;
     double scale_y;
 
     bool hover_tracked;     /* a TrackMouseEvent() request is outstanding */
-
-#ifdef CONFIG_OPENGL
-    bool opengl;
-    DisplayGLCtx dgc;
-    EGLSurface esurface;
-    EGLContext ectx;
-    QemuGLShader *gls;
-    int updates;
-    bool scanout_mode;
-    bool y0_top;
-    egl_fb guest_fb;
-    egl_fb win_fb;
-#endif
 };
 
 /* the consoles, in console-index order */
@@ -109,6 +125,32 @@ static inline struct win32_console *win32_console_from_hwnd(HWND hwnd)
 {
     return (struct win32_console *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 }
+
+/*
+ * Covers the handover slots in struct win32_console, and the terminal
+ * consoles' output queues.  Never held across a call into QEMU, and never
+ * held while waiting for anything.
+ */
+extern QemuMutex win32_ui_mutex;
+
+/*
+ * Messages the QEMU thread sends the UI thread.  They are posted, never
+ * sent: the QEMU thread must never wait for the UI thread, because the UI
+ * thread is allowed to wait for the BQL and a cycle between the two would
+ * deadlock the moment a Windows modal loop was on the stack.
+ */
+enum {
+    WIN32_UI_DAMAGE = WM_APP,   /* wparam: console index */
+    WIN32_UI_SWITCH,            /* wparam: console index */
+    WIN32_UI_CAPTION,
+    WIN32_UI_MOUSE_SET,         /* wparam: on, lparam: MAKELPARAM(x, y) */
+    WIN32_UI_CURSOR_DEFINE,     /* lparam: QEMUCursor *, one reference */
+    WIN32_UI_MOUSE_MODE,
+    WIN32_UI_TERM_OUTPUT,       /* wparam: console index */
+    WIN32_UI_SHUTDOWN,
+};
+
+void win32_ui_post(UINT msg, WPARAM wparam, LPARAM lparam);
 
 /* ui/win32-display.c */
 void win32_show_cursor(bool show);
@@ -143,6 +185,7 @@ void win32_term_console_init(struct win32_console *wcon, int vc_index);
 void win32_term_console_fini(struct win32_console *wcon);
 const char *win32_term_console_label(struct win32_console *wcon);
 void win32_term_consoles_set_dpi(unsigned dpi);
+void win32_term_console_drain(struct win32_console *wcon);
 Win32Term *win32_term_console_term(struct win32_console *wcon);
 
 static inline bool win32_console_is_term(const struct win32_console *wcon)

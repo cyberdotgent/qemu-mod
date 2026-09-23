@@ -13,28 +13,77 @@
  * single frame window in ui/win32-tabs.c, which owns the tab strip, the menu
  * bar and everything else that has to reason about all the consoles at once.
  *
+ * Threading
+ * ---------
+ * The UI owns the process's main thread and QEMU's main loop runs on a
+ * thread of its own, exactly as on macOS: system/main.c already creates
+ * that thread and calls whatever ui/ puts in qemu_main(), and the comment
+ * there ("main thread must be reserved for UI") is as true on Windows as it
+ * is on Darwin.  It has to be, because Windows runs a modal message loop of
+ * its own inside DefWindowProc for several perfectly ordinary things the
+ * user does with a window -- holding the menu bar open, dragging the title
+ * bar, dragging a border, holding a scrollbar thumb.  That loop does not
+ * return until the user lets go.  While the pump rode on dpy_refresh, the
+ * thread it stopped was QEMU's main loop, so the vCPUs, block I/O, the
+ * monitor and QMP were all held up for as long as the mouse button was.
+ * Now it stops only the display and input.
+ *
+ * The split is the same one ui/cocoa.m makes, and has the same two halves:
+ *
+ *   - QEMU -> UI.  DisplayChangeListenerOps callbacks, the mouse-mode
+ *     notifier and the terminal chardev's writes all arrive on the QEMU
+ *     thread, and none of them may touch a window: on Windows the thread
+ *     that created a window is the only one that may pump its messages, and
+ *     the PuTTY terminal state in ui/win32-term.c is the UI thread's alone.
+ *     Where cocoa.m does dispatch_async(dispatch_get_main_queue(), ...),
+ *     this file does win32_ui_post() -- PostMessage() to a message-only
+ *     window created on the UI thread.  Posting, never sending: see below.
+ *
+ *   - UI -> QEMU.  Input, the menu actions and the caption all read or
+ *     write emulator state and so need the BQL.  cocoa.m wraps those in
+ *     with_bql(); C has no blocks, but QEMU's own BQL_LOCK_GUARD() is the
+ *     same thing -- a scoped conditional lock with the same bql_locked()
+ *     re-entrancy check, which matters because the very same functions are
+ *     also reached from init and cleanup with the BQL already held.
+ *
+ * Deadlock is avoided by making the wait graph acyclic rather than by being
+ * careful: *the QEMU thread never waits for the UI thread*.  Every
+ * QEMU -> UI handover is a PostMessage(), so a UI thread parked inside a
+ * menu's modal loop cannot hold the QEMU thread up, and a UI thread that
+ * blocks on the BQL is therefore always waiting on someone who is running.
+ * The one exception is the shutdown handshake in win32_display_cleanup(),
+ * which drops the BQL for the duration of its bounded wait precisely so
+ * that it is not an exception at all.
+ *
+ * Surface lifetime is the other thing the split breaks, and it breaks
+ * silently.  The DisplaySurface passed to dpy_gfx_switch is freed as soon
+ * as the callback returns, so once painting happens on another thread a
+ * blit from it is a use-after-free.  cocoa.m answers this with
+ * pixman_image_ref() before the dispatch_async, and so does this file:
+ * win32_2d_switch() wraps the incoming image in a DisplaySurface of its
+ * own via qemu_create_displaysurface_pixman(), which takes the reference,
+ * and the UI thread frees the one it is replacing.  A reference rather than
+ * a copy, for the same reason cocoa.m does: the guest writes into that
+ * buffer continuously, so a copy would have to be retaken on every frame to
+ * be worth anything, and the tearing a reference can show is exactly the
+ * tearing every other backend shows.
+ *
  * The 2D path blits the guest surface straight from pixman memory with
  * StretchDIBits(), so there is no intermediate copy and no texture to keep in
  * sync.  Because the render window's client area is always exactly the area
  * the image is stretched into, the zoom factor is expressed purely as a
  * window size and the blit itself never has to know about it.
  *
- * The GL path (-display win32,gl=on) goes through EGL rather than WGL.  That
- * is deliberate: QEMU's blit shaders are '#version 300 es', and the GL context
- * virtio-gpu-gl/virgl needs must come from the same stack, so an ES-capable
- * implementation is required.  On Windows that means ANGLE, which is an EGL
- * implementation, and ui/egl-helpers.c already knows how to drive it
- * (qemu_egl_init_dpy_win32() even prefers ES for exactly this reason).  WGL
- * would give a desktop-GL context that neither the shaders nor virgl can use.
- *
- * The GL code below is structured like ui/gtk-egl.c and ui/sdl2-gl.c -- one
- * EGL context and one window surface per console, a QemuGLShader for the
- * surface blit, and a scanout mode for guest-supplied textures -- so that
- * upstream changes to the shared helpers stay easy to absorb.  Each console's
- * EGLSurface is created from its child HWND and lives exactly as long as that
- * HWND does; tab switches only show and hide the window, so no surface is
- * ever recreated behind the guest's back.  dma-buf is deliberately absent: it
- * is a Linux concept and CONFIG_GBM is off here.
+ * There is no GL path: -display win32,gl=on is rejected.  It used to exist,
+ * built on EGL/ANGLE, and it is gone because of the threading split
+ * described below.  EGL contexts are thread-affine, so the render window's
+ * context would have to be current only on the UI thread -- while the
+ * guest's own context (virtio-gpu-gl, virgl) is made current on the QEMU
+ * thread and drew into the very same EGLSurface.  No QEMU display backend
+ * has ever combined a threaded UI with GL; making this one the first is a
+ * larger piece of work than the freeze it would have to pay for, so the
+ * emulator running while a menu is open won out over accelerated guest
+ * rendering that was never demonstrated end to end.
  */
 
 #include "qemu/osdep.h"
@@ -59,23 +108,18 @@
 #include "ui/win32-kbd-hook.h"
 #include "standard-headers/linux/input-event-codes.h"
 
-#ifdef CONFIG_OPENGL
-#include "ui/egl-helpers.h"
-#include "ui/egl-context.h"
-#include "ui/shader.h"
-#endif
-
 /*
- * Refresh pacing, mirroring ui/sdl2.c: poll aggressively while events are
- * arriving, then fall back to the default interval once things go quiet.
+ * Refresh pacing, mirroring ui/sdl2.c: refresh aggressively while the user
+ * is doing something, then fall back to the default interval once things go
+ * quiet.
  */
 #define WIN32_REFRESH_INTERVAL_BUSY 10
-#define WIN32_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
-                              / WIN32_REFRESH_INTERVAL_BUSY + 1)
 
 int win32_num_outputs;
 struct win32_console *win32_consoles;
 DisplayOptions *win32_opts;
+
+QemuMutex win32_ui_mutex;
 
 bool gui_grab;
 bool alt_grab;
@@ -87,16 +131,81 @@ HCURSOR guest_sprite;
 HCURSOR cursor_arrow;
 
 static ATOM win32_class_atom;
+static ATOM win32_ui_class_atom;
 static bool swallow_next_char;
 static int guest_x, guest_y;
 static bool cursor_visible = true;
 static Notifier mouse_mode_notifier;
 
-#ifdef CONFIG_OPENGL
-static void win32_gl_init(struct win32_console *wcon);
-static void win32_gl_fini(struct win32_console *wcon);
-static void win32_gl_redraw(struct win32_console *wcon);
-#endif
+/* the message-only window win32_ui_post() posts to; UI thread */
+static HWND win32_uiwnd;
+/* signalled by the UI thread once it has torn its windows down */
+static HANDLE win32_ui_done;
+
+static void win32_ui_handle(UINT msg, WPARAM wparam, LPARAM lparam);
+static void win32_ui_teardown(void);
+
+/* ------------------------------------------------------------------ */
+/* QEMU thread -> UI thread                                             */
+
+/*
+ * Hand a message to the UI thread.  Always asynchronous, so that the
+ * calling thread -- which in every real case is the QEMU main loop, holding
+ * the BQL -- cannot be held up by a UI thread that is inside one of
+ * Windows' modal loops or waiting for the BQL itself.
+ *
+ * PostMessage() can fail: a thread's message queue holds 10000 messages by
+ * default, and a UI thread held in a modal loop for long enough with a very
+ * busy guest could in principle reach that.  Every message this backend
+ * posts is coalesced -- at most one of each kind per console is ever in
+ * flight -- so the real bound is a couple of dozen, and a failure here means
+ * something is wrong rather than something is busy.  Say so, once.
+ */
+void win32_ui_post(UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    static bool complained;
+
+    if (!win32_uiwnd) {
+        return;
+    }
+    if (!PostMessage(win32_uiwnd, msg, wparam, lparam)) {
+        if (!complained) {
+            complained = true;
+            warn_report("win32: could not post message %u to the UI thread "
+                        "(error %lu); the display may stop updating",
+                        (unsigned)(msg - WM_APP), GetLastError());
+        }
+    }
+}
+
+/*
+ * How recently the UI thread last saw something worth being quick about.
+ * Read by the refresh callbacks on the QEMU thread to pace dcl.update_interval,
+ * which is what the per-console idle counter used to do back when the pump
+ * and the refresh were the same call.
+ */
+static int win32_ui_active_tick;
+
+static void win32_ui_note_activity(void)
+{
+    g_atomic_int_set(&win32_ui_active_tick, (int)GetTickCount());
+}
+
+static void win32_ui_tick(void);
+
+static LRESULT CALLBACK win32_uiproc(HWND hwnd, UINT msg,
+                                     WPARAM wparam, LPARAM lparam)
+{
+    if (msg >= WM_APP && msg <= WIN32_UI_SHUTDOWN) {
+        win32_ui_handle(msg, wparam, lparam);
+        return 0;
+    }
+    if (msg == WM_TIMER) {
+        win32_ui_tick();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wparam, lparam);
+}
 
 /* ------------------------------------------------------------------ */
 /* render windows                                                       */
@@ -116,11 +225,10 @@ static void win32_gl_redraw(struct win32_console *wcon);
  * 3.  Best Fit (win32_frame_fit()) and the minimum track size therefore get
  * correctly sized windows at any DPI, and the zoom steps stay relative.
  *
- * This is the *only* place the DPI factor is applied.  The blit stretches the
- * guest surface into the render window's client rectangle -- StretchDIBits()
- * in the 2D path, surface_gl_setup_viewport() in the GL path -- so both scale
- * to whatever window size comes out of here, and applying the factor again
- * inside either of them would square it.
+ * This is the *only* place the DPI factor is applied.  StretchDIBits()
+ * stretches the guest surface into the render window's client rectangle, so
+ * the blit already scales to whatever window size comes out of here, and
+ * applying the factor again inside it would square it.
  */
 void win32_console_size(struct win32_console *wcon, int *w, int *h)
 {
@@ -150,12 +258,6 @@ void win32_console_redraw(struct win32_console *wcon)
     if (!wcon || !wcon->hwnd) {
         return;
     }
-#ifdef CONFIG_OPENGL
-    if (wcon->opengl) {
-        win32_gl_redraw(wcon);
-        return;
-    }
-#endif
     InvalidateRect(wcon->hwnd, NULL, FALSE);
 }
 
@@ -186,16 +288,6 @@ static void win32_window_create(struct win32_console *wcon)
 
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, (LONG_PTR)wcon);
 
-#ifdef CONFIG_OPENGL
-    /*
-     * The EGL window surface is tied to this HWND, so it is created and
-     * destroyed in step with it rather than once at init time.
-     */
-    if (wcon->opengl) {
-        win32_gl_init(wcon);
-    }
-#endif
-
     win32_frame_add_console(wcon);
 }
 
@@ -204,11 +296,6 @@ static void win32_window_destroy(struct win32_console *wcon)
     if (!wcon->hwnd) {
         return;
     }
-#ifdef CONFIG_OPENGL
-    if (wcon->opengl) {
-        win32_gl_fini(wcon);
-    }
-#endif
     SetWindowLongPtr(wcon->hwnd, GWLP_USERDATA, 0);
     DestroyWindow(wcon->hwnd);
     wcon->hwnd = NULL;
@@ -258,8 +345,16 @@ void win32_grab_start(void)
 {
     struct win32_console *wcon = win32_active;
     QemuConsole *con = wcon ? wcon->dcl.con : NULL;
+    bool graphic;
 
-    if (!con || !qemu_console_is_graphic(con) || !wcon->hwnd) {
+    if (!con || !wcon->hwnd) {
+        return;
+    }
+    {
+        BQL_LOCK_GUARD();
+        graphic = qemu_console_is_graphic(con);
+    }
+    if (!graphic) {
         return;
     }
     if (GetForegroundWindow() != win32_frame) {
@@ -304,14 +399,28 @@ static struct win32_console *win32_first_gfx_console(void)
     return NULL;
 }
 
+/*
+ * The notifier itself fires on the QEMU thread, from the input layer; the
+ * work it wants done -- ending the grab -- is the UI thread's.
+ */
 static void win32_mouse_mode_change(Notifier *notify, void *data)
 {
+    win32_ui_post(WIN32_UI_MOUSE_MODE, 0, 0);
+}
+
+static void win32_mouse_mode_changed(void)
+{
     struct win32_console *gfx = win32_first_gfx_console();
+    bool absolute;
 
     if (!gfx) {
         return;
     }
-    if (qemu_input_is_absolute(gfx->dcl.con)) {
+    {
+        BQL_LOCK_GUARD();
+        absolute = qemu_input_is_absolute(gfx->dcl.con);
+    }
+    if (absolute) {
         absolute_enabled = true;
     } else if (absolute_enabled) {
         if (!gui_fullscreen) {
@@ -327,6 +436,8 @@ static void win32_mouse_mode_change(Notifier *notify, void *data)
 static void win32_send_mouse_motion(struct win32_console *wcon,
                                     int x, int y, int dx, int dy, bool relative)
 {
+    BQL_LOCK_GUARD();
+
     if (!qemu_console_is_graphic(wcon->dcl.con) || !wcon->surface) {
         return;
     }
@@ -372,6 +483,8 @@ static void win32_send_mouse_buttons(struct win32_console *wcon, WPARAM wparam)
     uint32_t state = wparam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON |
                                MK_XBUTTON1 | MK_XBUTTON2);
 
+    BQL_LOCK_GUARD();
+
     if (!qemu_console_is_graphic(wcon->dcl.con)) {
         return;
     }
@@ -385,6 +498,8 @@ static void win32_send_mouse_buttons(struct win32_console *wcon, WPARAM wparam)
 
 static void win32_send_wheel(struct win32_console *wcon, InputButton btn)
 {
+    BQL_LOCK_GUARD();
+
     if (!qemu_console_is_graphic(wcon->dcl.con)) {
         return;
     }
@@ -473,7 +588,16 @@ void win32_release_modifiers(struct win32_console *wcon)
     if (!wcon || !wcon->kbd) {
         return;
     }
-    qkbd_state_lift_all_keys(wcon->kbd);
+    {
+        BQL_LOCK_GUARD();
+        /*
+         * Re-checked with the lock held: win32_display_cleanup() clears
+         * this pointer on the QEMU thread under the same lock.
+         */
+        if (wcon->kbd) {
+            qkbd_state_lift_all_keys(wcon->kbd);
+        }
+    }
 }
 
 /* Returns true when the key was consumed as a UI hotkey. */
@@ -539,6 +663,13 @@ static void win32_handle_key(struct win32_console *wcon,
         return;
     }
 
+    /*
+     * Everything below this point reaches into emulator state, and on the
+     * UI thread that means the BQL.  The hotkey handling above it does not,
+     * which is deliberate: Ctrl-Alt-F and friends have to keep working even
+     * if the QEMU thread is wedged, since they are how the user gets the
+     * pointer back.
+     */
     if (down) {
         /*
          * TranslateMessage() has already queued the WM_CHAR belonging to
@@ -552,6 +683,11 @@ static void win32_handle_key(struct win32_console *wcon,
         if (swallow_next_char) {
             return;
         }
+    }
+
+    BQL_LOCK_GUARD();
+    if (!wcon->kbd) {
+        return;                          /* cleanup got here first */
     }
 
     /*
@@ -662,7 +798,10 @@ static void win32_handle_char(struct win32_console *wcon, WPARAM wparam)
         return;
     }
 
-    qemu_text_console_put_string(QEMU_TEXT_CONSOLE(con), utf8, u8len);
+    {
+        BQL_LOCK_GUARD();
+        qemu_text_console_put_string(QEMU_TEXT_CONSOLE(con), utf8, u8len);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,10 +826,15 @@ static void win32_fill_bitmapinfo(DisplaySurface *surf, BITMAPINFO *bmi)
 /*
  * Blit the guest surface into the window.
  *
- * This runs on QEMU's main thread from inside dpy_refresh, once per
- * WM_PAINT, and every WM_PAINT covers the whole client area -- so a slow
- * blit is a slow guest, and a guest that redraws at any rate turns the
- * cost of one blit into a permanent tax on the main loop.
+ * This runs on the UI thread, from WM_PAINT.  wcon->surface is the UI
+ * thread's own DisplaySurface -- a private reference on the guest's pixman
+ * image, taken in win32_2d_switch() -- and not the one ui/console.c is
+ * about to free, so reading it here does not race the switch.  It does race
+ * the *guest*, which keeps writing into that buffer; that shows up as the
+ * same tearing every other backend can show and is why there is no copy.
+ *
+ * A slow blit is no longer a slow guest, but it is still a slow UI, and
+ * every WM_PAINT covers whatever BeginPaint() says is dirty:
  *
  * HALFTONE is GDI's software resampler and by a wide margin its most
  * expensive StretchBlt mode.  It earns its cost when the image is being
@@ -756,14 +900,7 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
     switch (msg) {
     case WM_PAINT:
         hdc = BeginPaint(hwnd, &ps);
-#ifdef CONFIG_OPENGL
-        if (wcon->opengl) {
-            win32_gl_redraw(wcon);
-        } else
-#endif
-        {
-            win32_paint(wcon, hdc);
-        }
+        win32_paint(wcon, hdc);
         EndPaint(hwnd, &ps);
         return 0;
 
@@ -772,15 +909,6 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
         return 1;
 
     case WM_SIZE:
-#ifdef CONFIG_OPENGL
-        /*
-         * The EGL surface follows the HWND, but nothing repaints it by
-         * itself; redraw here so a resize does not leave a stale image.
-         */
-        if (wcon->opengl) {
-            win32_gl_redraw(wcon);
-        }
-#endif
         InvalidateRect(hwnd, NULL, FALSE);
         if (gui_grab) {
             win32_clip_cursor(true);
@@ -828,11 +956,19 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
          * how the user asks for the pointer, matching the SDL behaviour.
          */
         SetFocus(hwnd);
-        if (!gui_grab && !qemu_input_is_absolute(wcon->dcl.con)) {
-            win32_grab_start();
-        } else {
-            SetCapture(hwnd);
-            win32_send_mouse_buttons(wcon, wparam);
+        {
+            bool absolute;
+
+            {
+                BQL_LOCK_GUARD();
+                absolute = qemu_input_is_absolute(wcon->dcl.con);
+            }
+            if (!gui_grab && !absolute) {
+                win32_grab_start();
+            } else {
+                SetCapture(hwnd);
+                win32_send_mouse_buttons(wcon, wparam);
+            }
         }
         return 0;
 
@@ -857,8 +993,16 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
     case WM_INPUT: {
         RAWINPUT ri;
         UINT size = sizeof(ri);
+        bool absolute;
 
-        if (!gui_grab || qemu_input_is_absolute(wcon->dcl.con)) {
+        if (!gui_grab) {
+            break;
+        }
+        {
+            BQL_LOCK_GUARD();
+            absolute = qemu_input_is_absolute(wcon->dcl.con);
+        }
+        if (absolute) {
             break;
         }
         if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, &ri, &size,
@@ -897,13 +1041,16 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg,
 /* ------------------------------------------------------------------ */
 /* DisplayChangeListener ops                                            */
 
-static void win32_2d_update(DisplayChangeListener *dcl,
-                            int x, int y, int w, int h)
+/*
+ * Turn an accumulated guest-side dirty rectangle into an InvalidateRect()
+ * on the render window.  UI thread.
+ */
+static void win32_2d_invalidate(struct win32_console *wcon, const RECT *guest)
 {
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
     RECT client, dirty;
     int sw, sh;
+    int x = guest->left, y = guest->top;
+    int w = guest->right - guest->left, h = guest->bottom - guest->top;
 
     if (!wcon->hwnd || !wcon->surface || wcon != win32_active) {
         return;
@@ -914,12 +1061,10 @@ static void win32_2d_update(DisplayChangeListener *dcl,
     }
 
     /*
-     * A zero-dimension surface would divide by zero below.  That raises a
-     * hardware exception rather than a signal, and this code runs inside
-     * dpy_refresh, whose caller in ui/console.c re-arms the GUI timer only
-     * after we return -- so one such fault would cost the whole session's
-     * display, not one frame.  It should not be reachable; treat it as
-     * "nothing to invalidate" rather than trusting that.
+     * A zero-dimension surface would divide by zero below, and on Windows
+     * that is a hardware exception rather than a signal.  It should not be
+     * reachable; treat it as "nothing to invalidate" rather than trusting
+     * that.
      */
     sw = surface_width(wcon->surface);
     sh = surface_height(wcon->surface);
@@ -937,8 +1082,73 @@ static void win32_2d_update(DisplayChangeListener *dcl,
 }
 
 /*
+ * dpy_gfx_update: QEMU thread.
+ *
+ * All this does is remember what changed and make sure the UI thread has
+ * been told to look.  The rectangles are unioned rather than queued: a
+ * guest that dirties a thousand small rectangles between two of the UI
+ * thread's message-loop iterations should cost one repaint, not a thousand
+ * posted messages.  Keeping the union in guest coordinates rather than
+ * window ones is what lets the mapping stay on the UI thread, where the
+ * window size and the UI-owned surface both live.
+ */
+static void win32_2d_update(DisplayChangeListener *dcl,
+                            int x, int y, int w, int h)
+{
+    struct win32_console *wcon =
+        container_of(dcl, struct win32_console, dcl);
+    bool post;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    qemu_mutex_lock(&win32_ui_mutex);
+    if (!wcon->damage_valid) {
+        wcon->damage_valid = true;
+        wcon->damage.left = x;
+        wcon->damage.top = y;
+        wcon->damage.right = x + w;
+        wcon->damage.bottom = y + h;
+    } else {
+        wcon->damage.left = MIN(wcon->damage.left, x);
+        wcon->damage.top = MIN(wcon->damage.top, y);
+        wcon->damage.right = MAX(wcon->damage.right, x + w);
+        wcon->damage.bottom = MAX(wcon->damage.bottom, y + h);
+    }
+    post = !wcon->damage_posted;
+    wcon->damage_posted = true;
+    qemu_mutex_unlock(&win32_ui_mutex);
+
+    if (post) {
+        win32_ui_post(WIN32_UI_DAMAGE, wcon->idx, 0);
+    }
+}
+
+/* UI thread: drain whatever win32_2d_update() has accumulated. */
+static void win32_ui_damage(struct win32_console *wcon)
+{
+    RECT dirty;
+    bool valid;
+
+    qemu_mutex_lock(&win32_ui_mutex);
+    dirty = wcon->damage;
+    valid = wcon->damage_valid;
+    wcon->damage_valid = false;
+    wcon->damage_posted = false;
+    qemu_mutex_unlock(&win32_ui_mutex);
+
+    if (valid) {
+        win32_2d_invalidate(wcon, &dirty);
+    }
+}
+
+/*
  * Common to both paths: decide whether this console still deserves a window,
  * create or drop it, and re-fit the frame if it is the visible one.
+ *
+ * UI thread in the 2D case, QEMU thread under gl=on -- which is the same
+ * thread in both cases, because gl=on does not take the main thread over.
  */
 static void win32_switch_common(struct win32_console *wcon,
                                 DisplaySurface *old_surface)
@@ -946,8 +1156,7 @@ static void win32_switch_common(struct win32_console *wcon,
     DisplaySurface *new_surface = wcon->surface;
 
     if (!new_surface ||
-        (surface_is_placeholder(new_surface) &&
-         qemu_console_get_index(wcon->dcl.con))) {
+        (surface_is_placeholder(new_surface) && wcon->con_index)) {
         win32_window_destroy(wcon);
         return;
     }
@@ -967,15 +1176,72 @@ static void win32_switch_common(struct win32_console *wcon,
     }
 }
 
+/*
+ * dpy_gfx_switch: QEMU thread.
+ *
+ * The surface handed to us here is freed the moment this returns, so the UI
+ * thread cannot be given it.  Take a reference on the pixman image behind
+ * it instead -- which is exactly what ui/cocoa.m does at the same point --
+ * and wrap that in a DisplaySurface the UI thread owns outright.  The
+ * placeholder bit is carried over because win32_switch_common() decides
+ * whether the console deserves a window at all from it; nothing else in the
+ * original struct is needed, and QEMU_ALLOCATED_FLAG deliberately is not
+ * copied, since the allocation is not ours to free.
+ *
+ * A switch that arrives while a previous one is still queued replaces it:
+ * only the newest surface is ever of any interest, and the superseded
+ * reference is dropped here rather than leaked.
+ */
 static void win32_2d_switch(DisplayChangeListener *dcl,
                             DisplaySurface *new_surface)
 {
     struct win32_console *wcon =
         container_of(dcl, struct win32_console, dcl);
-    DisplaySurface *old_surface = wcon->surface;
+    DisplaySurface *proxy = NULL, *superseded;
+    bool post;
 
+    if (new_surface) {
+        proxy = qemu_create_displaysurface_pixman(new_surface->image);
+        proxy->flags = new_surface->flags & QEMU_PLACEHOLDER_FLAG;
+    }
+
+    qemu_mutex_lock(&win32_ui_mutex);
+    superseded = wcon->pending_surface;
+    wcon->pending_surface = proxy;
+    wcon->pending_switch = true;
+    post = !wcon->switch_posted;
+    wcon->switch_posted = true;
+    qemu_mutex_unlock(&win32_ui_mutex);
+
+    qemu_free_displaysurface(superseded);
+
+    if (post) {
+        win32_ui_post(WIN32_UI_SWITCH, wcon->idx, 0);
+    }
+}
+
+/* UI thread: adopt the surface win32_2d_switch() left for us. */
+static void win32_ui_switch(struct win32_console *wcon)
+{
+    DisplaySurface *old, *new_surface;
+    bool pending;
+
+    qemu_mutex_lock(&win32_ui_mutex);
+    new_surface = wcon->pending_surface;
+    pending = wcon->pending_switch;
+    wcon->pending_surface = NULL;
+    wcon->pending_switch = false;
+    wcon->switch_posted = false;
+    qemu_mutex_unlock(&win32_ui_mutex);
+
+    if (!pending) {
+        return;
+    }
+
+    old = wcon->surface;
     wcon->surface = new_surface;
-    win32_switch_common(wcon, old_surface);
+    win32_switch_common(wcon, old);
+    qemu_free_displaysurface(old);
 }
 
 static bool win32_2d_check_format(DisplayChangeListener *dcl,
@@ -990,146 +1256,121 @@ static bool win32_2d_check_format(DisplayChangeListener *dcl,
 }
 
 /*
- * How many messages one call may dispatch before handing control back.
- *
- * Draining until PeekMessage() comes up empty is the obvious thing and it
- * is wrong here: the terminal tabs arm short Windows timers to drive
- * PuTTY's own timer wheel, and a WM_TIMER is regenerated as soon as its
- * interval has passed.  If a batch of terminal output takes longer to
- * process than that interval -- which, for a guest spewing a boot log, it
- * does -- the queue refills exactly as fast as it drains and this loop
- * never ends.  Control never returns to QEMU's main loop, so the guest
- * stops as well as the window.  A budget makes that a slow frame instead
- * of a hang.
- */
-#define WIN32_MAX_DISPATCH_PER_POLL 256
-
-/*
  * What the pump is doing right now.  Set around DispatchMessage() and used
  * only by win32_fault_handler() below, to say which window message QEMU was
  * delivering when a window procedure blew up.  It is deliberately not used
  * as a re-entrancy guard: a flag that a non-local exit could leave set would
  * be one more way to kill the pump for good, which is the failure this file
- * is trying to make impossible.  Nesting cannot happen anyway -- every
- * caller of win32_poll_events() is a QEMU timer callback, and QEMU's main
- * loop is not re-entered from a window procedure.
+ * is trying to make impossible.
+ *
+ * Thread-local, because with the UI on its own thread there are now two
+ * places a fault can come from and the handler runs on whichever thread
+ * faulted: a message being dispatched on the UI thread, and a refresh
+ * running on the QEMU thread.  A process-wide flag would let one thread's
+ * state describe the other thread's fault.
  */
-static bool win32_in_dispatch;
-static UINT win32_dispatch_msg;
-static HWND win32_dispatch_hwnd;
+static __thread bool win32_in_dispatch;
+static __thread UINT win32_dispatch_msg;
+static __thread HWND win32_dispatch_hwnd;
 
-static void win32_poll_events(struct win32_console *wcon)
+/* Translate and dispatch one message.  Common to both pumps. */
+static void win32_dispatch_one(MSG *msg)
 {
-    MSG msg;
-    bool idle = true;
-    int budget = WIN32_MAX_DISPATCH_PER_POLL;
-
-    while (budget-- > 0 && PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        idle = false;
-        /*
-         * A dialog owned by the frame needs IsDialogMessage() to see its
-         * input before it is translated and dispatched, or it has no Tab
-         * navigation and neither Esc nor Enter reaches it.
-         */
-        if (win32_dialog_filter(&msg)) {
-            continue;
-        }
-        TranslateMessage(&msg);
-
-        win32_dispatch_msg = msg.message;
-        win32_dispatch_hwnd = msg.hwnd;
-        win32_in_dispatch = true;
-        DispatchMessage(&msg);
-        win32_in_dispatch = false;
-    }
-
-    if (!wcon) {
-        /* driven by the standalone pump timer, which has no console */
+    /*
+     * A dialog owned by the frame needs IsDialogMessage() to see its
+     * input before it is translated and dispatched, or it has no Tab
+     * navigation and neither Esc nor Enter reaches it.
+     */
+    if (win32_dialog_filter(msg)) {
         return;
     }
+    if ((msg->message >= WM_KEYFIRST && msg->message <= WM_KEYLAST) ||
+        (msg->message >= WM_MOUSEFIRST && msg->message <= WM_MOUSELAST)) {
+        win32_ui_note_activity();
+    }
+    TranslateMessage(msg);
 
-    if (idle) {
-        if (wcon->idle_counter < WIN32_MAX_IDLE_COUNT) {
-            wcon->idle_counter++;
-            if (wcon->idle_counter >= WIN32_MAX_IDLE_COUNT) {
-                wcon->dcl.update_interval = GUI_REFRESH_INTERVAL_DEFAULT;
-            }
-        }
-    } else {
-        wcon->idle_counter = 0;
+    win32_dispatch_msg = msg->message;
+    win32_dispatch_hwnd = msg->hwnd;
+    win32_in_dispatch = true;
+    DispatchMessage(msg);
+    win32_in_dispatch = false;
+}
+
+/*
+ * How long after the last piece of UI activity the refresh rate drops back
+ * to the idle one.  The old code counted idle polls because the pump and
+ * the refresh were the same call; they are not any more, so the QEMU thread
+ * asks the UI thread's clock instead.  The value is the same one the count
+ * worked out to.
+ */
+#define WIN32_UI_BUSY_WINDOW_MS (2 * GUI_REFRESH_INTERVAL_DEFAULT)
+
+/* QEMU thread: pick dcl.update_interval from how busy the UI thread is. */
+static void win32_pace_refresh(struct win32_console *wcon)
+{
+    DWORD last = (DWORD)g_atomic_int_get(&win32_ui_active_tick);
+    DWORD now = GetTickCount();
+
+    if (last && now - last < WIN32_UI_BUSY_WINDOW_MS) {
         wcon->dcl.update_interval = WIN32_REFRESH_INTERVAL_BUSY;
+    } else {
+        wcon->dcl.update_interval = GUI_REFRESH_INTERVAL_DEFAULT;
     }
 }
 
 /*
- * The pump's own timer.
+ * The two liveness timers.
  *
- * This used to exist only when there was no graphics console at all
- * ("-vga none", or a target with no display device), on the reasoning that
- * with a graphics console the pump rides on dpy_refresh and QEMU's display
- * timer keeps calling us whatever happened last frame.  That reasoning does
- * not hold.  ui/console.c's gui_update() is
+ * win32_pump_timer runs on the *QEMU* thread.  It no longer pumps anything
+ * -- the UI thread's own GetMessage() loop does that now -- but it is still
+ * the only thing that can notice two failures that have no other symptom:
  *
- *     ds->refreshing = true;
- *     dpy_refresh(ds);                                  <- us
- *     ds->refreshing = false;
- *     ...
- *     timer_mod(ds->gui_timer, ds->last_update + interval);
+ *   - ui/console.c's GUI timer dying.  gui_update() is
  *
- * i.e. a one-shot timer re-armed *after* the callback returns, with exactly
- * the shape this file used to get wrong: anything that leaves
- * win32_2d_refresh()/win32_gl_refresh() other than by returning takes the
- * whole session's display with it, and the guest, the monitor and QMP carry
- * on regardless, so it looks like "the window froze".
+ *         ds->refreshing = true;
+ *         dpy_refresh(ds);                                  <- us
+ *         ds->refreshing = false;
+ *         ...
+ *         timer_mod(ds->gui_timer, ds->last_update + interval);
  *
- * How reachable that is was measured rather than assumed, by faulting on
- * purpose in two places and watching what happened:
+ *     i.e. a one-shot re-armed *after* the callback returns, so anything
+ *     that leaves win32_2d_refresh() other than by returning takes the
+ *     whole session's display with it while the guest carries on.  The
+ *     window would still be alive and still repaint on WM_PAINT; it would
+ *     simply never be told the guest had changed anything.
+ *     win32_refresh_watchdog() says so.
  *
- *   - A fault raised inside a window procedure is swallowed.  On x86-64
- *     the kernel-mode callback dispatcher catches exceptions raised in a
- *     user-mode callback (wine prints "err:seh:dispatch_callback ignoring
- *     exception" at the same spot).  But control comes *back* out of
- *     DispatchMessage() normally, so the pump carries on, the refresh
- *     returns, and gui_update() re-arms.  Only the one message is lost.
+ *   - QEMU's own main loop stalling.  This used to mean "a window is being
+ *     dragged", because the pump ran on this thread; it cannot mean that
+ *     any more, which is exactly the point of the change.  If this timer is
+ *     late now, the emulator itself is stuck and the report should say so.
  *
- *   - A fault raised in the refresh path proper, outside any window
- *     procedure, is not swallowed at all: it is an ordinary unhandled
- *     exception and the process dies.  That is a crash, not a freeze.
- *
- * So the swallowed-fault route to a dead GUI timer is not the open door it
- * looks like, and this timer is a backstop rather than a cure for a known
- * bug.  It is still worth having: it costs one timer at the default refresh
- * interval, it removes the UI's dependence on someone else's error handling
- * entirely, and it is what makes win32_refresh_watchdog() below possible --
- * something has to still be running to notice that the refresh is not.
+ * win32_ui_timer is its opposite number on the UI thread, an ordinary
+ * WM_TIMER on the message-only window.  *That* is where the modal-loop
+ * lateness now shows up: holding the menu bar open, dragging the title bar,
+ * dragging a border or holding a scrollbar thumb all run a message loop
+ * inside DefWindowProc that does not return until the user lets go, and
+ * nothing of ours runs meanwhile.  It is still worth reporting -- input and
+ * the display really were paused -- but it is no longer a freeze, and the
+ * text says which it is.
  */
 static QEMUTimer *win32_pump_timer;
+
+#define WIN32_UI_TIMER_ID     1
+#define WIN32_UI_TIMER_MS     GUI_REFRESH_INTERVAL_DEFAULT
 
 /*
  * Watchdog state.  A graphics console sets dcl.update_interval to at most
  * GUI_REFRESH_INTERVAL_DEFAULT, so dpy_refresh is due every 30ms at worst;
  * if several seconds go by without one while the pump timer is still
- * ticking, the GUI timer described above has died and we want to say so
- * rather than leave the user guessing which half of the machine is stuck.
+ * ticking, the GUI timer described above has died.
  */
 #define WIN32_REFRESH_WATCHDOG_MS 5000
 
-/*
- * How late this timer has to be before it is worth saying so.
- *
- * Windows runs its own message loop inside DefWindowProc for several
- * things the user does with an ordinary window: holding the menu bar open,
- * dragging the title bar, dragging a border, holding a scrollbar thumb.
- * That loop does not return until the user lets go, and because QEMU's
- * main loop is what called us, the whole emulator -- vCPUs, block I/O, the
- * monitor, QMP -- is stopped for exactly as long as the mouse button is
- * held.  There is no way to notice that from inside, because nothing of
- * ours runs; but the moment it ends, this timer fires late by the whole
- * duration, so it can be reported after the fact.  Saying so turns "it
- * froze" into something the user can act on, and distinguishes it from the
- * display-only stall the watchdog above detects.
- */
+/* how late either timer has to be before it is worth saying so */
 #define WIN32_MAINLOOP_STALL_MS 1000
+#define WIN32_UI_STALL_MS 1000
 
 static int64_t win32_last_refresh_ms;
 static int64_t win32_last_tick_ms;
@@ -1146,10 +1387,11 @@ static void win32_refresh_watchdog(int64_t now)
         if (!win32_refresh_stalled) {
             win32_refresh_stalled = true;
             warn_report("win32: no display refresh for %" PRId64 "ms; "
-                        "ui/console.c's GUI timer has stopped. The window is "
-                        "being kept alive by the display backend's own pump. "
-                        "Please report this together with any "
-                        "'win32: fault' line above.",
+                        "ui/console.c's GUI timer has stopped. The window "
+                        "itself is still alive -- it is only no longer being "
+                        "told that the guest has changed anything. Please "
+                        "report this together with any 'win32: fault' line "
+                        "above.",
                         now - win32_last_refresh_ms);
         }
     } else if (win32_refresh_stalled) {
@@ -1158,30 +1400,51 @@ static void win32_refresh_watchdog(int64_t now)
     }
 }
 
+/*
+ * UI thread: report how long the last Windows modal loop held us.  This is
+ * the observable proof that the split works -- the guest kept running for
+ * the whole of the interval this reports.
+ */
+static void win32_ui_tick(void)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    DWORD late;
+
+    win32_ui_note_activity();
+
+    if (last) {
+        late = now - last;
+        if (late >= WIN32_UI_STALL_MS) {
+            warn_report("win32: the UI thread did not run for %lums. If the "
+                        "menu was open, or a window was being dragged or "
+                        "resized, or a scrollbar held, that is why: Windows "
+                        "runs its own message loop for those. The emulator "
+                        "kept running throughout; only the display and input "
+                        "were paused.",
+                        (unsigned long)late);
+        }
+    }
+    last = now;
+}
+
 static void win32_pump_tick(void *opaque)
 {
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
-    /*
-     * Re-arm *before* dispatching, never after, for the reason above: one
-     * window procedure that does not return normally must cost a frame, not
-     * the session.
-     */
     timer_mod(win32_pump_timer, now + GUI_REFRESH_INTERVAL_DEFAULT);
 
     if (win32_last_tick_ms &&
         now - win32_last_tick_ms >= WIN32_MAINLOOP_STALL_MS) {
         warn_report("win32: QEMU's main loop did not run for %" PRId64 "ms. "
-                    "If the menu was open, or a window was being dragged or "
-                    "resized, or a scrollbar held, that is why: Windows runs "
-                    "its own message loop for those and the emulator cannot "
-                    "run until it ends.",
+                    "The display runs on its own thread, so this is a stall "
+                    "inside the emulator itself and not something the window "
+                    "did.",
                     now - win32_last_tick_ms);
     }
     win32_last_tick_ms = now;
 
     win32_refresh_watchdog(now);
-    win32_poll_events(NULL);
 }
 
 /*
@@ -1267,6 +1530,15 @@ static LONG CALLBACK win32_fault_handler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/*
+ * dpy_refresh: QEMU thread, BQL held.
+ *
+ * What is left here is only the half that belongs on this thread:
+ * qemu_console_hw_update() pulls the guest's pending damage out of the
+ * device model, which is emulator state and must not move.  Everything it
+ * causes -- the InvalidateRect(), the repaint -- happens on the UI thread,
+ * driven by the dpy_gfx_update calls hw_update makes from inside here.
+ */
 static void win32_2d_refresh(DisplayChangeListener *dcl)
 {
     struct win32_console *wcon =
@@ -1281,13 +1553,19 @@ static void win32_2d_refresh(DisplayChangeListener *dcl)
 
     if (running != was_running) {
         was_running = running;
-        win32_update_caption();
+        win32_ui_post(WIN32_UI_CAPTION, 0, 0);
     }
 
-    win32_poll_events(wcon);
+    win32_pace_refresh(wcon);
     win32_in_refresh = false;
 }
 
+/*
+ * dpy_mouse_set: QEMU thread.  SetCursor() and ShowCursor() are both
+ * per-thread state in Win32, so they have to happen where the window is.
+ * The position fits in an LPARAM the way every Win32 mouse message's does,
+ * and nothing reads it back out of the guest's range.
+ */
 static void win32_mouse_warp(DisplayChangeListener *dcl,
                              int x, int y, bool on)
 {
@@ -1297,12 +1575,29 @@ static void win32_mouse_warp(DisplayChangeListener *dcl,
     if (!qemu_console_is_graphic(dcl->con) || !wcon->hwnd) {
         return;
     }
+    win32_ui_post(WIN32_UI_MOUSE_SET, on,
+                  MAKELPARAM((WORD)x, (WORD)y));
+}
+
+/* UI thread */
+static void win32_ui_mouse_set(bool on, int x, int y)
+{
+    struct win32_console *wcon = win32_active;
+    bool absolute = false;
+
+    if (!wcon || win32_console_is_term(wcon) || !wcon->hwnd) {
+        return;
+    }
+    {
+        BQL_LOCK_GUARD();
+        absolute = qemu_input_is_absolute(wcon->dcl.con);
+    }
 
     if (on) {
         if (!guest_cursor) {
             win32_show_cursor(true);
         }
-        if (gui_grab || qemu_input_is_absolute(dcl->con) || absolute_enabled) {
+        if (gui_grab || absolute || absolute_enabled) {
             SetCursor(guest_sprite);
         }
     } else if (gui_grab) {
@@ -1313,7 +1608,18 @@ static void win32_mouse_warp(DisplayChangeListener *dcl,
     guest_y = y;
 }
 
+/*
+ * dpy_cursor_define: QEMU thread.  The QEMUCursor belongs to the device
+ * model and is refcounted, not owned by us, so take a reference for the
+ * message and let the UI thread drop it once the HCURSOR has been built.
+ */
 static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
+{
+    win32_ui_post(WIN32_UI_CURSOR_DEFINE, 0, (LPARAM)cursor_ref(c));
+}
+
+/* UI thread; consumes the reference win32_mouse_define() took. */
+static void win32_ui_cursor_define(QEMUCursor *c)
 {
     BITMAPV5HEADER bi = { 0 };
     HBITMAP color, mask;
@@ -1321,6 +1627,7 @@ static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
     void *bits = NULL;
     ICONINFO ii;
     HCURSOR cur;
+    bool absolute;
 
     bi.bV5Size = sizeof(bi);
     bi.bV5Width = c->width;
@@ -1338,7 +1645,7 @@ static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
                              &bits, NULL, 0);
     ReleaseDC(NULL, hdc);
     if (!color || !bits) {
-        return;
+        goto out;
     }
     memcpy(bits, c->data, (size_t)c->width * c->height * 4);
 
@@ -1346,7 +1653,7 @@ static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
     mask = CreateBitmap(c->width, c->height, 1, 1, NULL);
     if (!mask) {
         DeleteObject(color);
-        return;
+        goto out;
     }
 
     ii.fIcon = FALSE;
@@ -1359,7 +1666,7 @@ static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
     DeleteObject(color);
     DeleteObject(mask);
     if (!cur) {
-        return;
+        goto out;
     }
 
     if (guest_sprite) {
@@ -1367,9 +1674,24 @@ static void win32_mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
     }
     guest_sprite = cur;
 
-    if (guest_cursor &&
-        (gui_grab || qemu_input_is_absolute(dcl->con) || absolute_enabled)) {
+    absolute = false;
+    if (win32_active && !win32_console_is_term(win32_active)) {
+        BQL_LOCK_GUARD();
+        absolute = qemu_input_is_absolute(win32_active->dcl.con);
+    }
+    if (guest_cursor && (gui_grab || absolute || absolute_enabled)) {
         SetCursor(guest_sprite);
+    }
+
+out:
+    /*
+     * cursor_unref() manipulates a plain refcount owned by the device
+     * model, so it is emulator state like any other and is taken with the
+     * BQL held.
+     */
+    {
+        BQL_LOCK_GUARD();
+        cursor_unref(c);
     }
 }
 
@@ -1384,335 +1706,195 @@ static const DisplayChangeListenerOps dcl_2d_ops = {
 };
 
 /* ------------------------------------------------------------------ */
-/* OpenGL (EGL/ANGLE) path                                              */
-
-#ifdef CONFIG_OPENGL
+/* the UI thread                                                        */
 
 /*
- * Bind this console's context together with its own window surface, the way
- * gd_egl_make_current() does: every console draws into its own HWND, so the
- * surface must be re-bound and not left wherever the previous console put it.
+ * Everything the QEMU thread asked for, executed here where the windows
+ * are.  Called from win32_uiproc() for a posted message.
  */
-static bool win32_gl_make_current(struct win32_console *wcon)
+static void win32_ui_handle(UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    if (!wcon->esurface || !wcon->ectx) {
-        return false;
+    struct win32_console *wcon = NULL;
+
+    switch (msg) {
+    case WIN32_UI_DAMAGE:
+    case WIN32_UI_SWITCH:
+    case WIN32_UI_TERM_OUTPUT:
+        if (!win32_consoles || (int)wparam >= win32_num_outputs) {
+            return;
+        }
+        wcon = &win32_consoles[wparam];
+        break;
+    default:
+        break;
     }
-    if (!eglMakeCurrent(qemu_egl_display, wcon->esurface,
-                        wcon->esurface, wcon->ectx)) {
-        error_report("win32: eglMakeCurrent failed: %s",
-                     qemu_egl_get_error_string());
-        return false;
+
+    switch (msg) {
+    case WIN32_UI_DAMAGE:
+        win32_ui_damage(wcon);
+        break;
+    case WIN32_UI_SWITCH:
+        win32_ui_switch(wcon);
+        break;
+    case WIN32_UI_CAPTION:
+        win32_update_caption();
+        break;
+    case WIN32_UI_MOUSE_SET:
+        win32_ui_mouse_set(wparam, (short)LOWORD(lparam),
+                           (short)HIWORD(lparam));
+        break;
+    case WIN32_UI_CURSOR_DEFINE:
+        win32_ui_cursor_define((QEMUCursor *)lparam);
+        break;
+    case WIN32_UI_MOUSE_MODE:
+        win32_mouse_mode_changed();
+        break;
+    case WIN32_UI_TERM_OUTPUT:
+        win32_term_console_drain(wcon);
+        break;
+    case WIN32_UI_SHUTDOWN:
+        win32_ui_teardown();
+        break;
+    default:
+        break;
     }
-    return true;
 }
 
-static void win32_gl_init(struct win32_console *wcon)
-{
-    assert(wcon->hwnd);
-    assert(!wcon->esurface);
+#define WIN32_UI_CLASS "QemuWin32Ui"
 
-    wcon->ectx = qemu_egl_init_ctx();
-    if (!wcon->ectx) {
-        error_report("win32: could not create an EGL context");
+/*
+ * A message-only window, created on the UI thread.  It exists so that
+ * win32_ui_post() has somewhere to post to that is not bound up with the
+ * frame's lifetime, and so that the cross-thread messages cannot be
+ * confused with, or delayed behind subclassing of, the frame's own.
+ */
+static void win32_ui_window_init(void)
+{
+    WNDCLASSEX wc = {
+        .cbSize        = sizeof(wc),
+        .lpfnWndProc   = win32_uiproc,
+        .hInstance     = GetModuleHandle(NULL),
+        .lpszClassName = WIN32_UI_CLASS,
+    };
+
+    win32_ui_class_atom = RegisterClassEx(&wc);
+    if (!win32_ui_class_atom) {
+        error_report("win32: could not register the UI message class "
+                     "(error %lu)", GetLastError());
         exit(1);
+    }
+    win32_uiwnd = CreateWindowEx(0, WIN32_UI_CLASS, NULL, 0, 0, 0, 0, 0,
+                                 HWND_MESSAGE, NULL, GetModuleHandle(NULL),
+                                 NULL);
+    if (!win32_uiwnd) {
+        error_report("win32: could not create the UI message window "
+                     "(error %lu)", GetLastError());
+        exit(1);
+    }
+    SetTimer(win32_uiwnd, WIN32_UI_TIMER_ID, WIN32_UI_TIMER_MS, NULL);
+}
+
+/*
+ * Run the messages posted so far to completion, on the thread that will go
+ * on to own them.  win32_display_init() calls this once at the end: the
+ * listener registrations it has just done fire dpy_gfx_switch synchronously,
+ * and the windows those create have to exist before init returns, because
+ * the caller may immediately ask for fullscreen and because anything that
+ * looks at win32_active would otherwise see nothing there.
+ */
+static void win32_ui_drain(void)
+{
+    MSG msg;
+
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        win32_dispatch_one(&msg);
+    }
+}
+
+/*
+ * Tear the windows down.  UI thread, from WIN32_UI_SHUTDOWN, with the QEMU
+ * thread waiting on win32_ui_done and *not* holding the BQL -- see
+ * win32_display_cleanup().
+ */
+static void win32_ui_teardown(void)
+{
+    int i;
+
+    if (win32_fault_handle) {
+        RemoveVectoredExceptionHandler(win32_fault_handle);
+        win32_fault_handle = NULL;
     }
 
     /*
-     * Despite its name this helper is platform independent -- it is just
-     * eglCreateWindowSurface() plus eglMakeCurrent() -- and on Windows the
-     * EGLNativeWindowType is an HWND.  A child HWND works exactly as well as
-     * a top-level one, and since the child is never reparented the surface
-     * stays valid across every tab switch.
+     * The low-level keyboard hook is delivered to the thread that installed
+     * it, which is this one, so it also has to be removed from here.
      */
-    wcon->esurface = qemu_egl_init_surface_x11(wcon->ectx,
-                                               (EGLNativeWindowType)wcon->hwnd);
-    if (!wcon->esurface) {
-        error_report("win32: could not create an EGL surface for the window");
-        exit(1);
-    }
+    win32_kbd_set_grab(false);
+    win32_kbd_set_window(NULL);
+    ClipCursor(NULL);
+    win32_show_cursor(true);
 
-    wcon->gls = qemu_gl_init_shader();
-}
+    for (i = 0; win32_consoles && i < win32_num_outputs; i++) {
+        struct win32_console *wcon = &win32_consoles[i];
 
-static void win32_gl_fini(struct win32_console *wcon)
-{
-    if (wcon->esurface) {
-        eglMakeCurrent(qemu_egl_display, wcon->esurface,
-                       wcon->esurface, wcon->ectx);
-    }
-
-    if (wcon->gls) {
-        surface_gl_destroy_texture(wcon->gls, wcon->surface);
-        egl_fb_destroy(&wcon->guest_fb);
-        egl_fb_destroy(&wcon->win_fb);
-        qemu_gl_fini_shader(wcon->gls);
-        wcon->gls = NULL;
-    }
-    wcon->scanout_mode = false;
-    wcon->updates = 0;
-
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
-
-    if (wcon->esurface) {
-        eglDestroySurface(qemu_egl_display, wcon->esurface);
-        wcon->esurface = NULL;
-    }
-    if (wcon->ectx) {
-        eglDestroyContext(qemu_egl_display, wcon->ectx);
-        wcon->ectx = NULL;
-    }
-}
-
-/* mirrors sdl2_set_scanout_mode() / gtk_egl_set_scanout_mode() */
-static void win32_gl_set_scanout_mode(struct win32_console *wcon, bool scanout)
-{
-    if (wcon->scanout_mode == scanout) {
-        return;
-    }
-
-    wcon->scanout_mode = scanout;
-    if (!wcon->scanout_mode) {
-        egl_fb_destroy(&wcon->guest_fb);
-        if (wcon->surface && wcon->gls) {
-            surface_gl_destroy_texture(wcon->gls, wcon->surface);
-            surface_gl_create_texture(wcon->gls, wcon->surface);
+        if (win32_console_is_term(wcon)) {
+            win32_term_console_fini(wcon);
+            continue;
         }
+        win32_window_destroy(wcon);
+        qemu_free_displaysurface(wcon->surface);
+        wcon->surface = NULL;
+        qemu_free_displaysurface(wcon->pending_surface);
+        wcon->pending_surface = NULL;
     }
+    win32_frame_fini();
+    win32_active = NULL;
+
+    if (guest_sprite) {
+        DestroyIcon(guest_sprite);
+        guest_sprite = NULL;
+    }
+    if (win32_class_atom) {
+        UnregisterClass(WIN32_WINDOW_CLASS, GetModuleHandle(NULL));
+        win32_class_atom = 0;
+    }
+
+    KillTimer(win32_uiwnd, WIN32_UI_TIMER_ID);
+    DestroyWindow(win32_uiwnd);
+    win32_uiwnd = NULL;
+    if (win32_ui_class_atom) {
+        UnregisterClass(WIN32_UI_CLASS, GetModuleHandle(NULL));
+        win32_ui_class_atom = 0;
+    }
+
+    SetEvent(win32_ui_done);
+    PostQuitMessage(0);
 }
 
 /*
- * The client area of the render window is the whole of the area the guest
- * image occupies, so this is also where the zoom factor is honoured: it has
- * already been applied to the window size by the frame.
+ * qemu_main(): the real main thread, handed over by system/main.c once it
+ * has spawned the thread QEMU's main loop runs on.
  */
-static bool win32_gl_client_size(struct win32_console *wcon, int *w, int *h)
+static int win32_main(void)
 {
-    RECT client;
+    MSG msg;
 
-    if (!wcon->hwnd || !GetClientRect(wcon->hwnd, &client)) {
-        return false;
-    }
-    if (client.right <= 0 || client.bottom <= 0) {
-        return false;
-    }
-    *w = client.right;
-    *h = client.bottom;
-    return true;
-}
-
-static void win32_gl_render_surface(struct win32_console *wcon)
-{
-    int ww, wh;
-
-    if (!wcon->gls || !wcon->surface) {
-        return;
-    }
-    if (!win32_gl_client_size(wcon, &ww, &wh)) {
-        return;
-    }
-    if (!win32_gl_make_current(wcon)) {
-        return;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        win32_dispatch_one(&msg);
     }
 
-    surface_gl_setup_viewport(wcon->gls, wcon->surface, ww, wh);
-    surface_gl_render_texture(wcon->gls, wcon->surface);
-    eglSwapBuffers(qemu_egl_display, wcon->esurface);
-}
-
-static void win32_gl_scanout_flush(DisplayChangeListener *dcl,
-                                   uint32_t x, uint32_t y,
-                                   uint32_t w, uint32_t h)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-    int ww, wh;
-
-    if (!wcon->scanout_mode || !wcon->guest_fb.framebuffer) {
-        return;
-    }
-    if (!win32_gl_client_size(wcon, &ww, &wh)) {
-        return;
-    }
-    if (!win32_gl_make_current(wcon)) {
-        return;
-    }
-
-    egl_fb_setup_default(&wcon->win_fb, ww, wh, 0, 0);
-    egl_fb_blit(&wcon->win_fb, &wcon->guest_fb, !wcon->y0_top);
-    eglSwapBuffers(qemu_egl_display, wcon->esurface);
-}
-
-/* repaint the window from whatever the current source is */
-static void win32_gl_redraw(struct win32_console *wcon)
-{
-    if (!wcon->hwnd) {
-        return;
-    }
-    if (wcon->scanout_mode) {
-        /* only the dcl argument of the flush is used */
-        win32_gl_scanout_flush(&wcon->dcl, 0, 0, 0, 0);
-        return;
-    }
-    win32_gl_render_surface(wcon);
-}
-
-static void win32_gl_update(DisplayChangeListener *dcl,
-                            int x, int y, int w, int h)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-
-    if (!wcon->gls || !wcon->surface) {
-        return;
-    }
-    if (!win32_gl_make_current(wcon)) {
-        return;
-    }
-    surface_gl_update_texture(wcon->gls, wcon->surface, x, y, w, h);
-    wcon->updates++;
-}
-
-static void win32_gl_switch(DisplayChangeListener *dcl,
-                            DisplaySurface *new_surface)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-    DisplaySurface *old_surface = wcon->surface;
-
-    if (wcon->gls && win32_gl_make_current(wcon)) {
-        surface_gl_destroy_texture(wcon->gls, wcon->surface);
-    }
-
-    wcon->surface = new_surface;
-    win32_switch_common(wcon, old_surface);
-
-    if (wcon->gls && win32_gl_make_current(wcon)) {
-        surface_gl_create_texture(wcon->gls, new_surface);
-        wcon->updates++;
-    }
-}
-
-static void win32_gl_refresh(DisplayChangeListener *dcl)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-    static bool was_running;
-    bool running = runstate_is_running();
-
-    win32_last_refresh_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    win32_in_refresh = true;
-
-    qemu_console_hw_update(dcl->con);
-
-    if (running != was_running) {
-        was_running = running;
-        win32_update_caption();
-    }
-
-    if (wcon->updates && wcon->hwnd && wcon == win32_active) {
-        wcon->updates = 0;
-        win32_gl_render_surface(wcon);
-    }
-
-    win32_poll_events(wcon);
-    win32_in_refresh = false;
-}
-
-static void win32_gl_scanout_disable(DisplayChangeListener *dcl)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-
-    if (!win32_gl_make_current(wcon)) {
-        /* no context to delete objects with; just drop out of scanout mode */
-        wcon->scanout_mode = false;
-        return;
-    }
-    win32_gl_set_scanout_mode(wcon, false);
-}
-
-static void win32_gl_scanout_texture(DisplayChangeListener *dcl,
-                                     uint32_t backing_id,
-                                     bool backing_y_0_top,
-                                     uint32_t backing_width,
-                                     uint32_t backing_height,
-                                     uint32_t x, uint32_t y,
-                                     uint32_t w, uint32_t h,
-                                     void *d3d_tex2d)
-{
-    struct win32_console *wcon =
-        container_of(dcl, struct win32_console, dcl);
-
-    wcon->y0_top = backing_y_0_top;
-
-    if (!win32_gl_make_current(wcon)) {
-        return;
-    }
-
-    win32_gl_set_scanout_mode(wcon, true);
-    egl_fb_setup_for_tex(&wcon->guest_fb, backing_width, backing_height,
-                         backing_id, false);
-}
-
-static const DisplayChangeListenerOps dcl_gl_ops = {
-    .dpy_name               = "win32-gl",
-    .dpy_gfx_update         = win32_gl_update,
-    .dpy_gfx_switch         = win32_gl_switch,
-    .dpy_gfx_check_format   = console_gl_check_format,
-    .dpy_refresh            = win32_gl_refresh,
-    .dpy_mouse_set          = win32_mouse_warp,
-    .dpy_cursor_define      = win32_mouse_define,
-
-    .dpy_gl_scanout_disable = win32_gl_scanout_disable,
-    .dpy_gl_scanout_texture = win32_gl_scanout_texture,
-    .dpy_gl_update          = win32_gl_scanout_flush,
-};
-
-static bool win32_gl_is_compatible_dcl(DisplayGLCtx *dgc,
-                                       DisplayChangeListener *dcl)
-{
-    return dcl->ops == &dcl_gl_ops;
-}
-
-/*
- * Contexts handed to the guest device (virtio-gpu-gl) share ours, so the
- * textures it renders into can be blitted by the scanout path above.
- */
-static QEMUGLContext win32_gl_create_context(DisplayGLCtx *dgc,
-                                             QEMUGLParams *params)
-{
-    struct win32_console *wcon =
-        container_of(dgc, struct win32_console, dgc);
-
-    win32_gl_make_current(wcon);
-    return qemu_egl_create_context(dgc, params, wcon->ectx);
-}
-
-static int win32_gl_make_context_current(DisplayGLCtx *dgc,
-                                         QEMUGLContext ctx)
-{
-    struct win32_console *wcon =
-        container_of(dgc, struct win32_console, dgc);
-
-    if (!eglMakeCurrent(qemu_egl_display, wcon->esurface,
-                        wcon->esurface, ctx)) {
-        error_report("win32: eglMakeCurrent failed: %s",
-                     qemu_egl_get_error_string());
-        return -1;
+    /*
+     * The loop only ends because win32_ui_teardown() asked it to, which
+     * means the QEMU thread is already on its way through the rest of
+     * qemu_cleanup() and will finish the process with exit().  Returning
+     * from here would run main()'s own return path at the same time, so
+     * park instead and let that exit() be the only one.
+     */
+    for (;;) {
+        SleepEx(INFINITE, FALSE);
     }
     return 0;
 }
-
-static const DisplayGLCtxOps gl_ctx_ops = {
-    .dpy_gl_ctx_is_compatible_dcl = win32_gl_is_compatible_dcl,
-    .dpy_gl_ctx_create            = win32_gl_create_context,
-    .dpy_gl_ctx_destroy           = qemu_egl_destroy_context,
-    .dpy_gl_ctx_make_current      = win32_gl_make_context_current,
-};
-
-#endif /* CONFIG_OPENGL */
 
 /* ------------------------------------------------------------------ */
 /* init / cleanup                                                       */
@@ -1725,43 +1907,53 @@ static void win32_display_cleanup(void)
         return;
     }
 
+    /*
+     * QEMU thread, BQL held, from qemu_cleanup().  The windows belong to
+     * the UI thread and DestroyWindow() from anywhere else silently does
+     * nothing, so the teardown is a handshake: do the emulator-side half
+     * here, ask the UI thread for its half, wait for it to finish.
+     */
     if (win32_pump_timer) {
         timer_free(win32_pump_timer);
         win32_pump_timer = NULL;
     }
-
-    if (win32_fault_handle) {
-        RemoveVectoredExceptionHandler(win32_fault_handle);
-        win32_fault_handle = NULL;
-    }
-
     qemu_remove_mouse_mode_change_notifier(&mouse_mode_notifier);
-    win32_kbd_set_grab(false);
-    win32_kbd_set_window(NULL);
-    ClipCursor(NULL);
-    win32_show_cursor(true);
 
     for (i = 0; i < win32_num_outputs; i++) {
-        if (win32_console_is_term(&win32_consoles[i])) {
-            win32_term_console_fini(&win32_consoles[i]);
+        struct win32_console *wcon = &win32_consoles[i];
+
+        if (win32_console_is_term(wcon)) {
             continue;
         }
-        qemu_console_unregister_listener(&win32_consoles[i].dcl);
-        qkbd_state_free(win32_consoles[i].kbd);
-        win32_window_destroy(&win32_consoles[i]);
+        /* after this no DisplayChangeListener op can arrive any more */
+        qemu_console_unregister_listener(&wcon->dcl);
+        /*
+         * The UI thread reads wcon->kbd under the BQL and re-checks it
+         * after taking the lock, so clearing it here -- with the BQL held
+         * -- is what makes a keystroke that is already in flight harmless.
+         */
+        qkbd_state_free(wcon->kbd);
+        wcon->kbd = NULL;
     }
-    win32_frame_fini();
-    win32_active = NULL;
-    g_clear_pointer(&win32_consoles, g_free);
-    win32_num_outputs = 0;
 
-    if (guest_sprite) {
-        DestroyIcon(guest_sprite);
-        guest_sprite = NULL;
-    }
-    if (win32_class_atom) {
-        UnregisterClass(WIN32_WINDOW_CLASS, GetModuleHandle(NULL));
-        win32_class_atom = 0;
+    /*
+     * This is the one place the QEMU thread waits for the UI thread, and
+     * it drops the BQL for the duration so that it is not a cycle: a UI
+     * thread parked on bql_lock() inside a modal loop can then make
+     * progress and get to the shutdown message.  The wait is bounded
+     * anyway, because a UI thread that never comes back must not stop the
+     * process from exiting.
+     */
+    win32_ui_post(WIN32_UI_SHUTDOWN, 0, 0);
+    bql_unlock();
+    if (WaitForSingleObject(win32_ui_done, 5000) == WAIT_OBJECT_0) {
+        bql_lock();
+        g_clear_pointer(&win32_consoles, g_free);
+        win32_num_outputs = 0;
+    } else {
+        bql_lock();
+        warn_report("win32: the UI thread did not shut down in time; "
+                    "leaving its windows to the process exit");
     }
 }
 
@@ -1777,40 +1969,16 @@ static void win32_display_early_init(DisplayOptions *o)
      */
     win32_term_chardev_register();
 
-    if (!o->has_gl || o->gl == DISPLAY_GL_MODE_OFF) {
-        return;
-    }
-
-#ifndef CONFIG_OPENGL
-    error_report("win32: this QEMU was built without OpenGL support, "
-                 "so -display win32,gl=on is not available");
-    exit(1);
-#else
     /*
-     * epoxy resolves the EGL entry points lazily with LoadLibrary(), and
-     * aborts the process if it cannot; ask it first so that a host without
-     * ANGLE gets a diagnostic instead of a crash.
+     * There is no GL path any more; see the top of this file.  Fail rather
+     * than quietly fall back to the 2D one, so that a command line asking
+     * for acceleration is never silently not getting it.
      */
-    if (!epoxy_has_egl()) {
-        error_report("win32: no EGL implementation could be loaded; "
-                     "-display win32,gl=on requires ANGLE -- put libEGL.dll "
-                     "and libGLESv2.dll next to the QEMU executable");
+    if (o->has_gl && o->gl != DISPLAY_GL_MODE_OFF) {
+        error_report("win32: OpenGL is not supported by this display "
+                     "backend");
         exit(1);
     }
-
-    /*
-     * Do this here rather than in init(): display_opengl has to be set
-     * before the guest devices are created, and a GL-capable device such as
-     * virtio-gpu-gl picks up qemu_egl_display at realize time.
-     */
-    if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, o->gl) < 0) {
-        error_report("win32: could not initialise EGL; "
-                     "-display win32,gl=on is not usable on this host");
-        exit(1);
-    }
-
-    display_opengl = 1;
-#endif
 }
 
 static void win32_register_class(void)
@@ -1862,6 +2030,24 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     assert(o->type == DISPLAY_TYPE_WIN32);
 
     win32_opts = o;
+
+    qemu_mutex_init(&win32_ui_mutex);
+    win32_ui_done = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!win32_ui_done) {
+        error_report("win32: could not create the shutdown event (error %lu)",
+                     GetLastError());
+        exit(1);
+    }
+
+    /*
+     * Take the process's main thread for the UI and let system/main.c put
+     * QEMU's main loop on a thread of its own -- the hook is already there
+     * for ui/cocoa.m and needs nothing but a non-NULL qemu_main.  This is
+     * set here, in init rather than early_init, because it must not happen
+     * unless the backend really is going to come up.
+     */
+    qemu_main = win32_main;
+    win32_ui_window_init();
 
     if (o->u.win32.has_grab_mod) {
         if (o->u.win32.grab_mod == HOT_KEY_MOD_LSHIFT_LCTRL_LALT) {
@@ -1915,24 +2101,10 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
 
         assert(con != NULL);
         win32_consoles[i].kbd = qkbd_state_init(con);
-#ifdef CONFIG_OPENGL
-        win32_consoles[i].opengl = display_opengl;
-        if (display_opengl) {
-            ops = &dcl_gl_ops;
-            win32_consoles[i].dgc.ops = &gl_ctx_ops;
-            qemu_console_set_display_gl_ctx(con, &win32_consoles[i].dgc);
-        }
-#endif
+        win32_consoles[i].con_index = qemu_console_get_index(con);
         qemu_console_register_listener(con, &win32_consoles[i].dcl, ops);
     }
 
-    /*
-     * Always, whether or not there is a graphics console: see the comment
-     * on win32_pump_timer.  With no graphics console it is the only thing
-     * that dispatches messages at all; with one it is the backstop that
-     * keeps the window alive if ui/console.c's GUI timer ever fails to be
-     * re-armed, and the watchdog that says so when it does.
-     */
     win32_have_gfx_console = (n_gfx > 0);
     win32_last_refresh_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     win32_pump_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
@@ -1945,16 +2117,18 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
     mouse_mode_notifier.notify = win32_mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
 
+    /*
+     * Everything above ran on the process's main thread, which is about to
+     * become the UI thread, so the windows it created are already owned by
+     * the right one.  What it has *not* done is run the messages those
+     * registrations posted: do that now, so that init returns with the
+     * windows that exist actually created.
+     */
+    win32_ui_drain();
+
     if (o->has_full_screen && o->full_screen) {
         win32_toggle_fullscreen();
     }
-
-    /*
-     * The message pump runs from dpy_refresh on the main thread, so the
-     * main loop stays where it is -- no equivalent of Cocoa's main-thread
-     * takeover is needed here.
-     */
-    qemu_main = NULL;
 }
 
 static QemuDisplay qemu_display_win32 = {
