@@ -1346,14 +1346,19 @@ static void win32_pace_refresh(struct win32_console *wcon)
  *     any more, which is exactly the point of the change.  If this timer is
  *     late now, the emulator itself is stuck and the report should say so.
  *
- * win32_ui_timer is its opposite number on the UI thread, an ordinary
- * WM_TIMER on the message-only window.  *That* is where the modal-loop
- * lateness now shows up: holding the menu bar open, dragging the title bar,
- * dragging a border or holding a scrollbar thumb all run a message loop
- * inside DefWindowProc that does not return until the user lets go, and
- * nothing of ours runs meanwhile.  It is still worth reporting -- input and
- * the display really were paused -- but it is no longer a freeze, and the
- * text says which it is.
+ * The UI thread has an opposite number, an ordinary WM_TIMER on the
+ * message-only window.  It reports the same kind of thing for the thread it
+ * runs on: the UI thread's message loop not getting round to it.
+ *
+ * It fires less often than one might expect, and that is worth knowing
+ * rather than discovering.  Windows' modal loops are message loops -- they
+ * call GetMessage()/PeekMessage() and dispatch what is not theirs -- so a
+ * held menu or a grabbed scrollbar thumb does *not* stop this timer, as a
+ * 45-second menu hold under wine confirmed.  What does stop it is the UI
+ * thread being blocked rather than merely busy elsewhere: waiting for the
+ * BQL behind a long-running QEMU operation, or a genuinely non-pumping
+ * loop.  So the message says what was actually measured and what it does
+ * and does not imply, rather than naming a cause it cannot know.
  */
 static QEMUTimer *win32_pump_timer;
 
@@ -1400,11 +1405,7 @@ static void win32_refresh_watchdog(int64_t now)
     }
 }
 
-/*
- * UI thread: report how long the last Windows modal loop held us.  This is
- * the observable proof that the split works -- the guest kept running for
- * the whole of the interval this reports.
- */
+/* UI thread; see the comment above for when this can and cannot fire. */
 static void win32_ui_tick(void)
 {
     static DWORD last;
@@ -1416,12 +1417,10 @@ static void win32_ui_tick(void)
     if (last) {
         late = now - last;
         if (late >= WIN32_UI_STALL_MS) {
-            warn_report("win32: the UI thread did not run for %lums. If the "
-                        "menu was open, or a window was being dragged or "
-                        "resized, or a scrollbar held, that is why: Windows "
-                        "runs its own message loop for those. The emulator "
-                        "kept running throughout; only the display and input "
-                        "were paused.",
+            warn_report("win32: the UI thread did not process messages for "
+                        "%lums, so the window will have stopped updating and "
+                        "ignored input for that long. The emulator itself "
+                        "was not affected: it runs on its own thread.",
                         (unsigned long)late);
         }
     }
