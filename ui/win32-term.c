@@ -1475,8 +1475,24 @@ void win32_term_write(Win32Term *wt, const char *buf, int len)
     if (len <= 0) {
         return;
     }
+    /*
+     * Do not repaint here.  term_data() parses the bytes and, whenever
+     * anything visible changed, calls term_schedule_update(), which queues
+     * term_update_callback() -- and *that* is where PuTTY's 20ms display
+     * coalescing lives (terminal.c: window_update_cooldown).  term_update()
+     * has no cooldown of its own: calling it directly, as this used to,
+     * bypassed the coalescing entirely and turned every single chardev
+     * write into a full synchronous GDI repaint of the terminal.  A guest
+     * draining a UART FIFO a few bytes at a time therefore converted its
+     * output rate straight into main-thread GDI work, on the same thread
+     * the guest runs on, with nothing able to slow it down.
+     *
+     * win32_term_kick_timer() runs the callback queue immediately, so the
+     * first write after a quiet moment still repaints within this call; it
+     * is only a burst that now gets coalesced, which is the entire point of
+     * PuTTY having the cooldown.
+     */
     term_data(wt->term, buf, len);
-    term_update(wt->term);
     win32_term_kick_timer(wt);
 }
 

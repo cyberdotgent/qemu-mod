@@ -684,11 +684,37 @@ static void win32_fill_bitmapinfo(DisplaySurface *surf, BITMAPINFO *bmi)
     bmi->bmiHeader.biCompression = BI_RGB;
 }
 
+/*
+ * Blit the guest surface into the window.
+ *
+ * This runs on QEMU's main thread from inside dpy_refresh, once per
+ * WM_PAINT, and every WM_PAINT covers the whole client area -- so a slow
+ * blit is a slow guest, and a guest that redraws at any rate turns the
+ * cost of one blit into a permanent tax on the main loop.
+ *
+ * HALFTONE is GDI's software resampler and by a wide margin its most
+ * expensive StretchBlt mode.  It earns its cost when the image is being
+ * *shrunk*, where simply dropping pixels visibly destroys text.  It does
+ * not earn it anywhere else:
+ *
+ *   - At 1:1 there is nothing to resample.  COLORONCOLOR lets GDI take a
+ *     straight copy, clipped by the DC's clip region (BeginPaint() has
+ *     already set that to the update region), instead of running the
+ *     resampler over the whole screen to produce the identical pixels.
+ *     This is the ordinary case at 100% display scaling.
+ *
+ *   - When the image is being *enlarged* the resampler has no information
+ *     to add; every destination pixel comes from one source pixel except
+ *     at cell boundaries.  Enlargement is not a corner case: the frame is
+ *     DPI-scaled (see win32_console_pixel_size()), so every machine whose
+ *     display is set above 100% took the HALFTONE path for every frame.
+ */
 static void win32_paint(struct win32_console *wcon, HDC hdc)
 {
     DisplaySurface *surf = wcon->surface;
     BITMAPINFO bmi;
     RECT client;
+    int sw, sh;
 
     if (!surf || !GetClientRect(wcon->hwnd, &client)) {
         return;
@@ -697,12 +723,19 @@ static void win32_paint(struct win32_console *wcon, HDC hdc)
         return;
     }
 
+    sw = surface_width(surf);
+    sh = surface_height(surf);
+    if (sw <= 0 || sh <= 0) {
+        return;
+    }
+
     win32_fill_bitmapinfo(surf, &bmi);
-    SetStretchBltMode(hdc, HALFTONE);
+    SetStretchBltMode(hdc, (client.right < sw || client.bottom < sh)
+                           ? HALFTONE : COLORONCOLOR);
     SetBrushOrgEx(hdc, 0, 0, NULL);
     StretchDIBits(hdc,
                   0, 0, client.right, client.bottom,
-                  0, 0, surface_width(surf), surface_height(surf),
+                  0, 0, sw, sh,
                   surface_data(surf), &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
@@ -870,6 +903,7 @@ static void win32_2d_update(DisplayChangeListener *dcl,
     struct win32_console *wcon =
         container_of(dcl, struct win32_console, dcl);
     RECT client, dirty;
+    int sw, sh;
 
     if (!wcon->hwnd || !wcon->surface || wcon != win32_active) {
         return;
@@ -879,15 +913,25 @@ static void win32_2d_update(DisplayChangeListener *dcl,
         return;
     }
 
+    /*
+     * A zero-dimension surface would divide by zero below.  That raises a
+     * hardware exception rather than a signal, and this code runs inside
+     * dpy_refresh, whose caller in ui/console.c re-arms the GUI timer only
+     * after we return -- so one such fault would cost the whole session's
+     * display, not one frame.  It should not be reachable; treat it as
+     * "nothing to invalidate" rather than trusting that.
+     */
+    sw = surface_width(wcon->surface);
+    sh = surface_height(wcon->surface);
+    if (sw <= 0 || sh <= 0) {
+        return;
+    }
+
     /* map the guest-side dirty rectangle onto the (possibly scaled) window */
-    dirty.left   = x * client.right / surface_width(wcon->surface);
-    dirty.top    = y * client.bottom / surface_height(wcon->surface);
-    dirty.right  = ((x + w) * client.right
-                    + surface_width(wcon->surface) - 1)
-                   / surface_width(wcon->surface);
-    dirty.bottom = ((y + h) * client.bottom
-                    + surface_height(wcon->surface) - 1)
-                   / surface_height(wcon->surface);
+    dirty.left   = x * client.right / sw;
+    dirty.top    = y * client.bottom / sh;
+    dirty.right  = ((x + w) * client.right + sw - 1) / sw;
+    dirty.bottom = ((y + h) * client.bottom + sh - 1) / sh;
 
     InvalidateRect(wcon->hwnd, &dirty, FALSE);
 }
@@ -960,6 +1004,20 @@ static bool win32_2d_check_format(DisplayChangeListener *dcl,
  */
 #define WIN32_MAX_DISPATCH_PER_POLL 256
 
+/*
+ * What the pump is doing right now.  Set around DispatchMessage() and used
+ * only by win32_fault_handler() below, to say which window message QEMU was
+ * delivering when a window procedure blew up.  It is deliberately not used
+ * as a re-entrancy guard: a flag that a non-local exit could leave set would
+ * be one more way to kill the pump for good, which is the failure this file
+ * is trying to make impossible.  Nesting cannot happen anyway -- every
+ * caller of win32_poll_events() is a QEMU timer callback, and QEMU's main
+ * loop is not re-entered from a window procedure.
+ */
+static bool win32_in_dispatch;
+static UINT win32_dispatch_msg;
+static HWND win32_dispatch_hwnd;
+
 static void win32_poll_events(struct win32_console *wcon)
 {
     MSG msg;
@@ -977,11 +1035,16 @@ static void win32_poll_events(struct win32_console *wcon)
             continue;
         }
         TranslateMessage(&msg);
+
+        win32_dispatch_msg = msg.message;
+        win32_dispatch_hwnd = msg.hwnd;
+        win32_in_dispatch = true;
         DispatchMessage(&msg);
+        win32_in_dispatch = false;
     }
 
     if (!wcon) {
-        /* driven by the standalone timer below, which has no console */
+        /* driven by the standalone pump timer, which has no console */
         return;
     }
 
@@ -999,32 +1062,209 @@ static void win32_poll_events(struct win32_console *wcon)
 }
 
 /*
- * The message pump normally rides on a graphics console's refresh
- * callback.  A machine with no graphics console at all -- "-vga none", or a
- * target that has no display device -- still has terminal tabs, and they
- * are ordinary windows that will not so much as repaint unless somebody
- * dispatches their messages.  So in that case, and only in that case, drive
- * the pump from a timer instead.
+ * The pump's own timer.
+ *
+ * This used to exist only when there was no graphics console at all
+ * ("-vga none", or a target with no display device), on the reasoning that
+ * with a graphics console the pump rides on dpy_refresh and QEMU's display
+ * timer keeps calling us whatever happened last frame.  That reasoning does
+ * not hold.  ui/console.c's gui_update() is
+ *
+ *     ds->refreshing = true;
+ *     dpy_refresh(ds);                                  <- us
+ *     ds->refreshing = false;
+ *     ...
+ *     timer_mod(ds->gui_timer, ds->last_update + interval);
+ *
+ * i.e. a one-shot timer re-armed *after* the callback returns, with exactly
+ * the shape this file used to get wrong: anything that leaves
+ * win32_2d_refresh()/win32_gl_refresh() other than by returning takes the
+ * whole session's display with it, and the guest, the monitor and QMP carry
+ * on regardless, so it looks like "the window froze".
+ *
+ * How reachable that is was measured rather than assumed, by faulting on
+ * purpose in two places and watching what happened:
+ *
+ *   - A fault raised inside a window procedure is swallowed.  On x86-64
+ *     the kernel-mode callback dispatcher catches exceptions raised in a
+ *     user-mode callback (wine prints "err:seh:dispatch_callback ignoring
+ *     exception" at the same spot).  But control comes *back* out of
+ *     DispatchMessage() normally, so the pump carries on, the refresh
+ *     returns, and gui_update() re-arms.  Only the one message is lost.
+ *
+ *   - A fault raised in the refresh path proper, outside any window
+ *     procedure, is not swallowed at all: it is an ordinary unhandled
+ *     exception and the process dies.  That is a crash, not a freeze.
+ *
+ * So the swallowed-fault route to a dead GUI timer is not the open door it
+ * looks like, and this timer is a backstop rather than a cure for a known
+ * bug.  It is still worth having: it costs one timer at the default refresh
+ * interval, it removes the UI's dependence on someone else's error handling
+ * entirely, and it is what makes win32_refresh_watchdog() below possible --
+ * something has to still be running to notice that the refresh is not.
  */
 static QEMUTimer *win32_pump_timer;
 
+/*
+ * Watchdog state.  A graphics console sets dcl.update_interval to at most
+ * GUI_REFRESH_INTERVAL_DEFAULT, so dpy_refresh is due every 30ms at worst;
+ * if several seconds go by without one while the pump timer is still
+ * ticking, the GUI timer described above has died and we want to say so
+ * rather than leave the user guessing which half of the machine is stuck.
+ */
+#define WIN32_REFRESH_WATCHDOG_MS 5000
+
+/*
+ * How late this timer has to be before it is worth saying so.
+ *
+ * Windows runs its own message loop inside DefWindowProc for several
+ * things the user does with an ordinary window: holding the menu bar open,
+ * dragging the title bar, dragging a border, holding a scrollbar thumb.
+ * That loop does not return until the user lets go, and because QEMU's
+ * main loop is what called us, the whole emulator -- vCPUs, block I/O, the
+ * monitor, QMP -- is stopped for exactly as long as the mouse button is
+ * held.  There is no way to notice that from inside, because nothing of
+ * ours runs; but the moment it ends, this timer fires late by the whole
+ * duration, so it can be reported after the fact.  Saying so turns "it
+ * froze" into something the user can act on, and distinguishes it from the
+ * display-only stall the watchdog above detects.
+ */
+#define WIN32_MAINLOOP_STALL_MS 1000
+
+static int64_t win32_last_refresh_ms;
+static int64_t win32_last_tick_ms;
+static bool win32_refresh_stalled;
+static bool win32_have_gfx_console;
+
+static void win32_refresh_watchdog(int64_t now)
+{
+    if (!win32_have_gfx_console) {
+        return;
+    }
+
+    if (now - win32_last_refresh_ms >= WIN32_REFRESH_WATCHDOG_MS) {
+        if (!win32_refresh_stalled) {
+            win32_refresh_stalled = true;
+            warn_report("win32: no display refresh for %" PRId64 "ms; "
+                        "ui/console.c's GUI timer has stopped. The window is "
+                        "being kept alive by the display backend's own pump. "
+                        "Please report this together with any "
+                        "'win32: fault' line above.",
+                        now - win32_last_refresh_ms);
+        }
+    } else if (win32_refresh_stalled) {
+        win32_refresh_stalled = false;
+        warn_report("win32: display refresh resumed");
+    }
+}
+
 static void win32_pump_tick(void *opaque)
 {
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
     /*
-     * Re-arm *before* dispatching, never after.  A window procedure that
-     * does not return normally -- an access violation swallowed by a
-     * vectored handler, say -- would otherwise unwind past the re-arm and
-     * leave this timer dead for the rest of the session, taking the whole
-     * UI with it, because nothing else drives it.  That is not a
-     * theoretical worry: it is precisely the difference between this path
-     * and the one a graphics console uses, where QEMU's own display timer
-     * keeps calling us whatever happened last frame, so one bad dispatch
-     * costs a frame instead of the session.
+     * Re-arm *before* dispatching, never after, for the reason above: one
+     * window procedure that does not return normally must cost a frame, not
+     * the session.
      */
-    timer_mod(win32_pump_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-              GUI_REFRESH_INTERVAL_DEFAULT);
+    timer_mod(win32_pump_timer, now + GUI_REFRESH_INTERVAL_DEFAULT);
+
+    if (win32_last_tick_ms &&
+        now - win32_last_tick_ms >= WIN32_MAINLOOP_STALL_MS) {
+        warn_report("win32: QEMU's main loop did not run for %" PRId64 "ms. "
+                    "If the menu was open, or a window was being dragged or "
+                    "resized, or a scrollbar held, that is why: Windows runs "
+                    "its own message loop for those and the emulator cannot "
+                    "run until it ends.",
+                    now - win32_last_tick_ms);
+    }
+    win32_last_tick_ms = now;
+
+    win32_refresh_watchdog(now);
     win32_poll_events(NULL);
+}
+
+/*
+ * Fault reporting.
+ *
+ * A window procedure that raises a hardware exception is not a noisy
+ * failure on Windows: on x86-64 the kernel-mode callback dispatcher
+ * catches exceptions raised in a callback, so a dereference of a NULL
+ * surface inside WM_PAINT does not produce a crash dump, an error message
+ * or anything else -- the message is simply dropped and whatever that stack
+ * was carrying is discarded.  Under wine the same thing shows up as
+ * "err:seh:dispatch_callback ignoring exception".  QEMU carries on, one
+ * frame or one keystroke poorer, and nobody ever finds out; repeated often
+ * enough that is a display that "sometimes does nothing", reported as a
+ * freeze, with not one line of evidence anywhere.
+ *
+ * A vectored handler runs before any of that, so this sees the fault even
+ * though nothing else will.  It only reports, never handles: it returns
+ * EXCEPTION_CONTINUE_SEARCH so the normal machinery still runs and a fault
+ * that would have been fatal still is.
+ *
+ * The filtering matters, because a first-chance vectored handler sees every
+ * exception in the process, including the ones that are a normal part of
+ * how other code works (C++ throws, the debugger's thread-naming exception,
+ * guard-page hits used to grow stacks).  Only the hardware faults that mean
+ * "this code is broken" are reported, only while the pump is dispatching a
+ * message or inside a refresh, and only a few times, so that a fault in a
+ * message that repeats cannot itself become the problem.
+ */
+#define WIN32_MAX_FAULT_REPORTS 8
+
+static bool win32_in_refresh;
+static int win32_fault_reports;
+static PVOID win32_fault_handle;
+
+static LONG CALLBACK win32_fault_handler(PEXCEPTION_POINTERS ep)
+{
+    const EXCEPTION_RECORD *er;
+
+    if (!ep || !ep->ExceptionRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (!win32_in_dispatch && !win32_in_refresh) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (win32_fault_reports >= WIN32_MAX_FAULT_REPORTS) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    er = ep->ExceptionRecord;
+    switch (er->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    win32_fault_reports++;
+    if (win32_in_dispatch) {
+        error_report("win32: fault 0x%08lx at %p while dispatching message "
+                     "0x%04x to window %p. Windows discards this message "
+                     "silently; the display may miss updates or input. "
+                     "Please report it",
+                     (unsigned long)er->ExceptionCode, er->ExceptionAddress,
+                     (unsigned)win32_dispatch_msg,
+                     (void *)win32_dispatch_hwnd);
+    } else {
+        error_report("win32: fault 0x%08lx at %p during display refresh -- "
+                     "please report it",
+                     (unsigned long)er->ExceptionCode, er->ExceptionAddress);
+    }
+    if (win32_fault_reports == WIN32_MAX_FAULT_REPORTS) {
+        error_report("win32: further faults will not be reported");
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void win32_2d_refresh(DisplayChangeListener *dcl)
@@ -1034,6 +1274,9 @@ static void win32_2d_refresh(DisplayChangeListener *dcl)
     static bool was_running;
     bool running = runstate_is_running();
 
+    win32_last_refresh_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    win32_in_refresh = true;
+
     qemu_console_hw_update(dcl->con);
 
     if (running != was_running) {
@@ -1042,6 +1285,7 @@ static void win32_2d_refresh(DisplayChangeListener *dcl)
     }
 
     win32_poll_events(wcon);
+    win32_in_refresh = false;
 }
 
 static void win32_mouse_warp(DisplayChangeListener *dcl,
@@ -1357,6 +1601,9 @@ static void win32_gl_refresh(DisplayChangeListener *dcl)
     static bool was_running;
     bool running = runstate_is_running();
 
+    win32_last_refresh_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    win32_in_refresh = true;
+
     qemu_console_hw_update(dcl->con);
 
     if (running != was_running) {
@@ -1370,6 +1617,7 @@ static void win32_gl_refresh(DisplayChangeListener *dcl)
     }
 
     win32_poll_events(wcon);
+    win32_in_refresh = false;
 }
 
 static void win32_gl_scanout_disable(DisplayChangeListener *dcl)
@@ -1480,6 +1728,11 @@ static void win32_display_cleanup(void)
     if (win32_pump_timer) {
         timer_free(win32_pump_timer);
         win32_pump_timer = NULL;
+    }
+
+    if (win32_fault_handle) {
+        RemoveVectoredExceptionHandler(win32_fault_handle);
+        win32_fault_handle = NULL;
     }
 
     qemu_remove_mouse_mode_change_notifier(&mouse_mode_notifier);
@@ -1673,13 +1926,21 @@ static void win32_display_init(DisplayState *ds, DisplayOptions *o)
         qemu_console_register_listener(con, &win32_consoles[i].dcl, ops);
     }
 
-    if (n_gfx == 0) {
-        win32_pump_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                        win32_pump_tick, NULL);
-        timer_mod(win32_pump_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                  GUI_REFRESH_INTERVAL_DEFAULT);
-    }
+    /*
+     * Always, whether or not there is a graphics console: see the comment
+     * on win32_pump_timer.  With no graphics console it is the only thing
+     * that dispatches messages at all; with one it is the backstop that
+     * keeps the window alive if ui/console.c's GUI timer ever fails to be
+     * re-armed, and the watchdog that says so when it does.
+     */
+    win32_have_gfx_console = (n_gfx > 0);
+    win32_last_refresh_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    win32_pump_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                    win32_pump_tick, NULL);
+    timer_mod(win32_pump_timer,
+              win32_last_refresh_ms + GUI_REFRESH_INTERVAL_DEFAULT);
+
+    win32_fault_handle = AddVectoredExceptionHandler(1, win32_fault_handler);
 
     mouse_mode_notifier.notify = win32_mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);

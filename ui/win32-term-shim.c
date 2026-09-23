@@ -188,9 +188,20 @@ bool win32_term_pump(unsigned long *next)
      * back, and that write kicks the pump again.  PuTTY's queue is not
      * re-entrant, and it does not need to be -- the outer call will pick up
      * anything left behind.
+     *
+     * Report this as "come back later", not as "nothing to do".  The caller
+     * is win32_term_kick_timer(), which only arms a Windows timer when we
+     * say there is work left -- and it is reached from WM_TIMER, which kills
+     * the timer first.  So answering "nothing to do" here would let a
+     * WM_TIMER for one terminal that happened to be dispatched while
+     * another terminal's pump was on the stack disarm that first terminal
+     * for good: its cursor would stop blinking and its deferred work would
+     * sit there until some unrelated event kicked it again.  Asking for
+     * another timer costs one SetTimer and cannot get stuck.
      */
     if (running) {
-        return false;
+        *next = GETTICKCOUNT();
+        return true;
     }
     running = true;
 
