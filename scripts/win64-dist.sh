@@ -108,13 +108,20 @@ fi
 # The ORDER matters, and the sysroot deliberately comes first.  Several names
 # exist in more than one of these directories -- libwinpthread-1.dll,
 # libstdc++-6.dll, libgcc_s_seh-1.dll -- and only one file of a given name can
-# sit next to the .exe.  The sysroot's ANGLE is an MSYS2 gcc-16 build, and the
-# distro's gcc-13 runtime does not export everything it imports
-# (__cxa_call_terminate from libstdc++, nanosleep64 and
-# pthread_cond_timedwait64 from libwinpthread), so picking the distro copy
-# would leave libGLESv2.dll unloadable.  The reverse is safe: QEMU itself needs
-# only clock_gettime out of libwinpthread and nothing at all out of the C++
-# runtime, and the sysroot copies export those.  Hence: newest first.
+# sit next to the .exe.
+#
+# The original reason for preferring the sysroot was ANGLE: its MSYS2 gcc-16
+# DLLs import symbols the distro's gcc-13 runtime does not export, so shipping
+# the distro copies left libGLESv2.dll unloadable.  ANGLE is gone -- the win32
+# UI has no GL path any more -- so that reason has gone with it, and the two
+# DLLs QEMU actually needs (libssp-0.dll, libwinpthread-1.dll) resolve from
+# the gcc runtime and the distro sysroot.
+#
+# The order is kept as it is anyway, because "newest first" is the safe
+# direction whichever copy is picked: of libwinpthread QEMU uses only
+# clock_gettime, which every copy exports, and a newer runtime satisfies an
+# older binary while the reverse is what fails.  If the sysroot ever holds
+# these DLLs again, its copies will be the ones shipped, as before.
 : "${MINGW_PREFIX:=$HOME/mingw}"
 gcc_lib_dir=$(${cross_prefix}gcc -print-search-dirs 2>/dev/null |
               sed -n 's/^install: //p') || true
@@ -152,8 +159,9 @@ if [ -f "$runtime_dll_list" ]; then
             printf '    %s <- %s\n' "$dll" "$path"
             copied=$((copied + 1))
         else
-            # Not an error: a sysroot without ANGLE just has no GL display path.
-            printf '    %s not found -- skipping (no GL display path)\n' "$dll" >&2
+            # Not an error: the list names optional runtime dependencies, and
+            # a sysroot that has none of them is perfectly legitimate.
+            printf '    %s not found -- skipping\n' "$dll" >&2
         fi
     done < "$runtime_dll_list"
 fi
