@@ -86,6 +86,24 @@ typedef struct S3ChipInfo {
     uint8_t cr36_reset;  /* configuration 1, bits 4-0 (bus type) */
     uint8_t cr37_reset;  /* configuration 2 */
     uint8_t cr5a_reset;  /* linear address window position, bits 23-16 */
+    /*
+     * Size of the PCI aperture, and whether the "new MMIO" register window
+     * lives inside it.  The Trio64V+ publishes one 64MB aperture with video
+     * memory at the bottom and the registers at +16MB.  The Vision864 has
+     * no such aperture: its linear window is 64K/1M/2M/8M selected by CR58
+     * bits 1-0, and 86Box maps the new MMIO window separately at the linear
+     * base + 16MB (s3_updatemapping), outside the window itself.  The size
+     * matters because the PCI core aligns a BAR to its own size, and AIX's
+     * E15 driver relocates the aperture to 0x01000000.
+     */
+    uint32_t bar0_size;
+    bool mmio_in_bar;
+    /*
+     * Whether the MMIO window carries the packed register file at
+     * 0x8100-0x816F (86Box s3->packed_mmio, set only from the Vision964
+     * onwards).  On a Vision864 those addresses are not decoded specially.
+     */
+    bool packed_mmio;
     const char *desc;
 } S3ChipInfo;
 
@@ -96,6 +114,9 @@ static const S3ChipInfo s3_chip_trio64 = {
     .cr2e = 0x11,   /* 86C764 */
     .cr2f = 0x40,   /* Trio64V+ */
     .cr30 = 0xe1,
+    .bar0_size = 0x4000000,
+    .mmio_in_bar = true,
+    .packed_mmio = true,
     /*
      * CR36/CR37/CR5A are left at zero for the Trio64.  86Box has the video
      * BIOS put the bus type in CR36 bits 4-0 and 0xe5 in CR37, but this
@@ -122,6 +143,8 @@ static const S3ChipInfo s3_chip_vision864 = {
     .cr36_reset = 0x1e,  /* PCI: 2 | (3 << 2) | (1 << 4) */
     .cr37_reset = 0xe5,  /* 1 | (7 << 5) | 0x04 for chips >= 86C928 */
     .cr5a_reset = 0x0a,
+    .bar0_size = 0x800000,   /* largest linear window CR58 can select */
+    .mmio_in_bar = false,
     .desc = "S3 Vision864 VGA",
 };
 
@@ -290,6 +313,11 @@ typedef struct S3TrioState {
     uint8_t unlock_pll;
 
     const S3ChipInfo *chip;
+
+    /* new MMIO placement, for chips that map it outside the aperture */
+    bool new_mmio_mapped;
+    uint32_t new_mmio_addr;
+    bool in_law_update;
 
     /* external S3 86C716 "SDAC", present on Vision864 boards only */
     struct {
@@ -1771,8 +1799,11 @@ static bool s3_mmio_enabled(S3TrioState *s)
     return (s->vga.cr[0x53] & 0x10) || (s->advfunc_cntl & 0x20);
 }
 
-static int s3_mmio_packed_port(uint32_t addr)
+static int s3_mmio_packed_port(S3TrioState *s, uint32_t addr)
 {
+    if (!s->chip->packed_mmio) {
+        return -1;
+    }
     switch (addr & 0xfffe) {
     case 0x8100: return PORT_CUR_Y;
     case 0x8102: return PORT_CUR_X;
@@ -1808,8 +1839,11 @@ static int s3_mmio_packed_port(uint32_t addr)
 }
 
 /* packed MULTIFUNC registers written directly, 0x8138-0x8148 */
-static int s3_mmio_packed_mfc(uint32_t addr)
+static int s3_mmio_packed_mfc(S3TrioState *s, uint32_t addr)
 {
+    if (!s->chip->packed_mmio) {
+        return -1;
+    }
     switch (addr & 0xfffe) {
     case 0x8138: return MF_SCISSORS_T;
     case 0x813a: return MF_SCISSORS_L;
@@ -1845,7 +1879,7 @@ static void s3_mmio_write_byte(S3TrioState *s, uint32_t addr, uint8_t val)
     default:
         break;
     }
-    mfc = s3_mmio_packed_mfc(addr);
+    mfc = s3_mmio_packed_mfc(s, addr);
     if (mfc >= 0) {
         if (mfc == MF_READ_SEL) {
             if (!(addr & 1)) {
@@ -1858,7 +1892,7 @@ static void s3_mmio_write_byte(S3TrioState *s, uint32_t addr, uint8_t val)
         }
         return;
     }
-    port = s3_mmio_packed_port(addr);
+    port = s3_mmio_packed_port(s, addr);
     if (port >= 0) {
         s3_accel_out_byte(s, port | (addr & 1), val);
         return;
@@ -1880,7 +1914,7 @@ static void s3_mmio_write(S3TrioState *s, uint32_t addr, uint64_t val,
     if (size > 1 && ((addr & 0xfffc) == PORT_PIX_TRANS ||
                      (addr & 0xfffe) == 0x811c ||
                      (addr & 0xfffe) == PORT_SHORT_STROKE)) {
-        int port = s3_mmio_packed_port(addr);
+        int port = s3_mmio_packed_port(s, addr);
 
         s3_accel_out(s, port >= 0 ? port : addr, val, size);
         return;
@@ -1905,12 +1939,12 @@ static uint64_t s3_mmio_read(S3TrioState *s, uint32_t addr, unsigned size)
         }
         return val;
     }
-    mfc = s3_mmio_packed_mfc(addr);
+    mfc = s3_mmio_packed_mfc(s, addr);
     if (mfc >= 0) {
         uint16_t v = mfc == MF_READ_SEL ? s->read_sel : s->mfc[mfc];
         return (v >> (8 * (addr & 1))) & ((1u << (8 * size)) - 1);
     }
-    port = s3_mmio_packed_port(addr);
+    port = s3_mmio_packed_port(s, addr);
     if (port >= 0) {
         return s3_accel_in(s, port | (addr & 1), size);
     }
@@ -1937,14 +1971,68 @@ static uint64_t s3_mmio_read(S3TrioState *s, uint32_t addr, unsigned size)
 #define SERIAL_PORT_SDR 0x08
 #define SERIAL_PORT_EN  0x10
 
+/* linear address window base, CR59 (bits 31-24) and CR5A bit 7 (bit 23) */
+static uint32_t s3_law_base(S3TrioState *s)
+{
+    return ((uint32_t)s->vga.cr[0x59] << 24) |
+           ((uint32_t)(s->vga.cr[0x5a] & 0x80) << 16);
+}
+
 static void s3_update_new_mmio(S3TrioState *s)
 {
     bool en = s->vga.cr[0x53] & 0x08;
+    MemoryRegion *as;
+    uint32_t base, addr;
+    bool want;
 
-    if (s->new_mmio.enabled != en) {
-        trace_s3_vga_new_mmio(en);
+    if (s->chip->mmio_in_bar) {
+        if (s->new_mmio.enabled != en) {
+            trace_s3_vga_new_mmio(en);
+        }
+        memory_region_set_enabled(&s->new_mmio, en);
+        return;
     }
-    memory_region_set_enabled(&s->new_mmio, en);
+
+    /*
+     * 86Box s3_updatemapping(): with CR53 bit 3 set the window appears at
+     * the linear base + 16MB, and is disabled when there is no linear base.
+     */
+    base = s3_law_base(s);
+    want = en && base != 0;
+    addr = base + 0x1000000;
+    as = pci_address_space(&s->dev);
+
+    if (s->new_mmio_mapped && (!want || addr != s->new_mmio_addr)) {
+        memory_region_del_subregion(as, &s->new_mmio);
+        s->new_mmio_mapped = false;
+        trace_s3_vga_new_mmio(false);
+    }
+    if (want && !s->new_mmio_mapped) {
+        memory_region_add_subregion(as, addr, &s->new_mmio);
+        s->new_mmio_mapped = true;
+        s->new_mmio_addr = addr;
+        trace_s3_vga_new_mmio(true);
+    }
+}
+
+/*
+ * On the S3 the linear address window base and PCI base address register 0
+ * are the same register: 86Box's s3_pci_write puts config bytes 0x12 and
+ * 0x13 into CR5A and CR59, and s3_updatemapping() derives the aperture from
+ * the CRTC pair, so writing the CRTC registers alone moves the window too.
+ */
+static void s3_law_to_bar(S3TrioState *s)
+{
+    uint32_t base = s3_law_base(s);
+    uint32_t bar = pci_get_long(s->dev.config + PCI_BASE_ADDRESS_0);
+
+    if (s->in_law_update || (bar & 0xff800000) == base) {
+        return;
+    }
+    s->in_law_update = true;
+    pci_default_write_config(&s->dev, PCI_BASE_ADDRESS_0,
+                             base | (bar & 0x0000000f), 4);
+    s->in_law_update = false;
 }
 
 static void s3_serialport_write(S3TrioState *s, uint8_t val)
@@ -2841,7 +2929,15 @@ static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
         s3_update_bank(s);
         break;
     case 0x53:
+    case 0x58:
         vga_ioport_write(&s->vga, addr, val);
+        s3_update_new_mmio(s);
+        break;
+    case 0x59:
+    case 0x5a:
+        /* 86Box calls s3_updatemapping() for CR53, CR58, CR59 and CR5A */
+        vga_ioport_write(&s->vga, addr, val);
+        s3_law_to_bar(s);
         s3_update_new_mmio(s);
         break;
     case 0x69:
@@ -3194,6 +3290,7 @@ static void s3_trio_pci_write_config(PCIDevice *dev, uint32_t address,
         s->vga.cr[0x59] = bar >> 24;
         s->vga.cr[0x5a] = (bar >> 16) & 0x80;
         trace_s3_vga_law_base(bar & 0xff800000);
+        s3_update_new_mmio(s);
     }
 }
 
@@ -3320,12 +3417,22 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
      * through its 5333:8811 device ID, which the Trio64V+ shares with the
      * Trio64.
      */
-    memory_region_init(&s->bar0, o, "s3-trio-bar0", 0x4000000);
-    memory_region_add_subregion(&s->bar0, 0, &s->vga.vram);
-    memory_region_init_io(&s->new_mmio, o, &s3_new_mmio_ops, s,
-                          "s3-trio-mmio", 0x20000);
-    memory_region_set_enabled(&s->new_mmio, false);
-    memory_region_add_subregion(&s->bar0, 0x1000000, &s->new_mmio);
+    {
+        uint64_t bar_size = s->chip->bar0_size;
+        uint64_t vram_size = memory_region_size(&s->vga.vram);
+
+        while (bar_size < vram_size) {
+            bar_size <<= 1;
+        }
+        memory_region_init(&s->bar0, o, "s3-bar0", bar_size);
+        memory_region_add_subregion(&s->bar0, 0, &s->vga.vram);
+        memory_region_init_io(&s->new_mmio, o, &s3_new_mmio_ops, s,
+                              "s3-mmio", 0x20000);
+        if (s->chip->mmio_in_bar) {
+            memory_region_set_enabled(&s->new_mmio, false);
+            memory_region_add_subregion(&s->bar0, 0x1000000, &s->new_mmio);
+        }
+    }
 
     /* setup PCI */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->bar0);
