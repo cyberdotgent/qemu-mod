@@ -378,7 +378,7 @@ static void ibm_40p_init(MachineState *machine)
         /* XXX: s3-trio at PCI_DEVFN(2, 0) */
         pci_vga_init(pci_bus);
 
-        /* First PCNET device at PCI_DEVFN(3, 0) */
+        /* First network device at PCI_DEVFN(3, 0) */
         pci_init_nic_in_slot(pci_bus, mc->default_nic, NULL, "3");
         pci_init_nic_devices(pci_bus, mc->default_nic);
     }
@@ -487,7 +487,17 @@ static void ibm_40p_machine_init(MachineClass *mc)
     mc->default_boot_order = "c";
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
     mc->default_display = "s3";
-    mc->default_nic = "pcnet";
+    /*
+     * A DEC 21140 rather than the AMD PCnet QEMU used to default to.  The
+     * PCnet has no driver in any AIX release: a real 7020-40P never shipped
+     * one, so AIX brings up the IP layer, finds no adapter underneath and
+     * fails with "if_en: ns_alloc(en0) failed".  The 21140 is what IBM sold
+     * for these machines as the 10/100 Mbps Ethernet PCI Adapter, so AIX has
+     * a driver for it and configures ent0/en0 normally.
+     *
+     * Pass -nic model=pcnet to get the old default back.
+     */
+    mc->default_nic = "tulip";
     compat_props_add(mc->compat_props, hw_compat_ibm_40p,
                      hw_compat_ibm_40p_len);
 
