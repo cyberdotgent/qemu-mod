@@ -1207,7 +1207,7 @@ static void s3_accel_start(S3TrioState *s, int count, bool cpu_input,
     }
 
     default:
-        qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented command %d (%04x)\n",
+        qemu_log_mask(LOG_UNIMP, "s3: unimplemented command %d (%04x)\n",
                       op, s->cmd);
         s3_accel_done(s);
         break;
@@ -1606,7 +1606,7 @@ static void s3_accel_out_byte(S3TrioState *s, uint16_t port, uint8_t val)
         }
         break;
     default:
-        qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: write to unknown engine "
+        qemu_log_mask(LOG_GUEST_ERROR, "s3: write to unknown engine "
                       "register %04x\n", port);
         break;
     }
@@ -2884,7 +2884,7 @@ static void s3_crtc_write(S3TrioState *s, uint32_t addr, uint8_t index,
     case 0x18:
         if (s->unlock_pll) {
             qemu_log_mask(LOG_UNIMP,
-                          "s3_trio: unimplemented PLL change\n");
+                          "s3: unimplemented PLL change\n");
         } else {
             vga_ioport_write(&s->vga, addr, val);
         }
@@ -3398,12 +3398,12 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
      * Legacy VGA ports.  Register them through the generic portio API so
      * the device does not depend on an ISA bus being present.
      */
-    portio_list_init(&s->portio, OBJECT(s), s3_trio_portio_list, s, "s3_trio");
+    portio_list_init(&s->portio, OBJECT(s), s3_trio_portio_list, s, "s3-vga");
     portio_list_add(&s->portio, pci_address_space_io(dev), 0);
 
     /* DDC monitor channel behind the new MMIO serial port */
     {
-        I2CBus *i2cbus = i2c_init_bus(DEVICE(s), "s3-trio.ddc");
+        I2CBus *i2cbus = i2c_init_bus(DEVICE(s), "s3-vga.ddc");
 
         bitbang_i2c_init(&s->bbi2c, i2cbus);
         i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50);
