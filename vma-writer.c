@@ -140,11 +140,15 @@ int vma_writer_add_config(VmaWriter *vmaw, const char *name, gpointer data,
     g_free(basename);
 
     if (!name_ptr) {
+        vma_writer_set_error(vmaw, "vma_writer_add_config: unable to allocate"
+                             " name_ptr");
         return -1;
     }
 
     uint32_t data_ptr = allocate_header_blob(vmaw, data, len);
     if (!data_ptr) {
+        vma_writer_set_error(vmaw, "vma_writer_add_config: unable to allocate"
+                             " data_ptr");
         return -1;
     }
 
