@@ -681,9 +681,10 @@ static int create_archive(int argc, char **argv)
         }
 
         if (vma_writer_add_config(vmaw, name, cdata, clen) != 0) {
+            vma_writer_error_propagate(vmaw, &local_err);
             unlink(archivename);
-            g_error("Unable to append config data %s (len = %zd)",
-                    name, clen);
+            g_error("Unable to append config data %s (len = %zd) - %s",
+                    name, clen, error_get_pretty(local_err));
         }
         l = g_list_next(l);
     }
@@ -737,8 +738,10 @@ static int create_archive(int argc, char **argv)
         int64_t size = blk_getlength(target);
         int dev_id = vma_writer_register_stream(vmaw, devname, size);
         if (dev_id <= 0) {
+            vma_writer_error_propagate(vmaw, &errp);
             unlink(archivename);
-            g_error("vma_writer_register_stream '%s' failed", devname);
+            g_error("vma_writer_register_stream '%s' failed - %s", devname,
+                    error_get_pretty(errp));
         }
 
         BackupJob *job = g_new0(BackupJob, 1);

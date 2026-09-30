@@ -160,6 +160,12 @@ int vma_writer_add_config(VmaWriter *vmaw, const char *name, gpointer data,
         return -1;
     }
 
+    if (len > UINT16_MAX) {
+        vma_writer_set_error(vmaw, "vma_writer_add_config: config data too large"
+                             " (%zu bytes, maximum is %d)", len, UINT16_MAX);
+        return -1;
+    }
+
     uint32_t name_ptr = allocate_header_string(vmaw, basename);
     if (!name_ptr) {
         vma_writer_set_error(vmaw, "vma_writer_add_config: unable to allocate"

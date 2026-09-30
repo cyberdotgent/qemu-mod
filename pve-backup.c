@@ -578,7 +578,9 @@ static int coroutine_fn pvebackup_co_add_config(
 
     if (format == BACKUP_FORMAT_VMA) {
         if (vma_writer_add_config(vmaw, name, cdata, clen) != 0) {
-            error_setg(errp, "unable to add %s config data to vma archive", file);
+            vma_writer_error_propagate(vmaw, errp);
+            error_prepend(errp, "unable to add %s config data to vma archive - ",
+                          file);
             goto err;
         }
     } else if (format == BACKUP_FORMAT_PBS) {
@@ -1554,8 +1556,9 @@ UuidInfo coroutine_fn *qmp_backup(
 
             int dev_id = vma_writer_register_stream(vmaw, di->device_name, di->size);
             if (dev_id <= 0) {
-                error_set(errp, ERROR_CLASS_GENERIC_ERROR,
-                          "register_stream failed");
+                vma_writer_error_propagate(vmaw, errp);
+                error_prepend(errp, "unable to register device '%s' in vma archive - ",
+                              di->device_name);
                 goto err_mutex;
             }
             assert(dev_id < 256);
