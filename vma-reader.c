@@ -123,7 +123,7 @@ static const VmaBlob *get_header_blob(VmaReader *vmar, uint32_t pos)
 static const char *get_header_str(VmaReader *vmar, uint32_t pos)
 {
     const VmaBlob *blob = get_header_blob(vmar, pos);
-    if (!blob) {
+    if (!blob || !blob->len) {
         return NULL;
     }
     const char *res = (char *)blob->data;
