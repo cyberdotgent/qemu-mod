@@ -51,21 +51,6 @@ struct VmaReader {
     int clusters_read_per;
 };
 
-static bool vma_check_member_name(const char *member_name, Error **errp)
-{
-    if (strchr(member_name, '/')) {
-        error_setg(errp, "must not contain '/' - ('%s')", member_name);
-        return false;
-    } else if (strcmp(member_name, "..") == 0) {
-        error_setg(errp, "must not equal '..'");
-        return false;
-    } else if (strcmp(member_name, ".") == 0) {
-        error_setg(errp, "must not equal '.'");
-        return false;
-    }
-    return true;
-}
-
 static guint
 g_int32_hash(gconstpointer v)
 {

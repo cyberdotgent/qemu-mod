@@ -114,6 +114,8 @@ typedef struct VmaDeviceInfo {
     const char *devname;
 } VmaDeviceInfo;
 
+bool vma_check_member_name(const char *member_name, Error **errp);
+
 VmaWriter *vma_writer_create(const char *filename, uuid_t uuid, Error **errp);
 int vma_writer_close(VmaWriter *vmaw, Error **errp);
 void vma_writer_error_propagate(VmaWriter *vmaw, Error **errp);

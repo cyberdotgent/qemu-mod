@@ -74,6 +74,21 @@ struct VmaWriter {
     uint32_t config_count;
 };
 
+bool vma_check_member_name(const char *member_name, Error **errp)
+{
+    if (strchr(member_name, '/')) {
+        error_setg(errp, "must not contain '/' - ('%s')", member_name);
+        return false;
+    } else if (strcmp(member_name, "..") == 0) {
+        error_setg(errp, "must not equal '..'");
+        return false;
+    } else if (strcmp(member_name, ".") == 0) {
+        error_setg(errp, "must not equal '.'");
+        return false;
+    }
+    return true;
+}
+
 void vma_writer_set_error(VmaWriter *vmaw, const char *fmt, ...)
 {
     va_list ap;
@@ -129,16 +144,23 @@ static uint32_t allocate_header_string(VmaWriter *vmaw, const char *str)
 int vma_writer_add_config(VmaWriter *vmaw, const char *name, gpointer data,
                           gsize len)
 {
+    Error *local_err = NULL;
+
     assert(vmaw);
     assert(!vmaw->header_written);
     assert(vmaw->config_count < VMA_MAX_CONFIGS);
     assert(name);
     assert(data);
 
-    gchar *basename = g_path_get_basename(name);
-    uint32_t name_ptr = allocate_header_string(vmaw, basename);
-    g_free(basename);
+    g_autofree gchar *basename = g_path_get_basename(name);
+    if (!vma_check_member_name(basename, &local_err)) {
+        vma_writer_set_error(vmaw, "vma_writer_add_config: invalid config name:"
+                             " %s", error_get_pretty(local_err));
+        error_free(local_err);
+        return -1;
+    }
 
+    uint32_t name_ptr = allocate_header_string(vmaw, basename);
     if (!name_ptr) {
         vma_writer_set_error(vmaw, "vma_writer_add_config: unable to allocate"
                              " name_ptr");
@@ -163,6 +185,8 @@ int vma_writer_add_config(VmaWriter *vmaw, const char *name, gpointer data,
 int vma_writer_register_stream(VmaWriter *vmaw, const char *devname,
                                size_t size)
 {
+    Error *local_err = NULL;
+
     assert(vmaw);
     assert(devname);
     assert(!vmaw->status);
@@ -187,6 +211,14 @@ int vma_writer_register_stream(VmaWriter *vmaw, const char *devname,
     if (size <= 0) {
         vma_writer_set_error(vmaw, "vma_writer_register_stream: "
                              "got strange size %zd", size);
+        return -1;
+    }
+
+    if (!vma_check_member_name(devname, &local_err)) {
+        vma_writer_set_error(vmaw, "vma_writer_register_stream: "
+                             "invalid device name: %s",
+                             error_get_pretty(local_err));
+        error_free(local_err);
         return -1;
     }
 
