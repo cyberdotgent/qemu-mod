@@ -1655,6 +1655,9 @@ err:
     if (vmaw) {
         Error *err = NULL;
         vma_writer_close(vmaw, &err);
+        if (err) {
+            error_report_err(err);
+        }
         unlink(backup_file);
     }
 
