@@ -286,13 +286,15 @@ static int vma_reader_read_head(VmaReader *vmar, Error **errp)
     uint32_t bstart = h->blob_buffer_offset + 1;
     uint32_t bend = h->blob_buffer_offset + h->blob_buffer_size;
 
-    if (bstart <= sizeof(VmaHeader)) {
+    if (h->blob_buffer_offset < sizeof(VmaHeader) ||
+        h->blob_buffer_offset >= header_size) {
         error_setg(errp, "wrong vma blob buffer offset %d",
                    h->blob_buffer_offset);
         return -1;
     }
 
-    if (bend > header_size) {
+    /* compare with the remaining size, the end offset could wrap around */
+    if (h->blob_buffer_size > header_size - h->blob_buffer_offset) {
         error_setg(errp, "wrong vma blob buffer size %d/%d",
                    h->blob_buffer_offset, h->blob_buffer_size);
         return -1;
