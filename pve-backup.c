@@ -1552,12 +1552,14 @@ UuidInfo coroutine_fn *qmp_backup(
                 goto err_mutex;
             }
 
-            di->dev_id = vma_writer_register_stream(vmaw, di->device_name, di->size);
-            if (di->dev_id <= 0) {
+            int dev_id = vma_writer_register_stream(vmaw, di->device_name, di->size);
+            if (dev_id <= 0) {
                 error_set(errp, ERROR_CLASS_GENERIC_ERROR,
                           "register_stream failed");
                 goto err_mutex;
             }
+            assert(dev_id < 256);
+            di->dev_id = dev_id;
         }
     } else {
         error_set(errp, ERROR_CLASS_GENERIC_ERROR, "unknown backup format");
