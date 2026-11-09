@@ -49,6 +49,10 @@ struct VmaReader {
     int64_t zero_cluster_data;
     int64_t partial_zero_cluster_data;
     int clusters_read_per;
+    /* queued writes, covering one contiguous range of a single target */
+    BlockBackend *batch_target;
+    int64_t batch_offset;
+    QEMUIOVector batch_qiov;
 };
 
 static guint
@@ -209,6 +213,8 @@ void vma_reader_destroy(VmaReader *vmar)
     if (vmar->head_data) {
         g_free(vmar->head_data);
     }
+
+    qemu_iovec_destroy(&vmar->batch_qiov);
 
     g_free(vmar);
 
@@ -372,6 +378,7 @@ VmaReader *vma_reader_create(const char *filename, Error **errp)
     assert(errp);
 
     VmaReader *vmar = g_new0(VmaReader, 1);
+    qemu_iovec_init(&vmar->batch_qiov, 1);
 
     if (strcmp(filename, "-") == 0) {
         vmar->fd = dup(0);
@@ -523,6 +530,64 @@ static size_t full_write(int fd, void *buf, size_t len)
     return total;
 }
 
+static int restore_flush_writes(VmaReader *vmar, Error **errp)
+{
+    QEMUIOVector *qiov = &vmar->batch_qiov;
+    BlockBackend *target = vmar->batch_target;
+
+    if (!qiov->size) {
+        return 0;
+    }
+
+    int res = blk_pwritev(target, vmar->batch_offset, qiov->size, qiov, 0);
+    qemu_iovec_reset(qiov);
+    if (res < 0) {
+        bdrv_graph_rdlock_main_loop();
+        error_setg(errp, "blk_pwrite to %s failed (%d)",
+                   bdrv_get_device_name(blk_bs(target)), res);
+        bdrv_graph_rdunlock_main_loop();
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Writing every cluster, or every 4 KiB block of a partial cluster, on its
+ * own is slow without the host page cache, which otherwise merges them. So
+ * extend the queued write as long as the data continues it on the same target.
+ */
+static int restore_queue_write(VmaReader *vmar, BlockBackend *target,
+                               unsigned char *buf, int64_t offset,
+                               size_t bytes, Error **errp)
+{
+    QEMUIOVector *qiov = &vmar->batch_qiov;
+
+    if (qiov->size && (target != vmar->batch_target ||
+                       offset != vmar->batch_offset + (int64_t)qiov->size ||
+                       qiov->niov >= blk_get_max_iov(target))) {
+        if (restore_flush_writes(vmar, errp) < 0) {
+            return -1;
+        }
+    }
+
+    if (!qiov->size) {
+        vmar->batch_target = target;
+        vmar->batch_offset = offset;
+    }
+
+    struct iovec *last = qiov->niov ? &qiov->iov[qiov->niov - 1] : NULL;
+    if (last && (unsigned char *)last->iov_base + last->iov_len == buf) {
+        /* adjacent in memory, keep the vector short */
+        last->iov_len += bytes;
+        qiov->size += bytes;
+    } else {
+        qemu_iovec_add(qiov, buf, bytes);
+    }
+
+    return 0;
+}
+
 static int restore_write_data(VmaReader *vmar, guint8 dev_id,
                               BlockBackend *target, int vmstate_fd,
                               unsigned char *buf, int64_t sector_num,
@@ -540,12 +605,9 @@ static int restore_write_data(VmaReader *vmar, guint8 dev_id,
             }
         }
     } else {
-        int res = blk_pwrite(target, sector_num * BDRV_SECTOR_SIZE, nb_sectors * BDRV_SECTOR_SIZE, buf, 0);
-        if (res < 0) {
-            bdrv_graph_rdlock_main_loop();
-            error_setg(errp, "blk_pwrite to %s failed (%d)",
-                       bdrv_get_device_name(blk_bs(target)), res);
-            bdrv_graph_rdunlock_main_loop();
+        if (restore_queue_write(vmar, target, buf,
+                                sector_num * BDRV_SECTOR_SIZE,
+                                nb_sectors * BDRV_SECTOR_SIZE, errp) < 0) {
             return -1;
         }
     }
@@ -720,7 +782,8 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
         return -1;
     }
 
-    return 0;
+    /* queued writes point into the extent buffer, which gets reused */
+    return restore_flush_writes(vmar, errp);
 }
 
 static int vma_reader_restore_full(VmaReader *vmar, int vmstate_fd,
