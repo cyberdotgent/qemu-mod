@@ -875,21 +875,23 @@ static int vma_reader_restore_full(VmaReader *vmar, int vmstate_fd,
     int i;
     for (i = 1; i < 256; i++) {
         VmaRestoreState *rstate = &vmar->rstate[i];
-        if (!rstate->target) {
-            continue;
+
+        if (rstate->target) {
+            int res = blk_flush(rstate->target);
+            if (res < 0) {
+                error_setg(errp, "vma blk_flush %s failed - %s",
+                           vmar->devinfo[i].devname, g_strerror(-res));
+                return -1;
+            }
         }
 
-        int res = blk_flush(rstate->target);
-        if (res < 0) {
-            error_setg(errp, "vma blk_flush %s failed - %s",
-                       vmar->devinfo[i].devname, g_strerror(-res));
-            return -1;
+        /* verify has no targets, but needs to detect missing clusters too */
+        if (!rstate->bitmap || rstate->skip) {
+            continue;
         }
 
         if (vmar->devinfo[i].size &&
             (strcmp(vmar->devinfo[i].devname, "vmstate") != 0)) {
-            assert(rstate->bitmap);
-
             int64_t cluster_num, end;
 
             end = DIV_ROUND_UP(vmar->devinfo[i].size, VMA_CLUSTER_SIZE);
