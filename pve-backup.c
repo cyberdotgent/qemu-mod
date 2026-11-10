@@ -156,11 +156,7 @@ pvebackup_co_dump_pbs_cb(
 
     bool is_zero_block = size == di->block_size && buffer_is_zero(buf, size);
 
-    qemu_co_mutex_lock(&backup_state.dump_callback_mutex);
-
-    // avoid deadlock if job is cancelled
     if (pvebackup_error_or_canceled()) {
-        qemu_co_mutex_unlock(&backup_state.dump_callback_mutex);
         return -1;
     }
 
@@ -177,14 +173,12 @@ pvebackup_co_dump_pbs_cb(
 
         if (pbs_res < 0) {
             pvebackup_propagate_error(local_err);
-            qemu_co_mutex_unlock(&backup_state.dump_callback_mutex);
             return pbs_res;
         }
 
         reused += pbs_res == 0 ? to_transfer : 0;
     }
 
-    qemu_co_mutex_unlock(&backup_state.dump_callback_mutex);
     pvebackup_add_transferred_bytes(size, is_zero_block ? size : 0, reused);
 
     return size;
