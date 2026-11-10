@@ -21,7 +21,8 @@
 #include "block/block.h"
 #include "system/block-backend.h"
 
-static unsigned char zero_vma_block[VMA_BLOCK_SIZE];
+/* aligned like the extent buffer in vma_reader_restore_full */
+static unsigned char zero_vma_block[VMA_BLOCK_SIZE] QEMU_ALIGNED(512);
 
 typedef struct VmaRestoreState {
     BlockBackend *target;
@@ -791,7 +792,12 @@ static int vma_reader_restore_full(VmaReader *vmar, int vmstate_fd,
     assert(vmar->head_data);
 
     int ret = 0;
-    unsigned char buf[VMA_MAX_EXTENT_SIZE];
+    /*
+     * Direct I/O to targets like zvols or device-mapper volumes needs memory
+     * aligned to 512 bytes, otherwise QEMU copies every write to a bounce
+     * buffer first. As the extent header is 512 bytes, this aligns the data.
+     */
+    unsigned char buf[VMA_MAX_EXTENT_SIZE] QEMU_ALIGNED(512);
     int buf_pos = 0;
     unsigned char md5sum[16];
     VmaHeader *h = (VmaHeader *)vmar->head_data;
