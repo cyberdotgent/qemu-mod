@@ -461,7 +461,7 @@ static void allocate_rstate(VmaReader *vmar,  guint8 dev_id,
     vmar->rstate[dev_id].bitmap_size = bitmap_size;
     vmar->rstate[dev_id].bitmap = g_new0(unsigned long, bitmap_size);
 
-    vmar->cluster_count += size/VMA_CLUSTER_SIZE;
+    vmar->cluster_count += DIV_ROUND_UP(size, VMA_CLUSTER_SIZE);
 }
 
 int vma_reader_register_bs(VmaReader *vmar, guint8 dev_id, BlockBackend *target,
@@ -673,7 +673,8 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
 
         vmar->clusters_read++;
 
-        if (verbose) {
+        /* on restore, the count leaves out a vmstate stream, which can be all */
+        if (verbose && vmar->cluster_count) {
             time_t duration = time(NULL) - vmar->start_time;
             int percent = (vmar->clusters_read*100)/vmar->cluster_count;
             if (percent != vmar->clusters_read_per) {
