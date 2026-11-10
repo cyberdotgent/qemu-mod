@@ -455,9 +455,8 @@ static void allocate_rstate(VmaReader *vmar,  guint8 dev_id,
 
     int64_t size = vmar->devinfo[dev_id].size;
 
-    int64_t bitmap_size = (size/BDRV_SECTOR_SIZE) +
-        (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG - 1;
-    bitmap_size /= (VMA_CLUSTER_SIZE/BDRV_SECTOR_SIZE) * BITS_PER_LONG;
+    int64_t bitmap_size = DIV_ROUND_UP(DIV_ROUND_UP(size, VMA_CLUSTER_SIZE),
+                                       BITS_PER_LONG);
 
     vmar->rstate[dev_id].bitmap_size = bitmap_size;
     vmar->rstate[dev_id].bitmap = g_new0(unsigned long, bitmap_size);
@@ -642,8 +641,14 @@ static int restore_extent(VmaReader *vmar, unsigned char *buf,
 
         if (dev_id != vmar->vmstate_stream) {
             target = rstate->target;
-            if (!verify && !target && !skip) {
+            if (!rstate->bitmap || (!verify && !target && !skip)) {
                 error_setg(errp, "got wrong dev id %d", dev_id);
+                return -1;
+            }
+
+            if (cluster_num >= DIV_ROUND_UP(vmar->devinfo[dev_id].size,
+                                            VMA_CLUSTER_SIZE)) {
+                error_setg(errp, "got wrong block address - write beyond end");
                 return -1;
             }
 
