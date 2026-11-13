@@ -506,6 +506,7 @@ typedef struct ChscResp {
 #define CHSC_SSD  0x0004
 #define CHSC_SSCUD 0x0006
 #define CHSC_SCSC 0x0010
+#define CHSC_SCI  0x0012
 #define CHSC_SDA  0x0031
 #define CHSC_SDCAL 0x0034
 #define CHSC_SEI  0x000e
@@ -774,6 +775,40 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
   out_err:
     res->code = cpu_to_be16(resp_code);
     res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+    res->param = 0;
+}
+
+#define CHSC_SCI_0_FMT  0x0f000000
+#define CHSC_SCI_0_RES  0xf0ffffff
+static void ioinst_handle_chsc_sci(ChscReq *req, ChscResp *res)
+{
+    uint32_t param0 = be32_to_cpu(req->param0);
+
+    if (param0 & CHSC_SCI_0_FMT) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0007);
+        res->param = 0;
+        return;
+    }
+
+    if (be16_to_cpu(req->len) != sizeof(*req) ||
+        (param0 & CHSC_SCI_0_RES) ||
+        req->param1 || req->param2) {
+        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+        res->code = cpu_to_be16(0x0003);
+        res->param = 0;
+        return;
+    }
+
+    /*
+     * Store Configuration Information in basic (non-MIF) mode.  The M bit
+     * and CSSID/SSID fields are rejected because QEMU does not model MIF.
+     * Byte 2 identifies the response format; all other fields are zero.
+     */
+    memset(res->data, 0, 0x0138 - CHSC_MIN_RESP_LEN);
+    res->data[2] = 0x01;
+    res->len = cpu_to_be16(0x0138);
+    res->code = cpu_to_be16(0x0001);
     res->param = 0;
 }
 
@@ -1058,6 +1093,9 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     switch (command) {
     case CHSC_SCSC:
         ioinst_handle_chsc_scsc(req, res);
+        break;
+    case CHSC_SCI:
+        ioinst_handle_chsc_sci(req, res);
         break;
     case CHSC_SCPD:
         ioinst_handle_chsc_scpd(req, res);

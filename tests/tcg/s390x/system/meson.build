@@ -101,6 +101,7 @@ tests += {
 # C tests using the minilib runtime
 setup_c = {'cflags': [cflags], 'qemu_args': qemu_args}
 tests += {
+  'chsc-sci.c': setup_c,
   'decimal.c': setup_c,
   'diag204.c': setup_c,
   'edat.c': setup_c,
