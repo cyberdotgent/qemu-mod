@@ -156,11 +156,6 @@ struct SubchDev {
     void *driver_data;
     ESW esw;
     bool ccw_async_pending;
-    /* Program-controlled-interruption status is separate from final status. */
-    SCSW pci_status;
-    bool pci_pending;
-    bool pci_presented;
-    bool final_status_deferred;
     const S390QdioOps *qdio_ops;
 };
 

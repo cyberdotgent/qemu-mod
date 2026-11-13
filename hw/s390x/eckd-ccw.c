@@ -71,6 +71,8 @@
 #define CMD_READ_HA_MT 0x9a
 #define CMD_WRITE_TRACK_DATA 0xa5
 #define CMD_READ_TRACK_DATA 0xa6
+#define CMD_WRITE_DATA_SPECIAL_MT 0xb5
+#define CMD_READ_DATA_SPECIAL_MT 0xb6
 #define CMD_SET_PGID 0xaf
 #define CMD_RESERVE 0xb4
 #define CMD_READ_TRACK 0xde
@@ -235,7 +237,8 @@ static int eckd_unit_exception(EckdCcwDevice *eckd)
 static void eckd_set_length_status(EckdCcwDevice *eckd, const CCW1 *ccw,
                                    uint32_t transferred, uint32_t available)
 {
-    bool suppress = ccw->flags & CCW_FLAG_SLI;
+    bool suppress = (ccw->flags & CCW_FLAG_SLI) &&
+                    !(ccw->flags & CCW_FLAG_DC);
     bool continues = (ccw->flags & CCW_FLAG_DC) && transferred < available;
 
     if (!suppress && !continues && ccw->count != available) {
@@ -275,8 +278,8 @@ static int eckd_copy_response(EckdCcwDevice *eckd, const CCW1 *ccw,
     return ret;
 }
 
-static bool eckd_valid_track(EckdCcwDevice *eckd, uint16_t cylinder,
-                             uint16_t head)
+static bool eckd_track_in_extent(EckdCcwDevice *eckd, uint16_t cylinder,
+                                 uint16_t head)
 {
     uint32_t track = (uint32_t)cylinder * eckd->image.heads + head;
     uint32_t first = (uint32_t)eckd->extent_begin_cylinder *
@@ -284,10 +287,16 @@ static bool eckd_valid_track(EckdCcwDevice *eckd, uint16_t cylinder,
     uint32_t last = (uint32_t)eckd->extent_end_cylinder *
                     eckd->image.heads + eckd->extent_end_head;
 
+    return !eckd->extent_defined || (track >= first && track <= last);
+}
+
+static bool eckd_valid_track(EckdCcwDevice *eckd, uint16_t cylinder,
+                             uint16_t head)
+{
     if (cylinder >= eckd->image.cylinders || head >= eckd->image.heads) {
         return false;
     }
-    return !eckd->extent_defined || (track >= first && track <= last);
+    return eckd_track_in_extent(eckd, cylinder, head);
 }
 
 static int eckd_position(EckdCcwDevice *eckd, uint16_t cylinder,
@@ -321,6 +330,12 @@ static int eckd_next_track(EckdCcwDevice *eckd)
     if (head == eckd->image.heads) {
         head = 0;
         cylinder++;
+    }
+    if (cylinder >= eckd->image.cylinders) {
+        return eckd_unit_check(eckd, 0, SENSE1_END_CYLINDER);
+    }
+    if (!eckd_track_in_extent(eckd, cylinder, head)) {
+        return eckd_unit_check(eckd, 0, SENSE1_FILE_PROTECTED);
     }
     return eckd_position(eckd, cylinder, head, 0);
 }
@@ -743,8 +758,13 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
     }
     transferred = MIN((uint32_t)ccw->count, length);
     eckd->read_used += transferred;
-    if ((ccw->flags & CCW_FLAG_DC) &&
-        eckd->read_used < eckd->read_length) {
+    if (ccw->flags & CCW_FLAG_DC) {
+        /*
+         * Data chaining preserves orientation even when this CCW exactly
+         * exhausts the record.  A following data-chained CCW must then see
+         * no data and retain its full residual; it must not start reading
+         * the next physical record.
+         */
         eckd->read_active = true;
         return 0;
     }
@@ -781,6 +801,7 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
     const CkdImageRecord *record;
     uint32_t offset;
     uint32_t expected;
+    uint32_t remaining;
     uint32_t length;
     int ret;
 
@@ -821,12 +842,16 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
         eckd->update_active = false;
         return eckd_no_record(eckd);
     }
+    if (!record->data_length) {
+        eckd->update_active = false;
+        return eckd_unit_exception(eckd);
+    }
     if (eckd->update_used > expected) {
         eckd->update_active = false;
         return eckd_unit_check(eckd, SENSE_DATA_CHECK, 0);
     }
-    length = MIN((uint32_t)ccw->count,
-                 expected - eckd->update_used);
+    remaining = expected - eckd->update_used;
+    length = MIN((uint32_t)ccw->count, remaining);
     ret = eckd_read_guest(eckd,
                           eckd->write_record + offset + eckd->update_used,
                           length);
@@ -840,6 +865,9 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
         return 0;
     }
     eckd->update_active = false;
+    if (ccw->count < remaining) {
+        eckd_set_length_status(eckd, ccw, length, remaining);
+    }
     if (eckd->update_used < expected) {
         /*
          * CKD update writes pad a short data transfer with zeroes.  This is
@@ -1073,8 +1101,10 @@ static int eckd_read_track(EckdCcwDevice *eckd, const CCW1 *ccw)
         return eckd_unit_check(eckd, SENSE_DATA_CHECK,
                                SENSE1_INVALID_TRACK);
     }
-    return eckd_copy_response(eckd, ccw, eckd->image.track,
-                              eckd->image.used_length);
+    /* Read Track starts with R0's count field; the home address is not
+     * part of the transferred track data. */
+    return eckd_copy_response(eckd, ccw, eckd->image.track + 5,
+                              eckd->image.used_length - 5);
 }
 
 static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
@@ -1422,14 +1452,19 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     case CMD_READ_R0:
         eckd->record = 0;
         return eckd_read_record(eckd, &ccw, 0x1e, true);
-    case CMD_READ_TRACK:
     case CMD_READ_TRACK_DATA:
+    case CMD_READ_DATA_SPECIAL_MT:
+        return eckd_read_record(eckd, &ccw, CMD_READ_MT, true);
+    case CMD_READ_TRACK:
         return eckd_read_track(eckd, &ccw);
     case CMD_WRITE:
     case CMD_WRITE_MT:
     case CMD_WRITE_KD:
     case CMD_WRITE_KD_MT:
         return eckd_write_existing(eckd, &ccw, ccw.cmd_code);
+    case CMD_WRITE_TRACK_DATA:
+    case CMD_WRITE_DATA_SPECIAL_MT:
+        return eckd_write_existing(eckd, &ccw, CMD_WRITE_MT);
     case CMD_WRITE_R0:
         return eckd_write_r0(eckd, &ccw);
     case 0x1d:
@@ -1446,7 +1481,6 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd_format_begin(eckd);
         return eckd_format_commit(eckd);
     case CMD_WRITE_FULL_TRACK:
-    case CMD_WRITE_TRACK_DATA:
         if (ccw.count > ECKD_TRACK_SIZE) {
             return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
         }

@@ -16,7 +16,6 @@
 #include "qemu/error-report.h"
 #include "system/address-spaces.h"
 #include "system/physmem.h"
-#include "exec/target_page.h"
 #include "hw/s390x/ioinst.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/css.h"
@@ -24,7 +23,6 @@
 #include "hw/s390x/s390_flic.h"
 #include "hw/s390x/s390-virtio-ccw.h"
 #include "hw/s390x/s390-ccw.h"
-#include "hw/s390x/storage-keys.h"
 #include "exec/cpu-common.h"
 #include "qapi/qapi-builtin-type-infos.h"
 
@@ -206,7 +204,7 @@ static int subch_dev_pre_save(void *opaque);
 
 const VMStateDescription vmstate_subch_dev = {
     .name = "s390_subch_dev",
-    .version_id = 2,
+    .version_id = 1,
     .minimum_version_id = 1,
     .post_load = subch_dev_post_load,
     .pre_save = subch_dev_pre_save,
@@ -229,9 +227,6 @@ const VMStateDescription vmstate_subch_dev = {
         VMSTATE_STRUCT(id, SubchDev, 0, vmstate_sense_id, SenseId),
         VMSTATE_BOOL(ccw_fmt_1, SubchDev),
         VMSTATE_UINT8(ccw_no_data_cnt, SubchDev),
-        VMSTATE_STRUCT(pci_status, SubchDev, 2, vmstate_scsw, SCSW),
-        VMSTATE_BOOL_V(pci_pending, SubchDev, 2),
-        VMSTATE_BOOL_V(final_status_deferred, SubchDev, 2),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {
@@ -609,26 +604,6 @@ void css_inject_io_interrupt(SubchDev *sch)
                       isc << 27);
 }
 
-static void css_raise_pci(SubchDev *sch, hwaddr next_ccw)
-{
-    SCSW *scsw = &sch->pci_status;
-
-    *scsw = sch->curr_status.scsw;
-    scsw->ctrl &= ~(SCSW_CTRL_MASK_ACTL | SCSW_CTRL_MASK_STCTL);
-    scsw->ctrl |= SCSW_ACTL_SUBCH_ACTIVE | SCSW_ACTL_DEVICE_ACTIVE |
-                  SCSW_STCTL_INTERMEDIATE | SCSW_STCTL_STATUS_PEND;
-    scsw->cpa = next_ccw;
-    scsw->dstat = 0;
-    scsw->cstat = SCSW_CSTAT_PCI;
-    scsw->count = 0;
-
-    /* A later PCI replaces status that has not yet been presented. */
-    if (!sch->pci_pending) {
-        sch->pci_pending = true;
-        css_inject_io_interrupt(sch);
-    }
-}
-
 bool css_inject_qdio_pci(SubchDev *sch)
 {
     if (!(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ENA) ||
@@ -877,42 +852,6 @@ static inline bool cds_ccw_addrs_ok(hwaddr addr, int len, bool ccw_fmt1)
     return (addr + len) < (ccw_fmt1 ? (1UL << 31) : (1UL << 24));
 }
 
-static int css_update_storage_keys(hwaddr addr, size_t len,
-                                   CcwDataStreamOp op)
-{
-    S390SKeysState *ss = s390_get_skeys_device();
-    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
-    uint64_t first_gfn;
-    uint64_t count;
-    uint8_t bits;
-    uint8_t *keys;
-    int ret;
-
-    if (!len || op == CDS_OP_A || !skeyclass->skeys_are_enabled(ss)) {
-        return 0;
-    }
-
-    first_gfn = addr / TARGET_PAGE_SIZE;
-    count = ((addr + len - 1) / TARGET_PAGE_SIZE) - first_gfn + 1;
-    keys = g_new(uint8_t, count);
-    ret = s390_skeys_get(ss, first_gfn, count, keys);
-    if (ret) {
-        g_free(keys);
-        return ret;
-    }
-
-    bits = S390_SKEY_REFERENCE;
-    if (op == CDS_OP_W) {
-        bits |= S390_SKEY_CHANGE;
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        keys[i] |= bits;
-    }
-    ret = s390_skeys_set(ss, first_gfn, count, keys);
-    g_free(keys);
-    return ret;
-}
-
 static int ccw_dstream_rw_noflags(CcwDataStream *cds, void *buff, int len,
                                   CcwDataStreamOp op)
 {
@@ -935,10 +874,6 @@ static int ccw_dstream_rw_noflags(CcwDataStream *cds, void *buff, int len,
         ret = MEMTX_OK;
     }
     if (ret != MEMTX_OK) {
-        cds->flags |= CDS_F_STREAM_BROKEN;
-        return -EINVAL;
-    }
-    if (css_update_storage_keys(cds->cda, len, op)) {
         cds->flags |= CDS_F_STREAM_BROKEN;
         return -EINVAL;
     }
@@ -1046,10 +981,6 @@ static int ccw_dstream_rw_ida(CcwDataStream *cds, void *buff, int len,
                 ret = -EINVAL; /* channel program check */
                 goto err;
             }
-            if (css_update_storage_keys(cds->cda, iter_len, op)) {
-                ret = -EINVAL;
-                goto err;
-            }
         }
         cds->at_byte += iter_len;
         cds->cda += iter_len;
@@ -1115,9 +1046,6 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
     ccw = copy_ccw_from_guest(ccw_addr, sch->ccw_fmt_1);
     trace_css_ccw(sch->devno, ccw_addr, ccw.cmd_code, ccw.cda, ccw.count,
                   ccw.flags);
-    if (ccw.flags & CCW_FLAG_PCI) {
-        css_raise_pci(sch, ccw_addr + 8);
-    }
     data_chained = sch->last_cmd_valid &&
                    (sch->last_cmd.flags & CCW_FLAG_DC);
 
@@ -1262,6 +1190,18 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
     }
 
     /*
+     * Program-controlled interruption is status for an accepted CCW, not a
+     * separate channel program.  Keep it in the live SCSW so synchronous
+     * completion can merge intermediate PCI with the final device status.
+     */
+    if ((ccw.flags & CCW_FLAG_PCI) && ccw.cmd_code != CCW_CMD_TIC &&
+        (ret == 0 || ret == -EIO || ret == CSS_CCW_PENDING)) {
+        sch->curr_status.scsw.cstat |= SCSW_CSTAT_PCI;
+        sch->curr_status.scsw.ctrl |= SCSW_STCTL_INTERMEDIATE |
+                                      SCSW_STCTL_STATUS_PEND;
+    }
+
+    /*
      * A CCW that transfers no data is allowed, but ensure an upper limit
      * is established to prevent long-running channel programs that don't
      * move actual data.
@@ -1368,6 +1308,9 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
             schib->scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;
             schib->scsw.ctrl |= SCSW_STCTL_PRIMARY | SCSW_STCTL_SECONDARY |
                     SCSW_STCTL_STATUS_PEND;
+            if (schib->scsw.cstat & SCSW_CSTAT_PCI) {
+                schib->scsw.ctrl |= SCSW_STCTL_INTERMEDIATE;
+            }
             schib->scsw.dstat = SCSW_DSTAT_CHANNEL_END | SCSW_DSTAT_DEVICE_END;
             schib->scsw.cpa = sch->channel_prog + 8;
             break;
@@ -1501,11 +1444,7 @@ IOInstEnding do_subchannel_work_virtual(SubchDev *sch)
         inject = sch_handle_start_func_virtual(sch, false, 0);
     }
     if (inject) {
-        if (sch->pci_pending) {
-            sch->final_status_deferred = true;
-        } else {
-            css_inject_io_interrupt(sch);
-        }
+        css_inject_io_interrupt(sch);
     }
     /* inst must succeed if this func is called */
     return IOINST_CC_EXPECTED;
@@ -1518,11 +1457,7 @@ void css_virtual_ccw_complete(SubchDev *sch, int ret)
     }
 
     if (sch_handle_start_func_virtual(sch, true, ret)) {
-        if (sch->pci_pending) {
-            sch->final_status_deferred = true;
-        } else {
-            css_inject_io_interrupt(sch);
-        }
+        css_inject_io_interrupt(sch);
     }
 }
 
@@ -2022,17 +1957,11 @@ int css_do_tsch_get_irb(SubchDev *sch, IRB *target_irb, int *irb_len)
     /* Prepare the irb for the guest. */
     memset(&irb, 0, sizeof(IRB));
 
-    /* PCI intermediate status precedes separately pending final status. */
-    if (sch->pci_pending) {
-        irb.scsw = sch->pci_status;
-        stctl = irb.scsw.ctrl & SCSW_CTRL_MASK_STCTL;
-        sch->pci_presented = true;
-    } else {
-        irb.scsw = schib->scsw;
-    }
+    /* Copy scsw from current status. */
+    irb.scsw = schib->scsw;
 
     /* Build other IRB data, if necessary */
-    if (!sch->pci_pending && sch->irb_cb) {
+    if (sch->irb_cb) {
         sch->irb_cb(sch, &irb);
     }
 
@@ -2052,18 +1981,6 @@ void css_do_tsch_update_subch(SubchDev *sch)
     uint16_t stctl;
     uint16_t fctl;
     uint16_t actl;
-
-    if (sch->pci_presented) {
-        sch->pci_presented = false;
-        sch->pci_pending = false;
-        memset(&sch->pci_status, 0, sizeof(sch->pci_status));
-        css_clear_io_interrupt(css_build_subchannel_id(sch), sch->schid);
-        if (sch->final_status_deferred) {
-            sch->final_status_deferred = false;
-            css_inject_io_interrupt(sch);
-        }
-        return;
-    }
 
     stctl = schib->scsw.ctrl & SCSW_CTRL_MASK_STCTL;
     fctl = schib->scsw.ctrl & SCSW_CTRL_MASK_FCTL;
@@ -2749,10 +2666,6 @@ void css_reset_sch(SubchDev *sch)
     sch->last_cmd_valid = false;
     sch->last_ccw_was_tic = false;
     sch->thinint_active = false;
-    memset(&sch->pci_status, 0, sizeof(sch->pci_status));
-    sch->pci_pending = false;
-    sch->pci_presented = false;
-    sch->final_status_deferred = false;
 }
 
 void css_reset(void)

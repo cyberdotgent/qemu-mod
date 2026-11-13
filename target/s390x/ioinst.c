@@ -312,7 +312,7 @@ void ioinst_handle_stcps(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
      */
     for (ssid = 0; ssid <= MAX_SSID; ssid++) {
         for (schid = 0; schid <= MAX_SCHID; schid++) {
-            SubchDev *sch = css_find_subch(1, 0, ssid, schid);
+            SubchDev *sch = css_find_subch(0, 0, ssid, schid);
             SCHIB status;
             unsigned int path;
             uint8_t lpum;
@@ -338,6 +338,9 @@ void ioinst_handle_stcps(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
                 if (lpum & (0x80 >> path)) {
                     break;
                 }
+            }
+            if (path == ARRAY_SIZE(status.pmcw.chpid)) {
+                continue;
             }
             chpid = status.pmcw.chpid[path];
             active_chpids[chpid / 8] |= 0x80 >> (chpid % 8);
@@ -503,7 +506,6 @@ typedef struct ChscResp {
 #define CHSC_SSD  0x0004
 #define CHSC_SSCUD 0x0006
 #define CHSC_SCSC 0x0010
-#define CHSC_SCI  0x0012
 #define CHSC_SDA  0x0031
 #define CHSC_SDCAL 0x0034
 #define CHSC_SEI  0x000e
@@ -772,35 +774,6 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
   out_err:
     res->code = cpu_to_be16(resp_code);
     res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
-    res->param = 0;
-}
-
-#define CHSC_SCI_0_M    0x20000000
-#define CHSC_SCI_0_FMT  0x0f000000
-#define CHSC_SCI_0_RES  0xc0ffffff
-static void ioinst_handle_chsc_sci(ChscReq *req, ChscResp *res)
-{
-    uint32_t param0 = be32_to_cpu(req->param0);
-
-    if (be16_to_cpu(req->len) != sizeof(*req) ||
-        (param0 & (CHSC_SCI_0_FMT | CHSC_SCI_0_RES)) ||
-        req->param1 || req->param2) {
-        res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
-        res->code = cpu_to_be16(0x0003);
-        res->param = 0;
-        return;
-    }
-
-    /*
-     * Store Configuration Information in basic (non-MIF) mode.  Byte 2
-     * identifies the response format; the remaining basic-mode fields are
-     * reserved and must be zero.  z/OS uses this response while constructing
-     * its IOS device configuration during NIP.
-     */
-    memset(res->data, 0, 0x0138 - CHSC_MIN_RESP_LEN);
-    res->data[2] = 0x01;
-    res->len = cpu_to_be16(0x0138);
-    res->code = cpu_to_be16(0x0001);
     res->param = 0;
 }
 
@@ -1085,9 +1058,6 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     switch (command) {
     case CHSC_SCSC:
         ioinst_handle_chsc_scsc(req, res);
-        break;
-    case CHSC_SCI:
-        ioinst_handle_chsc_sci(req, res);
         break;
     case CHSC_SCPD:
         ioinst_handle_chsc_scpd(req, res);

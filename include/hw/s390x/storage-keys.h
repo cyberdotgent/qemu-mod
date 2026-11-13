@@ -18,9 +18,6 @@
 #define TYPE_S390_SKEYS "s390-skeys"
 OBJECT_DECLARE_TYPE(S390SKeysState, S390SKeysClass, S390_SKEYS)
 
-#define S390_SKEY_CHANGE     0x02
-#define S390_SKEY_REFERENCE  0x04
-
 struct S390SKeysState {
     DeviceState parent_obj;
 };
