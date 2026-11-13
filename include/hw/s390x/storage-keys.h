@@ -119,6 +119,20 @@ int s390_skeys_get(S390SKeysState *ks, uint64_t start_gfn,
 int s390_skeys_set(S390SKeysState *ks, uint64_t start_gfn,
                    uint64_t count, uint8_t *keys);
 
+/**
+ * s390_skeys_update_access:
+ * @addr: absolute address of the accessed range
+ * @len: length of the accessed range
+ * @is_write: whether the access stored into memory
+ *
+ * Record an access performed by a system device in the storage keys of all
+ * pages intersecting the range.  Reads set Reference; writes set Reference
+ * and Change.  This is a no-op while storage keys are disabled.
+ *
+ * Returns 0 on success, or the error returned by the storage-key backend.
+ */
+int s390_skeys_update_access(uint64_t addr, uint64_t len, bool is_write);
+
 S390SKeysState *s390_get_skeys_device(void);
 
 void s390_qmp_dump_skeys(const char *filename, Error **errp);

@@ -84,6 +84,46 @@ int s390_skeys_set(S390SKeysState *ks, uint64_t start_gfn,
     return rc;
 }
 
+int s390_skeys_update_access(uint64_t addr, uint64_t len, bool is_write)
+{
+    S390SKeysState *ss = s390_get_skeys_device();
+    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
+    uint64_t start_gfn, end_gfn, count;
+    g_autofree uint8_t *keys = NULL;
+    uint8_t bits = 0x04; /* Reference */
+    bool changed = false;
+    int rc;
+
+    if (!len || !skeyclass->skeys_are_enabled(ss)) {
+        return 0;
+    }
+    if (addr > UINT64_MAX - (len - 1)) {
+        return -EINVAL;
+    }
+
+    start_gfn = addr / TARGET_PAGE_SIZE;
+    end_gfn = (addr + len - 1) / TARGET_PAGE_SIZE;
+    count = end_gfn - start_gfn + 1;
+    keys = g_new(uint8_t, count);
+
+    rc = s390_skeys_get(ss, start_gfn, count, keys);
+    if (rc) {
+        return rc;
+    }
+
+    if (is_write) {
+        bits |= 0x02; /* Change */
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t old_key = keys[i];
+
+        keys[i] |= bits;
+        changed |= keys[i] != old_key;
+    }
+
+    return changed ? s390_skeys_set(ss, start_gfn, count, keys) : 0;
+}
+
 static void write_keys(FILE *f, uint8_t *keys, uint64_t startgfn,
                        uint64_t count, Error **errp)
 {

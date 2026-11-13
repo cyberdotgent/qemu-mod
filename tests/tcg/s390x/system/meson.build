@@ -136,6 +136,7 @@ term3215_input_qemu_args = ['-monitor', 'none',
 tests += {
   'fba-tic.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-chp.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
+  'sclp-skey.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-cpu.c': {'cflags': [ccw_cflags], 'qemu_args': qemu_args},
   'terminal3215.c': {'cflags': [ccw_cflags], 'qemu_args': term3215_qemu_args},
   'terminal3215-input.c': {

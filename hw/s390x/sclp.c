@@ -24,6 +24,7 @@
 #include "hw/s390x/ipl.h"
 #include "hw/s390x/cpu-topology.h"
 #include "hw/s390x/s390-virtio-ccw.h"
+#include "hw/s390x/storage-keys.h"
 
 static SCLPDevice *get_sclp_device(void)
 {
@@ -41,6 +42,7 @@ static inline bool sclp_command_code_valid(uint32_t code)
     case SCLP_CMDW_READ_SCP_INFO:
     case SCLP_CMDW_READ_SCP_INFO_FORCED:
     case SCLP_CMDW_READ_CHP_INFO:
+    case SCLP_CMDW_READ_CSI_INFO:
     case SCLP_CMDW_READ_CPU_INFO:
     case SCLP_CMDW_CONFIGURE_IOA:
     case SCLP_CMDW_DECONFIGURE_IOA:
@@ -241,6 +243,22 @@ static void sclp_read_chp_info(SCCB *sccb)
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }
 
+static void sclp_read_csi_info(SCCB *sccb)
+{
+    ReadCsiInfo *info = (ReadCsiInfo *)sccb;
+
+    if (be16_to_cpu(sccb->h.length) < sizeof(*info)) {
+        sccb->h.response_code =
+            cpu_to_be16(SCLP_RC_INSUFFICIENT_SCCB_LENGTH);
+        return;
+    }
+
+    memset(info->facilities, 0, sizeof(info->facilities));
+    memset(info->reserved, 0, sizeof(info->reserved));
+    info->facilities[0] = SCLP_CSI_CONCURRENT_SENSE;
+    sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
+}
+
 /* Provide information about the CPU */
 static void sclp_read_cpu_info(SCLPDevice *sclp, SCCB *sccb)
 {
@@ -310,6 +328,9 @@ static void sclp_execute(SCLPDevice *sclp, SCCB *sccb, uint32_t code)
         break;
     case SCLP_CMDW_READ_CHP_INFO:
         sclp_read_chp_info(sccb);
+        break;
+    case SCLP_CMDW_READ_CSI_INFO:
+        sclp_read_csi_info(sccb);
         break;
     case SCLP_CMDW_READ_CPU_INFO:
         sclp_c->read_cpu_info(sclp, sccb);
@@ -392,6 +413,9 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     if (ret != MEMTX_OK) {
         return -PGM_ADDRESSING;
     }
+    if (s390_skeys_update_access(sccb, sizeof(SCCBHeader), false)) {
+        return -PGM_ADDRESSING;
+    }
 
     /* Valid sccb sizes */
     if (be16_to_cpu(header.length) < sizeof(SCCBHeader)) {
@@ -408,6 +432,9 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     ret = address_space_read(as, sccb, attrs,
                             work_sccb, be16_to_cpu(header.length));
     if (ret != MEMTX_OK) {
+        return -PGM_ADDRESSING;
+    }
+    if (s390_skeys_update_access(sccb, be16_to_cpu(header.length), false)) {
         return -PGM_ADDRESSING;
     }
     work_sccb->h = header;
@@ -427,6 +454,9 @@ out_write:
     ret = address_space_write(as, sccb, attrs,
                               work_sccb, be16_to_cpu(header.length));
     if (ret != MEMTX_OK) {
+        return -PGM_PROTECTION;
+    }
+    if (s390_skeys_update_access(sccb, be16_to_cpu(header.length), true)) {
         return -PGM_PROTECTION;
     }
 
