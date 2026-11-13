@@ -1126,7 +1126,7 @@ static void kvm_sclp_service_call(S390CPU *cpu, struct kvm_run *run,
                                  uint16_t ipbh0)
 {
     CPUS390XState *env = &cpu->env;
-    uint64_t sccb;
+    uint32_t sccb;
     uint32_t code;
     int r;
 
