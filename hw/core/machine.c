@@ -18,6 +18,7 @@
 #include "hw/core/loader.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/qapi-type-infos-machine.h"
 #include "qapi/qapi-visit-machine.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qemu/madvise.h"
@@ -43,6 +44,8 @@
 GlobalProperty hw_compat_11_1[] = {
     { "sysbus-ehci-usb", "x-migrate-fetch-addr-64bit", "off" },
     { "pci-ehci-usb", "x-migrate-fetch-addr-64bit", "off" },
+    { "pcie-root-port", "speed", "16" },
+    { "virtio-blk-device", "fua", "off" },
 };
 const size_t hw_compat_11_1_len = G_N_ELEMENTS(hw_compat_11_1);
 
@@ -57,6 +60,10 @@ GlobalProperty hw_compat_11_0[] = {
     { TYPE_ARM_SMMUV3, "ssidsize", "0" },
     { TYPE_ARM_SMMUV3, "oas", "44" },
     { "migration", "switchover-ack-legacy", "on" },
+    { "usb-ccid", "x-accurate-message-length", "off" },
+    { "usb-ccid", "x-pin-support", "on" },
+    { "usb-ccid", "x-t1-support", "off" },
+    { "usb-ccid", "x-migrate-pending-answers", "off" },
 };
 const size_t hw_compat_11_0_len = G_N_ELEMENTS(hw_compat_11_0);
 
@@ -1115,25 +1122,30 @@ static void machine_class_init(ObjectClass *oc, const void *data)
         "Dump current dtb to a file and quit");
 
     object_class_property_add(oc, "boot", "BootConfiguration",
-        machine_get_boot, machine_set_boot,
-        NULL, NULL);
+                              &BootConfiguration_type_info,
+                              machine_get_boot, machine_set_boot,
+                              NULL, NULL);
     object_class_property_set_description(oc, "boot",
         "Boot configuration");
 
     object_class_property_add(oc, "smp", "SMPConfiguration",
-        machine_get_smp, machine_set_smp,
-        NULL, NULL);
+                              &SMPConfiguration_type_info,
+                              machine_get_smp, machine_set_smp,
+                              NULL, NULL);
     object_class_property_set_description(oc, "smp",
         "CPU topology");
 
     object_class_property_add(oc, "smp-cache", "SmpCachePropertiesWrapper",
-        machine_get_smp_cache, machine_set_smp_cache, NULL, NULL);
+                              &SmpCachePropertiesWrapper_type_info,
+                              machine_get_smp_cache, machine_set_smp_cache,
+                              NULL, NULL);
     object_class_property_set_description(oc, "smp-cache",
         "Cache properties list for SMP machine");
 
-    object_class_property_add(oc, "phandle-start", "int",
-        machine_get_phandle_start, machine_set_phandle_start,
-        NULL, NULL);
+    object_class_property_add(oc, "phandle-start", "int", &int_type_info,
+                              machine_get_phandle_start,
+                              machine_set_phandle_start,
+                              NULL, NULL);
     object_class_property_set_description(oc, "phandle-start",
         "The first phandle ID we may generate dynamically");
 
@@ -1209,8 +1221,9 @@ static void machine_class_init(ObjectClass *oc, const void *data)
                                           "Valid value is ID of hostmem based backend");
 
     object_class_property_add(oc, "memory", "MemorySizeConfiguration",
-        machine_get_mem, machine_set_mem,
-        NULL, NULL);
+                              &MemorySizeConfiguration_type_info,
+                              machine_get_mem, machine_set_mem,
+                              NULL, NULL);
     object_class_property_set_description(oc, "memory",
         "Memory size configuration");
 }
@@ -1337,7 +1350,7 @@ bool machine_mem_merge(MachineState *machine)
     return machine->mem_merge;
 }
 
-bool machine_require_guest_memfd(MachineState *machine)
+bool machine_require_guest_memfd_private(MachineState *machine)
 {
     return machine->cgs && machine->cgs->require_guest_memfd;
 }

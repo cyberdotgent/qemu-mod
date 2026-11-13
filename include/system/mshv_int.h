@@ -15,6 +15,7 @@
 #define QEMU_MSHV_INT_H
 
 #include "hw/hyperv/hvhdk.h"
+#include "exec/vaddr.h"
 
 #define MSHV_MSR_ENTRIES_COUNT 64
 
@@ -48,6 +49,7 @@ struct AccelCPUState {
 
 typedef struct MshvMemoryListener {
     MemoryListener listener;
+    GHashTable *mapped_regions;
     int as_id;
 } MshvMemoryListener;
 
@@ -55,6 +57,13 @@ typedef struct MshvAddressSpace {
     MshvMemoryListener *ml;
     AddressSpace *as;
 } MshvAddressSpace;
+
+struct MshvSwBreakpoint {
+    vaddr pc;
+    vaddr saved_insn;
+    int use_count;
+    QTAILQ_ENTRY(MshvSwBreakpoint) entry;
+};
 
 struct MshvState {
     AccelState parent_obj;
@@ -70,6 +79,8 @@ struct MshvState {
     unsigned long *used_gsi_bitmap;
     unsigned int gsi_count;
     union hv_partition_processor_features processor_features;
+    QTAILQ_HEAD(, MshvSwBreakpoint) sw_breakpoints;
+    bool exception_intercepts_installed;
 };
 
 typedef struct MshvMsiControl {
@@ -85,7 +96,17 @@ typedef enum MshvVmExit {
     MshvVmExitIgnore   = 0,
     MshvVmExitShutdown = 1,
     MshvVmExitSpecial  = 2,
+    MshvVmExitDebug    = 3,
 } MshvVmExit;
+
+typedef enum MshvPutState {
+    /* state subset only touched by the VCPU itself during runtime */
+    MSHV_PUT_RUNTIME_STATE = 1,
+    /* state subset modified during VCPU reset */
+    MSHV_PUT_RESET_STATE = 2,
+    /* full state set, modified during initialization or on vmload */
+    MSHV_PUT_FULL_STATE = 3,
+} MshvPutState;
 
 void mshv_init_mmio_emu(void);
 int mshv_create_vcpu(int vm_fd, uint8_t vp_index, int *cpu_fd);
@@ -96,10 +117,13 @@ int mshv_set_generic_regs(const CPUState *cpu, const hv_register_assoc *assocs,
                           size_t n_regs);
 int mshv_get_generic_regs(CPUState *cpu, hv_register_assoc *assocs,
                           size_t n_regs);
-int mshv_arch_store_vcpu_state(const CPUState *cpu);
+int mshv_arch_store_vcpu_state(const CPUState *cpu, MshvPutState state);
 int mshv_arch_load_vcpu_state(CPUState *cpu);
 int mshv_arch_set_partition_msrs(const CPUState *cpu);
 int mshv_arch_set_mp_state(const CPUState *cpu);
+int mshv_arch_insert_sw_breakpoint(CPUState *cpu, struct MshvSwBreakpoint *bp);
+int mshv_arch_remove_sw_breakpoint(CPUState *cpu, struct MshvSwBreakpoint *bp);
+struct MshvSwBreakpoint *mshv_find_sw_breakpoint(CPUState *cpu, vaddr pc);
 void mshv_arch_init_vcpu(CPUState *cpu);
 void mshv_arch_destroy_vcpu(CPUState *cpu);
 void mshv_arch_amend_proc_features(
@@ -138,7 +162,7 @@ void mshv_log_global_stop(MemoryListener *listener);
 /* msr */
 int mshv_init_msrs(const CPUState *cpu);
 int mshv_get_msrs(CPUState *cpu);
-int mshv_set_msrs(const CPUState *cpu);
+int mshv_set_msrs(const CPUState *cpu, MshvPutState put_state);
 
 /* synic */
 int mshv_get_simp(int cpu_fd, uint8_t *page);

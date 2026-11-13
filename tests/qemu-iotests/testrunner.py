@@ -108,7 +108,7 @@ class TestResult:
 
 
 class TestRunner(contextlib.AbstractContextManager['TestRunner']):
-    shared_self = None
+    shared_self: Optional['TestRunner'] = None
 
     @staticmethod
     def proc_run_test(test: str, test_field_width: int) -> TestResult:
@@ -376,7 +376,8 @@ class TestRunner(contextlib.AbstractContextManager['TestRunner']):
         sys.stdout.flush()
         return res
 
-    def run_tests(self, tests: List[str], jobs: int = 1) -> bool:
+    def run_tests(self, tests: List[str], jobs: int = 1,
+                  quiet: bool = False) -> bool:
         n_run = 0
         failed = []
         notrun = []
@@ -384,9 +385,10 @@ class TestRunner(contextlib.AbstractContextManager['TestRunner']):
 
         if self.tap:
             print('TAP version 13')
-            self.env.print_env('# ')
+            if not quiet:
+                self.env.print_env('# ')
             print('1..%d' % len(tests))
-        else:
+        elif not quiet:
             self.env.print_env()
 
         test_field_width = max(len(os.path.basename(t)) for t in tests) + 2

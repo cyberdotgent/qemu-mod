@@ -31,6 +31,8 @@
 #include "qemu/thread.h"
 #include "system/qtest.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/qapi-type-infos-block-core.h"
 #include "qapi/qapi-visit-block-core.h"
 #include "qom/object.h"
 #include "qom/object_interfaces.h"
@@ -581,7 +583,6 @@ void throttle_group_register_tgm(ThrottleGroupMember *tgm,
     ThrottleState *ts = throttle_group_incref(groupname);
     ThrottleGroup *tg = container_of(ts, ThrottleGroup, ts);
 
-    tgm->throttle_state = ts;
     tgm->aio_context = ctx;
     qatomic_set(&tgm->restart_pending, 0);
 
@@ -602,6 +603,9 @@ void throttle_group_register_tgm(ThrottleGroupMember *tgm,
                          read_timer_cb,
                          write_timer_cb,
                          tgm);
+
+    /* The I/O path reads this without tg->lock, so publish it last */
+    qatomic_store_release(&tgm->throttle_state, ts);
 }
 
 /* Unregister a ThrottleGroupMember from its group, removing it from the list,
@@ -982,17 +986,16 @@ static void throttle_group_obj_class_init(ObjectClass *klass,
 
     /* individual properties */
     for (i = 0; i < sizeof(properties) / sizeof(ThrottleParamInfo); i++) {
-        object_class_property_add(klass,
-                                  properties[i].name,
-                                  "int64",
+        object_class_property_add(klass, properties[i].name, "int64",
+                                  &int64_type_info,
                                   throttle_group_get,
                                   throttle_group_set,
                                   NULL, &properties[i]);
     }
 
     /* ThrottleLimits */
-    object_class_property_add(klass,
-                              "limits", "ThrottleLimits",
+    object_class_property_add(klass, "limits", "ThrottleLimits",
+                              &ThrottleLimits_type_info,
                               throttle_group_get_limits,
                               throttle_group_set_limits,
                               NULL, NULL);

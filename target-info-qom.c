@@ -9,7 +9,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qom/object.h"
-#include "qemu/target-info-impl.h"
+#include "qemu/target-info-def.h"
 #include "qemu/target-info-init.h"
 #include "qemu/target-info-qom.h"
 
@@ -52,4 +52,9 @@ void target_info_qom_set_target(void)
     }
 
     target_info_ptr = TARGET_INFO_CLASS(targets->data)->target_info;
+}
+
+void target_info_qom_set_target_info(const TargetInfo *ti)
+{
+    target_info_ptr = ti;
 }

@@ -358,7 +358,7 @@ int kvm_arch_get_default_type(MachineState *ms);
 int kvm_arch_init(MachineState *ms, KVMState *s);
 
 int kvm_arch_pre_create_vcpu(CPUState *cpu, Error **errp);
-int kvm_arch_init_vcpu(CPUState *cpu);
+int kvm_arch_init_vcpu(CPUState *cpu, Error **errp);
 int kvm_arch_destroy_vcpu(CPUState *cpu);
 
 #ifdef TARGET_KVM_HAVE_RESET_PARKED_VCPU
@@ -551,6 +551,7 @@ int kvm_create_guest_memfd(uint64_t size, uint64_t flags, Error **errp);
 
 int kvm_set_memory_attributes_private(hwaddr start, uint64_t size);
 int kvm_set_memory_attributes_shared(hwaddr start, uint64_t size);
+bool kvm_private_memory_attribute_supported(void);
 
 int kvm_convert_memory(hwaddr start, hwaddr size, bool to_private);
 

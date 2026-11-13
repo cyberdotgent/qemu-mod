@@ -456,9 +456,15 @@ static void xhci_mfwrap_timer(void *opaque)
 {
     XHCIState *xhci = opaque;
     XHCIEvent wrap = { ER_MFINDEX_WRAP, CC_SUCCESS };
+    MemReentrancyGuard *guard = &xhci->parent.mem_reentrancy_guard;
+
+    assert(!guard->engaged_in_io);
+    guard->engaged_in_io = true;
 
     xhci_event(xhci, &wrap, 0);
     xhci_mfwrap_update(xhci);
+
+    guard->engaged_in_io = false;
 }
 
 static void xhci_die(XHCIState *xhci)
@@ -512,6 +518,7 @@ static inline void xhci_dma_write_u32s(XHCIState *xhci, dma_addr_t addr,
     int i;
     uint32_t tmp[5];
     uint32_t n = len / sizeof(uint32_t);
+    const MemTxAttrs memtx_attrs = { .memory = true };
 
     assert((len % sizeof(uint32_t)) == 0);
     assert(n <= ARRAY_SIZE(tmp));
@@ -519,13 +526,29 @@ static inline void xhci_dma_write_u32s(XHCIState *xhci, dma_addr_t addr,
     for (i = 0; i < n; i++) {
         tmp[i] = cpu_to_le32(buf[i]);
     }
-    if (dma_memory_write(xhci->as, addr, tmp, len,
-                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+    if (dma_memory_write(xhci->as, addr, tmp, len, memtx_attrs) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
                       __func__);
         xhci_die(xhci);
         return;
     }
+}
+
+static bool xhci_read_dcbaa(XHCIState *xhci, unsigned int slotid,
+                            dma_addr_t *octx)
+{
+    dma_addr_t dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
+    uint64_t poctx;
+
+    if (ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &poctx,
+                   MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
+                      __func__);
+        xhci_die(xhci);
+        return false;
+    }
+    *octx = xhci_mask64(poctx);
+    return true;
 }
 
 static XHCIPort *xhci_lookup_port(XHCIState *xhci, struct USBPort *uport)
@@ -607,6 +630,7 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
     XHCIInterrupter *intr = &xhci->intr[v];
     XHCITRB ev_trb;
     dma_addr_t addr;
+    const MemTxAttrs memtx_attrs = { .memory = true };
 
     ev_trb.parameter = cpu_to_le64(event->ptr);
     ev_trb.status = cpu_to_le32(event->length | (event->ccode << 24));
@@ -623,7 +647,7 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
 
     addr = intr->er_start + TRB_SIZE*intr->er_ep_idx;
     if (dma_memory_write(xhci->as, addr, &ev_trb, TRB_SIZE,
-                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                         memtx_attrs) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
                       __func__);
         xhci_die(xhci);
@@ -1086,7 +1110,14 @@ static void xhci_set_ep_state(XHCIState *xhci, XHCIEPContext *epctx,
 static void xhci_ep_kick_timer(void *opaque)
 {
     XHCIEPContext *epctx = opaque;
+    MemReentrancyGuard *guard = &epctx->xhci->parent.mem_reentrancy_guard;
+
+    assert(!guard->engaged_in_io);
+    guard->engaged_in_io = true;
+
     xhci_kick_epctx(epctx, 0);
+
+    guard->engaged_in_io = false;
 }
 
 static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
@@ -1742,8 +1773,7 @@ static int xhci_fire_ctl_transfer(XHCIState *xhci, XHCITransfer *xfer)
 static void xhci_calc_intr_kick(XHCIState *xhci, XHCITransfer *xfer,
                                 XHCIEPContext *epctx, uint64_t mfindex)
 {
-    uint64_t asap = ((mfindex + epctx->interval - 1) &
-                     ~(epctx->interval-1));
+    uint64_t asap = ROUND_UP(mfindex, epctx->interval);
     uint64_t kick = epctx->mfindex_last + epctx->interval;
 
     assert(epctx->interval != 0);
@@ -1754,8 +1784,7 @@ static void xhci_calc_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
                                XHCIEPContext *epctx, uint64_t mfindex)
 {
     if (xfer->trbs[0].control & TRB_TR_SIA) {
-        uint64_t asap = ((mfindex + epctx->interval - 1) &
-                         ~(epctx->interval-1));
+        uint64_t asap = ROUND_UP(mfindex, epctx->interval);
         if (asap >= epctx->mfindex_last &&
             asap <= epctx->mfindex_last + epctx->interval * 4) {
             xfer->mfindex_kick = epctx->mfindex_last + epctx->interval;
@@ -1914,26 +1943,15 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
             xfer->timed_xfer = 0;
             xfer->running_retry = 1;
         }
-        if (xfer->iso_xfer) {
-            /* retry iso transfer */
-            if (xhci_setup_packet(xfer) < 0) {
-                return;
-            }
-            usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
-            assert(xfer->packet.status != USB_RET_NAK);
-            xhci_try_complete_packet(xfer);
-        } else {
-            /* retry nak'ed transfer */
-            if (xhci_setup_packet(xfer) < 0) {
-                return;
-            }
-            usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
-            if (xfer->packet.status == USB_RET_NAK) {
-                xhci_xfer_unmap(xfer);
-                return;
-            }
-            xhci_try_complete_packet(xfer);
+        if (xhci_setup_packet(xfer) < 0) {
+            return;
         }
+        usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+        if (xfer->packet.status == USB_RET_NAK) {
+            xhci_xfer_unmap(xfer);
+            return;
+        }
+        xhci_try_complete_packet(xfer);
         assert(!xfer->running_retry);
         if (xfer->complete) {
             /* update ring dequeue ptr */
@@ -2102,8 +2120,7 @@ static TRBCCode xhci_address_slot(XHCIState *xhci, unsigned int slotid,
     XHCISlot *slot;
     USBPort *uport;
     USBDevice *dev;
-    dma_addr_t ictx, octx, dcbaap;
-    uint64_t poctx;
+    dma_addr_t ictx, octx;
     uint32_t ictl_ctx[2];
     uint32_t slot_ctx[4];
     uint32_t ep0_ctx[5];
@@ -2112,10 +2129,10 @@ static TRBCCode xhci_address_slot(XHCIState *xhci, unsigned int slotid,
 
     assert(slotid >= 1 && slotid <= xhci->numslots);
 
-    dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
-    ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &poctx, MEMTXATTRS_UNSPECIFIED);
+    if (!xhci_read_dcbaa(xhci, slotid, &octx)) {
+        return CC_TRB_ERROR;
+    }
     ictx = xhci_mask64(pictx);
-    octx = xhci_mask64(poctx);
 
     DPRINTF("xhci: input context at "DMA_ADDR_FMT"\n", ictx);
     DPRINTF("xhci: output context at "DMA_ADDR_FMT"\n", octx);
@@ -2440,6 +2457,7 @@ static void xhci_detach_slot(XHCIState *xhci, USBPort *uport)
 static TRBCCode xhci_get_port_bandwidth(XHCIState *xhci, uint64_t pctx)
 {
     dma_addr_t ctx;
+    const MemTxAttrs memtx_attrs = { .memory = true };
 
     DPRINTF("xhci_get_port_bandwidth()\n");
 
@@ -2448,9 +2466,9 @@ static TRBCCode xhci_get_port_bandwidth(XHCIState *xhci, uint64_t pctx)
     DPRINTF("xhci: bandwidth context at "DMA_ADDR_FMT"\n", ctx);
 
     /* TODO: actually implement real values here. This is 80% for all ports. */
-    if (stb_dma(xhci->as, ctx, 0, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+    if (stb_dma(xhci->as, ctx, 0, memtx_attrs) != MEMTX_OK ||
         dma_memory_set(xhci->as, ctx + 1, 80, xhci->numports,
-                       MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                       memtx_attrs) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory write failed!\n",
                       __func__);
         return CC_TRB_ERROR;
@@ -3249,49 +3267,73 @@ static const MemoryRegionOps xhci_doorbell_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static bool xhci_engage_reentrancy_guard(XHCIState *xhci)
+{
+    bool prev_engaged = xhci->parent.mem_reentrancy_guard.engaged_in_io;
+
+    xhci->parent.mem_reentrancy_guard.engaged_in_io = true;
+    return prev_engaged;
+}
+
+static void xhci_restore_reentrancy_guard(XHCIState *xhci, bool engaged)
+{
+    xhci->parent.mem_reentrancy_guard.engaged_in_io = engaged;
+}
+
 static void xhci_attach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged = xhci_engage_reentrancy_guard(xhci);
 
     xhci_port_update(port, 0);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_detach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged = xhci_engage_reentrancy_guard(xhci);
 
     xhci_detach_slot(xhci, usbport);
     xhci_port_update(port, 1);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_wakeup(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged;
 
     assert(port);
     if (get_field(port->portsc, PORTSC_PLS) != PLS_U3) {
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     set_field(&port->portsc, PLS_RESUME, PORTSC_PLS);
     xhci_port_notify(port, PORTSC_PLC);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_complete(USBPort *port, USBPacket *packet)
 {
     XHCITransfer *xfer = container_of(packet, XHCITransfer, packet);
+    XHCIState *xhci = xfer->epctx->xhci;
+    bool prev_engaged;
 
     if (packet->status == USB_RET_REMOVE_FROM_QUEUE) {
         xhci_ep_nuke_one_xfer(xfer, 0);
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     xhci_try_complete_packet(xfer);
     xhci_kick_epctx(xfer->epctx, xfer->streamid);
     if (xfer->complete) {
         xhci_ep_free_xfer(xfer);
     }
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_child_detach(USBPort *uport, USBDevice *child)
@@ -3343,6 +3385,7 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
 {
     XHCIState *xhci = container_of(bus, XHCIState, bus);
     int slotid;
+    bool prev_engaged;
 
     DPRINTF("%s\n", __func__);
     slotid = ep->dev->addr;
@@ -3351,7 +3394,9 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
         DPRINTF("%s: oops, no slot for dev %d\n", __func__, ep->dev->addr);
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     xhci_kick_ep(xhci, slotid, xhci_find_epid(ep), stream);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static USBBusOps xhci_bus_ops = {
@@ -3493,24 +3538,21 @@ static int usb_xhci_post_load(void *opaque, int version_id)
     XHCIState *xhci = opaque;
     XHCISlot *slot;
     XHCIEPContext *epctx;
-    dma_addr_t dcbaap, pctx;
+    dma_addr_t pctx;
     uint32_t slot_ctx[4];
     uint32_t ep_ctx[5];
     int slotid, epid, state;
-    uint64_t addr;
-
-    dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
 
     for (slotid = 1; slotid <= xhci->numslots; slotid++) {
         slot = &xhci->slots[slotid-1];
         if (!slot->addressed) {
             continue;
         }
-        ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &addr, MEMTXATTRS_UNSPECIFIED);
-        slot->ctx = xhci_mask64(addr);
-
-        xhci_dma_read_u32s(xhci, slot->ctx, slot_ctx, sizeof(slot_ctx));
-        slot->uport = xhci_lookup_uport(xhci, slot_ctx);
+        slot->uport = NULL;
+        if (xhci_read_dcbaa(xhci, slotid, &slot->ctx)) {
+            xhci_dma_read_u32s(xhci, slot->ctx, slot_ctx, sizeof(slot_ctx));
+            slot->uport = xhci_lookup_uport(xhci, slot_ctx);
+        }
         if (!slot->uport) {
             /* should not happen, but may trigger on guest bugs */
             slot->enabled = 0;

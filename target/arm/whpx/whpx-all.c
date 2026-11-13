@@ -767,7 +767,8 @@ void whpx_arm_set_cpu_features_from_host(ARMCPU *cpu)
              * We can't report this error yet, so flag that we need to
              * in arm_cpu_realizefn().
              */
-            cpu->host_cpu_probe_failed = true;
+            error_setg(&cpu->host_cpu_probe_err,
+                      "failed to retrieve host CPU features");
             return;
         }
     }
@@ -775,7 +776,7 @@ void whpx_arm_set_cpu_features_from_host(ARMCPU *cpu)
     cpu->dtb_compatible = arm_host_cpu_features.dtb_compatible;
     cpu->isar = arm_host_cpu_features.isar;
     cpu->env.features = arm_host_cpu_features.features;
-    cpu->midr = arm_host_cpu_features.midr;
+    SET_IDREG(&cpu->isar, MIDR, arm_host_cpu_features.midr);
     cpu->reset_sctlr = arm_host_cpu_features.reset_sctlr;
 }
 
@@ -836,13 +837,13 @@ int whpx_init_vcpu(CPUState *cpu)
     assert(write_cpustate_to_list(arm_cpu, false));
 
     /* Set CP_NO_RAW system registers on init */
-    val.Reg64 = arm_cpu->midr;
+    val.Reg64 = GET_IDREG(&arm_cpu->isar, MIDR);
     whpx_set_reg(cpu, WHvArm64RegisterMidrEl1,
                               val);
 
     clean_whv_register_value(&val);
 
-    val.Reg64 = deposit64(arm_cpu->mp_affinity, 31, 1, 1 /* RES1 */);
+    val.Reg64 = GET_IDREG(&arm_cpu->isar, MPIDR);
     whpx_set_reg(cpu, WHvArm64RegisterMpidrEl1, val);
 
     clamp_id_aa64mmfr0_parange_to_ipa_size(&arm_cpu->isar);
@@ -879,14 +880,6 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         goto error;
     }
 
-    if (mc->get_physical_address_range) {
-        pa_range = mc->get_physical_address_range(ms,
-            whpx_arm_get_ipa_bit_size(), whpx_arm_get_ipa_bit_size());
-        if (pa_range < 0) {
-            return -EINVAL;
-        }
-    }
-
     whpx->mem_quota = ms->ram_size;
 
     hr = whp_dispatch.WHvGetCapability(
@@ -912,6 +905,14 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
             "Please update your operating system to at least build 26100.3915");
         ret = -EINVAL;
         goto error;
+    }
+
+    if (mc->get_physical_address_range) {
+        pa_range = mc->get_physical_address_range(ms,
+            whpx_arm_get_ipa_bit_size(), whpx_arm_get_ipa_bit_size());
+        if (pa_range < 0) {
+            return -EINVAL;
+        }
     }
 
     hr = whp_dispatch.WHvCreatePartition(&whpx->partition);

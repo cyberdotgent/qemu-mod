@@ -48,13 +48,16 @@ tests += {
   multiarch/'sigreturn-sigmask.c': {'cflags': ['-lpthread']},
   multiarch/'tb-link.c': {'cflags': ['-lpthread']},
   multiarch/'test-mmap.c': {},
+  multiarch/'test-xpage-chain.c': {'cflags': ['-lpthread']},
   multiarch/'testthread.c': {'cflags': ['-lpthread']},
   multiarch/'threadcount.c': {'cflags': ['-lpthread']},
+  multiarch/'vma-pthread.c': {'cflags': ['-lpthread']},
 }
 
 # Linux tests
 tests += {
   multiarch/'linux/linux-madvise.c': {},
+  multiarch/'linux/linux-null-buffer.c': {},
   multiarch/'linux/linux-shmat-maps.c': {},
   multiarch/'linux/linux-shmat-null.c': {},
   multiarch/'linux/linux-sigrtminmax.c': {},
@@ -116,6 +119,12 @@ tests += {
   multiarch/'follow-fork-mode.c': {
     'test_name': 'follow-fork-mode-parent',
     'gdb_test': ['--test', files('gdbstub/follow-fork-mode-parent.py')],
+  },
+}
+tests += {
+  multiarch/'test-xpage-chain.c': {
+    'test_name': 'xpage-chain',
+    'gdb_test': ['--test', files('gdbstub/xpage-bp.py'), '--pargs=-b'],
   },
 }
 

@@ -1,7 +1,3 @@
-cc = 'arm-linux-gnueabihf-gcc'
-cc_dockerfile = 'debian-all-test-cross'
-cc_docker_host_arch = ['aarch64', 'x86_64']
-
 subdir('system')
 
 tests = []
@@ -39,6 +35,8 @@ tests += {
     'expected_output': 'fcvt.ref',
   },
   'pcalign-a32.c': {'cflags': ['-marm']},
+  'issue4448.c': {},
+  'test-arm-opt-ror.c': {'cflags': ['-marm']},
 }
 
 # Vector SHA1
@@ -68,9 +66,8 @@ tests += {
 if 'qemu-arm' in emulators
   tcg_tests += {
     'arm-linux-user': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
-      'cc_docker_host_arch': cc_docker_host_arch,
+      'cc': 'arm-linux-gnueabihf-gcc',
+      'cc_dockerfile': 'debian-all-test-cross',
       'folder': 'arm',
       'gdb_arch': 'arm',
       'qemu': emulators['qemu-arm'],

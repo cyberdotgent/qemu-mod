@@ -23,27 +23,26 @@
  * Realization
  * -----------
  *
- * Devices are constructed in two stages:
+ * Devices are constructed in the following order:
  *
- * 1) object instantiation via object_initialize() and
- * 2) device realization via the #DeviceState.realized property
+ * 1) #TypeInfo.instance_init
+ * 2) pre-realize property value setting
+ * 3) device realization
  *
- * The former may not fail (and must not abort or exit, since it is called
- * during device introspection already), and the latter may return error
- * information to the caller and must be re-entrant.
- * Trivial field initializations should go into #TypeInfo.instance_init.
- * Operations depending on @props static properties should go into @realize.
+ * #TypeInfo.instance_init may not fail. #DeviceClass.realize can
+ * fail, returning error information to the caller, and must be re-entrant.
+ *
+ * #TypeInfo.instance_init should add instance properties but must not
+ * have any side effect not contained in the instance, since it happens
+ * during device introspection. Any operations without special requirements
+ * should go into @realize so that they can be skipped during device
+ * introspection. It is possible to add properties during realization,
+ * but they will not be introspectable or configurable before realization.
+ *
+ * Child buses are automatically realized. Child devices must be manually
+ * realized (e.g. by calling qdev_realize()).
+ *
  * After successful realization, setting static properties will fail.
- *
- * As an interim step, the #DeviceState.realized property can also be
- * set with qdev_realize(). In the future, devices will propagate this
- * state change to their children and along busses they expose. The
- * point in time will be deferred to machine creation, so that values
- * set in @realize will not be introspectable beforehand. Therefore
- * devices must not create children during @realize; they should
- * initialize them via object_initialize() in their own
- * #TypeInfo.instance_init and forward the realization events
- * appropriately.
  *
  * Any type may override the @realize and/or @unrealize callbacks but needs
  * to call the parent type's implementation if keeping their functionality
@@ -102,10 +101,8 @@ typedef int (*DeviceSyncConfig)(DeviceState *dev, Error **errp);
 /**
  * struct DeviceClass - The base class for all devices.
  * @props: Properties accessing state fields.
- * @realize: Callback function invoked when the #DeviceState:realized
- * property is changed to %true.
- * @unrealize: Callback function invoked when the #DeviceState:realized
- * property is changed to %false.
+ * @realize: Callback function to realize the device.
+ * @unrealize: Callback function to unrealize the device.
  * @sync_config: Callback function invoked when QMP command device-sync-config
  * is called. Should synchronize device configuration from host to guest part
  * and notify the guest about the change.
@@ -956,9 +953,18 @@ void device_class_set_props_n(DeviceClass *dc, const Property *props, size_t n);
  *
  * This is intended to be used when the new realize function will
  * eventually call its parent realization function during creation.
- * This requires storing the function call somewhere (usually in the
- * instance structure) so you can eventually call
- * dc->parent_realize(dev, errp)
+ * @parent_realize should be where you want to save the pointer to
+ * the parent class realize function; the recommended location is a
+ * field named "parent_realize" in your class's class struct.
+ * (Some existing code puts the field in the parent class's class
+ * struct; this will work but is not the preferred thing for new code.)
+ *
+ * In your realize function you should chain to your parent's
+ * realize function using something like::
+ *
+ *    MyThingClass *mc = MY_THING_GET_CLASS(dev);
+ *    (do your child class realize actions here)
+ *    mc->parent_realize(dev, errp);
  */
 void device_class_set_parent_realize(DeviceClass *dc,
                                      DeviceRealize dev_realize,

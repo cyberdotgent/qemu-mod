@@ -351,7 +351,7 @@ typedef enum {
 #define BDRV_WANT_OFFSET_VALID  BDRV_BLOCK_OFFSET_VALID
 #define BDRV_WANT_ALLOCATED     BDRV_BLOCK_ALLOCATED
 #define BDRV_WANT_PRECISE       (BDRV_WANT_ZERO | BDRV_WANT_OFFSET_VALID | \
-                                 BDRV_WANT_OFFSET_VALID)
+                                 BDRV_WANT_ALLOCATED)
 
 typedef QTAILQ_HEAD(BlockReopenQueue, BlockReopenQueueEntry) BlockReopenQueue;
 
@@ -583,5 +583,6 @@ char *path_combine(const char *base_path, const char *filename);
 char *bdrv_get_full_backing_filename_from_filename(const char *backed,
                                                    const char *backing,
                                                    Error **errp);
+void bdrv_show_help(void);
 
 #endif /* BLOCK_COMMON_H */

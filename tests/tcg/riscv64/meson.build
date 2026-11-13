@@ -1,7 +1,3 @@
-cc = 'riscv64-linux-gnu-gcc'
-cc_dockerfile = 'debian-all-test-cross'
-cc_docker_host_arch = ['aarch64', 'x86_64']
-
 subdir('system')
 
 tests = []
@@ -26,9 +22,9 @@ tests += {
 if 'qemu-riscv64' in emulators
   tcg_tests += {
     'riscv64-linux-user': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
-      'cc_docker_host_arch': cc_docker_host_arch,
+      'cc': 'riscv64-linux-gnu-gcc',
+      'cc_alt': ['riscv64-redhat-linux-gnu-gcc'],
+      'cc_dockerfile': 'debian-all-test-cross',
       'folder': 'riscv64',
       'gdb_arch': 'riscv64',
       'qemu': emulators['qemu-riscv64'],

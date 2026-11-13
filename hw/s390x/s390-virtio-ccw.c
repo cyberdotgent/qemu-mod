@@ -43,6 +43,8 @@
 #include "system/hostmem.h"
 #include "target/s390x/kvm/pv.h"
 #include "migration/blocker.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/qapi-type-infos-machine-s390x.h"
 #include "qapi/visitor.h"
 #include "qapi/qapi-visit-machine-s390x.h"
 #include "hw/s390x/cpu-topology.h"
@@ -908,6 +910,13 @@ static inline void machine_set_secure_boot(Object *obj, bool value,
     ms->secure_boot = value;
 }
 
+static inline bool machine_get_pv(Object *obj, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    return ms->pv;
+}
+
  /*
   * S390x-specific global compatibility properties.
   *
@@ -971,7 +980,7 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "dea-key-wrap",
             "enable/disable DEA key wrapping using the CPACF wrapping key");
 
-    object_class_property_add(oc, "loadparm", "loadparm",
+    object_class_property_add(oc, "loadparm", "loadparm", &str_type_info,
                               machine_get_loadparm, machine_set_loadparm,
                               NULL, NULL);
     object_class_property_set_description(oc, "loadparm",
@@ -979,11 +988,12 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             " to upper case) to pass to machine loader, boot manager,"
             " and guest kernel");
 
-    object_class_property_add(oc, "ipl", "str", machine_get_ipl,
-                              machine_set_ipl, NULL, NULL);
+    object_class_property_add(oc, "ipl", "str", &str_type_info,
+                              machine_get_ipl, machine_set_ipl, NULL, NULL);
     object_class_property_set_description(oc, "ipl",
             "CCW device address to IPL from, as devno or cssid.ssid.devno");
     object_class_property_add(oc, "boot-certs", "BootCertificatesList",
+                              &BootCertificatesList_type_info,
                               machine_get_boot_certs, machine_set_boot_certs, NULL, NULL);
     object_class_property_set_description(oc, "boot-certs",
             "provide paths to a directory and/or a certificate file for secure boot");
@@ -993,6 +1003,12 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
                                    machine_set_secure_boot);
     object_class_property_set_description(oc, "secure-boot",
             "enable/disable secure boot");
+
+    object_class_property_add_bool(oc, "pv",
+                                   machine_get_pv,
+                                   NULL);
+    object_class_property_set_description(oc, "pv",
+            "true while the guest runs in protected virtualization mode (read-only)");
 }
 
 static inline void s390_machine_initfn(Object *obj)
@@ -1058,6 +1074,7 @@ static const TypeInfo ccw_machine_info = {
         .name = MACHINE_VER_TYPE_NAME("s390-ccw-virtio", __VA_ARGS__),        \
         .parent = TYPE_S390_CCW_MACHINE,                                      \
         .class_init = MACHINE_VER_SYM(class_init, ccw, __VA_ARGS__),          \
+        .secure = true,                                                       \
     };                                                                        \
     static void MACHINE_VER_SYM(register, ccw, __VA_ARGS__)(void)             \
     {                                                                         \
@@ -1095,12 +1112,16 @@ static void ccw_machine_11_1_instance_options(MachineState *machine)
 static void ccw_machine_11_1_class_options(MachineClass *mc)
 {
     S390CcwMachineClass *s390mc = S390_CCW_MACHINE_CLASS(mc);
+    static GlobalProperty compat[] = {
+        { TYPE_S390_PCI_HOST_BRIDGE, "x-zpci-migr-enabled", "off" },
+    };
 
     s390mc->use_certs = false;
     s390mc->use_secure = false;
 
     ccw_machine_11_2_class_options(mc);
     compat_props_add(mc->compat_props, hw_compat_11_1, hw_compat_11_1_len);
+    compat_props_add(mc->compat_props, compat, G_N_ELEMENTS(compat));
 }
 DEFINE_CCW_MACHINE(11, 1);
 

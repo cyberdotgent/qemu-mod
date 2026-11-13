@@ -45,6 +45,12 @@ tests += {
                '-T', files('test-armv6m-undef.ld')],
     'qemu_args': ['-M', 'microbit', qemu_base_args],
   },
+  'test-armv6m-control.S': {
+    'cflags': ['-mcpu=cortex-m0', '-mfloat-abi=soft', '-nostdlib',
+               '-Wl,--build-id=none',
+               '-T', files('test-armv6m-undef.ld')],
+    'qemu_args': ['-M', 'microbit', qemu_base_args],
+  },
   'semiconsole.c': {
     'cflags': cflags,
     'qemu_args': ['-serial', 'none', '-chardev', 'stdio,mux=on,id=stdio0',
@@ -63,9 +69,9 @@ tests += {
 if 'qemu-system-arm' in emulators
   tcg_tests += {
     'arm-softmmu': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
-      'cc_docker_host_arch': cc_docker_host_arch,
+      'cc': 'arm-linux-gnueabihf-gcc',
+      'cc_alt': ['arm-none-eabi-gcc'],
+      'cc_dockerfile': 'debian-all-test-cross',
       'folder': 'arm/system',
       'gdb_arch': 'arm',
       'qemu': emulators['qemu-system-arm'],

@@ -18,6 +18,13 @@
 #ifndef HEXAGON_CPU_H
 #define HEXAGON_CPU_H
 
+typedef struct HexagonHLXContext HexagonHLXContext;
+
+#ifdef CONFIG_USER_ONLY
+/* linux-user embeds an HLX context and needs the full type. */
+#include "hw/hexagon/hexagon_hlx.h"
+#endif
+
 #include "fpu/softfloat-types.h"
 
 #ifndef CONFIG_USER_ONLY
@@ -29,12 +36,18 @@
 
 typedef struct HexagonTLBState HexagonTLBState;
 typedef struct HexagonGlobalRegState HexagonGlobalRegState;
+typedef struct HexagonHVXContextState HexagonHVXContextState;
+typedef struct HexagonHLXState HexagonHLXState;
+typedef struct HexagonHMXContextState HexagonHMXContextState;
 
 #include "cpu-qom.h"
 #include "exec/cpu-common.h"
 #include "exec/target_long.h"
 #include "hex_regs.h"
+#include "hlx/hlx.h"
 #include "mmvec/mmvec.h"
+#include "hmx_config.h"
+#include "hmx_state.h"
 #include "hw/core/registerfields.h"
 #include "qemu/bitmap.h"
 
@@ -49,6 +62,7 @@ typedef struct HexagonGlobalRegState HexagonGlobalRegState;
 #define REG_WRITES_MAX 32
 #define PRED_WRITES_MAX 5                   /* 4 insns + endloop */
 #define VSTORES_MAX 2
+#define HVX_CONTEXTS_MAX 8
 #define MAX_TLB_ENTRIES 1024
 #define THREADS_MAX 16
 
@@ -57,6 +71,7 @@ typedef struct HexagonGlobalRegState HexagonGlobalRegState;
 #define CPU_INTERRUPT_SWI      CPU_INTERRUPT_TGT_INT_0
 #define CPU_INTERRUPT_K0_UNLOCK CPU_INTERRUPT_TGT_INT_1
 #define CPU_INTERRUPT_TLB_UNLOCK CPU_INTERRUPT_TGT_INT_2
+#define CPU_INTERRUPT_NMI CPU_INTERRUPT_TGT_EXT_0
 
 #define HEX_CPU_MODE_USER    1
 #define HEX_CPU_MODE_GUEST   2
@@ -72,6 +87,14 @@ typedef struct HexagonGlobalRegState HexagonGlobalRegState;
 #ifndef CONFIG_USER_ONLY
 #define MMU_GUEST_IDX        1
 #define MMU_KERNEL_IDX       2
+
+/*
+ * TLB entry match is by ASID and global bit, neither of which is encoded in
+ * mmu_idx, so a JTLB change has to be flushed out of every mmu_idx.
+ */
+#define MMU_IDX_ALL          ((1 << MMU_USER_IDX) | \
+                              (1 << MMU_GUEST_IDX) | \
+                              (1 << MMU_KERNEL_IDX))
 
 typedef enum {
     HEX_LOCK_UNLOCKED       = 0,
@@ -101,7 +124,7 @@ typedef struct {
 typedef struct {
     target_ulong va;
     int size;
-    DECLARE_BITMAP(mask, MAX_VEC_SIZE_BYTES) QEMU_ALIGNED(16);
+    DECLARE_BITMAP(mask, sizeof_field(MMVector, ub)) QEMU_ALIGNED(16);
     MMVector data QEMU_ALIGNED(16);
 } VStoreLog;
 
@@ -120,10 +143,18 @@ typedef struct {
 /* Maximum number of vector temps in a packet */
 #define VECTOR_TEMPS_MAX            4
 
+typedef struct HexagonHVXContext {
+    MMVector VRegs[NUM_VREGS];
+    MMQReg QRegs[NUM_QREGS];
+} QEMU_ALIGNED(16) HexagonHVXContext;
+
 typedef struct CPUArchState {
     target_ulong gpr[TOTAL_PER_THREAD_REGS];
     target_ulong pred[NUM_PREGS];
     uint32_t cause_code;
+    uint32_t cfi_active;
+    uint32_t cfi_active_log;
+    uint32_t cfi_updated;
 
     /* For comparing with LLDB on target - see adjust_stack_ptrs function */
     target_ulong last_pc_dumped;
@@ -136,7 +167,6 @@ typedef struct CPUArchState {
     uint32_t t_sreg[NUM_SREGS];
 
     uint32_t greg[NUM_GREGS];
-    uint32_t wait_next_pc;
 
     /* This alias of CPUState.cpu_index is used by imported sources: */
     uint32_t threadId;
@@ -144,9 +174,7 @@ typedef struct CPUArchState {
     hex_lock_state_t k0_lock_state;
     uint32_t tlb_lock_count;
     uint32_t k0_lock_count;
-    uint64_t t_cycle_count;
 #endif
-    uint32_t next_PC;
     uint32_t imprecise_exception;
     target_ulong new_value_usr;
 
@@ -159,12 +187,30 @@ typedef struct CPUArchState {
     target_ulong llsc_val;
     uint64_t     llsc_val_i64;
 
-    MMVector VRegs[NUM_VREGS] QEMU_ALIGNED(16);
+#ifdef CONFIG_USER_ONLY
+    HexagonHVXContext hvx_ctx;
+#else
+    HexagonHVXContext *hvx;
+#endif
+
     MMVector future_VRegs[VECTOR_TEMPS_MAX] QEMU_ALIGNED(16);
     MMVector tmp_VRegs[VECTOR_TEMPS_MAX] QEMU_ALIGNED(16);
 
-    MMQReg QRegs[NUM_QREGS] QEMU_ALIGNED(16);
     MMQReg future_QRegs[NUM_QREGS] QEMU_ALIGNED(16);
+
+    /* Active HLX context, or NULL when disabled or unavailable. */
+    HexagonHLXContext *hlx_ctx;
+
+#ifdef CONFIG_USER_ONLY
+    HexagonHLXContext hlx_user_ctx;
+#endif
+
+    HLXVector future_LRegs[NUM_LREGS] QEMU_ALIGNED(16);
+    HLXVector tmp_LRegs[NUM_LREGS] QEMU_ALIGNED(16);
+    /* Pending HLX store. */
+    HLXVector hlx_store_data QEMU_ALIGNED(16);
+    target_ulong hlx_store_va;
+    bool hlx_store_pending;
 
     /* Temporaries used within instructions */
     MMVectorPair VuuV QEMU_ALIGNED(16);
@@ -177,6 +223,8 @@ typedef struct CPUArchState {
     target_ulong vstore_pending[VSTORES_MAX];
     bool vtcm_pending;
     VTCMStoreLog vtcm_log;
+
+    HmxState *hmx_state;
 } CPUHexagonState;
 
 typedef struct HexagonCPUClass {
@@ -196,17 +244,34 @@ struct ArchCPU {
     CPUHexagonState env;
     HexagonCPUConfig cfg;
 #ifndef CONFIG_USER_ONLY
+    HexagonHVXContextState *hvx_ctx[HVX_CONTEXTS_MAX];
+    HexagonHMXContextState *hmx_ctx;
     HexagonTLBState *tlb;
     uint32_t boot_addr;
     HexagonGlobalRegState *globalregs;
     uint32_t htid;
     HexL2VicInterface *l2vic;
+    HexagonHLXState *hlx;
 #endif
+    HmxState *hmx;
+    HmxConfig hmx_cfg;
 };
+
+static inline HexagonHVXContext *hex_hvx(CPUHexagonState *env)
+{
+#ifdef CONFIG_USER_ONLY
+    return &env->hvx_ctx;
+#else
+    return env->hvx;
+#endif
+}
 
 FIELD(TB_FLAGS, IS_TIGHT_LOOP, 0, 1)
 FIELD(TB_FLAGS, MMU_INDEX, 1, 3)
-FIELD(TB_FLAGS, PCYCLE_ENABLED, 4, 1)
+FIELD(TB_FLAGS, HVX_COPROC_ENABLED, 5, 1)
+FIELD(TB_FLAGS, CPU_MODE, 6, 2)
+FIELD(TB_FLAGS, SS_ACTIVE, 8, 1)
+FIELD(TB_FLAGS, HMX_COPROC_ENABLED, 15, 1)
 
 G_NORETURN void hexagon_raise_exception_err(CPUHexagonState *env,
                                             uint32_t exception,
@@ -219,6 +284,7 @@ G_NORETURN void hexagon_raise_exception_err(CPUHexagonState *env,
  */
 bool hexagon_thread_is_enabled(const CPUHexagonState *thread_env);
 uint32_t hexagon_greg_read(CPUHexagonState *env, uint32_t reg);
+void hexagon_greg_write(CPUHexagonState *env, uint32_t reg, uint32_t val);
 void hexagon_cpu_soft_reset(CPUHexagonState *env);
 #endif
 

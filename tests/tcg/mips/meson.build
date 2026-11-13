@@ -1,5 +1,27 @@
 tests = []
 
+# MSA tests shared by the mipsel and mips64 targets
+tests_mips_msa_groups = [
+  '../mips/test_msa_bit_count.c',
+  '../mips/test_msa_bit_move.c',
+  '../mips/test_msa_bit_set.c',
+  '../mips/test_msa_fixed_multiply.c',
+  '../mips/test_msa_float_max_min.c',
+  '../mips/test_msa_int_add.c',
+  '../mips/test_msa_int_average.c',
+  '../mips/test_msa_int_compare.c',
+  '../mips/test_msa_int_div_mod.c',
+  '../mips/test_msa_int_dot_product.c',
+  '../mips/test_msa_int_max_min.c',
+  '../mips/test_msa_int_multiply.c',
+  '../mips/test_msa_int_subtract.c',
+  '../mips/test_msa_interleave.c',
+  '../mips/test_msa_load_store.c',
+  '../mips/test_msa_logic.c',
+  '../mips/test_msa_pack.c',
+  '../mips/test_msa_shift.c',
+]
+
 tests += tcg_tests['multiarch-linux-user']['tests']
 
 tests += {
@@ -14,8 +36,6 @@ if 'qemu-mips' in emulators
     'mips-linux-user': {
       'cc': 'mips-linux-gnu-gcc',
       'cc_dockerfile': 'debian-all-test-cross',
-      'cc_docker_host_arch': ['aarch64', 'x86_64'],
-      'cc_feat_cflags': cc_feat_cflags,
       'folder': 'mips',
       'gdb_arch': 'mips',
       'qemu': emulators['qemu-mips'],

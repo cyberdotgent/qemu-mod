@@ -30,6 +30,7 @@
 #include "system/tpm_backend.h"
 #include "system/tpm_util.h"
 #include "trace.h"
+#include "qapi/qapi-builtin-type-infos.h"
 
 /* tpm backend property */
 
@@ -78,6 +79,7 @@ static void release_tpm(Object *obj, const char *name, void *opaque)
 
 const PropertyInfo qdev_prop_tpm = {
     .type  = "str",
+    .qapi_type = &str_type_info,
     .description = "ID of a tpm to use as a backend",
     .get   = get_tpm,
     .set   = set_tpm,
@@ -87,12 +89,23 @@ const PropertyInfo qdev_prop_tpm = {
 /*
  * Write an error message in the given output buffer.
  */
-void tpm_util_write_fatal_error_response(uint8_t *out, uint32_t out_len)
+void tpm_util_write_fatal_error_response(uint8_t *out, uint32_t out_len,
+                                         TPMVersion tpm_version)
 {
     if (out_len >= sizeof(struct tpm_resp_hdr)) {
-        tpm_cmd_set_tag(out, TPM_TAG_RSP_COMMAND);
+        switch (tpm_version) {
+        case TPM_VERSION_1_2:
+            tpm_cmd_set_tag(out, TPM_TAG_RSP_COMMAND);
+            tpm_cmd_set_error(out, TPM_FAIL);
+            break;
+        case TPM_VERSION_2_0:
+            tpm_cmd_set_tag(out, TPM2_ST_NO_SESSIONS);
+            tpm_cmd_set_error(out, TPM_RC_FAILURE);
+            break;
+        default:
+            g_assert_not_reached();
+        }
         tpm_cmd_set_size(out, sizeof(struct tpm_resp_hdr));
-        tpm_cmd_set_error(out, TPM_FAIL);
     }
 }
 

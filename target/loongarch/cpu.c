@@ -58,20 +58,16 @@ static vaddr loongarch_cpu_get_pc(CPUState *cs)
 #ifndef CONFIG_USER_ONLY
 #include "hw/loongarch/virt.h"
 
-void loongarch_cpu_update_irq(LoongArchCPU *cpu, uint64_t old)
+void loongarch_cpu_update_irq(LoongArchCPU *cpu)
 {
     CPULoongArchState *env = &cpu->env;
     CPUState *cs = CPU(cpu);
     CPUSysState *sys = env_sys(env);
 
     if (FIELD_EX64(sys->CSR_ESTAT, CSR_ESTAT, IS)) {
-        if (!FIELD_EX64(old, CSR_ESTAT, IS)) {
-            cpu_interrupt(cs, CPU_INTERRUPT_HARD);
-        }
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
-        if (FIELD_EX64(old, CSR_ESTAT, IS)) {
-            cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
-        }
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
     }
 }
 
@@ -81,21 +77,20 @@ static void loongarch_cpu_self_set_irq(CPUState *cs, run_on_cpu_data data)
     CPULoongArchState *env = cpu_env(cs);
     CPUSysState *sys = env_sys(env);
     int irq, level;
-    uint64_t old;
 
     irq = data.host_int & ~BIT(31);
     level = (data.host_int >> 31) & 1;
-    old = sys->CSR_ESTAT;
     sys->CSR_ESTAT = deposit64(sys->CSR_ESTAT, irq, 1, level != 0);
-    loongarch_cpu_update_irq(cpu, old);
+    loongarch_cpu_update_irq(cpu);
 }
 
 void loongarch_cpu_set_irq(void *opaque, int irq, int level)
 {
     LoongArchCPU *cpu = opaque;
     CPUState *cs = CPU(cpu);
+    CPULoongArchState *env = &cpu->env;
 
-    if (irq < 0 || irq >= N_IRQS) {
+    if (irq < 0 || irq >= env->irq_nr) {
         return;
     }
 
@@ -123,7 +118,7 @@ bool cpu_loongarch_hw_interrupts_pending(CPULoongArchState *env)
 #endif
 
 #ifndef CONFIG_USER_ONLY
-bool loongarch_cpu_has_work(CPUState *cs)
+static bool loongarch_cpu_has_work(CPUState *cs)
 {
     bool has_work = false;
 
@@ -237,7 +232,9 @@ static void loongarch_set_lasx(Object *obj, bool value, Error **errp)
 
 static bool loongarch_get_msgint(Object *obj, Error **errp)
 {
-    return LOONGARCH_CPU(obj)->msgint != ON_OFF_AUTO_OFF;
+    LoongArchCPU *cpu = LOONGARCH_CPU(obj);
+
+    return cpu_has_msgint(&cpu->env);
 }
 
 static void loongarch_set_msgint(Object *obj, bool value, Error **errp)
@@ -304,7 +301,7 @@ static void loongarch_la464_initfn(Object *obj)
     uint32_t data = 0, field;
     int i;
 
-    set_sys_state(env, &env->sys_states[0]);
+    set_sys(env, VM_LEVEL0);
     for (i = 0; i < 21; i++) {
         env->cpucfg[i] = 0x0;
     }
@@ -434,7 +431,7 @@ static void loongarch_la132_initfn(Object *obj)
     uint32_t data = 0;
     int i;
 
-    set_sys_state(env, &env->sys_states[0]);
+    set_sys(env, VM_LEVEL0);
     for (i = 0; i < 21; i++) {
         env->cpucfg[i] = 0x0;
     }
@@ -730,12 +727,13 @@ static void loongarch_cpu_init(Object *obj)
 {
 #ifndef CONFIG_USER_ONLY
     LoongArchCPU *cpu = LOONGARCH_CPU(obj);
-#ifdef CONFIG_TCG
     CPULoongArchState *env = &cpu->env;
+#ifdef CONFIG_TCG
     CPUTimerState *timer;
 #endif
 
-    qdev_init_gpio_in(DEVICE(cpu), loongarch_cpu_set_irq, N_IRQS);
+    env->irq_nr = N_IRQS;
+    qdev_init_gpio_in(DEVICE(cpu), loongarch_cpu_set_irq, env->irq_nr);
 #ifdef CONFIG_TCG
     timer = env_timer(env);
     timer->irq = IRQ_TIMER;
@@ -841,13 +839,52 @@ static void loongarch_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     }
 }
 
+static const struct {
+    int32_t exccode;
+    const char * const name;
+} excp_names[] = {
+    {EXCCODE_INT, "Interrupt"},
+    {EXCCODE_PIL, "Page invalid exception for load"},
+    {EXCCODE_PIS, "Page invalid exception for store"},
+    {EXCCODE_PIF, "Page invalid exception for fetch"},
+    {EXCCODE_PME, "Page modified exception"},
+    {EXCCODE_PNR, "Page Not Readable exception"},
+    {EXCCODE_PNX, "Page Not Executable exception"},
+    {EXCCODE_PPI, "Page Privilege error"},
+    {EXCCODE_ADEF, "Address error for instruction fetch"},
+    {EXCCODE_ADEM, "Address error for Memory access"},
+    {EXCCODE_SYS, "Syscall"},
+    {EXCCODE_BRK, "Break"},
+    {EXCCODE_INE, "Instruction Non-Existent"},
+    {EXCCODE_IPE, "Instruction privilege error"},
+    {EXCCODE_FPD, "Floating Point Disabled"},
+    {EXCCODE_FPE, "Floating Point Exception"},
+    {EXCCODE_DBP, "Debug breakpoint"},
+    {EXCCODE_BCE, "Bound Check Exception"},
+    {EXCCODE_SXD, "128 bit vector instructions Disable exception"},
+    {EXCCODE_ASXD, "256 bit vector instructions Disable exception"},
+    {EXCP_HLT, "EXCP_HLT"},
+};
+
+const char *loongarch_exception_name(int exception)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(excp_names); i++) {
+        if (excp_names[i].exccode == exception) {
+            return excp_names[i].name;
+        }
+    }
+    return "unknown";
+}
+
 #ifndef CONFIG_USER_ONLY
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps loongarch_sysemu_ops = {
     .has_work = loongarch_cpu_has_work,
     .write_elf64_note = loongarch_cpu_write_elf64_note,
-    .get_phys_addr_debug = loongarch_cpu_get_phys_addr_debug,
+    .get_dump_info = loongarch_get_dump_info,
+    .get_note_size = loongarch_get_note_size,
+    .translate_for_debug = loongarch_cpu_translate_for_debug,
 };
 
 static int64_t loongarch_cpu_get_arch_id(CPUState *cs)
@@ -881,6 +918,7 @@ static void loongarch_cpu_class_init(ObjectClass *c, const void *data)
                                        &lacc->parent_phases);
 
     cc->class_by_name = loongarch_cpu_class_by_name;
+    cc->exception_name = loongarch_exception_name;
     cc->dump_state = loongarch_cpu_dump_state;
     cc->set_pc = loongarch_cpu_set_pc;
     cc->get_pc = loongarch_cpu_get_pc;

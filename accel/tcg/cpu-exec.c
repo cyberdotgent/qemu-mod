@@ -478,16 +478,16 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
                          last_tb->tc.ptr, pc, lookup_symbol(pc));
             }
         }
-    }
-
-    /*
-     * If gdb single-step, and we haven't raised another exception,
-     * raise a debug exception.  Single-step with another exception
-     * is handled in cpu_handle_exception.
-     */
-    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1) {
-        cpu->exception_index = EXCP_DEBUG;
-        cpu_loop_exit(cpu);
+    } else {
+        /*
+         * If gdb single-step, and we haven't raised another exception,
+         * raise a debug exception.  Single-step with another exception
+         * is handled in cpu_handle_exception.
+         */
+        if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1) {
+            cpu->exception_index = EXCP_DEBUG;
+            cpu_loop_exit(cpu);
+        }
     }
 
     return last_tb;
@@ -566,7 +566,9 @@ void cpu_exec_step_atomic(CPUState *cpu)
         /* Execute in a serial context. */
         s.cflags &= ~CF_PARALLEL;
         /* After 1 insn, return and release the exclusive lock. */
-        s.cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
+        s.cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+                    CF_NOIRQ | CF_STEP_ATOMIC | 1;
+
         /*
          * No need to check_for_breakpoints here.
          * We only arrive in cpu_exec_step_atomic after beginning execution
@@ -654,18 +656,25 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 }
 
 #ifndef CONFIG_USER_ONLY
-static inline bool cpu_handle_halt(CPUState *cpu)
+static bool cpu_poll_while_halted(CPUState *cpu)
 {
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
-    bool leave_halt = tcg_ops->cpu_exec_halt(cpu);
 
-    if (!leave_halt) {
-        return true;
+    if (tcg_ops->poll_during_halt) {
+        tcg_ops->poll_during_halt(cpu);
+    }
+
+    if (!cpu_has_work(cpu)) {
+        return false;
+    }
+
+    if (tcg_ops->leaving_halt) {
+        tcg_ops->leaving_halt(cpu);
     }
 
     cpu->halted = 0; /* allow execution */
 
-    return false;
+    return true;
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -1027,7 +1036,7 @@ int cpu_exec(CPUState *cpu)
 
 #ifndef CONFIG_USER_ONLY
     if (cpu->halted) {
-        if (cpu_handle_halt(cpu)) {
+        if (!cpu_poll_while_halted(cpu)) {
             return EXCP_HALTED;
         }
         assert(!cpu->halted);
@@ -1059,7 +1068,6 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         /* Check mandatory TCGCPUOps handlers */
         const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 #ifndef CONFIG_USER_ONLY
-        assert(tcg_ops->cpu_exec_halt);
         assert(tcg_ops->cpu_exec_interrupt);
         assert(tcg_ops->cpu_exec_reset);
         assert(tcg_ops->pointer_wrap);
@@ -1070,6 +1078,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         tcg_ops->initialize();
         tcg_target_initialized = true;
     }
+
+    /* Pick up one-insn-per-tb and -d nochain from the command line. */
+    tcg_update_cflags(cpu);
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
     tlb_init(cpu);

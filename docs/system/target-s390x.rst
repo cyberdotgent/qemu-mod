@@ -41,3 +41,4 @@ Architectural features
    s390x/protvirt
    s390x/cpu-topology
    s390x/secure-ipl
+   s390x/cpacf

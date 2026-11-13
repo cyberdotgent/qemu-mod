@@ -25,6 +25,9 @@ foreach t: tcg_tests['multiarch-softmmu']['tests']
     if fs.stem(src) == 'memory'
       new_cflags += '-DCHECK_UNALIGNED=0'
     endif
+    if 'gdb_test' in setup
+      setup += {'gdb_feat': 'loongarch64'}
+    endif
     if src not in multi_src
       setup += {'cflags': [new_cflags]}
       multi_src += src
@@ -36,11 +39,15 @@ endforeach
 if 'qemu-system-loongarch64' in emulators
   tcg_tests += {
     'loongarch64-softmmu': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
-      'cc_docker_host_arch': cc_docker_host_arch,
+      'cc': 'loongarch64-unknown-linux-gnu-gcc',
+      'cc_dockerfile': 'debian-loongarch-cross',
       'folder': 'loongarch64/system',
       'gdb_arch': 'loongarch64',
+      'gdb_feat_version': {
+        # previous version report "Architecture rejected target-supplied
+        # description", exposing a mismatch between our gdbstub and gdb.
+        'loongarch64': '16.1',
+      },
       'qemu': emulators['qemu-system-loongarch64'],
       'tests': tests,
     }

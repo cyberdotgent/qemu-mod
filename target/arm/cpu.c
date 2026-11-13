@@ -144,20 +144,21 @@ int arm_cpu_mmu_index(CPUState *cs, bool ifetch)
 static bool arm_cpu_has_work(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
+    ARMHaltReason halt_reason = qatomic_read(&cpu->env.halt_reason);
 
     /*
      * Only another PSCI call can wake the CPU up in which case the
      * power_state would be set by arm_set_cpu_on_and_reset_async_work()
      */
-    if (cpu->power_state == PSCI_OFF) {
-        g_assert(cpu->env.halt_reason == HALT_PSCI);
+    if (qatomic_read(&cpu->power_state) == PSCI_OFF) {
+        g_assert(halt_reason == HALT_PSCI);
         return false;
     }
 
     /*
      * A wake-up event should only wake us if we are halted on a WFE
      */
-    if (cpu->env.halt_reason == HALT_WFE && cpu->env.event_register) {
+    if (halt_reason == HALT_WFE && qatomic_read(&cpu->env.event_register)) {
         return true;
     }
 
@@ -351,8 +352,6 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     env->vfp.xregs[ARM_VFP_MVFR1] = cpu->isar.mvfr1;
     env->vfp.xregs[ARM_VFP_MVFR2] = cpu->isar.mvfr2;
 
-    arm_set_cpu_power_state(cpu, cs->start_powered_off ? PSCI_OFF : PSCI_ON);
-
     if (arm_feature(env, ARM_FEATURE_AARCH64)) {
         /* 64 bit CPUs always start in 64 bit mode */
         env->aarch64 = true;
@@ -387,6 +386,10 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
             if (cpu_isar_feature(aa64_sme_fa64, cpu)) {
                 env->vfp.smcr_el[1] = FIELD_DP64(env->vfp.smcr_el[1],
                                                  SMCR, FA64, 1);
+            }
+            if (cpu_isar_feature(aa64_sme2, cpu)) {
+                env->vfp.smcr_el[1] = FIELD_DP64(env->vfp.smcr_el[1],
+                                                 SMCR, EZT0, 1);
             }
         }
         /*
@@ -671,6 +674,8 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_AH_F16]);
 
 #ifndef CONFIG_USER_ONLY
+    arm_set_cpu_power_state(cpu, cs->start_powered_off ? PSCI_OFF : PSCI_ON);
+
     if (kvm_enabled()) {
         kvm_arm_reset_vcpu(cpu);
     }
@@ -807,9 +812,8 @@ void arm_emulate_firmware_reset(CPUState *cpustate, int target_el)
 
 
 #ifndef CONFIG_USER_ONLY
-static void arm_cpu_set_irq(void *opaque, int irq, int level)
+void arm_cpu_set_irq(ARMCPU *cpu, int irq, int level)
 {
-    ARMCPU *cpu = opaque;
     CPUARMState *env = &cpu->env;
     CPUState *cs = CPU(cpu);
     static const int mask[] = {
@@ -861,6 +865,15 @@ static void arm_cpu_set_irq(void *opaque, int irq, int level)
     }
 }
 
+/*
+ * Wrapper of arm_cpu_set_irq with the right argument types to be a
+ * qemu_irq_handler function for our inbound GPIO lines.
+ */
+static void arm_cpu_gpio_set_irq(void *opaque, int irq, int level)
+{
+    arm_cpu_set_irq(opaque, irq, level);
+}
+
 static bool arm_cpu_internal_is_big_endian(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
@@ -871,20 +884,16 @@ static bool arm_cpu_internal_is_big_endian(CPUState *cs)
 }
 
 #ifdef CONFIG_TCG
-bool arm_cpu_exec_halt(CPUState *cs)
+static void arm_cpu_leaving_halt(CPUState *cs)
 {
-    bool leave_halt = cpu_has_work(cs);
+    ARMCPU *cpu = ARM_CPU(cs);
 
-    if (leave_halt) {
-        /* We're about to come out of WFI/WFE: disable the WFxT timer */
-        ARMCPU *cpu = ARM_CPU(cs);
-        if (cpu->wfxt_timer) {
-            timer_del(cpu->wfxt_timer);
-        }
-        /* clear the halt reason */
-        cpu->env.halt_reason = NOT_HALTED;
+    /* We're about to come out of WFI/WFE: disable the WFxT timer */
+    if (cpu->wfxt_timer) {
+        timer_del(cpu->wfxt_timer);
     }
-    return leave_halt;
+    /* clear the halt reason */
+    qatomic_set(&cpu->env.halt_reason, NOT_HALTED);
 }
 #endif
 
@@ -1206,17 +1215,19 @@ static void arm_cpu_dump_state(CPUState *cs, FILE *f, int flags)
 }
 
 #ifndef CONFIG_USER_ONLY
-bool gicv5_set_gicv5state(ARMCPU *cpu, GICv5Common *cs, uint32_t iaffid)
+bool gicv5_set_gicv5state(ARMCPU *cpu, GICv5Common *cs, uint32_t iaffid,
+                          uint32_t cpuidx)
 {
     /*
      * Set this CPU's gicv5state pointer to point to the GIC that we are
-     * connected to, and record our IAFFID.
+     * connected to, and record our IAFFID and CPU index.
      */
     if (!cpu_isar_feature(aa64_gcie, cpu)) {
         return false;
     }
-    cpu->env.gicv5state = cs;
-    cpu->env.gicv5_iaffid = iaffid;
+    cpu->env.gicv5.gicv5state = cs;
+    cpu->env.gicv5.iaffid = iaffid;
+    cpu->env.gicv5.cpuidx = cpuidx;
     return true;
 }
 #endif
@@ -1264,7 +1275,7 @@ static void arm_cpu_initfn(Object *obj)
          */
         qdev_init_gpio_in(DEVICE(cpu), arm_cpu_kvm_set_irq, 6);
     } else {
-        qdev_init_gpio_in(DEVICE(cpu), arm_cpu_set_irq, 6);
+        qdev_init_gpio_in(DEVICE(cpu), arm_cpu_gpio_set_irq, 6);
     }
 
     qdev_init_gpio_out(DEVICE(cpu), cpu->gt_timer_outputs,
@@ -1466,6 +1477,10 @@ static void arm_cpu_propagate_feature_implications(ARMCPU *cpu)
         set_feature(env, ARM_FEATURE_PMSA);
     }
 
+    if (arm_feature(env, ARM_FEATURE_M_MAIN)) {
+        set_feature(env, ARM_FEATURE_M_UNPRIV);
+    }
+
     if (arm_feature(env, ARM_FEATURE_V8)) {
         if (arm_feature(env, ARM_FEATURE_M)) {
             set_feature(env, ARM_FEATURE_V7);
@@ -1502,7 +1517,11 @@ static void arm_cpu_propagate_feature_implications(ARMCPU *cpu)
         set_feature(env, ARM_FEATURE_V7);
     }
     if (arm_feature(env, ARM_FEATURE_V7)) {
-        set_feature(env, ARM_FEATURE_VAPA);
+        /* VAPA appears in v7A, but not in R profile until v8R */
+        if (arm_feature(env, ARM_FEATURE_V8) ||
+            !arm_feature(env, ARM_FEATURE_PMSA)) {
+            set_feature(env, ARM_FEATURE_VAPA);
+        }
         set_feature(env, ARM_FEATURE_THUMB2);
         set_feature(env, ARM_FEATURE_MPIDR);
         if (!arm_feature(env, ARM_FEATURE_M)) {
@@ -1731,6 +1750,10 @@ static void arm_cpu_finalizefn(Object *obj)
 
     g_hash_table_destroy(cpu->cp_regs);
 
+    if (cpu->host_cpu_probe_err) {
+        error_free(cpu->host_cpu_probe_err);
+    }
+
     QLIST_FOREACH_SAFE(hook, &cpu->pre_el_change_hooks, node, next) {
         QLIST_REMOVE(hook, node);
         g_free(hook);
@@ -1833,12 +1856,14 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
      * then it's possible that might have failed in the initfn, but
      * this is the first point where we can report it.
      */
-    if (cpu->host_cpu_probe_failed) {
+    if (cpu->host_cpu_probe_err) {
         if (!kvm_enabled() && !hvf_enabled() && !whpx_enabled()) {
             error_setg(errp, "The 'host' CPU type can only be used with KVM, HVF or WHPX");
+            error_free(cpu->host_cpu_probe_err);
         } else {
-            error_setg(errp, "Failed to retrieve host CPU features");
+            error_propagate(errp, cpu->host_cpu_probe_err);
         }
+        cpu->host_cpu_probe_err = NULL;
         return;
     }
 
@@ -2163,6 +2188,23 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     if (cpu->mp_affinity == ARM64_AFFINITY_INVALID) {
         cpu->mp_affinity = arm_build_mp_affinity(cs->cpu_index,
                                                  ARM_DEFAULT_CPUS_PER_CLUSTER);
+    }
+
+    /* Consistently update MPIDR_EL1 in isar.idregs[] by adding feature bits */
+    {
+        uint64_t mpidr = cpu->mp_affinity;
+
+        if (arm_feature(env, ARM_FEATURE_V7MP)) {
+            mpidr |= (1U << 31);
+            /*
+             * Uniprocessor (non-coherent) cores that still implement the MP
+             * extensions set U (bit 30), e.g. Cortex-R5.
+             */
+            if (cpu->mp_is_up) {
+                mpidr |= (1u << 30);
+            }
+        }
+        SET_IDREG(&cpu->isar, MPIDR, mpidr);
     }
 
     if (cpu->reset_hivecs) {
@@ -2492,7 +2534,7 @@ static ObjectClass *arm_cpu_class_by_name(const char *cpu_model)
 }
 
 static const Property arm_cpu_properties[] = {
-    DEFINE_PROP_UINT64("midr", ARMCPU, midr, 0),
+    DEFINE_PROP_UINT64("midr", ARMCPU, isar.idregs[MIDR_EL1_IDX], 0),
     DEFINE_PROP_UINT64("mp-affinity", ARMCPU,
                         mp_affinity, ARM64_AFFINITY_INVALID),
     DEFINE_PROP_INT32("node-id", ARMCPU, node_id, CPU_UNSET_NUMA_NODE_ID),
@@ -2560,6 +2602,8 @@ static const struct SysemuCPUOps arm_sysemu_ops = {
     .asidx_from_attrs = arm_asidx_from_attrs,
     .write_elf32_note = arm_cpu_write_elf32_note,
     .write_elf64_note = arm_cpu_write_elf64_note,
+    .get_dump_info = arm_get_dump_info,
+    .get_note_size = arm_get_note_size,
     .internal_is_big_endian = arm_cpu_internal_is_big_endian,
     .legacy_vmsd = &vmstate_arm_cpu,
 };
@@ -2610,7 +2654,7 @@ static const TCGCPUOps arm_tcg_ops = {
     .tlb_fill_align = arm_cpu_tlb_fill_align,
     .pointer_wrap = aprofile_pointer_wrap,
     .cpu_exec_interrupt = arm_cpu_exec_interrupt,
-    .cpu_exec_halt = arm_cpu_exec_halt,
+    .leaving_halt = arm_cpu_leaving_halt,
     .cpu_exec_reset = cpu_reset,
     .do_interrupt = arm_cpu_do_interrupt,
     .do_transaction_failed = arm_cpu_do_transaction_failed,
@@ -2638,6 +2682,7 @@ static void arm_cpu_class_init(ObjectClass *oc, const void *data)
                                        &acc->parent_phases);
 
     cc->class_by_name = arm_cpu_class_by_name;
+    cc->exception_name = arm_exception_name;
     cc->dump_state = arm_cpu_dump_state;
     cc->set_pc = arm_cpu_set_pc;
     cc->get_pc = arm_cpu_get_pc;
@@ -2654,6 +2699,10 @@ static void arm_cpu_class_init(ObjectClass *oc, const void *data)
 
 #ifdef CONFIG_TCG
     cc->tcg_ops = &arm_tcg_ops;
+#if !defined(CONFIG_USER_ONLY) || defined(CONFIG_LINUX)
+    /* semihosting is not supported for bsd-user */
+    cc->semi_ops = &arm_semihosting_ops;
+#endif
 #endif /* CONFIG_TCG */
 }
 
