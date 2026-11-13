@@ -1206,7 +1206,7 @@ static int handle_b2(S390CPU *cpu, struct kvm_run *run, uint8_t ipa1)
         ioinst_handle_rchp(cpu, env->regs[1], RA_IGNORED);
         break;
     case PRIV_B2_STCPS:
-        /* We do not provide this instruction, it is suppressed. */
+        ioinst_handle_stcps(cpu, run->s390_sieic.ipb, RA_IGNORED);
         break;
     case PRIV_B2_SAL:
         ioinst_handle_sal(cpu, env->regs[1], RA_IGNORED);

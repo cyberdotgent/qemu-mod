@@ -10,6 +10,7 @@
 #include "s390-arch.h"
 
 #define ECKD_CMD_READ 0x06
+#define ECKD_CMD_WRITE 0x05
 #define ECKD_CMD_SEEK 0x07
 #define ECKD_CMD_SEEK_CYLINDER 0x0b
 #define ECKD_CMD_SEEK_HEAD 0x1b
@@ -38,6 +39,7 @@ static uint8_t locate[16] __attribute__((aligned(8))) = {
 };
 static uint8_t count[8] __attribute__((aligned(8)));
 static uint8_t data[128] __attribute__((aligned(8)));
+static uint8_t active_chpids[32] __attribute__((aligned(32)));
 static Ccw1 ccws[4] __attribute__((aligned(8)));
 
 static uint32_t addr32(const void *p)
@@ -63,6 +65,19 @@ int main(void)
     schib.pmcw.ena = 1;
     if (msch_err(schid, &schib)) {
         return 2;
+    }
+
+    /*
+     * KVM exits STCPS to userspace.  The intercept handler must execute the
+     * common implementation instead of silently leaving the operand and
+     * condition code unchanged.  No channel path is active at this point.
+     */
+    memset(active_chpids, 0xa5, sizeof(active_chpids));
+    asm volatile("stcps %0" : "=Q" (active_chpids) : : "cc");
+    for (int i = 0; i < sizeof(active_chpids); i++) {
+        if (active_chpids[i]) {
+            return 32;
+        }
     }
 
     ccws[0] = (Ccw1) {
@@ -259,6 +274,129 @@ int main(void)
     for (int i = 0; i < 100; i++) {
         if (data[i] != i) {
             return 18;
+        }
+    }
+
+    /*
+     * XCF updates its large couple-data-set records with a data-chained
+     * Write Data.  Both CCWs must update the same physical record; treating
+     * the first CCW as a short write advances to a nonexistent next record
+     * and reports unit check on the continuation.
+     */
+    for (int i = 0; i < 100; i++) {
+        data[i] = 255 - i;
+    }
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK_CYLINDER,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(seek_chain),
+        .cda = addr32(seek_chain),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_WRITE,
+        .flags = CCW_FLAG_DC,
+        .count = 60,
+        .cda = addr32(data),
+    };
+    ccws[2] = (Ccw1) {
+        .cmd_code = ECKD_CMD_WRITE,
+        .count = 40,
+        .cda = addr32(data + 60),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 19;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 20;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count ||
+        irb.scsw.cpa != addr32(&ccws[3])) {
+        return 21;
+    }
+
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK_CYLINDER,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(seek_chain),
+        .cda = addr32(seek_chain),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ,
+        .flags = CCW_FLAG_SLI,
+        .count = sizeof(data),
+        .cda = addr32(data),
+    };
+    memset(data, 0, sizeof(data));
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 22;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 23;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count != sizeof(data) - 100 ||
+        irb.scsw.cpa != addr32(&ccws[2])) {
+        return 24;
+    }
+    for (int i = 0; i < 100; i++) {
+        if (data[i] != 255 - i) {
+            return 25;
+        }
+    }
+
+    /*
+     * A PCI-flagged CCW presents intermediate status while the channel
+     * program continues.  The final completion must remain separately
+     * pending and be presented by a subsequent TSCH.  z/OS's loader uses
+     * this to consume TXT/RLD buffers while CKD reading continues.
+     */
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK_CYLINDER,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(seek_chain),
+        .cda = addr32(seek_chain),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ,
+        .flags = CCW_FLAG_PCI | CCW_FLAG_SLI,
+        .count = sizeof(data),
+        .cda = addr32(data),
+    };
+    memset(data, 0, sizeof(data));
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 26;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 27;
+    }
+    if (irb.scsw.cstat != SCSW_CSTAT_PCINT || irb.scsw.dstat ||
+        irb.scsw.count || irb.scsw.cpa != addr32(&ccws[2])) {
+        return 28;
+    }
+
+    irb = (Irb) { 0 };
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 29;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count != sizeof(data) - 100 ||
+        irb.scsw.cpa != addr32(&ccws[2])) {
+        return 30;
+    }
+    for (int i = 0; i < 100; i++) {
+        if (data[i] != 255 - i) {
+            return 31;
         }
     }
     return 0;

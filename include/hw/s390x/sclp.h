@@ -24,6 +24,7 @@
 #define SCLP_CMDW_READ_SCP_INFO                 0x00020001
 #define SCLP_CMDW_READ_SCP_INFO_FORCED          0x00120001
 #define SCLP_CMDW_READ_CHP_INFO                 0x00030001
+#define SCLP_CMDW_READ_CSI_INFO                 0x001C0001
 #define SCLP_READ_STORAGE_ELEMENT_INFO          0x00040001
 #define SCLP_ATTACH_STORAGE_ELEMENT             0x00080001
 #define SCLP_ASSIGN_STORAGE                     0x000D0001
@@ -107,6 +108,15 @@ typedef struct ReadChpInfo {
     uint8_t standby[32];
     uint8_t online[32];
 } QEMU_PACKED ReadChpInfo;
+
+typedef struct ReadCsiInfo {
+    SCCBHeader h;
+    uint8_t facilities[8];
+    uint8_t reserved[48];
+} QEMU_PACKED ReadCsiInfo;
+
+#define SCLP_CSI_CANCEL_IO              0x02
+#define SCLP_CSI_CONCURRENT_SENSE       0x01
 
 #define SCCB_DATA_LEN (SCCB_SIZE - sizeof(SCCBHeader))
 #define SCCB_CPU_FEATURE_LEN 6

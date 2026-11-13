@@ -131,6 +131,13 @@ struct EckdCcwDevice {
     uint32_t write_used;
     bool write_active;
 
+    uint8_t update_command;
+    uint8_t update_record;
+    uint32_t update_offset;
+    uint32_t update_expected;
+    uint32_t update_used;
+    bool update_active;
+
     uint8_t read_command;
     uint8_t read_record;
     uint32_t read_length;
@@ -228,8 +235,7 @@ static int eckd_unit_exception(EckdCcwDevice *eckd)
 static void eckd_set_length_status(EckdCcwDevice *eckd, const CCW1 *ccw,
                                    uint32_t transferred, uint32_t available)
 {
-    bool suppress = (ccw->flags & CCW_FLAG_SLI) &&
-                    !(ccw->flags & CCW_FLAG_DC);
+    bool suppress = ccw->flags & CCW_FLAG_SLI;
     bool continues = (ccw->flags & CCW_FLAG_DC) && transferred < available;
 
     if (!suppress && !continues && ccw->count != available) {
@@ -769,8 +775,10 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
 static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
                                uint8_t command)
 {
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+    bool continuation = eckd->update_active && sch->last_cmd_valid &&
+                        (sch->last_cmd.flags & CCW_FLAG_DC);
     const CkdImageRecord *record;
-    uint8_t *copy;
     uint32_t offset;
     uint32_t expected;
     uint32_t length;
@@ -782,35 +790,68 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
     if (!blk_is_writable(eckd->blk)) {
         return eckd_unit_check(eckd, 0, SENSE1_WRITE_INHIBITED);
     }
-    record = eckd_current_record(eckd, command & 0x80);
+    if (continuation) {
+        command = eckd->update_command;
+        record = ckd_image_find_record(&eckd->image,
+                                       eckd->update_record);
+        offset = eckd->update_offset;
+        expected = eckd->update_expected;
+    } else {
+        eckd->update_active = false;
+        eckd->write_active = false;
+        record = eckd_current_record(eckd, command & 0x80);
+        if (record) {
+            if ((command & 0x7f) == CMD_WRITE) {
+                offset = record->data_offset;
+                expected = record->data_length;
+            } else {
+                offset = record->key_offset;
+                expected = record->key_length + record->data_length;
+            }
+            memcpy(eckd->write_record, eckd->image.track,
+                   eckd->image.used_length);
+            eckd->update_command = command;
+            eckd->update_record = record->number;
+            eckd->update_offset = offset;
+            eckd->update_expected = expected;
+            eckd->update_used = 0;
+        }
+    }
     if (!record) {
+        eckd->update_active = false;
         return eckd_no_record(eckd);
     }
-    if ((command & 0x7f) == CMD_WRITE) {
-        offset = record->data_offset;
-        expected = record->data_length;
-    } else {
-        offset = record->key_offset;
-        expected = record->key_length + record->data_length;
+    if (eckd->update_used > expected) {
+        eckd->update_active = false;
+        return eckd_unit_check(eckd, SENSE_DATA_CHECK, 0);
     }
-    length = MIN((uint32_t)ccw->count, expected);
-
-    copy = g_memdup2(eckd->image.track, eckd->image.used_length);
-    ret = eckd_read_guest(eckd, copy + offset, length);
-    if (!ret && length < expected) {
+    length = MIN((uint32_t)ccw->count,
+                 expected - eckd->update_used);
+    ret = eckd_read_guest(eckd,
+                          eckd->write_record + offset + eckd->update_used,
+                          length);
+    if (ret) {
+        eckd->update_active = false;
+        return ret;
+    }
+    eckd->update_used += length;
+    if (ccw->flags & CCW_FLAG_DC) {
+        eckd->update_active = true;
+        return 0;
+    }
+    eckd->update_active = false;
+    if (eckd->update_used < expected) {
         /*
          * CKD update writes pad a short data transfer with zeroes.  This is
          * how ckd_write_data()/ckd_write_kd() behave in Hercules and is used
          * by VSE when rewriting fixed-size library blocks.
          */
-        memset(copy + offset + length, 0, expected - length);
+        memset(eckd->write_record + offset + eckd->update_used, 0,
+               expected - eckd->update_used);
     }
-    if (!ret) {
-        ret = ckd_image_store_track(&eckd->image, eckd->cylinder,
-                                    eckd->head, copy,
-                                    eckd->image.used_length);
-    }
-    g_free(copy);
+    ret = ckd_image_store_track(&eckd->image, eckd->cylinder,
+                                eckd->head, eckd->write_record,
+                                eckd->image.used_length);
     if (ret < 0) {
         eckd->fenced = true;
         return eckd_unit_check(eckd, SENSE_EQUIPMENT_CHECK, 0);
@@ -1058,6 +1099,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd->search_index = 0;
         eckd->search_index_seen = false;
         eckd->write_active = false;
+        eckd->update_active = false;
         eckd->read_active = false;
     }
     trace_eckd_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count, ccw.flags,
@@ -1506,6 +1548,7 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->reserved = false;
     eckd->format_active = false;
     eckd->write_active = false;
+    eckd->update_active = false;
     eckd->read_active = false;
     if (ec->parent_phases.hold) {
         ec->parent_phases.hold(obj, type);
