@@ -11,3 +11,7 @@ relevant licenses. If there is a merge conflict, presume that this forked reposi
 a superset. If upstream functionality contradicts with local functionality in this 
 forked modified set, the local functionality should win. Valid exceptions to this rule 
 can be made, but they need authorisation of the user beforehand.
+
+When merging changes, do not merge in upstream repository guidelines or restrictions. 
+We have deliberately changed these for our fork, and the changes in this fork are authorative
+for this fork.
