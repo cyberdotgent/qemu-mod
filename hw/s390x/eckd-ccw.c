@@ -493,6 +493,8 @@ static void eckd_ned_text(uint8_t *dest, const char *ascii, size_t length)
 static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
 {
     CcwDevice *cdev = CCW_DEVICE(eckd);
+    uint16_t lss = cdev->sch->devno & ~0x1f;
+    uint16_t interface_id = (lss >> 5) & 0x7;
     char text[33] = { 0 };
 
     memset(buf, 0, 256);
@@ -518,11 +520,14 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
     eckd_ned_text(buf + 100, text, 26);
 
     buf[224] = 0x80;
+    stw_be_p(buf + 226, interface_id);
     buf[230] = 0x1e;
+    stw_be_p(buf + 232, lss);
     buf[234] = 0x80;
     buf[235] = cdev->sch->devno;
     buf[236] = cdev->sch->devno;
     buf[237] = cdev->sch->devno;
+    buf[238] = interface_id;
     buf[241] = 0x80;
     buf[242] = 0x80;
     buf[243] = cdev->sch->devno;
@@ -1107,6 +1112,16 @@ static int eckd_read_track(EckdCcwDevice *eckd, const CCW1 *ccw)
                               eckd->image.used_length - 5);
 }
 
+static int eckd_sense(EckdCcwDevice *eckd, const CCW1 *ccw)
+{
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+    uint8_t sense[32];
+
+    memcpy(sense, sch->sense_data, sizeof(sense));
+    memset(sch->sense_data, 0, sizeof(sch->sense_data));
+    return eckd_copy_response(eckd, ccw, sense, sizeof(sense));
+}
+
 static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     EckdCcwDevice *eckd = sch->driver_data;
@@ -1143,9 +1158,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         sch->curr_status.scsw.count = ccw.count;
         return 0;
     case 0x04:
-        memcpy(buf, sch->sense_data, 32);
-        memset(sch->sense_data, 0, sizeof(sch->sense_data));
-        return eckd_copy_response(eckd, &ccw, buf, 32);
+        return eckd_sense(eckd, &ccw);
     case CMD_SET_FILE_MASK:
         if (ccw.count < 1 || eckd_read_guest(eckd, buf, 1)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
@@ -1502,12 +1515,10 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         return eckd_copy_response(eckd, &ccw, buf, 256);
     case CMD_RESERVE:
         eckd->reserved = true;
-        sch->curr_status.scsw.count = ccw.count;
-        return 0;
+        return eckd_sense(eckd, &ccw);
     case CMD_RELEASE:
         eckd->reserved = false;
-        sch->curr_status.scsw.count = ccw.count;
-        return 0;
+        return eckd_sense(eckd, &ccw);
     case CMD_SNID:
         memset(buf, 0, 12);
         buf[0] = memcmp(eckd->pgid, (uint8_t[11]) { 0 }, 11) ?
@@ -1539,12 +1550,14 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         }
     case CMD_SNSS:
         /*
-         * Report the device's ordinal in the modeled 32-device logical
-         * subsystem.  Other subsystem-status fields remain zero.
+         * Report the full unit address.  The device can be one of 32 units
+         * in the modeled logical subsystem, but this field is the unit
+         * address rather than an ordinal within that subsystem.
          */
         memset(buf, 0, 40);
-        buf[1] = sch->devno & 0x1f;
+        buf[1] = sch->devno;
         buf[2] = 31;
+        stw_be_p(buf + 38, sch->devno & ~0x1f);
         return eckd_copy_response(eckd, &ccw, buf, 40);
     case CMD_RSCK:
         memset(buf, 0, sizeof(buf));

@@ -23,6 +23,10 @@
 #define ECKD_CMD_READ_TRACK 0xde
 #define ECKD_CMD_LOCATE 0x47
 #define ECKD_CMD_DEFINE_EXTENT 0x63
+#define ECKD_CMD_SNSS 0x54
+#define ECKD_CMD_RCD 0xfa
+#define ECKD_CMD_RELEASE 0x94
+#define ECKD_CMD_RESERVE 0xb4
 
 LowCore *lowcore;
 
@@ -44,7 +48,7 @@ static uint8_t locate[16] __attribute__((aligned(8))) = {
     0xff, 0, 4,                /* sector, transfer length */
 };
 static uint8_t count[8] __attribute__((aligned(8)));
-static uint8_t data[128] __attribute__((aligned(8)));
+static uint8_t data[256] __attribute__((aligned(8)));
 static uint8_t sense[32] __attribute__((aligned(8)));
 static uint8_t active_chpids[32] __attribute__((aligned(32)));
 static Ccw1 ccws[4] __attribute__((aligned(8)));
@@ -73,6 +77,94 @@ int main(void)
     if (msch_err(schid, &schib)) {
         return 2;
     }
+
+    /*
+     * Sense Subsystem Status returns the full unit address, not its ordinal
+     * within a 32-device logical subsystem.  Keep it consistent with the
+     * device and logical-subsystem identities returned by RCD.
+     */
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SNSS,
+        .flags = CCW_FLAG_SLI,
+        .count = 40,
+        .cda = addr32(data),
+    };
+    memset(data, 0xa5, 40);
+    if (ssch(schid, &orb)) {
+        return 33;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 34;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count || data[0] || data[1] != 0x85 || data[2] != 31 ||
+        data[38] != 0x0a || data[39] != 0x80) {
+        return 35;
+    }
+    irb = (Irb) { 0 };
+
+    /* RCD must describe the same logical subsystem and interface. */
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_RCD,
+        .flags = CCW_FLAG_SLI,
+        .count = sizeof(data),
+        .cda = addr32(data),
+    };
+    memset(data, 0xa5, sizeof(data));
+    if (ssch(schid, &orb)) {
+        return 36;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 37;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count || data[226] || data[227] != 4 ||
+        data[232] != 0x0a || data[233] != 0x80 || data[238] != 4) {
+        return 38;
+    }
+    irb = (Irb) { 0 };
+
+    /* Reserve and Release complete with the same transfer shape as Sense. */
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_RESERVE,
+        .flags = CCW_FLAG_SLI,
+        .count = 1,
+        .cda = addr32(data),
+    };
+    data[0] = 0xa5;
+    if (ssch(schid, &orb)) {
+        return 39;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 40;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count || data[0]) {
+        return 41;
+    }
+    irb = (Irb) { 0 };
+
+    ccws[0].cmd_code = ECKD_CMD_RELEASE;
+    data[0] = 0xa5;
+    if (ssch(schid, &orb)) {
+        return 42;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb)) {
+        return 43;
+    }
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count || data[0]) {
+        return 44;
+    }
+    irb = (Irb) { 0 };
 
     /*
      * KVM exits STCPS to userspace.  The intercept handler must execute the

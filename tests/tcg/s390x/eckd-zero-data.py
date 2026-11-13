@@ -71,7 +71,7 @@ def main():
             "-display", "none",
             "-monitor", "none",
             "-action", "panic=exit-failure",
-            "-dev3390", f"file={image},format=raw,devno=300",
+            "-dev3390", f"file={image},format=raw,devno=0A85",
             "-kernel", guest,
         ], timeout=30)
         return result.returncode
