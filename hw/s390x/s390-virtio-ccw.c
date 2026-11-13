@@ -487,6 +487,23 @@ static void s390_pv_prepare_reset(S390CcwMachineState *ms)
     s390_pv_prep_reset();
 }
 
+static SubchDev *s390_get_ipl_subchannel(S390CcwMachineState *ms)
+{
+    IplParameterBlock *iplb = s390_ipl_get_iplb();
+    DeviceState *dev = ms->ipl_device ?: get_boot_device(0);
+    CcwDevice *ccw_dev;
+
+    if (!dev || !iplb || iplb->pbt != S390_IPL_TYPE_CCW) {
+        return NULL;
+    }
+    ccw_dev = (CcwDevice *)object_dynamic_cast(OBJECT(dev), TYPE_CCW_DEVICE);
+    if (!ccw_dev || ccw_dev->sch->ssid != (iplb->ccw.ssid & 3) ||
+        ccw_dev->sch->devno != be16_to_cpu(iplb->ccw.devno)) {
+        return NULL;
+    }
+    return ccw_dev->sch;
+}
+
 static void s390_machine_reset(MachineState *machine, ResetType type)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(machine);
@@ -494,6 +511,8 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
     enum s390_reset reset_type;
     CPUState *cs, *t;
     S390CPU *cpu;
+    SubchDev *ipl_sch = NULL;
+    uint8_t ipl_lpum = 0;
 
     /*
      * Temporarily drop the record/replay mutex to let rr_cpu_thread_fn()
@@ -555,8 +574,21 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
         /*
          * Subsystem reset needs to be done before we unshare memory
          * and lose access to VIRTIO structures in guest memory.
+         *
+         * The firmware has already performed the IPL channel program at
+         * this point.  A hardware IPL performs the reset first and leaves
+         * the selected path recorded in LPUM after the successful I/O.
+         * Preserve that result across the firmware's DIAG 308 reset so the
+         * loaded operating system observes the architectural IPL state.
          */
+        ipl_sch = s390_get_ipl_subchannel(ms);
+        if (ipl_sch) {
+            ipl_lpum = ipl_sch->curr_status.pmcw.lpum;
+        }
         subsystem_reset();
+        if (ipl_lpum) {
+            ipl_sch->curr_status.pmcw.lpum = ipl_lpum;
+        }
         s390_pv_prepare_reset(ms);
         CPU_FOREACH(t) {
             if (t == cs) {
