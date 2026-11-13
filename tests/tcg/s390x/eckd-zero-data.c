@@ -103,6 +103,9 @@ int main(void)
         data[38] != 0x0a || data[39] != 0x80) {
         return 35;
     }
+    if (stsch_err(schid, &schib) || schib.pmcw.lpum != 0x80) {
+        return 45;
+    }
     irb = (Irb) { 0 };
 
     /* RCD must describe the same logical subsystem and interface. */
@@ -203,9 +206,11 @@ int main(void)
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND |
                            SCSW_DSTAT_UEXCP) ||
         (irb.scsw.ctrl & (SCSW_SCTL_INTERMED | SCSW_SCTL_PRIMARY |
-                          SCSW_SCTL_SECONDARY | SCSW_SCTL_STATUS_PEND)) !=
+                          SCSW_SCTL_SECONDARY | SCSW_SCTL_ALERT |
+                          SCSW_SCTL_STATUS_PEND)) !=
         (SCSW_SCTL_INTERMED | SCSW_SCTL_PRIMARY |
-         SCSW_SCTL_SECONDARY | SCSW_SCTL_STATUS_PEND) ||
+         SCSW_SCTL_SECONDARY | SCSW_SCTL_ALERT |
+         SCSW_SCTL_STATUS_PEND) ||
         irb.scsw.count != sizeof(data) ||
         irb.scsw.cpa != addr32(&ccws[2])) {
         return 5;

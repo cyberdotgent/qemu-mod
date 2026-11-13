@@ -229,7 +229,7 @@ static int eckd_unit_exception(EckdCcwDevice *eckd)
     schib->scsw.ctrl &= ~SCSW_ACTL_START_PEND;
     schib->scsw.ctrl &= ~SCSW_CTRL_MASK_STCTL;
     schib->scsw.ctrl |= SCSW_STCTL_PRIMARY | SCSW_STCTL_SECONDARY |
-                        SCSW_STCTL_STATUS_PEND;
+                        SCSW_STCTL_ALERT | SCSW_STCTL_STATUS_PEND;
     schib->scsw.cpa = sch->channel_prog + 8;
     return -EIO;
 }
