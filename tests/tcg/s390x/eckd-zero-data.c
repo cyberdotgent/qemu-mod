@@ -352,7 +352,7 @@ int main(void)
     consume_io_int();
     if (tsch(schid, &irb) || irb.scsw.cstat ||
         irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
-        sense[0] || sense[1] != 0x20) {
+        sense[0] || sense[1] != 0x08) {
         return 61;
     }
 
