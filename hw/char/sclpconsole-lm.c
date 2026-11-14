@@ -39,6 +39,13 @@ typedef struct OprtnsCommand {
 /* max size for line-mode data in 4K SCCB page */
 #define SIZE_CONSOLE_BUFFER (SCCB_DATA_LEN - sizeof(OprtnsCommand))
 
+/*
+ * The command is nested in two one-byte-length GDS subvectors.  The outer
+ * self-defining-text subvector contains both subvector headers, so it is the
+ * tighter limit.
+ */
+#define MAX_COMMAND_LEN (UINT8_MAX - (2 * sizeof(GdsSubvector)))
+
 struct SCLPConsoleLM {
     SCLPEvent event;
     CharFrontend chr;
@@ -87,7 +94,7 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
         sclp_service_interrupt(0);
         return;
     }
-    if (scon->length == SIZE_CONSOLE_BUFFER) {
+    if (scon->length == MAX_COMMAND_LEN) {
         /* Eat the character, but still process CR and LF.  */
         return;
     }
@@ -151,11 +158,22 @@ static int read_event_data(SCLPEvent *event, EventBufferHeader *evt_buf_hdr,
     size_t src_len;
     uint8_t *to;
     OprtnsCommand *oc = (OprtnsCommand *) evt_buf_hdr;
+    size_t mdmsu_len;
+    size_t cpmsu_len;
+    size_t text_command_len;
+    size_t self_def_text_len;
+    size_t text_message_len;
 
     if (!event->event_pending) {
         /* no data pending */
         return 0;
     }
+    if (*slen < (int)sizeof(*oc)) {
+        return 1;
+    }
+
+    /* READ EVENT DATA does not require the guest to clear its SCCB. */
+    memset(oc, 0, sizeof(*oc));
 
     to = (uint8_t *)&oc->data;
     avail = *slen - sizeof(OprtnsCommand);
@@ -165,24 +183,28 @@ static int read_event_data(SCLPEvent *event, EventBufferHeader *evt_buf_hdr,
         return 1;
     }
 
+    g_assert(src_len <= MAX_COMMAND_LEN);
+
+    text_message_len = sizeof(GdsSubvector) + src_len;
+    self_def_text_len = sizeof(GdsSubvector) + text_message_len;
+    text_command_len = sizeof(GdsVector) + self_def_text_len;
+    cpmsu_len = sizeof(GdsVector) + text_command_len;
+    mdmsu_len = sizeof(GdsVector) + cpmsu_len;
+
     oc->message_unit.mdmsu.gds_id = GDS_ID_MDSMU;
-    oc->message_unit.mdmsu.length = cpu_to_be16(sizeof(struct MDMSU));
+    oc->message_unit.mdmsu.length = cpu_to_be16(mdmsu_len);
 
     oc->message_unit.cpmsu.gds_id = GDS_ID_CPMSU;
-    oc->message_unit.cpmsu.length =
-        cpu_to_be16(sizeof(struct MDMSU) - sizeof(GdsVector));
+    oc->message_unit.cpmsu.length = cpu_to_be16(cpmsu_len);
 
     oc->message_unit.text_command.gds_id = GDS_ID_TEXTCMD;
-    oc->message_unit.text_command.length =
-        cpu_to_be16(sizeof(struct MDMSU) - (2 * sizeof(GdsVector)));
+    oc->message_unit.text_command.length = cpu_to_be16(text_command_len);
 
     oc->message_unit.self_def_text_message.key = GDS_KEY_SELFDEFTEXTMSG;
-    oc->message_unit.self_def_text_message.length =
-        cpu_to_be16(sizeof(struct MDMSU) - (3 * sizeof(GdsVector)));
+    oc->message_unit.self_def_text_message.length = self_def_text_len;
 
     oc->message_unit.text_message.key = GDS_KEY_TEXTMSG;
-    oc->message_unit.text_message.length =
-        cpu_to_be16(sizeof(GdsSubvector) + src_len);
+    oc->message_unit.text_message.length = text_message_len;
 
     oc->header.length = cpu_to_be16(sizeof(OprtnsCommand) + src_len);
     oc->header.type = SCLP_EVENT_OPRTNS_COMMAND;

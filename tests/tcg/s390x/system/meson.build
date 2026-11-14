@@ -140,12 +140,26 @@ sclp_3270_qemu_args = ['-display', 'none',
                        '-chardev', 'ringbuf,id=sysg,size=4096',
                        '-device', 'sclp3270console,chardev=sysg',
                        '-kernel']
+sclp_line_qemu_args = ['-monitor', 'none',
+                       '-display', 'none',
+                       '-nodefaults',
+                       '-action', 'panic=exit-failure',
+                       '-chardev', 'stdio,id=sclplm,signal=off',
+                       '-device', 'sclplmconsole,chardev=sclplm,echo=off',
+                       '-kernel']
 tests += {
   'fba-tic.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-chp.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-skey.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-cpu.c': {'cflags': [ccw_cflags], 'qemu_args': qemu_args},
   'sclp-3270.c': {'cflags': [ccw_cflags], 'qemu_args': sclp_3270_qemu_args},
+  'sclp-line-console.c': {
+    'cflags': [ccw_cflags],
+    'qemu_args': sclp_line_qemu_args,
+    'wrapper': ['sh', '-c',
+                '{ sleep 1; printf \'D IPLINFO\\n\'; sleep 1; } | exec "$@"',
+                'sh'],
+  },
   'terminal3215.c': {'cflags': [ccw_cflags], 'qemu_args': term3215_qemu_args},
   'terminal3215-input.c': {
     'cflags': [ccw_cflags],
