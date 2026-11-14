@@ -19,11 +19,12 @@ Device support
 z/OS compatibility handshake under KVM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Set ``QEMU_S390_ZOS_COMPAT=1`` in QEMU's environment to enable an
-optional z/OS control-block adjustment at KVM STSI exits.  This reproduces
+The ``mtm-3907`` machine automatically enables a z/OS control-block
+adjustment at KVM STSI exits.  This reproduces
 the result of the compatibility handshake which some emulators perform
 at ``STNSM 0x950,0xff``; it is not an architectural instruction side effect.
-The default is disabled.
+Other machine types do not perform this adjustment.  No environment variable
+is required; ``QEMU_S390_ZOS_COMPAT`` is no longer used.
 
 The hook reads the CVT pointer at guest address 0x10, the ECVT pointer at
 CVT+0x8c, and the level halfword at ECVT+0x1dc.  For levels at least
@@ -35,7 +36,7 @@ initialization to publish the pointers after earlier STSI calls.
 
 For example::
 
-  QEMU_S390_ZOS_COMPAT=1 qemu-system-s390x -accel kvm -cpu host ...
+  qemu-system-s390x -machine mtm-3907 -accel kvm -cpu host ...
 
 This hook does not intercept STNSM itself.  It requires an STSI exit after
 the guest initializes the byte and before the guest consumes it; validate

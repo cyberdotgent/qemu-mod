@@ -1938,7 +1938,7 @@ static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
 }
 
 /*
- * Optional z/OS compatibility handshake.  This is an OS control-block
+ * mtm-3907 z/OS compatibility handshake.  This is an OS control-block
  * adjustment, not an architectural STSI side effect.  Some execution
  * environments perform it at STNSM 0x950,0xff; using the existing STSI exit
  * avoids instruction stepping and matches the alternate STSI handshake.
@@ -1950,7 +1950,8 @@ static void kvm_zos_compat_stsi(S390CPU *cpu)
     uint8_t word[4], version[2], value;
     uint32_t cvt, ecvt, svt;
 
-    if (g_strcmp0(getenv("QEMU_S390_ZOS_COMPAT"), "1") ||
+    if (!object_dynamic_cast(qdev_get_machine(),
+                             MACHINE_TYPE_NAME("mtm-3907")) ||
         cpu_memory_rw_debug(cs, 16, word, sizeof(word), false)) {
         return;
     }
