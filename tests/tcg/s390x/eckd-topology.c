@@ -8,7 +8,6 @@
 #include "s390-ccw.h"
 #undef main
 #include "s390-arch.h"
-#include <string.h>
 
 #define ECKD_CMD_SNSS 0x54
 #define ECKD_CMD_RCD  0xfa
@@ -140,9 +139,13 @@ int main(void)
         return 7;
     }
 
-    if (run_ccw(schid, &orb, ECKD_CMD_RCD, sizeof(data)) ||
-        memcmp(data + 224, expected_neq, sizeof(expected_neq))) {
+    if (run_ccw(schid, &orb, ECKD_CMD_RCD, sizeof(data))) {
         return 8;
+    }
+    for (unsigned int i = 0; i < sizeof(expected_neq); i++) {
+        if (data[224 + i] != expected_neq[i]) {
+            return 8;
+        }
     }
 
     return 0;
