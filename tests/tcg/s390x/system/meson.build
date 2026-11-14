@@ -172,6 +172,16 @@ tests += {
     'cflags': [ccw_cflags],
     'qemu_args': ['-accel', 'kvm', '-cpu', 'host'] + qemu_args,
   },
+  'stsi-zos-compat.c': {
+    'cflags': [cflags],
+    'qemu_args': ['-accel', 'kvm', '-cpu', 'host', '-m', '128M'] + qemu_args,
+    'wrapper': ['env', 'QEMU_S390_ZOS_COMPAT=1'],
+  },
+  'stsi-zos-compat-disabled.c': {
+    'cflags': [cflags],
+    'qemu_args': ['-accel', 'kvm', '-cpu', 'host', '-m', '128M'] + qemu_args,
+    'wrapper': ['env', '-u', 'QEMU_S390_ZOS_COMPAT'],
+  },
   'sclp-3270.c': {'cflags': [ccw_cflags], 'qemu_args': sclp_3270_qemu_args},
   'sclp-line-console.c': {
     'cflags': [ccw_cflags],
