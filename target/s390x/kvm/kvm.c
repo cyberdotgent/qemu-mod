@@ -913,6 +913,10 @@ int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
 {
     switch (type) {
     case GDB_BREAKPOINT_HW:
+        /* GDB may send Z1 with kind 0; KVM requires a nonempty range. */
+        if (len == 0) {
+            len = 1;
+        }
         type = KVM_HW_BP;
         break;
     case GDB_WATCHPOINT_WRITE:
@@ -931,7 +935,13 @@ int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
                                           GdbBreakpointType type)
 {
     int size;
-    struct kvm_hw_breakpoint *bp = find_hw_breakpoint(addr, len, type);
+    struct kvm_hw_breakpoint *bp;
+
+    /* Match the normalization performed by breakpoint insertion. */
+    if (type == GDB_BREAKPOINT_HW && len == 0) {
+        len = 1;
+    }
+    bp = find_hw_breakpoint(addr, len, type);
 
     if (bp == NULL) {
         return -ENOENT;

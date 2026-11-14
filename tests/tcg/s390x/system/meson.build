@@ -113,6 +113,11 @@ tests += {
                   '202122232425262728292a2b2c2d2e2f' +
                   '303132333435363738393a3b3c3d3e3f'] + qemu_args,
   },
+  'hw-breakpoint.c': {
+    'cflags': [cflags],
+    'qemu_args': ['-accel', 'kvm'] + qemu_args,
+    'gdb_test': ['--test', files('../gdbstub/test-hw-breakpoint.py')],
+  },
   'decimal.c': setup_c,
   'diag204.c': setup_c,
   'edat.c': setup_c,
