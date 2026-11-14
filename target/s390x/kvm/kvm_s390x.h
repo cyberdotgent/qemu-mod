@@ -49,4 +49,10 @@ void kvm_s390_stop_interrupt(S390CPU *cpu);
 void kvm_s390_set_diag318(CPUState *cs, uint64_t diag318_info);
 int kvm_s390_topology_set_mtcr(uint64_t attr);
 
+/* itrace.c: KVM single-step instruction tracer */
+struct kvm_run;
+void s390_kvm_itrace_arm(void);
+void s390_kvm_itrace_pre_run(CPUState *cs);
+bool s390_kvm_itrace_exit(CPUState *cs, struct kvm_run *run);
+
 #endif /* KVM_S390X_H */

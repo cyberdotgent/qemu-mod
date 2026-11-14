@@ -995,6 +995,7 @@ void kvm_arch_update_guest_debug(CPUState *cpu, struct kvm_guest_debug *dbg)
 
 void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
 {
+    s390_kvm_itrace_pre_run(cpu);
 }
 
 MemTxAttrs kvm_arch_post_run(CPUState *cs, struct kvm_run *run)
@@ -1937,6 +1938,11 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
 {
     S390CPU *cpu = S390_CPU(cs);
     int ret = 0;
+
+    /* Traced single-steps re-enter KVM without the BQL or a state sync. */
+    if (s390_kvm_itrace_exit(cs, run)) {
+        return 0;
+    }
 
     bql_lock();
 
