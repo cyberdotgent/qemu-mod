@@ -1937,10 +1937,53 @@ static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
     s390_cpu_virt_mem_write(cpu, addr, ar, &u, sizeof(u));
 }
 
+/*
+ * Optional z/OS compatibility handshake.  This is an OS control-block
+ * adjustment, not an architectural STSI side effect.  Some execution
+ * environments perform it at STNSM 0x950,0xff; using the existing STSI exit
+ * avoids instruction stepping and matches the alternate STSI handshake.
+ * Debug accesses deliberately leave missing guest mappings exception-free.
+ */
+static void kvm_zos_compat_stsi(S390CPU *cpu)
+{
+    CPUState *cs = CPU(cpu);
+    uint8_t word[4], version[2], value;
+    uint32_t cvt, ecvt, svt;
+
+    if (g_strcmp0(getenv("QEMU_S390_ZOS_COMPAT"), "1") ||
+        cpu_memory_rw_debug(cs, 16, word, sizeof(word), false)) {
+        return;
+    }
+    cvt = ldl_be_p(word);
+    if (!cvt || cvt > 0x7fffffff - 140 ||
+        cpu_memory_rw_debug(cs, cvt + 140, word, sizeof(word), false)) {
+        return;
+    }
+    ecvt = ldl_be_p(word);
+    if (!ecvt || ecvt > 0x7fffffff - 477 ||
+        cpu_memory_rw_debug(cs, ecvt + 476, version, sizeof(version), false) ||
+        lduw_be_p(version) < 258 ||
+        cpu_memory_rw_debug(cs, 2892, word, sizeof(word), false)) {
+        return;
+    }
+    svt = ldl_be_p(word);
+    if (!svt || svt > 0x7fffffff - 1376 ||
+        cpu_memory_rw_debug(cs, svt + 1376, &value, 1, false) || !value) {
+        return;
+    }
+    value = 0;
+    if (!cpu_memory_rw_debug(cs, svt + 1376, &value, 1, true)) {
+        info_report("s390 z/OS compatibility: STSI cleared SVT+0x560 at "
+                    "0x%08x", svt + 1376);
+    }
+}
+
 static int handle_stsi(S390CPU *cpu)
 {
     CPUState *cs = CPU(cpu);
     struct kvm_run *run = cs->kvm_run;
+
+    kvm_zos_compat_stsi(cpu);
 
     switch (run->s390_stsi.fc) {
     case 2:
