@@ -1881,9 +1881,10 @@ static void insert_stsi_3_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
 
 /*
  * For a host-mirrored LPAR personality, KVM has stored the host partition's
- * SYSIB 2.2.2.  Keep its CPU and capability data, but report the configured
- * virtual partition number and name, including the extended name when the
- * host provides one.
+ * SYSIB 2.2.2.  Present the virtual partition instead: its configured number
+ * and name (including the extended name when the host provides one) and CPU
+ * counts derived from the guest configuration.  All guest CPUs are dedicated;
+ * capability and multithreading data are kept from the host.
  */
 #define SYSIB_222_VSNE_OFFSET 79
 #define SYSIB_222_EXT_NAME_OFFSET 256
@@ -1906,6 +1907,24 @@ static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
     }
     u.sysib.lpar_num = cpu_to_be16(number);
     memcpy(u.sysib.name, name, sizeof(u.sysib.name));
+    {
+        const MachineState *ms = MACHINE(qdev_get_machine());
+        uint16_t conf_cpus = 0, reserved_cpus = 0;
+
+        for (int i = 0; i < ms->possible_cpus->len; i++) {
+            if (ms->possible_cpus->cpus[i].cpu) {
+                conf_cpus++;
+            } else {
+                reserved_cpus++;
+            }
+        }
+        u.sysib.total_cpus = cpu_to_be16(conf_cpus + reserved_cpus);
+        u.sysib.conf_cpus = cpu_to_be16(conf_cpus);
+        u.sysib.standby_cpus = 0;
+        u.sysib.reserved_cpus = cpu_to_be16(reserved_cpus);
+        u.sysib.dedicated_cpus = cpu_to_be16(conf_cpus);
+        u.sysib.shared_cpus = 0;
+    }
     if (u.raw[SYSIB_222_VSNE_OFFSET]) {
         S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
 

@@ -50,6 +50,7 @@ def main():
         "-accel", "kvm",
         "-cpu", "host",
         "-m", f"{MEMORY_MB}M",
+        "-smp", "2,maxcpus=4",
         "-nodefaults",
         "-display", "none",
         "-serial", "stdio",
@@ -68,6 +69,9 @@ def main():
         "stsi222-cc": "0",
         "stsi222-lpar-number": "1",
         "stsi222-lpar-name": ebcdic_hex("QEMUKVM", 8),
+        # total/configured/standby/reserved for -smp 2,maxcpus=4
+        "stsi222-cpus": "4/2/0/2",
+        "stsi222-dedicated-shared": "2/0",
         "increment-mb": str(block >> 20),
         "increments": str(MEMORY_MB // (block >> 20)),
     }

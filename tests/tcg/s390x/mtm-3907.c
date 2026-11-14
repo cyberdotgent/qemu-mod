@@ -91,6 +91,11 @@ int main(void)
     ml_printf("stsi222-cc=%d\n", cc);
     ml_printf("stsi222-lpar-number=%d\n", (sysib[32] << 8) | sysib[33]);
     print_hex("stsi222-lpar-name", sysib + 44, 8);
+    ml_printf("stsi222-cpus=%d/%d/%d/%d\n",
+              (sysib[36] << 8) | sysib[37], (sysib[38] << 8) | sysib[39],
+              (sysib[40] << 8) | sysib[41], (sysib[42] << 8) | sysib[43]);
+    ml_printf("stsi222-dedicated-shared=%d/%d\n",
+              (sysib[72] << 8) | sysib[73], (sysib[74] << 8) | sysib[75]);
 
     cc = read_scp_info();
     if (cc || ((SCCBHeader *)sccb_page)->response_code !=
