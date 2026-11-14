@@ -553,18 +553,36 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
     snprintf(text, sizeof(text), "  2107   HRCZZ000000000001");
     eckd_ned_text(buf + 100, text, 26);
 
-    buf[224] = 0x80;
-    stw_be_p(buf + 226, interface_id);
-    buf[230] = 0x1e;
-    stw_be_p(buf + 232, lss);
-    buf[234] = 0x80;
-    buf[235] = unit_address;
-    buf[236] = unit_address;
-    buf[237] = unit_address;
-    buf[238] = interface_id;
-    buf[241] = 0x80;
-    buf[242] = 0x80;
-    buf[243] = unit_address;
+    if (eckd_has_explicit_topology(eckd)) {
+        static const uint8_t neq_template[32] = {
+            0x80, 0x00, 0x02, 0x13, 0x2d, 0x00, 0x1e, 0x00,
+            0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x0c, 0xc0, 0x00, 0x4f, 0xe5, 0x64, 0x1b,
+            0x02, 0x13, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x00,
+        };
+
+        /*
+         * Keep the interface identifier distinct from the storage-access
+         * identifier.  IBM 2107-compatible RCD data uses a 16-bit interface
+         * identifier and leaves the latter qualifier zero.
+         */
+        memcpy(buf + 224, neq_template, sizeof(neq_template));
+        stw_be_p(buf + 226, interface_id);
+        stw_be_p(buf + 232, lss);
+    } else {
+        buf[224] = 0x80;
+        stw_be_p(buf + 226, interface_id);
+        buf[230] = 0x1e;
+        stw_be_p(buf + 232, lss);
+        buf[234] = 0x80;
+        buf[235] = unit_address;
+        buf[236] = unit_address;
+        buf[237] = unit_address;
+        buf[238] = interface_id;
+        buf[241] = 0x80;
+        buf[242] = 0x80;
+        buf[243] = unit_address;
+    }
 }
 
 static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
@@ -1661,12 +1679,11 @@ static void eckd_realize(DeviceState *dev, Error **errp)
          eckd->subsystem_id == UINT16_MAX ||
          eckd->lcu_queue_number == UINT16_MAX ||
          eckd->path_cu_number == UINT16_MAX ||
-         (eckd->interface_id != UINT16_MAX &&
-          eckd->interface_id > UINT8_MAX))) {
+         eckd->interface_id == UINT16_MAX)) {
         error_setg(errp, "Explicit ECKD topology requires unit-address, "
                    "unit-address-limit, subsystem-id, lcu-queue-number, "
-                   "and path-cu-number; unit-address, unit-address-limit, "
-                   "and interface-id must fit in 8 bits");
+                   "and path-cu-number; unit-address and unit-address-limit "
+                   "must fit in 8 bits");
         return;
     }
     if (explicit_topology && eckd->interface_id == UINT16_MAX) {

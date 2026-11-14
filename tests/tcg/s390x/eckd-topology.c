@@ -86,6 +86,12 @@ static int run_ccw(SubChannelId schid, CmdOrb *orb, uint8_t command,
 
 int main(void)
 {
+    static const uint8_t expected_neq[32] = {
+        0x80, 0x00, 0x02, 0x13, 0x2d, 0x00, 0x1e, 0x00,
+        0x0a, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x0c, 0xc0, 0x00, 0x4f, 0xe5, 0x64, 0x1b,
+        0x02, 0x13, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x00,
+    };
     SubChannelId schid = { .one = 1, .sch_no = 0 };
     CmdOrb orb = { .fmt = 1, .pfch = 1, .lpm = 0xff,
                    .cpa = addr32(&ccw) };
@@ -134,9 +140,7 @@ int main(void)
     }
 
     if (run_ccw(schid, &orb, ECKD_CMD_RCD, sizeof(data)) ||
-        data[226] || data[227] || data[232] || data[233] != 3 ||
-        data[235] != 5 || data[236] != 5 || data[237] != 5 ||
-        data[238] || data[243] != 5) {
+        memcmp(data + 224, expected_neq, sizeof(expected_neq))) {
         return 8;
     }
 
