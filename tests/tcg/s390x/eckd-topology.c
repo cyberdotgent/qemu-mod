@@ -8,6 +8,7 @@
 #include "s390-ccw.h"
 #undef main
 #include "s390-arch.h"
+#include <string.h>
 
 #define ECKD_CMD_SNSS 0x54
 #define ECKD_CMD_RCD  0xfa
