@@ -48,6 +48,7 @@ struct S390CcwMachineState {
     char *lpar_name;
     uint16_t lpar_number;
     uint64_t storage_increment;
+    uint32_t host_capability;
 
     SCLPDevice *sclp;
 };
@@ -74,6 +75,10 @@ void s390_handle_ptf(S390CPU *cpu, uint8_t r1, uintptr_t ra);
  */
 bool s390_mtm_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8]);
 uint64_t s390_mtm_storage_increment(void);
+/* LPAR-personality overlays for SCLP Read SCP Info and CHSC (see .c) */
+void s390_mtm_patch_read_info(uint8_t *read_info);
+bool s390_mtm_chsc_characteristics(uint32_t *general_chars,
+                                   uint32_t *chsc_chars);
 
 struct S390CcwMachineClass {
     /*< private >*/

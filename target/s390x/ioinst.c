@@ -789,6 +789,9 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
     memset(general_chars, 0, sizeof(general_chars));
     memset(chsc_chars, 0, sizeof(chsc_chars));
 
+    if (s390_mtm_chsc_characteristics(general_chars, chsc_chars)) {
+        goto out_chars;
+    }
     general_chars[0] = cpu_to_be32(0x03080000);
     general_chars[1] = cpu_to_be32(0x00079000);
     general_chars[3] = cpu_to_be32(0x00080000);
@@ -799,6 +802,7 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
      */
     chsc_chars[0] = cpu_to_be32(0x70800000);
 
+  out_chars:
     memcpy(res->data, general_chars, sizeof(general_chars));
     memcpy(res->data + sizeof(general_chars), chsc_chars, sizeof(chsc_chars));
     return;
@@ -865,8 +869,11 @@ static void ioinst_handle_chsc_sci(ChscReq *req, ChscResp *res)
 #define CHSC_SDA_0_RES 0xf0ff0000
 #define CHSC_SDA_OC_MCSSE 0x0
 #define CHSC_SDA_OC_MSS 0x2
+#define CHSC_SDA_OC_1 0x1
 static void ioinst_handle_chsc_sda(ChscReq *req, ChscResp *res)
 {
+    uint16_t lpar_number;
+    uint8_t lpar_name[8];
     uint16_t resp_code = 0x0001;
     uint16_t len = be16_to_cpu(req->len);
     uint32_t param0 = be32_to_cpu(req->param0);
@@ -884,6 +891,19 @@ static void ioinst_handle_chsc_sda(ChscReq *req, ChscResp *res)
     }
 
     oc = param0 & CHSC_SDA_0_OC;
+    if (s390_mtm_lpar_identity(&lpar_number, lpar_name)) {
+        /*
+         * LPAR personality: multiple-CSS, multiple-subchannel-set and
+         * extended-measurement (operation code 1) enablement are not
+         * offered.
+         */
+        if (oc == CHSC_SDA_OC_MCSSE || oc == CHSC_SDA_OC_MSS ||
+            oc == CHSC_SDA_OC_1) {
+            resp_code = 0x0101;
+            goto out;
+        }
+    }
+
     switch (oc) {
     case CHSC_SDA_OC_MCSSE:
         ret = css_enable_mcsse();
@@ -928,6 +948,32 @@ static void ioinst_handle_chsc_sdcal(ChscReq *req, ChscResp *res)
      * model MIF or logical partitions.  The first entry must describe the
      * default image, which is exposed to the guest as CSSID 0.
      */
+    uint16_t lpar_number;
+    uint8_t lpar_name[8];
+
+    if (s390_mtm_lpar_identity(&lpar_number, lpar_name)) {
+        /*
+         * LPAR personality: one channel-subsystem image (CSSID 0) holding
+         * this partition's MIF image.  The response echoes the attribute
+         * type and carries the image id, as on the reference LPAR.
+         */
+        if (atype != CHSC_SDCAL_ATYPE_CSS_IMG) {
+            res->len = cpu_to_be16(CHSC_MIN_RESP_LEN);
+            res->code = cpu_to_be16(0x0003);
+            res->param = 0;
+            return;
+        }
+        res->len = cpu_to_be16(20);
+        res->code = cpu_to_be16(0x0001);
+        res->param = 0;
+        stl_be_p((uint8_t *)res->data, CHSC_SDCAL_ATYPE_CSS_IMG);
+        stl_be_p((uint8_t *)res->data + 4, 0);
+        entry[0] = 0;
+        stw_be_p(entry + 1, lpar_number);
+        entry[3] = 0;
+        return;
+    }
+
     if (len != 0x0020 || atype != CHSC_SDCAL_ATYPE_CSS_IMG ||
         fmt != 0 || (param0 & 0x00f0ffff) ||
         req->param1 || req->param2) {

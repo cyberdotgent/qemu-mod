@@ -201,6 +201,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
 
     s390_ipl_convert_loadparm((char *)S390_CCW_MACHINE(machine)->loadparm,
                                 read_info->loadparm);
+    s390_mtm_patch_read_info((uint8_t *)read_info);
 
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }

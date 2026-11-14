@@ -1269,6 +1269,71 @@ uint64_t s390_mtm_storage_increment(void)
     return ms ? ms->storage_increment : 0;
 }
 
+/*
+ * Guest-visible SCLP Read SCP Info and CHSC values of a z14 ZR1 logical
+ * partition.  Under mtm-3907 these replace the generic virtual-machine
+ * values, so the guest sees the configuration and channel-subsystem
+ * characteristics of a real LPAR.
+ */
+static void mtm_set_bits(uint32_t *words, const uint8_t *bits, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        words[bits[i] / 32] |= cpu_to_be32(0x80000000U >> (bits[i] % 32));
+    }
+}
+
+bool s390_mtm_chsc_characteristics(uint32_t *general_chars,
+                                   uint32_t *chsc_chars)
+{
+    /*
+     * Facilities the emulated devices cannot back are deliberately absent:
+     * extended I/O measurement words (50; no channel timings), adapter
+     * interruptions and the QDIO assists (41, 56, 61, 66, 67; no QDIO
+     * devices).  Dynamic I/O (12) and alternate SSI (108) are kept as on
+     * the real machine.
+     */
+    static const uint8_t general[] = {
+        0, 6, 7, 9, 10, 12, 13, 31, 38, 44, 45, 46, 48, 60, 74, 93, 108,
+    };
+    /* CHSC 0x0021 (Set Channel Subsystem Characteristics, 107) is absent. */
+    static const uint8_t chsc[] = {
+        0, 1, 2, 3, 4, 6, 7, 8, 10, 11, 64, 89, 102, 108, 109, 112, 126,
+    };
+
+    if (!mtm_machine()) {
+        return false;
+    }
+    mtm_set_bits(general_chars, general, ARRAY_SIZE(general));
+    mtm_set_bits(chsc_chars, chsc, ARRAY_SIZE(chsc));
+    return true;
+}
+
+void s390_mtm_patch_read_info(uint8_t *ri)
+{
+    S390CcwMachineState *ms = mtm_machine();
+    /*
+     * Byte 84 bit 0x04 is set on real LPAR hardware; its meaning is not
+     * documented.
+     */
+    static const uint8_t conf_char[] = { 0x2e, 0x40, 0x93, 0xdf, 0xfd, 0xff };
+
+    if (!ms) {
+        return;
+    }
+    ri[11] = 0x04;
+    ri[12] = 0x00;
+    ri[13] = 0x01;
+    ri[15] = 0x02;                                  /* MNEST */
+    stl_be_p(ri + 44, 0xfcfcff77);
+    stq_be_p(ri + 48, 0xe8060c4080000000ULL);       /* SCLP facilities */
+    ri[67] = 0x01;
+    memcpy(ri + 80, conf_char, sizeof(conf_char));  /* bytes 80-85 */
+    stl_be_p(ri + 86, ms->host_capability);
+    ri[91] = 0x75;
+    ri[98] = 0xa3;
+    stl_be_p(ri + 124, 0x0b000000);                 /* HMFAI */
+}
+
 /* Return the trimmed value of a "Key: value" line of /proc/sysinfo. */
 static char *mtm_sysinfo_value(const char *sysinfo, const char *key)
 {
@@ -1309,6 +1374,12 @@ static void mtm_check_host(S390CcwMachineState *ms, uint16_t mtm,
         error_setg(errp, "machine mtm-%s mirrors its host, but the host "
                    "machine type is %s", expected, type ? type : "unknown");
         return;
+    }
+
+    {
+        g_autofree char *cap = mtm_sysinfo_value(sysinfo, "Capability");
+
+        ms->host_capability = cap ? g_ascii_strtoull(cap, NULL, 10) : 0;
     }
 
     if (!g_file_get_contents(MTM_BLOCK_SIZE_PATH, &block, NULL, &gerr)) {
