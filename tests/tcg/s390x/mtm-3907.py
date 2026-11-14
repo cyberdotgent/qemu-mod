@@ -53,6 +53,9 @@ def main():
         "-smp", "2,maxcpus=4",
         "-nodefaults",
         "-display", "none",
+        # mtm-3907: serial #0 is the line-mode console, #1 the ASCII
+        # console that the test guest prints to.
+        "-serial", "null",
         "-serial", "stdio",
         "-action", "panic=exit-failure",
         "-kernel", guest,

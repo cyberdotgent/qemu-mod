@@ -180,6 +180,17 @@ tests += {
                 '{ sleep 1; printf \'D IPLINFO\\n\'; sleep 1; } | exec "$@"',
                 'sh'],
   },
+  # mtm-3907 maps -serial #0 to the line-mode console (KVM, 3907 hosts).
+  'sclp-line-console-mtm.c': {
+    'cflags': [ccw_cflags],
+    'qemu_args': ['-machine', 'mtm-3907', '-accel', 'kvm', '-cpu', 'host',
+                  '-monitor', 'none', '-display', 'none', '-nodefaults',
+                  '-action', 'panic=exit-failure',
+                  '-serial', 'stdio', '-kernel'],
+    'wrapper': ['sh', '-c',
+                '{ sleep 1; printf \'D IPLINFO\\n\'; sleep 1; } | exec "$@"',
+                'sh'],
+  },
   'terminal3215.c': {'cflags': [ccw_cflags], 'qemu_args': term3215_qemu_args},
   'terminal3215-input.c': {
     'cflags': [ccw_cflags],

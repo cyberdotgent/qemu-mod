@@ -329,11 +329,19 @@ static void ccw_init(MachineState *machine)
     s390_create_virtio_net(BUS(css_bus), mc->default_nic);
 
     /* init consoles */
-    if (serial_hd(0)) {
-        s390_create_sclpconsole(ms->sclp, "sclpconsole", serial_hd(0));
-    }
-    if (serial_hd(1)) {
-        s390_create_sclpconsole(ms->sclp, "sclplmconsole", serial_hd(1));
+    {
+        bool lm_first = s390mc->line_mode_console_first;
+
+        if (serial_hd(0)) {
+            s390_create_sclpconsole(ms->sclp,
+                                    lm_first ? "sclplmconsole" : "sclpconsole",
+                                    serial_hd(0));
+        }
+        if (serial_hd(1)) {
+            s390_create_sclpconsole(ms->sclp,
+                                    lm_first ? "sclpconsole" : "sclplmconsole",
+                                    serial_hd(1));
+        }
     }
 
     /* init the TOD clock */
@@ -1409,6 +1417,8 @@ static void mtm_3907_class_init(ObjectClass *oc, const void *data)
                "KVM host";
     mc->init = mtm_3907_init;
     mc->default_cpu_type = S390_CPU_TYPE_NAME("host");
+    /* Operator messages on the first serial (e.g. stdio with -nographic). */
+    s390mc->line_mode_console_first = true;
     /* One storage increment of a typical z14 LPAR (1 GiB memory blocks). */
     mc->default_ram_size = 1 * GiB;
     s390mc->mtm = 0x3907;

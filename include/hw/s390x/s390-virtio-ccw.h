@@ -86,6 +86,12 @@ struct S390CcwMachineClass {
     bool use_secure;
     /* Machine type of a host-mirrored LPAR personality, 0 if none */
     uint16_t mtm;
+    /*
+     * Map -serial #0 to the line-mode console ("Operating System
+     * Messages") and #1 to the integrated ASCII console, as an LPAR's
+     * hardware console presents them.
+     */
+    bool line_mode_console_first;
 };
 
 #endif
