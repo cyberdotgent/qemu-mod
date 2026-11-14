@@ -234,6 +234,11 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../terminal3270-residual.py')],
   },
+  # Clear sends only its AID (short read); the wrapper runs it under KVM.
+  'terminal3270-clear.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../terminal3270-clear.py')],
+  },
   'tape-write.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../tape-write.py')],

@@ -519,6 +519,22 @@ static void terminal_finish_record(Terminal3270 *t)
         return;
     }
 
+    /* An empty TN3270 record carries no AID: it is not an inbound event. */
+    if (!t->record_len) {
+        return;
+    }
+
+    /*
+     * Clear erases the display buffer, homes the cursor and returns the
+     * display to its default size before the AID is sent.  Track that here
+     * so later buffer addressing and a reconnect do not use the old screen.
+     */
+    if (t->record_buf[0] == AID3270_CLEAR) {
+        t->pos = 0;
+        t->ewa = false;
+        g_byte_array_set_size(t->replay, 0);
+    }
+
     /*
      * A non-SNA 3270 has one pending input buffer, not a FIFO of AIDs.
      * If the host restores the keyboard without reading an earlier AID, the
@@ -1170,7 +1186,14 @@ static int terminal_transfer_record(Terminal3270 *t, CCW1 *ccw)
     }
 
     t->current_offset += len;
-    if (t->current_offset == record->len && record->len < 3) {
+    /*
+     * Clear, the PA keys and the cursor-select attention keys produce a
+     * short read: the inbound record is the AID byte alone, with no cursor
+     * address (GA23-0059, "Short Read").  The read ends normally with CE/DE
+     * and the residual count, subject to the usual SLI rules.  Only a record
+     * that stops inside the cursor address is malformed.
+     */
+    if (t->current_offset == record->len && record->len == 2) {
         terminal_sch(t)->sense_data[0] = SENSE_DATA_CHECK;
         terminal_discard_current_record(t);
         return -EIO;

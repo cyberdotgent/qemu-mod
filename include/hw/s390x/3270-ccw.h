@@ -66,6 +66,7 @@
 #define O3270_RA  0x3c
 
 #define SF3270_AID 0x88
+#define AID3270_CLEAR 0x6d
 
 OBJECT_DECLARE_TYPE(EmulatedCcw3270Device, EmulatedCcw3270Class, EMULATED_CCW_3270)
 
