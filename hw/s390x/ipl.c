@@ -25,6 +25,7 @@
 #include "hw/s390x/virtio-ccw.h"
 #include "hw/s390x/vfio-ccw.h"
 #include "hw/s390x/css.h"
+#include "hw/s390x/storage-keys.h"
 #include "hw/s390x/ebcdic.h"
 #include "hw/scsi/scsi.h"
 #include "hw/virtio/virtio-net.h"
@@ -239,7 +240,11 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
      * Always load the bios if it was enforced,
      * even if an external kernel has been defined.
      */
-    if (!ipl->kernel || ipl->enforce_bios) {
+    /*
+     * -ipl selects a native channel-program IPL performed by QEMU itself
+     * (see s390_ipl_native_ccw()), so no firmware is loaded into the guest.
+     */
+    if ((!ipl->kernel || ipl->enforce_bios) && !s390ms->ipl_devno_set) {
         uint64_t fwbase;
 
         if (ms->ram_size < BIOS_MAX_SIZE) {
@@ -648,6 +653,13 @@ void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
     if (search.matches > 1) {
         error_setg(errp, "IPL device number %s is ambiguous; use "
                    "cssid.ssid.devno", address);
+        return;
+    }
+
+    if (object_dynamic_cast(OBJECT(search.match), TYPE_VIRTIO_CCW_DEVICE)) {
+        error_setg(errp, "-ipl performs a channel-program IPL, which virtio "
+                   "device %s does not support; use bootindex instead",
+                   address);
         return;
     }
 
@@ -1134,9 +1146,132 @@ int s390_ipl_pv_unpack(struct S390PVResponse *pv_resp)
     return rc;
 }
 
+bool s390_ipl_native(void)
+{
+    Object *obj = qdev_get_machine();
+
+    return obj && object_dynamic_cast(obj, TYPE_S390_CCW_MACHINE) &&
+           S390_CCW_MACHINE(obj)->ipl_devno_set;
+}
+
+/*
+ * Initial program loading from a channel-attached device, performed by the
+ * channel subsystem as on hardware: an implied Read IPL CCW reads 24 bytes
+ * into absolute 0 with command chaining, so the channel program continues
+ * with the CCWs just read at absolute 8 and 16.  On completion the
+ * subchannel identification is stored at absolute 184, the interruption
+ * condition is withdrawn and the PSW at absolute 0 is loaded.  No firmware
+ * is involved, and nothing else in storage is touched.
+ *
+ * The 8-byte IPL PSW is in ESA/390 format.  The configuration operates only
+ * in z/Architecture mode (facility 138), so the PSW is converted as LPSW
+ * would: bit 12 (which must be one) is inverted and bit 32 becomes the
+ * basic-addressing-mode bit.
+ */
+#define IPL_CCW_READ_IPL     0x02
+#define IPL_ESA_PSW_BIT12    0x00080000U
+
+/* The IPL stores into the prefix area: set its reference and change bits. */
+static void s390_ipl_mark_prefix_page(uint64_t prefix)
+{
+    S390SKeysState *ss = s390_get_skeys_device();
+    S390SKeysClass *skc;
+    uint8_t key;
+
+    if (!ss) {
+        return;
+    }
+    skc = S390_SKEYS_GET_CLASS(ss);
+    if (!skc->skeys_are_enabled(ss) ||
+        skc->get_skeys(ss, prefix / TARGET_PAGE_SIZE, 1, &key)) {
+        return;
+    }
+    key |= SK_R | SK_C;
+    skc->set_skeys(ss, prefix / TARGET_PAGE_SIZE, 1, &key);
+}
+
+static void s390_ipl_native_ccw(S390CPU *cpu)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
+    CPUS390XState *env = &cpu->env;
+    static const uint8_t read_ipl[8] = {
+        IPL_CCW_READ_IPL, 0, 0, 0,
+        CCW_FLAG_CC | CCW_FLAG_SLI, 0, 0, 24,
+    };
+    ORB orb = { .lpm = 0xff };
+    uint8_t id[8];
+    uint8_t psw[8];
+    SubchDev *sch;
+    IRB irb;
+    int irb_len;
+    uint32_t mask, addr;
+
+    sch = ms->ipl_device ? CCW_DEVICE(ms->ipl_device)->sch : NULL;
+    if (!sch) {
+        error_report("IPL device has no subchannel");
+        goto failed;
+    }
+
+    physical_memory_write(0, read_ipl, sizeof(read_ipl));
+    sch->curr_status.pmcw.flags |= PMCW_FLAGS_MASK_ENA;
+    sch->curr_status.pmcw.intparm = 0;
+    if (css_do_ssch(sch, &orb) != IOINST_CC_EXPECTED) {
+        error_report("IPL device %04x is not operational", sch->devno);
+        goto failed;
+    }
+    css_do_tsch_get_irb(sch, &irb, &irb_len);
+    css_do_tsch_update_subch(sch);
+    if (irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHANNEL_END | SCSW_DSTAT_DEVICE_END)) {
+        error_report("IPL from device %04x failed: device status %02x, "
+                     "subchannel status %02x", sch->devno, irb.scsw.dstat,
+                     irb.scsw.cstat);
+        goto failed;
+    }
+
+    /* The IPL used the first path; nothing else reports status here. */
+    sch->curr_status.pmcw.lpum = 0x80;
+    stl_be_p(id, (css_build_subchannel_id(sch) << 16) | sch->schid);
+    stl_be_p(id + 4, 0);
+    physical_memory_write(184, id, sizeof(id));
+    s390_ipl_mark_prefix_page(env->psa);
+
+    physical_memory_read(0, psw, sizeof(psw));
+    mask = ldl_be_p(psw);
+    addr = ldl_be_p(psw + 4);
+    if (!(mask & IPL_ESA_PSW_BIT12)) {
+        error_report("IPL from device %04x failed: invalid IPL PSW "
+                     "%08x %08x", sch->devno, mask, addr);
+        goto failed;
+    }
+    memset(env->regs, 0, sizeof(env->regs));
+    memset(env->aregs, 0, sizeof(env->aregs));
+    env->psw.mask = ((uint64_t)(mask ^ IPL_ESA_PSW_BIT12) << 32) |
+                    ((addr & 0x80000000U) ? PSW_MASK_32 : 0);
+    env->psw.addr = addr & 0x7fffffffU;
+    return;
+
+failed:
+    /* The IPL did not complete: leave the CPU in a disabled wait. */
+    env->psw.mask = PSW_MASK_WAIT | PSW_MASK_32 | PSW_MASK_64;
+    env->psw.addr = 0;
+}
+
 void s390_ipl_prepare_cpu(S390CPU *cpu)
 {
     S390IPLState *ipl = get_ipl_device();
+
+    if (s390_ipl_native()) {
+        S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
+
+        /* Keep an IPL parameter block for DIAG 308 store. */
+        if (!ipl->iplb_valid && ms->ipl_device) {
+            ipl->iplb_valid = s390_build_iplb(ms->ipl_device, &ipl->iplb,
+                                              NULL);
+        }
+        s390_ipl_native_ccw(cpu);
+        return;
+    }
 
     cpu->env.psw.addr = ipl->start_addr;
     cpu->env.psw.mask = ipl->start_mask;

@@ -569,6 +569,10 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
         CPU_FOREACH(t) {
             run_on_cpu(t, s390_do_cpu_full_reset, RUN_ON_CPU_NULL);
         }
+        if (s390_ipl_native()) {
+            run_on_cpu(cs, s390_do_cpu_ipl, RUN_ON_CPU_NULL);
+            break;
+        }
         run_on_cpu(cs, s390_do_cpu_load_normal, RUN_ON_CPU_NULL);
         break;
     case S390_RESET_LOAD_NORMAL:
@@ -598,6 +602,10 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
             run_on_cpu(t, s390_do_cpu_reset, RUN_ON_CPU_NULL);
         }
         run_on_cpu(cs, s390_do_cpu_initial_reset, RUN_ON_CPU_NULL);
+        if (s390_ipl_native()) {
+            run_on_cpu(cs, s390_do_cpu_ipl, RUN_ON_CPU_NULL);
+            break;
+        }
         run_on_cpu(cs, s390_do_cpu_load_normal, RUN_ON_CPU_NULL);
         break;
     case S390_RESET_PV: /* Subcode 10 */

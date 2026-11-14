@@ -37,6 +37,7 @@ int s390_ipl_prepare_pv_header(struct S390PVResponse *pv_resp,
                                Error **errp);
 int s390_ipl_pv_unpack(struct S390PVResponse *pv_resp);
 void s390_ipl_prepare_cpu(S390CPU *cpu);
+bool s390_ipl_native(void);
 IplParameterBlock *s390_ipl_get_iplb(void);
 IplParameterBlock *s390_ipl_get_iplb_pv(void);
 S390IPLCertificateStore *s390_ipl_get_certificate_store(void);
