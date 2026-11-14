@@ -163,6 +163,10 @@ tests += {
   'sclp-chp.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-skey.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-cpu.c': {'cflags': [ccw_cflags], 'qemu_args': qemu_args},
+  'sclp-ibc.c': {
+    'cflags': [ccw_cflags],
+    'qemu_args': ['-accel', 'kvm', '-cpu', 'host'] + qemu_args,
+  },
   'sclp-3270.c': {'cflags': [ccw_cflags], 'qemu_args': sclp_3270_qemu_args},
   'sclp-line-console.c': {
     'cflags': [ccw_cflags],
