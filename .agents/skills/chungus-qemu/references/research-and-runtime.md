@@ -8,6 +8,25 @@ The hook checks PSA0x10 -> CVT+0x8c -> ECVT+0x1dc level>=0x0102 and clears `[PSA
 
 Under `mtm-3907`, SCLP Read SCP Info and CHSC characteristics may also be patched to real z14 ZR1 LPAR values (`s390_mtm_patch_read_info`, `s390_mtm_chsc_characteristics`). Check `git log`/`git status` for whether that work is committed or still a working-tree overlay before relying on it or reporting provenance. The machine also exposes `lpar-name` (SYSIB 2.2.2, default `QEMUKVM`).
 
+## QETH / OSA networking
+
+`qeth-ccw` supports layer 2 and layer 3 (guest-selected in ULP_ENABLE). z/OS
+TCP/IP uses layer 3: the image's TRLE `OSATRL1E` is READ/WRITE/DATAPATH
+0400/0401/0402, profile `ADCD.Z25C.TCPPARMS(PROF2)` -> `ZPDTDEV1` (HOME
+85.234.216.174, default gateway 85.234.216.161). Attach with
+`-qeth devno=0400,hostdev=tap0`; CHUNGUS's persistent `tap0` carries
+85.234.216.161/28 (plus 192.168.70.1/24 and fd70::1/64), so `ping
+85.234.216.174` and `c3270 85.234.216.174` work from the host once TCP/IP shows
+`EZZ4313I INITIALIZATION COMPLETE FOR DEVICE PORTA`. Only one QEMU can hold
+`tap0` at a time.
+
+Trace with `-trace 'qeth_*' -trace 'qdio_*'` (`qeth_ctrl_data` dumps raw
+IDX/MPC/IPA). Unattended tooling lives in `~/qeth-dev` on CHUNGUS:
+`run-zos.sh RUN` (sockets, scripted s3270, tcpdump), `zcmd RUN "cmd"`,
+`screen.sh PORT`, `stop-zos.sh RUN`, and `linux-qeth-test.sh RUN` (Linux
+qeth_l2/qeth_l3 regression with the host kernel and initramfs). The
+bring-up history is in zos-research `investigations/qeth-layer3.md`.
+
 ## SCLP consoles
 
 Source and `tests/tcg/s390x/system/meson.build` are authoritative; re-check them if this drifts.
