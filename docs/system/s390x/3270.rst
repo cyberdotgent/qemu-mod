@@ -84,6 +84,27 @@ the terminal client are external state and cannot be preserved. The log is
 limited to 4 MiB; a display command which would exceed that limit completes
 with data check without being sent.
 
+SCLP integrated 3270 console
+----------------------------
+
+Besides channel-attached terminals, the machine can provide the SCLP
+integrated 3270 console (``sclp3270console``), which corresponds to the HMC
+"Integrated 3270 Console" of a real partition. Operating systems such as z/OS
+use it as a console of last resort, for example during NIP, without needing an
+I/O definition for it. Add it with::
+
+   -sclp3270 port=3905
+
+or equivalently ``-sclp3270 3905``. Like ``-dev3270``, the shorthand creates a
+TN3270 server on the loopback interface that does not wait for a client
+connection. Connect ``x3270`` or ``c3270`` to the port. While no client is
+connected, the console reports "improper state" to the guest instead of
+accepting output. There is one integrated console per machine; use the
+expanded form for other listeners::
+
+   -chardev socket,id=sysg,host=0.0.0.0,port=3905,server=on,wait=off,tn3270=on
+   -device sclp3270console,chardev=sysg
+
 The ``-dev3270`` shorthand deliberately listens only on loopback and exposes
 only ``port`` and ``devno``. Use the expanded chardev/device form for TLS,
 non-loopback listeners, or other socket options. 3287 printer emulation is not

@@ -546,6 +546,19 @@ static QemuOptsList qemu_dev3270_opts = {
     },
 };
 
+static QemuOptsList qemu_sclp3270_opts = {
+    .name = "sclp3270",
+    .implied_opt_name = "port",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_sclp3270_opts.head),
+    .desc = {
+        {
+            .name = "port",
+            .type = QEMU_OPT_NUMBER,
+        },
+        { /* end of list */ }
+    },
+};
+
 static QemuOptsList qemu_dev3215_opts = {
     .name = "dev3215",
     .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3215_opts.head),
@@ -1480,6 +1493,81 @@ static bool dev3270_add(const char *optarg, Error **errp)
     }
 
     index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(chardev_opts);
+    qemu_opts_del(opts);
+    return false;
+}
+
+/*
+ * -sclp3270 port=N: the SCLP integrated 3270 console (event type 0x1b) on a
+ * loopback TN3270 listener, i.e. the expanded
+ *   -chardev socket,id=sclp3270-chardev,host=127.0.0.1,port=N,
+ *            server=on,wait=off,tn3270=on
+ *   -device sclp3270console,id=sclp3270,chardev=sclp3270-chardev
+ * There is a single integrated console per machine, so the option may be
+ * given only once.
+ */
+static bool sclp3270_add(const char *optarg, Error **errp)
+{
+    static bool added;
+    g_autofree char *port_str = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *chardev_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    uint64_t port;
+
+    if (added) {
+        error_setg(errp, "-sclp3270 may only be specified once");
+        return false;
+    }
+
+    opts = qemu_opts_parse(&qemu_sclp3270_opts, optarg, true, errp);
+    if (!opts) {
+        return false;
+    }
+
+    if (qemu_opts_id(opts)) {
+        error_setg(errp, "Parameter 'id' is not supported");
+        goto fail;
+    }
+    if (!qemu_opt_get(opts, "port")) {
+        error_setg(errp, "Parameter 'port' is required");
+        goto fail;
+    }
+
+    port = qemu_opt_get_number(opts, "port", 0);
+    if (port > 65535) {
+        error_setg(errp, "Parameter 'port' must be between 0 and 65535");
+        goto fail;
+    }
+    port_str = g_strdup_printf("%" PRIu64, port);
+
+    chardev_opts = qemu_opts_create(qemu_find_opts("chardev"),
+                                    "sclp3270-chardev", 1, errp);
+    if (!chardev_opts ||
+        !qemu_opt_set(chardev_opts, "backend", "socket", errp) ||
+        !qemu_opt_set(chardev_opts, "host", "127.0.0.1", errp) ||
+        !qemu_opt_set(chardev_opts, "port", port_str, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "server", true, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "wait", false, errp) ||
+        !qemu_opt_set_bool(chardev_opts, "tn3270", true, errp)) {
+        goto fail;
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"), "sclp3270",
+                                   1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "sclp3270console", errp) ||
+        !qemu_opt_set(device_opts, "chardev", "sclp3270-chardev", errp)) {
+        goto fail;
+    }
+
+    added = true;
     qemu_opts_del(opts);
     return true;
 
@@ -3888,6 +3976,15 @@ void qemu_init(int argc, char **argv)
                 Error *err = NULL;
 
                 if (!dev3270_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
+            case QEMU_OPTION_sclp3270: {
+                Error *err = NULL;
+
+                if (!sclp3270_add(optarg, &err)) {
                     error_report_err(err);
                     exit(1);
                 }

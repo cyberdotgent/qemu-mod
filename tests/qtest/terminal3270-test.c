@@ -264,6 +264,25 @@ static void test_dev3270_shortcut(void)
     qtest_quit(qts);
 }
 
+static void test_sclp3270_shortcut(void)
+{
+    QTestState *qts;
+    g_autofree char *chardev = NULL;
+    g_autofree char *chardev_implied = NULL;
+
+    qts = qtest_init("-nodefaults -sclp3270 port=0");
+    chardev = qom_get_string(qts, "/machine/peripheral/sclp3270", "chardev");
+    g_assert_cmpstr(chardev, ==, "sclp3270-chardev");
+    qtest_quit(qts);
+
+    /* The port may also be given without its key. */
+    qts = qtest_init("-nodefaults -sclp3270 0 -dev3270 port=0");
+    chardev_implied = qom_get_string(qts, "/machine/peripheral/sclp3270",
+                                     "chardev");
+    g_assert_cmpstr(chardev_implied, ==, "sclp3270-chardev");
+    qtest_quit(qts);
+}
+
 static void test_auto_devnos(void)
 {
     g_autofree char *devid0 = NULL;
@@ -526,6 +545,8 @@ int main(int argc, char **argv)
     qtest_add_func("/terminal3270/multiple", test_multiple_terminals);
     qtest_add_func("/terminal3270/dev3270-shortcut",
                    test_dev3270_shortcut);
+    qtest_add_func("/terminal3270/sclp3270-shortcut",
+                   test_sclp3270_shortcut);
     qtest_add_func("/terminal3270/auto-devnos", test_auto_devnos);
     qtest_add_func("/terminal3270/shared-chpid",
                    test_many_terminals_share_chpid);

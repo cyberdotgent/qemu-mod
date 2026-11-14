@@ -1149,6 +1149,30 @@ SRST
     different ports.
 ERST
 
+DEF("sclp3270", HAS_ARG, QEMU_OPTION_sclp3270,
+    "-sclp3270 [port=]port\n"
+    "                add the SCLP integrated 3270 console, listening on the\n"
+    "                loopback interface\n",
+    QEMU_ARCH_S390X)
+SRST
+``-sclp3270 [port=]port``
+    Add the SCLP integrated 3270 console (``sclp3270console``), the
+    equivalent of an HMC "Integrated 3270 Console", backed by a TN3270 socket
+    server listening on the loopback interface. The server does not wait for
+    a client when QEMU starts. Unlike ``-dev3270``, this console is reached
+    through SCLP event type 0x1b rather than a channel subsystem device, so
+    it has no device number. A machine has one integrated console, so the
+    option can be specified only once.
+
+    This option is equivalent to::
+
+        -chardev socket,id=sclp3270-chardev,host=127.0.0.1,port=port,server=on,wait=off,tn3270=on
+        -device sclp3270console,id=sclp3270,chardev=sclp3270-chardev
+
+    Use the expanded form for non-loopback listeners or other chardev
+    backends.
+ERST
+
 DEF("dev3215", HAS_ARG, QEMU_OPTION_dev3215,
     "-dev3215 [chardev=id][,devno=ccw-address][,id=id]\n"
     "                add an IBM 3215 console (stdio by default)\n",
