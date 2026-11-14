@@ -1401,11 +1401,8 @@ static void mtm_3907_class_init(ObjectClass *oc, const void *data)
                "KVM host";
     mc->init = mtm_3907_init;
     mc->default_cpu_type = S390_CPU_TYPE_NAME("host");
-    /*
-     * z/OS, the main user of this personality, requires at least 8 GiB.
-     * This is also a whole number of z14 storage increments (1 GiB).
-     */
-    mc->default_ram_size = 8 * GiB;
+    /* One storage increment of a typical z14 LPAR (1 GiB memory blocks). */
+    mc->default_ram_size = 1 * GiB;
     s390mc->mtm = 0x3907;
 
     object_class_property_add_str(oc, "lpar-name", mtm_get_lpar_name,
