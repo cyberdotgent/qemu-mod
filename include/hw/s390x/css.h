@@ -117,6 +117,17 @@ typedef enum IOInstEnding {
 } IOInstEnding;
 
 typedef struct SubchDev SubchDev;
+
+/* Optional explicitly configured device/control-unit topology. */
+typedef struct CssDeviceTopology {
+    bool valid;
+    uint8_t unit_address;
+    uint16_t lcu_queue_number;
+    uint8_t fla_valid_mask;
+    uint16_t fla[8];
+    uint16_t path_cu_number[8];
+} CssDeviceTopology;
+
 typedef struct S390QdioOps {
     int (*siga)(SubchDev *sch, uint8_t function, uint32_t output_mask,
                 uint32_t input_mask, uint64_t aob);
@@ -157,6 +168,7 @@ struct SubchDev {
     ESW esw;
     bool ccw_async_pending;
     const S390QdioOps *qdio_ops;
+    CssDeviceTopology topology;
 };
 
 /* A virtual device owns the current CCW and will complete it asynchronously. */

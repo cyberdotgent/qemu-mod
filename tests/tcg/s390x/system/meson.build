@@ -173,6 +173,10 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../eckd-zero-data.py')],
   },
+  'eckd-topology.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../eckd-topology.py')],
+  },
   'terminal3270-skip.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../terminal3270-skip.py')],

@@ -96,6 +96,15 @@ struct EckdCcwDevice {
     BlockBackend *blk;
     CkdImage image;
 
+    /* Optional explicit CU/LSS topology; UINT16_MAX selects legacy mode. */
+    uint16_t unit_address;
+    uint16_t unit_address_limit;
+    uint16_t subsystem_id;
+    uint16_t interface_id;
+    uint16_t lcu_queue_number;
+    uint16_t path_cu_number;
+    uint16_t fla;
+
     bool extent_defined;
     uint16_t extent_begin_cylinder;
     uint16_t extent_begin_head;
@@ -147,6 +156,29 @@ struct EckdCcwDevice {
     bool read_advance;
     bool read_active;
 };
+
+static bool eckd_has_explicit_topology(EckdCcwDevice *eckd)
+{
+    return eckd->unit_address != UINT16_MAX;
+}
+
+static uint8_t eckd_unit_address(EckdCcwDevice *eckd)
+{
+    return eckd_has_explicit_topology(eckd) ? eckd->unit_address :
+           CCW_DEVICE(eckd)->sch->devno;
+}
+
+static uint16_t eckd_subsystem_id(EckdCcwDevice *eckd)
+{
+    return eckd_has_explicit_topology(eckd) ? eckd->subsystem_id :
+           CCW_DEVICE(eckd)->sch->devno & ~0x1f;
+}
+
+static uint16_t eckd_interface_id(EckdCcwDevice *eckd)
+{
+    return eckd_has_explicit_topology(eckd) ? eckd->interface_id :
+           (eckd_subsystem_id(eckd) >> 5) & 0x7;
+}
 
 static uint8_t eckd_model(uint32_t cylinders)
 {
@@ -493,8 +525,9 @@ static void eckd_ned_text(uint8_t *dest, const char *ascii, size_t length)
 static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
 {
     CcwDevice *cdev = CCW_DEVICE(eckd);
-    uint16_t lss = cdev->sch->devno & ~0x1f;
-    uint16_t interface_id = (lss >> 5) & 0x7;
+    uint16_t lss = eckd_subsystem_id(eckd);
+    uint16_t interface_id = eckd_interface_id(eckd);
+    uint8_t unit_address = eckd_unit_address(eckd);
     char text[33] = { 0 };
 
     memset(buf, 0, 256);
@@ -524,13 +557,13 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
     buf[230] = 0x1e;
     stw_be_p(buf + 232, lss);
     buf[234] = 0x80;
-    buf[235] = cdev->sch->devno;
-    buf[236] = cdev->sch->devno;
-    buf[237] = cdev->sch->devno;
+    buf[235] = unit_address;
+    buf[236] = unit_address;
+    buf[237] = unit_address;
     buf[238] = interface_id;
     buf[241] = 0x80;
     buf[242] = 0x80;
-    buf[243] = cdev->sch->devno;
+    buf[243] = unit_address;
 }
 
 static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
@@ -562,7 +595,7 @@ static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
             }
             eckd->rssd_length = buf[8] ? 192 : 96;
             memset(data, 0, eckd->rssd_length);
-            data[1] = CCW_DEVICE(eckd)->sch->devno;
+            data[1] = eckd_unit_address(eckd);
             break;
         case 0x03: /* Read attention message: no message pending */
             memset(data, 0, 9);
@@ -1555,9 +1588,11 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
          * address rather than an ordinal within that subsystem.
          */
         memset(buf, 0, 40);
-        buf[1] = sch->devno;
-        buf[2] = 31;
-        stw_be_p(buf + 38, sch->devno & ~0x1f);
+        buf[1] = eckd_unit_address(eckd);
+        buf[3] = 1;
+        buf[2] = eckd_has_explicit_topology(eckd) ?
+                 eckd->unit_address_limit : 31;
+        stw_be_p(buf + 38, eckd_subsystem_id(eckd));
         return eckd_copy_response(eckd, &ccw, buf, 40);
     case CMD_RSCK:
         memset(buf, 0, sizeof(buf));
@@ -1611,6 +1646,31 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     uint16_t chpid;
     uint64_t perm = BLK_PERM_CONSISTENT_READ;
     Error *local_err = NULL;
+    bool explicit_topology = eckd->unit_address != UINT16_MAX ||
+                             eckd->unit_address_limit != UINT16_MAX ||
+                             eckd->subsystem_id != UINT16_MAX ||
+                             eckd->lcu_queue_number != UINT16_MAX ||
+                             eckd->path_cu_number != UINT16_MAX ||
+                             eckd->interface_id != UINT16_MAX ||
+                             eckd->fla != UINT16_MAX;
+
+    if (explicit_topology &&
+        (eckd->unit_address > UINT8_MAX ||
+         eckd->unit_address_limit > UINT8_MAX ||
+         eckd->subsystem_id == UINT16_MAX ||
+         eckd->lcu_queue_number == UINT16_MAX ||
+         eckd->path_cu_number == UINT16_MAX ||
+         (eckd->interface_id != UINT16_MAX &&
+          eckd->interface_id > UINT8_MAX))) {
+        error_setg(errp, "Explicit ECKD topology requires unit-address, "
+                   "unit-address-limit, subsystem-id, lcu-queue-number, "
+                   "and path-cu-number; unit-address, unit-address-limit, "
+                   "and interface-id must fit in 8 bits");
+        return;
+    }
+    if (explicit_topology && eckd->interface_id == UINT16_MAX) {
+        eckd->interface_id = 0;
+    }
 
     if (!eckd->blk) {
         error_setg(errp, "eckd-ccw requires a block backend via drive=");
@@ -1643,6 +1703,16 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     sch->id.dev_type = ECKD_DEV_TYPE;
     sch->id.dev_model = eckd_model(eckd->image.cylinders);
     css_sch_build_virtual_schib(sch, chpid, ECKD_CHPID_TYPE);
+    if (explicit_topology) {
+        sch->topology.valid = true;
+        sch->topology.unit_address = eckd->unit_address;
+        sch->topology.lcu_queue_number = eckd->lcu_queue_number;
+        sch->topology.path_cu_number[0] = eckd->path_cu_number;
+        if (eckd->fla != UINT16_MAX) {
+            sch->topology.fla_valid_mask = 0x80;
+            sch->topology.fla[0] = eckd->fla;
+        }
+    }
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = eckd_ccw_cb;
     sch->ccw_cb_first = true;
@@ -1676,6 +1746,19 @@ static void eckd_unrealize(DeviceState *dev)
 static const Property eckd_properties[] = {
     DEFINE_PROP_DRIVE("drive", EckdCcwDevice, blk),
     DEFINE_PROP_CCW_LOADPARM("loadparm", CcwDevice, loadparm),
+    DEFINE_PROP_UINT16("unit-address", EckdCcwDevice, unit_address,
+                       UINT16_MAX),
+    DEFINE_PROP_UINT16("unit-address-limit", EckdCcwDevice,
+                       unit_address_limit, UINT16_MAX),
+    DEFINE_PROP_UINT16("subsystem-id", EckdCcwDevice, subsystem_id,
+                       UINT16_MAX),
+    DEFINE_PROP_UINT16("interface-id", EckdCcwDevice, interface_id,
+                       UINT16_MAX),
+    DEFINE_PROP_UINT16("lcu-queue-number", EckdCcwDevice, lcu_queue_number,
+                       UINT16_MAX),
+    DEFINE_PROP_UINT16("path-cu-number", EckdCcwDevice, path_cu_number,
+                       UINT16_MAX),
+    DEFINE_PROP_UINT16("fla", EckdCcwDevice, fla, UINT16_MAX),
 };
 
 static void eckd_class_init(ObjectClass *klass, const void *data)

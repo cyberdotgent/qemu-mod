@@ -621,11 +621,22 @@ static void ioinst_handle_chsc_ssd(ChscReq *req, ChscResp *res)
             if (pmcw.flags & PMCW_FLAGS_MASK_DNV) {
                 desc[0] |= CHSC_SSD_VALID_DEV;
             }
-            desc[1] = pmcw.devno;
+            desc[1] = sch->topology.valid ? sch->topology.unit_address :
+                                            pmcw.devno;
             stw_be_p(desc + 2, pmcw.devno);
             desc[4] = pmcw.pim;
+            if (sch->topology.valid) {
+                desc[5] = sch->topology.fla_valid_mask;
+            }
             stw_be_p(desc + 6, schid);
             memcpy(desc + 8, pmcw.chpid, sizeof(pmcw.chpid));
+            if (sch->topology.valid) {
+                for (unsigned int path = 0;
+                     path < ARRAY_SIZE(sch->topology.fla); path++) {
+                    stw_be_p(desc + 16 + path * 2,
+                             sch->topology.fla[path]);
+                }
+            }
         }
         desc += CHSC_SSD_DESC_SIZE;
     }
@@ -691,6 +702,9 @@ static void ioinst_handle_chsc_sscud(ChscReq *req, ChscResp *res)
             }
             desc[1] = pmcw.pim;
             stw_be_p(desc + 2, pmcw.devno);
+            if (sch->topology.valid) {
+                stw_be_p(desc + 4, sch->topology.lcu_queue_number);
+            }
             stw_be_p(desc + 6, schid);
             memcpy(desc + 8, pmcw.chpid, sizeof(pmcw.chpid));
             for (path = 0; path < ARRAY_SIZE(pmcw.chpid); path++) {
@@ -704,7 +718,9 @@ static void ioinst_handle_chsc_sscud(ChscReq *req, ChscResp *res)
                  * used by Hercules: the device-number tens digit selects
                  * the CU, and the low byte identifies its channel path.
                  */
-                cun = ((pmcw.devno & 0x00f0) << 4) | pmcw.chpid[path];
+                cun = sch->topology.valid ?
+                      sch->topology.path_cu_number[path] :
+                      ((pmcw.devno & 0x00f0) << 4) | pmcw.chpid[path];
                 stw_be_p(desc + 16 + path * 2, cun);
             }
         }
