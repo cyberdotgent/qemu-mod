@@ -133,11 +133,19 @@ term3215_input_qemu_args = ['-monitor', 'none',
                             '-action', 'panic=exit-failure',
                             '-dev3215', 'devno=009',
                             '-kernel']
+sclp_3270_qemu_args = ['-display', 'none',
+                       '-action', 'panic=exit-failure',
+                       '-serial', 'stdio',
+                       '-nodefaults',
+                       '-chardev', 'ringbuf,id=sysg,size=4096',
+                       '-device', 'sclp3270console,chardev=sysg',
+                       '-kernel']
 tests += {
   'fba-tic.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-chp.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-skey.c': {'cflags': [ccw_cflags], 'qemu_args': fba_qemu_args},
   'sclp-cpu.c': {'cflags': [ccw_cflags], 'qemu_args': qemu_args},
+  'sclp-3270.c': {'cflags': [ccw_cflags], 'qemu_args': sclp_3270_qemu_args},
   'terminal3215.c': {'cflags': [ccw_cflags], 'qemu_args': term3215_qemu_args},
   'terminal3215-input.c': {
     'cflags': [ccw_cflags],
