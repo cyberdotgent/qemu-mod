@@ -77,6 +77,7 @@ int main(void)
     memset(&sccb, 0, sizeof(sccb));
     sccb.wem.h.length = sizeof(sccb.wem);
     sccb.wem.mask_length = 8;
+    sccb.wem.cp_receive[3] = 0x20;
     cc = service_call(SCLP_WRITE_EVENT_MASK);
     if (cc || sccb.wem.h.response_code != SCLP_RC_NORMAL_COMPLETION) {
         ml_printf("WEM cc=%d response=%04x\n", cc,
