@@ -73,6 +73,18 @@ def create_image(path):
                 end += 8
                 image[end:end + 4] = b"wrap"
                 end += 4
+            elif cylinder == 2 and head == 1:
+                # Write Track target: R0 with eight data bytes, then old
+                # R1..R3 which the format write must replace or erase.
+                struct.pack_into(">HHBBH", image, end, 2, 1, 0, 0, 8)
+                end += 8
+                image[end:end + 8] = b"oldR0dat"
+                end += 8
+                for number in (1, 2, 3):
+                    struct.pack_into(">HHBBH", image, end, 2, 1, number, 0, 4)
+                    end += 8
+                    image[end:end + 4] = b"old" + bytes((0x30 + number,))
+                    end += 4
             elif cylinder == 1 and head == 3:
                 struct.pack_into(">HHBBH", image, end, 1, 3, 0, 0, 100)
                 end += 8

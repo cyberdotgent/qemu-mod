@@ -155,6 +155,15 @@ struct EckdCcwDevice {
     uint32_t update_expected;
     uint32_t update_used;
     bool update_active;
+    /*
+     * A Write Data/Write Key-Data CCW that has just completed leaves the
+     * device oriented to the end of that record's data area.  A Write CKD
+     * command-chained directly to it formats the track from that point:
+     * this is how a Locate Record "Write Track" domain rewrites R0's data
+     * and then the following records.  Valid for the next command only.
+     */
+    bool update_done;
+    uint8_t update_done_record;
 
     uint8_t read_command;
     uint8_t read_record;
@@ -807,10 +816,12 @@ static int eckd_locate(EckdCcwDevice *eckd, const CCW1 *ccw,
     head = lduw_be_p(buf + 6);
     eckd->record = buf[12];
     eckd->locate_length = lduw_be_p(buf + 14);
-    if (operation == 0x03) {
+    if (operation == 0x03 || operation == 0x0b) {
         /*
-         * A new format-write domain replaces the track tail following the
-         * locate argument.  The first Write CKD will preserve that prefix.
+         * A new Format Write or Write Track domain replaces the track tail
+         * following the locate argument (for Write Track, following the
+         * record updated by the domain's first Write Data).  The first
+         * Write CKD will preserve that prefix.
          */
         eckd->format_active = false;
     }
@@ -1060,6 +1071,8 @@ static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
         eckd->fenced = true;
         return eckd_unit_check(eckd, SENSE_EQUIPMENT_CHECK, 0);
     }
+    eckd->update_done = true;
+    eckd->update_done_record = eckd->update_record;
     eckd_advance_record(eckd, record);
     return 0;
 }
@@ -1298,8 +1311,10 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     EckdCcwDevice *eckd = sch->driver_data;
     uint8_t buf[256] = { 0 };
     uint32_t length;
+    bool update_done = eckd->update_done;
     int ret;
 
+    eckd->update_done = false;
     if (!sch->last_cmd_valid) {
         /*
          * Define Extent, Locate Record and format-write domains belong to
@@ -1318,6 +1333,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd->write_active = false;
         eckd->update_active = false;
         eckd->read_active = false;
+        update_done = false;
     }
     trace_eckd_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count, ccw.flags,
                    eckd->cylinder, eckd->head, eckd->record);
@@ -1668,6 +1684,19 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         return eckd_write_r0(eckd, &ccw);
     case 0x1d:
     case CMD_WRITE_CKD_MT:
+        if (update_done) {
+            /*
+             * Write Data advanced the orientation to the next count field,
+             * but a Write CKD chained to it writes the record that follows
+             * the one just updated and erases the rest of the track.  z/OS
+             * formats JES2 checkpoint tracks with Locate Record Write Track:
+             * Write Data (R0), then data-chained Write CKD R1..Rn.  Starting
+             * the format domain after the advanced record instead kept the
+             * old R1 and rejected the new R1 with a data check.
+             */
+            eckd->record = eckd->update_done_record;
+            eckd->format_active = false;
+        }
         return eckd_write_ckd(eckd, &ccw);
     case CMD_ERASE:
         eckd_format_begin(eckd);
@@ -1786,6 +1815,7 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->format_active = false;
     eckd->write_active = false;
     eckd->update_active = false;
+    eckd->update_done = false;
     eckd->read_active = false;
     if (ec->parent_phases.hold) {
         ec->parent_phases.hold(obj, type);

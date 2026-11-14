@@ -29,6 +29,9 @@
 #define ECKD_CMD_RCD 0xfa
 #define ECKD_CMD_RELEASE 0x94
 #define ECKD_CMD_RESERVE 0xb4
+#define ECKD_CMD_WRITE_CKD 0x1d
+#define ECKD_LR_WRITE_TRACK 0x0b
+#define ECKD_LR_READ_TRACKS 0x0c
 
 LowCore *lowcore;
 
@@ -56,9 +59,41 @@ static uint8_t file_mask __attribute__((aligned(8)));
 static uint8_t active_chpids[32] __attribute__((aligned(32)));
 static Ccw1 ccws[8] __attribute__((aligned(8)));
 
+/*
+ * Write Track on track 2/1: Write Data (R0), then Write CKD R1 whose count
+ * field is data-chained to an IDA continuation carrying the 4K data area,
+ * then Write CKD R2.  The image holds old R1..R3 there.
+ */
+static uint8_t wt_extent[16] __attribute__((aligned(8))) = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 2, 0, 1,                /* begin CCHH 0002/0001 */
+    0, 2, 0, 1,                /* end CCHH 0002/0001 */
+};
+static uint8_t wt_locate[16] __attribute__((aligned(8)));
+static uint8_t wt_r0[8] __attribute__((aligned(8)));
+static uint8_t wt_count1[8] __attribute__((aligned(8)));
+static uint8_t wt_ckd2[12] __attribute__((aligned(8)));
+static uint8_t wt_buf[3 * 4096] __attribute__((aligned(4096)));
+static uint8_t rt_buf[8192] __attribute__((aligned(4096)));
+static uint64_t idaw2[2] __attribute__((aligned(8)));
+static uint32_t idaw1[3] __attribute__((aligned(8)));
+
 static uint32_t addr32(const void *p)
 {
     return (uint32_t)(unsigned long)p;
+}
+
+static bool bytes_differ(const void *a, const void *b, unsigned int n)
+{
+    const uint8_t *x = a;
+    const uint8_t *y = b;
+
+    for (unsigned int i = 0; i < n; i++) {
+        if (x[i] != y[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /*
@@ -1011,6 +1046,134 @@ int main(void)
     };
     if (!check_unit_check_sense(schid, &orb, 0x04)) {
         return 75;
+    }
+
+    /*
+     * Locate Record Write Track: z/OS formats JES2 checkpoint tracks with
+     * Write Data for R0 followed by Write CKD R1..Rn, each Write CKD's
+     * count field data-chained to an IDA continuation holding the data
+     * area.  The Write CKD must follow R0, replacing the old R1 and erasing
+     * the old track tail.  Run it with format-2 (4K) and format-1 (2K)
+     * IDAWs; the first IDAW starts mid-block so the transfer crosses blocks.
+     */
+    for (int variant = 0; variant < 2; variant++) {
+        CmdOrb ida_orb = orb;
+        uint8_t *r1 = wt_buf + 2048;
+        uint32_t expected = (8 + 8) + (8 + 4096) + (8 + 4) + 8;
+
+        ida_orb.c64 = variant == 0;
+        for (int i = 0; i < 4096; i++) {
+            r1[i] = (uint8_t)(i * 7 + variant);
+        }
+        if (variant == 0) {
+            idaw2[0] = (unsigned long)r1;
+            idaw2[1] = (unsigned long)(wt_buf + 4096);
+        } else {
+            idaw1[0] = addr32(r1);
+            idaw1[1] = addr32(wt_buf + 4096);
+            idaw1[2] = addr32(wt_buf + 6144);
+        }
+        memcpy(wt_r0, variant ? "R0DATA-1" : "R0DATA-0", 8);
+        memset(wt_locate, 0, sizeof(wt_locate));
+        wt_locate[0] = ECKD_LR_WRITE_TRACK;
+        wt_locate[3] = 3;
+        wt_locate[5] = 2;
+        wt_locate[7] = 1;
+        wt_locate[9] = 2;
+        wt_locate[11] = 1;
+        wt_locate[13] = 0xff;
+        wt_locate[14] = 0x10;
+        memcpy(wt_count1, "\x00\x02\x00\x01\x01\x00\x10\x00", 8);
+        memcpy(wt_ckd2, "\x00\x02\x00\x01\x02\x00\x00\x04", 8);
+        memcpy(wt_ckd2 + 8, variant ? "new1" : "new0", 4);
+        ccws[0] = (Ccw1) {
+            .cmd_code = ECKD_CMD_DEFINE_EXTENT,
+            .flags = CCW_FLAG_CC,
+            .count = sizeof(wt_extent),
+            .cda = addr32(wt_extent),
+        };
+        ccws[1] = (Ccw1) {
+            .cmd_code = ECKD_CMD_LOCATE,
+            .flags = CCW_FLAG_CC,
+            .count = sizeof(wt_locate),
+            .cda = addr32(wt_locate),
+        };
+        ccws[2] = (Ccw1) {
+            .cmd_code = ECKD_CMD_WRITE,
+            .flags = CCW_FLAG_CC,
+            .count = sizeof(wt_r0),
+            .cda = addr32(wt_r0),
+        };
+        ccws[3] = (Ccw1) {
+            .cmd_code = ECKD_CMD_WRITE_CKD,
+            .flags = CCW_FLAG_DC,
+            .count = sizeof(wt_count1),
+            .cda = addr32(wt_count1),
+        };
+        ccws[4] = (Ccw1) {
+            .cmd_code = ECKD_CMD_WRITE,   /* ignored: data chained */
+            .flags = CCW_FLAG_CC | CCW_FLAG_IDA,
+            .count = 4096,
+            .cda = variant ? addr32(idaw1) : addr32(idaw2),
+        };
+        ccws[5] = (Ccw1) {
+            .cmd_code = ECKD_CMD_WRITE_CKD,
+            .count = sizeof(wt_ckd2),
+            .cda = addr32(wt_ckd2),
+        };
+        irb = (Irb) { 0 };
+        if (ssch(schid, &ida_orb)) {
+            return 76;
+        }
+        consume_io_int();
+        if (tsch(schid, &irb) || irb.scsw.cstat ||
+            irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+            irb.scsw.count || irb.scsw.cpa != addr32(&ccws[6])) {
+            return 77;
+        }
+
+        /* Read the whole track back: R0, R1, R2, end of track only. */
+        memset(wt_locate, 0, sizeof(wt_locate));
+        wt_locate[0] = ECKD_LR_READ_TRACKS;
+        wt_locate[3] = 1;
+        wt_locate[5] = 2;
+        wt_locate[7] = 1;
+        wt_locate[9] = 2;
+        wt_locate[11] = 1;
+        wt_locate[13] = 0xff;
+        ccws[2] = (Ccw1) {
+            .cmd_code = ECKD_CMD_READ_TRACK,
+            .flags = CCW_FLAG_SLI,
+            .count = sizeof(rt_buf),
+            .cda = addr32(rt_buf),
+        };
+        memset(rt_buf, 0xa5, sizeof(rt_buf));
+        irb = (Irb) { 0 };
+        if (ssch(schid, &orb)) {
+            return 78;
+        }
+        consume_io_int();
+        if (tsch(schid, &irb) || irb.scsw.cstat ||
+            irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+            irb.scsw.count != sizeof(rt_buf) - expected) {
+            return 79;
+        }
+        if (bytes_differ(rt_buf, "\x00\x02\x00\x01\x00\x00\x00\x08", 8) ||
+            bytes_differ(rt_buf + 8, wt_r0, 8)) {
+            return 80;
+        }
+        if (bytes_differ(rt_buf + 16, wt_count1, 8) ||
+            bytes_differ(rt_buf + 24, r1, 4096)) {
+            return 81;
+        }
+        if (bytes_differ(rt_buf + 4120, wt_ckd2, sizeof(wt_ckd2))) {
+            return 82;
+        }
+        for (int i = 4132; i < 4140; i++) {
+            if (rt_buf[i] != 0xff) {
+                return 83;
+            }
+        }
     }
 
     return 0;
