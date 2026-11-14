@@ -1935,9 +1935,12 @@ void build_irb_virtual(SubchDev *sch, IRB *irb)
         /* If a unit check is pending, copy sense data. */
         if ((schib->scsw.dstat & SCSW_DSTAT_UNIT_CHECK) &&
             (schib->pmcw.chars & PMCW_CHARS_MASK_CSENSE)) {
-            irb->scsw.flags |= SCSW_FLAGS_MASK_ESWF | SCSW_FLAGS_MASK_ECTL;
+            /* Concurrent sense uses a format-1 ESW, not a format-0 logout. */
+            irb->scsw.flags |= SCSW_FLAGS_MASK_ECTL;
             build_irb_sense_data(sch, irb);
-            irb->esw.erw = ESW_ERW_SENSE | (sizeof(sch->sense_data) << 8);
+            /* Sense count occupies bits 8-13 (byte 1) of the ERW. */
+            irb->esw.erw = ESW_ERW_SENSE |
+                            (sizeof(sch->sense_data) << 16);
         }
     }
 }

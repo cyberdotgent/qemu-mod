@@ -115,5 +115,26 @@ int main(void)
         sense[0] != 0x40) {
         return 6;
     }
+
+    /* Concurrent sense uses a format-1 ESW and byte 1 for its count. */
+    if (stsch_err(schid, &schib)) {
+        return 7;
+    }
+    schib.pmcw.csense = 1;
+    if (msch_err(schid, &schib)) {
+        return 8;
+    }
+    ccw = (Ccw1) {
+        .cmd_code = TERM3270_CMD_NOP,
+        .flags = CCW_FLAG_SLI,
+        .count = 1,
+        .cda = 0,
+    };
+    if (run_ccw(schid, &orb, &irb) ||
+        irb.scsw.flags != 0x0082 || irb.scsw.dstat != SCSW_DSTAT_UCHK ||
+        irb.scsw.cstat || irb.scsw.count != 1 ||
+        irb.esw[1] != 0x01200000 || ((uint8_t *)irb.ecw)[0] != 0x40) {
+        return 9;
+    }
     return 0;
 }
