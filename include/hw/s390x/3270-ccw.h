@@ -41,6 +41,7 @@
 #define TC_SELRMP  0x2b         /* Select read modified protected */
 #define TC_SELRBP  0x3b         /* Select read buffer protected */
 #define TC_SELWRITE 0x4b        /* Select write */
+#define TC_RCD      0x72        /* Read configuration data */
 #define TC_SENSEID 0xe4         /* Sense ID */
 
 /* Remote TN3270 commands */

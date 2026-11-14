@@ -91,6 +91,7 @@ static int emulated_ccw_3270_cb(SubchDev *sch, CCW1 ccw)
     switch (ccw.cmd_code) {
     case TC_NOP:
     case TC_SENSE:
+    case TC_RCD:
     case TC_SENSEID:
         rc = ck->control_3270 ? ck->control_3270(dev, &ccw) : -ENOSYS;
         break;

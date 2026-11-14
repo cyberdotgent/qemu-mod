@@ -1243,6 +1243,16 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
     SubchDev *sch = terminal_sch(t);
+    static const uint8_t config_template[96] = {
+        0xd0, 0x01, 0x06, 0x01,
+        0x40, 0x40, 0xf2, 0xf0, 0xf7, 0xf4,
+        [31] = 0x17,
+        [32] = 0xf0, [33] = 0x01, [34] = 0x06, [35] = 0x01,
+        [36] = 0x40, [37] = 0x40, [38] = 0xf2,
+        [39] = 0xf0, [40] = 0xf7, [41] = 0xf4,
+        [62] = 0x20, [63] = 0x74,
+        [64] = 0x80, [67] = 0x17,
+    };
     uint8_t sense_id[] = {
         0xff,
         dev->cu_type >> 8,
@@ -1252,6 +1262,8 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
         dev->dev_type,
         dev->dev_model,
     };
+    uint8_t config_data[sizeof(config_template)];
+    char identifier[13];
     uint8_t *data;
     uint32_t available;
     uint32_t len;
@@ -1265,6 +1277,7 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
      * a client connects.
      */
     if (ccw->cmd_code != TC_SENSE && ccw->cmd_code != TC_SENSEID &&
+        ccw->cmd_code != TC_RCD &&
         (!t->connected || !t->ready)) {
         sch->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return -EIO;
@@ -1282,6 +1295,15 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     case TC_SENSEID:
         data = sense_id;
         available = sizeof(sense_id);
+        break;
+    case TC_RCD:
+        memcpy(config_data, config_template, sizeof(config_data));
+        snprintf(identifier, sizeof(identifier), "%012X",
+                 (unsigned int)sch->devno);
+        ebcdic_put(config_data + 18, identifier, 12);
+        ebcdic_put(config_data + 50, identifier, 12);
+        data = config_data;
+        available = sizeof(config_data);
         break;
     default:
         return -ENOSYS;
