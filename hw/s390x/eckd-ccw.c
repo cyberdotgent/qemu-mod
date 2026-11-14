@@ -526,6 +526,7 @@ static void eckd_ned_text(uint8_t *dest, const char *ascii, size_t length)
 static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
 {
     CcwDevice *cdev = CCW_DEVICE(eckd);
+    bool explicit_topology = eckd_has_explicit_topology(eckd);
     uint16_t lss = eckd_subsystem_id(eckd);
     uint16_t interface_id = eckd_interface_id(eckd);
     uint8_t unit_address = eckd_unit_address(eckd);
@@ -533,27 +534,50 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
 
     memset(buf, 0, 256);
     stl_be_p(buf, 0xdc010100);
-    snprintf(text, sizeof(text), "  33900%02XHRCZZ",
-             eckd_model(eckd->image.cylinders));
-    memcpy(text + 14, eckd->image.serial, 12);
+    if (explicit_topology) {
+        snprintf(text, sizeof(text), "002107900IBM75%012X",
+                 (unsigned int)lss);
+    } else {
+        snprintf(text, sizeof(text), "  33900%02XHRCZZ",
+                 eckd_model(eckd->image.cylinders));
+        memcpy(text + 14, eckd->image.serial, 12);
+    }
     eckd_ned_text(buf + 4, text, 26);
-    stw_be_p(buf + 30, cdev->sch->devno);
+    stw_be_p(buf + 30, explicit_topology ? unit_address :
+             cdev->sch->devno);
 
     stl_be_p(buf + 32, 0xd4020000);
-    snprintf(text, sizeof(text), "  33900%02XHRCZZ000000000003",
-             eckd_model(eckd->image.cylinders));
+    if (explicit_topology) {
+        snprintf(text, sizeof(text), "002107986IBM75%012X",
+                 (unsigned int)lss);
+    } else {
+        snprintf(text, sizeof(text), "  33900%02XHRCZZ000000000003",
+                 eckd_model(eckd->image.cylinders));
+    }
     eckd_ned_text(buf + 36, text, 26);
 
     stl_be_p(buf + 64, 0xd0000000);
-    snprintf(text, sizeof(text), "  21070E8HRCZZ000000000002");
+    if (explicit_topology) {
+        snprintf(text, sizeof(text), "002107986IBM75%012X",
+                 (unsigned int)lss);
+    } else {
+        snprintf(text, sizeof(text), "  21070E8HRCZZ000000000002");
+    }
     eckd_ned_text(buf + 68, text, 26);
-    buf[95] = cdev->sch->devno >> 8;
+    if (!explicit_topology) {
+        buf[95] = cdev->sch->devno >> 8;
+    }
 
     stl_be_p(buf + 96, 0xf0000001);
-    snprintf(text, sizeof(text), "  2107   HRCZZ000000000001");
+    if (explicit_topology) {
+        snprintf(text, sizeof(text), "002107900IBM75%012X",
+                 (unsigned int)lss);
+    } else {
+        snprintf(text, sizeof(text), "  2107   HRCZZ000000000001");
+    }
     eckd_ned_text(buf + 100, text, 26);
 
-    if (eckd_has_explicit_topology(eckd)) {
+    if (explicit_topology) {
         static const uint8_t neq_template[32] = {
             0x80, 0x00, 0x02, 0x13, 0x2d, 0x00, 0x1e, 0x00,
             0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
