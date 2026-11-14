@@ -1974,8 +1974,7 @@ static void kvm_zos_compat_stsi(S390CPU *cpu)
     }
     value = 0;
     if (!cpu_memory_rw_debug(cs, svt + 1376, &value, 1, true)) {
-        info_report("s390 z/OS compatibility: STSI cleared SVT+0x560 at "
-                    "0x%08x", svt + 1376);
+        trace_kvm_zos_svt560_cleared(svt + 1376);
     }
 }
 
