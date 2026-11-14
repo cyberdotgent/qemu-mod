@@ -10,7 +10,7 @@ import tempfile
 
 
 HEADS = 15
-CYLINDERS = 2
+CYLINDERS = 3
 TRACK_SIZE = 56832
 HEADER_SIZE = 512
 
@@ -56,6 +56,23 @@ def create_image(path):
                 end += 8
                 image[end:end + 3] = b"cyl"
                 end += 3
+            elif cylinder == 1 and head == 14:
+                # Last track of cylinder 1: two keyed records (44-byte keys,
+                # as VTOC DSCBs), then the cylinder boundary.
+                for number in (1, 2):
+                    struct.pack_into(">HHBBH", image, end, 1, 14, number,
+                                     44, 4)
+                    end += 8
+                    image[end:end + 44] = bytes([0x40 + number]) * 44
+                    end += 44
+                    image[end:end + 4] = b"last"
+                    end += 4
+            elif cylinder == 2 and head == 0:
+                # A record a wrapping multitrack read would wrongly find.
+                struct.pack_into(">HHBBH", image, end, 2, 0, 1, 0, 4)
+                end += 8
+                image[end:end + 4] = b"wrap"
+                end += 4
             elif cylinder == 1 and head == 3:
                 struct.pack_into(">HHBBH", image, end, 1, 3, 0, 0, 100)
                 end += 8

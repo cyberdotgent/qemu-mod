@@ -89,6 +89,12 @@
 #define SENSE1_END_CYLINDER 0x20
 #define SENSE1_NO_RECORD 0x08
 #define SENSE1_FILE_PROTECTED 0x04
+/* File mask (Define Extent byte 0 / Set File Mask) seek control */
+#define FILE_MASK_SEEK_CTL        0x18
+#define FILE_MASK_SEEK_ALL        0x00  /* allow all seeks and recalibrate */
+#define FILE_MASK_SEEK_CYL_HEAD   0x08  /* allow seek cylinder and head */
+#define FILE_MASK_SEEK_HEAD       0x10  /* allow seek head only */
+#define FILE_MASK_SEEK_INHIBIT    0x18  /* inhibit seek and multitrack */
 #define SENSE1_WRITE_INHIBITED 0x02
 
 struct EckdCcwDevice {
@@ -355,6 +361,48 @@ static int eckd_position(EckdCcwDevice *eckd, uint16_t cylinder,
     return 0;
 }
 
+static int eckd_next_track(EckdCcwDevice *eckd);
+
+/*
+ * Advance a multitrack operation to the next track.  Outside a Locate
+ * Record domain, multitrack operation terminates at the cylinder boundary
+ * with End of Cylinder instead of continuing on the next cylinder.
+ */
+static int eckd_next_track_mt(EckdCcwDevice *eckd)
+{
+    if (!eckd->locate_count) {
+        /*
+         * A file mask that inhibits seek and multitrack operation makes
+         * the track switch itself a file-protection violation.
+         */
+        if ((eckd->file_mask & FILE_MASK_SEEK_CTL) == FILE_MASK_SEEK_INHIBIT) {
+            return eckd_unit_check(eckd, 0, SENSE1_FILE_PROTECTED);
+        }
+        if (eckd->head + 1 >= eckd->image.heads) {
+            return eckd_unit_check(eckd, 0, SENSE1_END_CYLINDER);
+        }
+    }
+    return eckd_next_track(eckd);
+}
+
+/* Is a seek command permitted by the current file mask? */
+static bool eckd_seek_permitted(EckdCcwDevice *eckd, uint8_t command)
+{
+    uint8_t control = eckd->file_mask & FILE_MASK_SEEK_CTL;
+
+    switch (command) {
+    case CMD_SEEK:
+        return control == FILE_MASK_SEEK_ALL;
+    case CMD_SEEK_CYLINDER:
+        return control == FILE_MASK_SEEK_ALL ||
+               control == FILE_MASK_SEEK_CYL_HEAD;
+    case CMD_SEEK_HEAD:
+        return control != FILE_MASK_SEEK_INHIBIT;
+    default:
+        return true;
+    }
+}
+
 static int eckd_next_track(EckdCcwDevice *eckd)
 {
     uint16_t cylinder = eckd->cylinder;
@@ -432,11 +480,7 @@ static const CkdImageRecord *eckd_current_record(EckdCcwDevice *eckd,
          * does.  Trying only the immediately following track incorrectly
          * reported No Record Found when z/OS crossed a run of empty tracks.
          */
-        if (!eckd->locate_count && eckd->head + 1 >= eckd->image.heads) {
-            eckd_unit_check(eckd, 0, SENSE1_END_CYLINDER);
-            break;
-        }
-        if (eckd_next_track(eckd)) {
+        if (eckd_next_track_mt(eckd)) {
             break;
         }
         record = eckd_first_data_record(&eckd->image);
@@ -1263,6 +1307,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
          * a later START SUBCHANNEL incorrectly rejects ordinary seeks.
          */
         eckd->extent_defined = false;
+        eckd->file_mask = 0;
         eckd->locate_count = 0;
         eckd->locate_operation = 0;
         eckd->format_active = false;
@@ -1321,6 +1366,9 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         if (ccw.count < 6 || eckd_read_guest(eckd, buf, 6)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
+        if (!eckd_seek_permitted(eckd, ccw.cmd_code)) {
+            return eckd_unit_check(eckd, 0, SENSE1_FILE_PROTECTED);
+        }
         if (lduw_be_p(buf) != 0) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
         }
@@ -1334,6 +1382,9 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
          */
         if (ccw.count < 6 || eckd_read_guest(eckd, buf, 6)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        if (!eckd_seek_permitted(eckd, ccw.cmd_code)) {
+            return eckd_unit_check(eckd, 0, SENSE1_FILE_PROTECTED);
         }
         if (lduw_be_p(buf) != 0) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
@@ -1370,7 +1421,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
          */
         if (eckd->search_index >= eckd->image.record_count) {
             if (ccw.cmd_code & 0x80) {
-                ret = eckd_next_track(eckd);
+                ret = eckd_next_track_mt(eckd);
                 if (ret) {
                     return ret;
                 }
@@ -1530,6 +1581,17 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
                      ckd_image_find_record(&eckd->image, eckd->record) : NULL;
         }
         eckd->search_count_advance = false;
+        /*
+         * Read Count requires a user-data record: record zero is skipped
+         * (only Read R0, Read Track, Search ID and Locate Record reach it).
+         * After Read HA or a Seek the device is oriented at R0, so the next
+         * Read Count returns R1's count field.
+         */
+        if (record && record->number == 0) {
+            eckd_advance_record(eckd, record);
+            record = eckd->record <= UINT8_MAX ?
+                     ckd_image_find_record(&eckd->image, eckd->record) : NULL;
+        }
         if (!record && !multitrack && !eckd->search_index_seen) {
             /*
              * Reaching index during a non-multitrack count scan starts one
@@ -1551,7 +1613,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
              * next nonzero record is found.  Search operations use different
              * index/cylinder-boundary rules and stay in their own helper.
              */
-            ret = eckd_next_track(eckd);
+            ret = eckd_next_track_mt(eckd);
             if (ret) {
                 return ret;
             }
@@ -1579,10 +1641,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     case CMD_READ_HA:
     case CMD_READ_HA_MT:
         if (ccw.cmd_code == CMD_READ_HA_MT && !eckd->locate_count) {
-            if (eckd->head + 1 >= eckd->image.heads) {
-                return eckd_unit_check(eckd, 0, SENSE1_END_CYLINDER);
-            }
-            ret = eckd_next_track(eckd);
+            ret = eckd_next_track_mt(eckd);
             if (ret) {
                 return ret;
             }
@@ -1718,6 +1777,7 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     EckdCcwDeviceClass *ec = ECKD_CCW_GET_CLASS(eckd);
 
     eckd->extent_defined = false;
+    eckd->file_mask = 0;
     eckd->positioned = false;
     eckd->search_match = false;
     eckd->search_index = 0;

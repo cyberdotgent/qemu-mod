@@ -16,6 +16,8 @@
 #define ECKD_CMD_SEEK_HEAD 0x1b
 #define ECKD_CMD_READ_COUNT 0x12
 #define ECKD_CMD_READ_COUNT_MT 0x92
+#define ECKD_CMD_SEARCH_KEY_HIGH 0x49
+#define ECKD_CMD_SET_FILE_MASK 0x1f
 #define ECKD_CMD_WRITE_DATA_SPECIAL 0xa5
 #define ECKD_CMD_READ_DATA_SPECIAL 0xa6
 #define ECKD_CMD_WRITE_DATA_SPECIAL_2 0xb5
@@ -50,12 +52,49 @@ static uint8_t locate[16] __attribute__((aligned(8))) = {
 static uint8_t count[8] __attribute__((aligned(8)));
 static uint8_t data[256] __attribute__((aligned(8)));
 static uint8_t sense[32] __attribute__((aligned(8)));
+static uint8_t file_mask __attribute__((aligned(8)));
 static uint8_t active_chpids[32] __attribute__((aligned(32)));
-static Ccw1 ccws[4] __attribute__((aligned(8)));
+static Ccw1 ccws[8] __attribute__((aligned(8)));
 
 static uint32_t addr32(const void *p)
 {
     return (uint32_t)(unsigned long)p;
+}
+
+/*
+ * Run the channel program in ccws[], expect unit check, then read basic
+ * sense and expect sense byte 0 clear and byte 1 equal to sense1.
+ */
+static bool check_unit_check_sense(SubChannelId schid, CmdOrb *orb,
+                                   uint8_t sense1)
+{
+    Irb irb = { 0 };
+
+    if (ssch(schid, orb)) {
+        return false;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND |
+                           SCSW_DSTAT_UCHK)) {
+        return false;
+    }
+    memset(sense, 0, sizeof(sense));
+    ccws[0] = (Ccw1) {
+        .cmd_code = CCW_CMD_BASIC_SENSE,
+        .count = sizeof(sense),
+        .cda = addr32(sense),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, orb)) {
+        return false;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND)) {
+        return false;
+    }
+    return !sense[0] && sense[1] == sense1;
 }
 
 int main(void)
@@ -849,6 +888,129 @@ int main(void)
         data[16] != 'g' || data[17] != 'o' ||
         data[18] != 'o' || data[19] != 'd') {
         return 53;
+    }
+
+    /*
+     * Outside a Locate Record domain, a multitrack Read Count that runs off
+     * the last track of a cylinder ends with End of Cylinder; it must not
+     * continue on the next cylinder.  Head 14 of cylinder 1 holds one
+     * record; the second Read Count reaches the cylinder boundary, where a
+     * wrapping implementation would instead return cylinder 2's record.
+     */
+    memset(seek, 0, sizeof(seek));
+    seek[3] = 1;
+    seek[5] = 14;
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(seek),
+        .cda = addr32(seek),
+    };
+    /*
+     * As in VSE's VTOC scan: Read Count MT, Search Key High (the records
+     * have no key, so the search transfers nothing and does not match),
+     * then Read Count MT again past the last record of the cylinder.
+     */
+    memset(data, 0xff, 44);    /* higher than every key: never matches */
+    for (int i = 0; i < 2; i++) {
+        /* Like VSE, transfer only the CCHHR (5 bytes) of each count. */
+        ccws[1 + 2 * i] = (Ccw1) {
+            .cmd_code = ECKD_CMD_READ_COUNT_MT,
+            .flags = CCW_FLAG_CC | CCW_FLAG_SLI,
+            .count = 5,
+            .cda = addr32(count),
+        };
+        ccws[2 + 2 * i] = (Ccw1) {
+            .cmd_code = ECKD_CMD_SEARCH_KEY_HIGH,
+            .flags = CCW_FLAG_CC,
+            .count = 44,
+            .cda = addr32(data),
+        };
+    }
+    ccws[5] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ_COUNT_MT,
+        .flags = CCW_FLAG_SLI,
+        .count = 5,
+        .cda = addr32(count),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 70;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND |
+                           SCSW_DSTAT_UCHK)) {
+        return 71;
+    }
+    memset(sense, 0, sizeof(sense));
+    ccws[0] = (Ccw1) {
+        .cmd_code = CCW_CMD_BASIC_SENSE,
+        .count = sizeof(sense),
+        .cda = addr32(sense),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 72;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        sense[0] || sense[1] != 0x20) {
+        return 73;
+    }
+
+    /*
+     * File mask seek control "inhibit seek and multitrack" (X'18'): a Seek
+     * after Set File Mask is a file-protection violation.
+     */
+    file_mask = 0x18;
+    memset(seek, 0, sizeof(seek));
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SET_FILE_MASK,
+        .flags = CCW_FLAG_CC,
+        .count = 1,
+        .cda = addr32(&file_mask),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK,
+        .count = sizeof(seek),
+        .cda = addr32(seek),
+    };
+    if (!check_unit_check_sense(schid, &orb, 0x04)) {
+        return 74;
+    }
+
+    /*
+     * The same mask makes a multitrack track switch file protected: R1 is
+     * the last record of track 0/0, so the second Read Count MT would have
+     * to move to head 1.
+     */
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SEEK,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(seek),
+        .cda = addr32(seek),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_SET_FILE_MASK,
+        .flags = CCW_FLAG_CC,
+        .count = 1,
+        .cda = addr32(&file_mask),
+    };
+    ccws[2] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ_COUNT_MT,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(count),
+        .cda = addr32(count),
+    };
+    ccws[3] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ_COUNT_MT,
+        .count = sizeof(count),
+        .cda = addr32(count),
+    };
+    if (!check_unit_check_sense(schid, &orb, 0x04)) {
+        return 75;
     }
 
     return 0;
