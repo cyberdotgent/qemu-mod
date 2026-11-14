@@ -51,6 +51,7 @@ struct SCLPConsoleLM {
     SCLPEvent event;
     CharFrontend chr;
     bool echo;                  /* immediate echo of input if true        */
+    bool last_was_cr;           /* swallow the LF of a CR LF pair         */
     uint32_t write_errors;      /* errors writing to char layer           */
     uint32_t length;            /* length of byte stream in buffer        */
     uint8_t buf[SIZE_CONSOLE_BUFFER];
@@ -84,15 +85,42 @@ static int chr_can_read(void *opaque)
     return 1;
 }
 
+static void echo_output(SCLPConsoleLM *scon, const void *buf, int len)
+{
+    if (scon->echo) {
+        /*
+         * XXX this blocks entire thread. Rewrite to use
+         * qemu_chr_fe_write and background I/O callbacks
+         */
+        qemu_chr_fe_write_all(&scon->chr, buf, len);
+    }
+}
+
 static void chr_read(void *opaque, const uint8_t *buf, int size)
 {
     SCLPConsoleLM *scon = opaque;
+    bool after_cr = scon->last_was_cr;
 
     assert(size == 1);
 
+    scon->last_was_cr = *buf == '\r';
+    if (*buf == '\n' && after_cr) {
+        /* CR LF from a terminal or socket client is a single line end. */
+        return;
+    }
     if (*buf == '\r' || *buf == '\n') {
+        /* Leave the cursor at the start of the line after the command. */
+        echo_output(scon, NEWLINE, 1);
         scon->event.event_pending = true;
         sclp_service_interrupt(0);
+        return;
+    }
+    if (*buf == '\b' || *buf == 0x7f) {
+        /* Raw terminals (e.g. -nographic) deliver erase to the device. */
+        if (scon->length) {
+            scon->length--;
+            echo_output(scon, "\b \b", 3);
+        }
         return;
     }
     if (scon->length == MAX_COMMAND_LEN) {
@@ -101,11 +129,7 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
     }
     scon->buf[scon->length] = *buf;
     scon->length += 1;
-    if (scon->echo) {
-        /* XXX this blocks entire thread. Rewrite to use
-         * qemu_chr_fe_write and background I/O callbacks */
-        qemu_chr_fe_write_all(&scon->chr, buf, size);
-    }
+    echo_output(scon, buf, size);
 }
 
 /* functions to be called by event facility */
@@ -235,6 +259,9 @@ static int write_console_data(SCLPEvent *event, const uint8_t *buf, int len)
 
 static int process_mdb(SCLPEvent *event, MDBO *mdbo)
 {
+    SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
+    bool partial_input = scon->echo && scon->length &&
+                         !event->event_pending;
     int rc;
     int len;
     QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER];
@@ -250,11 +277,31 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
     /* convert EBCDIC SCLP contents to ASCII console message */
     ascii_put(buffer, mdbo->mto.message, len);
     trace_sclp_lm_message(len);
+
+    /*
+     * Each message is a complete line: terminate it, so that the cursor
+     * (and operator input) starts on a fresh line.  If the operator is in
+     * the middle of typing a command, finish that line first and repeat
+     * the partial input after the message.
+     */
+    if (partial_input) {
+        rc = write_console_data(event, (uint8_t *)NEWLINE, 1);
+        if (rc < 0) {
+            return rc;
+        }
+    }
+    rc = write_console_data(event, buffer, len);
+    if (rc < 0) {
+        return rc;
+    }
     rc = write_console_data(event, (uint8_t *)NEWLINE, 1);
     if (rc < 0) {
         return rc;
     }
-    return write_console_data(event, buffer, len);
+    if (partial_input) {
+        rc = write_console_data(event, scon->buf, scon->length);
+    }
+    return rc;
 }
 
 static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
@@ -357,6 +404,7 @@ static void console_reset(DeviceState *dev)
 
    event->event_pending = false;
    scon->length = 0;
+   scon->last_was_cr = false;
    scon->write_errors = 0;
 }
 
