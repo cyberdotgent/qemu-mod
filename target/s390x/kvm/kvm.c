@@ -1973,9 +1973,7 @@ static void kvm_zos_compat_stsi(S390CPU *cpu)
         return;
     }
     value = 0;
-    if (!cpu_memory_rw_debug(cs, svt + 1376, &value, 1, true)) {
-        trace_kvm_zos_svt560_cleared(svt + 1376);
-    }
+    cpu_memory_rw_debug(cs, svt + 1376, &value, 1, true);
 }
 
 static int handle_stsi(S390CPU *cpu)
