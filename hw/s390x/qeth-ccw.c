@@ -1,9 +1,23 @@
 /*
- * Emulated OSA Express QETH adapter
+ * Emulated OSA-Express QETH adapter (OSD)
  *
- * This implements the subset used by the Linux qeth OSD layer-2 driver:
- * three peer CCW subchannels, IDX/MPC/IPA control traffic, format-0 QDIO,
- * conventional PCI, and Ethernet transport through a QEMU netdev.
+ * The adapter presents three peer CCW subchannels (read, write and data)
+ * that carry the IDX, MPC (CM/ULP/DM) and IPA control protocols and a
+ * format-0 QDIO data path with conventional (PCI) interruptions, attached
+ * to a QEMU network backend.
+ *
+ * Both QETH modes are supported, selected by the guest per connection in
+ * ULP_ENABLE:
+ *  - layer 2: the guest exchanges Ethernet frames (qeth header type 2);
+ *  - layer 3: the guest exchanges IP packets (qeth header type 1) and the
+ *    adapter owns the link layer: it registers the guest's IP addresses
+ *    (SETIP), answers and resolves ARP on the guest's behalf, maps
+ *    broadcast and multicast destinations, and adds or strips the Ethernet
+ *    header.  This is the mode used by z/OS Communications Server (MPCIPA /
+ *    IPAQENET) and by the Linux qeth_l3 driver.
+ *
+ * Protocol layouts follow the Linux qeth driver and the architecture as
+ * observed on working OSA implementations.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -18,7 +32,9 @@
 #include "qemu/bswap.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "trace.h"
 
 #define QETH_CU_TYPE             0x1731
 #define QETH_CU_MODEL            0x01
@@ -26,6 +42,7 @@
 #define QETH_DEV_MODEL           0x01
 #define QETH_CHPID_TYPE          0x11
 #define QETH_AUTO_DEVNO          0x0400
+#define QETH_PEERS               3
 
 #define QETH_CMD_WRITE           0x01
 #define QETH_CMD_READ            0x02
@@ -38,24 +55,156 @@
 #define QETH_CMD_AQ              0x1f
 #define QETH_CMD_SENSE_ID        0xe4
 
-#define QETH_IDX_SIZE            0x22
-#define QETH_MPC_CM_ENABLE_SIZE  0x63
-#define QETH_MPC_CM_SETUP_SIZE   0x64
-#define QETH_MPC_ULP_ENABLE_SIZE 0x6b
-#define QETH_MPC_ULP_SETUP_SIZE  0x6c
-#define QETH_MPC_DM_ACT_SIZE     0x55
+/* Self-description */
+#define QETH_RCD_SIZE            128
+#define QETH_RNI_SIZE            64
+#define QETH_CULA                0x00
+#define QETH_LINK_ADDRESS        0x0d
+#define QETH_NED_FLAGS           0xd0   /* NED, serial number valid */
+#define QETH_NED_TOKEN           0x20
+#define QETH_NED_TYPE_DEVICE     0x01
+#define QETH_NED_TYPE_CU         0x02
+#define QETH_NED_CLASS_COMM      0x06
+#define QETH_NEQ_GENERAL         0x80
+#define QETH_CIW_VALID           0x40
+
 #define QETH_MAX_CTRL            4096
 #define QETH_MAX_FRAME           65536
+#define QETH_HDR_SIZE            32
+#define QETH_RESPONSES_MAX       16
 
-#define QETH_IPA_STARTLAN        0x01
-#define QETH_IPA_STOPLAN         0x02
-#define QETH_IPA_QIPASSIST       0xb2
-#define QETH_IPA_SETADAPTERPARMS 0xb8
-#define QETH_IPA_SETADP_QUERY    0x00000001
-#define QETH_IPA_SETADP_READ_MAC 0x00000002
-#define QETH_IPA_SETADAPTER_CAP  0x00000400
+/* IDX */
+#define QETH_IDX_SIZE            0x22
+#define QETH_IDX_REQ             0x00008000
+#define QETH_IDX_TYPE_READ       0x1901
+#define QETH_IDX_TYPE_WRITE      0x1501
+
+/* Adapter tokens ("QEMU", "QEM1" .. "QEM4" in ASCII) */
+#define QETH_TOKEN_ISSUER        0x51454d55
+#define QETH_TOKEN_CM_FILTER     0x51454d31
+#define QETH_TOKEN_CM_CONN       0x51454d32
+#define QETH_TOKEN_ULP_FILTER    0x51454d33
+#define QETH_TOKEN_ULP_CONN      0x51454d34
+
+/* MPC transport header, request/response header, PDU header */
+#define MPC_TH_FIRST4            0x00e00000
+#define MPC_TH_SIZE              0x14
+#define MPC_RRH_SIZE_SHORT       0x1c
+#define MPC_PH_SIZE              0x08
+#define MPC_PUK_SIZE             0x0c
+#define MPC_RRH_TYPE_CM          0x81
+#define MPC_RRH_TYPE_ULP         0x41
+#define MPC_RRH_TYPE_IPA         0xc1
+#define MPC_PROTO_ULP            0x02
+#define MPC_PROTO_UNKNOWN        0x7e
+#define MPC_PROT_LAYER3          0x03
+#define MPC_PUK_WHAT_41          0x41
+#define MPC_PUK_WHAT_43          0x43
+#define MPC_PUK_ENABLE           0x02
+#define MPC_PUK_DISABLE          0x03
+#define MPC_PUK_SETUP            0x04
+#define MPC_PUK_TAKEDOWN         0x05
+#define MPC_PUK_CONFIRM          0x06
+#define MPC_PUK_ACTIVE           0x60
+#define MPC_TOKEN_X5             0x05
+
+/* IPA */
+#define IPA_HDR_SIZE             0x14
+#define IPA_HDR_SIZE_SHORT       0x10
+#define IPA_INITIATOR_HOST       0x00
+#define IPA_PROT_IPV4            4
+#define IPA_PROT_IPV6            6
+
+#define IPA_CMD_STARTLAN         0x01
+#define IPA_CMD_STOPLAN          0x02
+#define IPA_CMD_SETVMAC          0x21
+#define IPA_CMD_DELVMAC          0x22
+#define IPA_CMD_SETGMAC          0x23
+#define IPA_CMD_DELGMAC          0x24
+#define IPA_CMD_SETVLAN          0x25
+#define IPA_CMD_DELVLAN          0x26
+#define IPA_CMD_SETIP            0xb1
+#define IPA_CMD_QIPASSIST        0xb2
+#define IPA_CMD_SETASSPARMS      0xb3
+#define IPA_CMD_SETIPM           0xb4
+#define IPA_CMD_DELIPM           0xb5
+#define IPA_CMD_SETRTG           0xb6
+#define IPA_CMD_DELIP            0xb7
+#define IPA_CMD_SETADAPTERPARMS  0xb8
+#define IPA_CMD_SET_DIAG_ASS     0xb9
+#define IPA_CMD_CREATE_ADDR      0xc3
+
+#define IPA_RC_SUCCESS           0x0000
+#define IPA_RC_NOTSUPP           0x0001
+#define IPA_RC_UNREGISTERED_ADDR 0x0011
+#define IPA_RC_INVALID_IP_VERSION 0x0020
+#define IPA_RC_IP_ADDR_TABLE_FULL 0xe006
+#define IPA_RC_IP_ADDR_ALREADY_USED 0xe00a
+#define IPA_RC_UNSUPPORTED_SUBCMD 0xe00e
+
+#define IPA_ARP_PROCESSING       0x00000001
+#define IPA_FILTERING            0x00000010
+#define IPA_IPV6                 0x00000020
+#define IPA_MULTICASTING         0x00000040
+#define IPA_QUERY_ARP_COUNTERS   0x00000100
+#define IPA_SETADAPTERPARMS      0x00000400
+#define IPA_PASSTHRU             0x00001000
+
+#define IPA_ASSISTS_V4           (IPA_ARP_PROCESSING | IPA_FILTERING | \
+                                  IPA_IPV6 | IPA_MULTICASTING | \
+                                  IPA_QUERY_ARP_COUNTERS | \
+                                  IPA_SETADAPTERPARMS | IPA_PASSTHRU)
+#define IPA_ASSISTS_V6           (IPA_IPV6 | IPA_MULTICASTING | \
+                                  IPA_SETADAPTERPARMS | IPA_PASSTHRU)
+#define IPA_ASSISTS_L2           IPA_SETADAPTERPARMS
+
+#define IPA_ASS_START            0x0001
+#define IPA_ASS_STOP             0x0002
+
+#define IPA_SETDELIP_DEFAULT     0x00
+#define IPA_SETIP_VIPA           0x01
+#define IPA_SETIP_TAKEOVER       0x02
+
+#define IPA_SETADP_QUERY         0x00000001
+#define IPA_SETADP_ALTER_MAC     0x00000002
+#define IPA_SETADP_CARD_INFO     0x00000400
+#define IPA_SETADP_PROMISC       0x00000800
+#define IPA_SETADP_ACCESS_CTRL   0x00010000
+#define IPA_SETADP_SUPPORTED     (IPA_SETADP_QUERY | IPA_SETADP_ALTER_MAC | \
+                                  IPA_SETADP_CARD_INFO | IPA_SETADP_PROMISC | \
+                                  IPA_SETADP_ACCESS_CTRL)
+#define IPA_SETADP_HDR_SIZE      24     /* hw_cmds caps + subcommand header */
+#define IPA_SETADP_VIRTUAL_MAC   0x80
+
 #define QETH_LINK_TYPE_10GBE     0x10
-#define QETH_SETADP_VIRTUAL_MAC  0x80
+#define QETH_MTU_LAYER2          1500
+#define QETH_MTU_LAYER3          1492
+
+/* qeth header */
+#define QETH_HDR_LAYER3          0x01
+#define QETH_HDR_LAYER2          0x02
+#define QETH_HDR3_IPV6           0x80
+#define QETH_HDR3_PASSTHRU       0x10
+#define QETH_HDR3_CAST_MASK      0x07
+#define QETH_CAST_MULTICAST      0x04
+#define QETH_CAST_BROADCAST      0x05
+#define QETH_CAST_UNICAST        0x06
+
+/* Layer-3 link-layer emulation */
+#define QETH_MAX_IP4             32
+#define QETH_MAX_IP6             16
+#define QETH_MAX_MC              64
+#define QETH_ARP_ENTRIES         64
+#define QETH_PENDING_MAX         32
+#define QETH_ARP_RETRY_MS        1000
+
+#define ETH_HDR                  14
+#define ETHERTYPE_IPV4           0x0800
+#define ETHERTYPE_ARP            0x0806
+#define ETHERTYPE_IPV6           0x86dd
+#define ARP_PACKET               28
+#define ARP_REQUEST              1
+#define ARP_REPLY                2
 
 typedef enum QethPeerRole {
     QETH_ROLE_NONE,
@@ -64,11 +213,29 @@ typedef enum QethPeerRole {
     QETH_ROLE_DATA,
 } QethPeerRole;
 
+typedef struct QethIp4 {
+    uint32_t addr;
+    uint32_t flags;
+} QethIp4;
+
+typedef struct QethArpEntry {
+    uint32_t ip;
+    uint8_t mac[ETH_ALEN];
+    int64_t used;
+} QethArpEntry;
+
+typedef struct QethPending {
+    uint32_t ip;
+    size_t len;
+    uint8_t *frame;     /* Ethernet frame, destination MAC not yet set */
+} QethPending;
+
 struct QethCcwDevice {
     CcwDevice parent_obj;
-    SubchDev *peer[3];
-    QethPeerRole role[3];
+    SubchDev *peer[QETH_PEERS];
+    QethPeerRole role[QETH_PEERS];
     uint8_t chpid;
+    uint16_t chpid_prop;
 
     NICConf conf;
     NICState *nic;
@@ -76,17 +243,41 @@ struct QethCcwDevice {
 
     S390QdioState qdio;
     SubchDev *data_sch;
-    SubchDev *pending_read;
-    uint8_t response[QETH_MAX_CTRL];
-    size_t response_len;
+
+    /* Control responses queued per subchannel, and outstanding READs */
+    GQueue responses[QETH_PEERS];
+    bool read_pending[QETH_PEERS];
+    uint32_t sii;
+
+    /* MPC connection state */
+    uint32_t guest_issuer_token;
+    uint32_t guest_cm_filter;
+    uint32_t guest_cm_conn;
+    uint32_t guest_ulp_filter;
+    uint32_t guest_ulp_conn;
+    uint32_t ulp_seq;
+    bool layer3;
     bool lan_online;
+    uint32_t assists_enabled[2];    /* IPv4, IPv6 */
+
+    /* Layer-3 address tables and link-layer emulation */
+    QethIp4 ip4[QETH_MAX_IP4];
+    unsigned int nr_ip4;
+    uint8_t ip6[QETH_MAX_IP6][16];
+    unsigned int nr_ip6;
+    uint8_t mc[QETH_MAX_MC][ETH_ALEN];
+    unsigned int nr_mc;
+    QethArpEntry arp[QETH_ARP_ENTRIES];
+    GQueue pending;
+    int64_t arp_last_request;
+    uint32_t arp_last_ip;
 };
 
 static int qeth_peer_index(QethCcwDevice *s, SubchDev *sch)
 {
     int i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         if (s->peer[i] == sch) {
             return i;
         }
@@ -94,8 +285,45 @@ static int qeth_peer_index(QethCcwDevice *s, SubchDev *sch)
     return -1;
 }
 
-static int qeth_unit_check(SubchDev *sch, uint8_t sense)
+static int qeth_peer_with_role(QethCcwDevice *s, QethPeerRole role)
 {
+    int i;
+
+    for (i = 0; i < QETH_PEERS; i++) {
+        if (s->role[i] == role) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void qeth_trace_data(SubchDev *sch, const char *dir,
+                            const uint8_t *buf, size_t len)
+{
+    size_t off;
+
+    if (!trace_event_get_state_backends(TRACE_QETH_CTRL_DATA)) {
+        return;
+    }
+    for (off = 0; off < len; off += 32) {
+        char hex[32 * 2 + 1];
+        size_t i, n = MIN(len - off, (size_t)32);
+
+        for (i = 0; i < n; i++) {
+            snprintf(hex + i * 2, 3, "%02x", buf[off + i]);
+        }
+        trace_qeth_ctrl_data(sch->devno, dir, off, hex);
+    }
+}
+
+static void qeth_unhandled(SubchDev *sch, const char *what, uint32_t value)
+{
+    trace_qeth_unhandled(sch ? sch->devno : 0, what, value);
+}
+
+static int qeth_unit_check(SubchDev *sch, uint8_t cmd, uint8_t sense)
+{
+    trace_qeth_unit_check(sch->devno, cmd, sense);
     sch->sense_data[0] = sense;
     sch->curr_status.scsw.dstat = SCSW_DSTAT_CHANNEL_END |
                                   SCSW_DSTAT_DEVICE_END |
@@ -129,186 +357,952 @@ static int qeth_copy_response(SubchDev *sch, const void *buf, size_t len)
 {
     size_t count = MIN(len, (size_t)ccw_dstream_avail(&sch->cds));
 
+    qeth_trace_data(sch, "to-guest", buf, count);
     return qeth_write_ccw(sch, buf, count);
 }
 
-static void qeth_deliver_response(QethCcwDevice *s)
+/*
+ * Control responses.  IDX responses are read back on the subchannel that
+ * issued the request; MPC and IPA responses arrive on the read subchannel.
+ */
+static void qeth_queue_response(QethCcwDevice *s, int peer,
+                                const uint8_t *buf, size_t len)
 {
-    SubchDev *sch = s->pending_read;
+    GByteArray *rsp;
+    SubchDev *sch;
 
-    if (!sch || !s->response_len) {
+    if (peer < 0) {
+        qeth_unhandled(NULL, "response without read subchannel", len);
         return;
     }
-    s->pending_read = NULL;
-    if (qeth_copy_response(sch, s->response, s->response_len)) {
-        css_virtual_ccw_complete(sch, -EFAULT);
-    } else {
-        css_virtual_ccw_complete(sch, 0);
+    if (g_queue_get_length(&s->responses[peer]) >= QETH_RESPONSES_MAX) {
+        qeth_unhandled(s->peer[peer], "response queue full", len);
+        return;
     }
-    s->response_len = 0;
+    rsp = g_byte_array_sized_new(len);
+    g_byte_array_append(rsp, buf, len);
+    g_queue_push_tail(&s->responses[peer], rsp);
+
+    if (!s->read_pending[peer]) {
+        return;
+    }
+    sch = s->peer[peer];
+    s->read_pending[peer] = false;
+    rsp = g_queue_pop_head(&s->responses[peer]);
+    css_virtual_ccw_complete(sch, qeth_copy_response(sch, rsp->data, rsp->len) ?
+                             -EFAULT : 0);
+    g_byte_array_unref(rsp);
 }
 
-static void qeth_make_idx_response(QethCcwDevice *s, SubchDev *sch,
-                                   uint8_t *buf, size_t len)
+static void qeth_flush_responses(QethCcwDevice *s)
 {
+    int i;
+
+    for (i = 0; i < QETH_PEERS; i++) {
+        GByteArray *rsp;
+
+        while ((rsp = g_queue_pop_head(&s->responses[i]))) {
+            g_byte_array_unref(rsp);
+        }
+        s->read_pending[i] = false;
+    }
+}
+
+/*
+ * IDX ACTIVATE: the read and write subchannels identify themselves and
+ * list the data device(s).  The response echoes the request with a
+ * positive response code in the low two bits of byte 8 (the high bits keep
+ * the request type, as z/OS VTAM checks), no port name required, the
+ * adapter's issuer token, function level 0x0201 and a microcode level.
+ */
+static void qeth_process_idx(QethCcwDevice *s, SubchDev *sch,
+                             const uint8_t *buf, size_t len)
+{
+    uint8_t rsp[QETH_MAX_CTRL];
     int peer = qeth_peer_index(s, sch);
     uint16_t type;
 
     if (len < QETH_IDX_SIZE || peer < 0) {
-        s->response_len = 0;
+        qeth_unhandled(sch, "short idx", len);
         return;
     }
     type = lduw_be_p(buf + 8);
-    if (type == 0x1901) {
+    trace_qeth_idx(sch->devno, type, buf[11], ldl_be_p(buf + 12));
+    if (type == QETH_IDX_TYPE_READ) {
         s->role[peer] = QETH_ROLE_READ;
-    } else if (type == 0x1501) {
+    } else if (type == QETH_IDX_TYPE_WRITE) {
         s->role[peer] = QETH_ROLE_WRITE;
+        s->guest_issuer_token = ldl_be_p(buf + 12);
     } else {
-        s->response_len = 0;
+        qeth_unhandled(sch, "idx type", type);
         return;
     }
 
-    memcpy(s->response, buf, QETH_IDX_SIZE);
-    s->response[8] = 0x02;
-    s->response[9] = 0;
-    s->response[11] = 0xc0;
-    stl_be_p(s->response + 12, 0x51454d55); /* "QEMU" */
-    stw_be_p(s->response + 16, 0x0201);
-    memcpy(s->response + 18, "QEMU", 4);
-    s->response_len = QETH_IDX_SIZE;
+    memcpy(rsp, buf, len);
+    rsp[8] = (buf[8] & ~0x03) | 0x02;
+    rsp[11] = 0xc0;
+    stl_be_p(rsp + 12, QETH_TOKEN_ISSUER);
+    stw_be_p(rsp + 16, 0x0201);
+    memcpy(rsp + 18, "QEMU", 4);
+    qeth_queue_response(s, peer, rsp, len);
 }
 
-static void qeth_make_mpc_response(QethCcwDevice *s, const uint8_t *buf,
-                                   size_t len)
+/* MPC protocol data units */
+
+static const uint8_t *qeth_find_pus(const uint8_t *puk, size_t len,
+                                    uint8_t type, size_t *pus_len)
 {
-    if (len > QETH_MAX_CTRL) {
-        s->response_len = 0;
+    size_t off = MIN((size_t)lduw_be_p(puk), len);
+
+    while (off + 4 <= len) {
+        size_t l = lduw_be_p(puk + off);
+
+        if (l < 4 || off + l > len) {
+            break;
+        }
+        if (puk[off + 3] == type) {
+            *pus_len = l;
+            return puk + off;
+        }
+        off += l;
+    }
+    return NULL;
+}
+
+static size_t qeth_pus_token(uint8_t *out, uint8_t type, uint32_t token)
+{
+    out[0] = 0;
+    out[1] = 9;
+    out[2] = 0x04;
+    out[3] = type;
+    out[4] = MPC_TOKEN_X5;
+    stl_be_p(out + 5, token);
+    return 9;
+}
+
+static size_t qeth_pus_filter(uint8_t *out, uint8_t proto, uint32_t token)
+{
+    out[0] = 0;
+    out[1] = 0x0b;
+    out[2] = 0x04;
+    out[3] = 0x01;
+    out[4] = proto;
+    out[5] = 0x04;
+    out[6] = MPC_TOKEN_X5;
+    stl_be_p(out + 7, token);
+    return 0x0b;
+}
+
+/*
+ * Build a CM/ULP/DM response PDU: transport header, short request/response
+ * header, one PDU header and a PUK with the given structured fields.
+ */
+static void qeth_mpc_reply(QethCcwDevice *s, uint8_t rrh_type,
+                           uint8_t rrh_proto, uint32_t token,
+                           uint32_t seq, uint32_t ackseq,
+                           uint8_t puk_what, uint8_t puk_type,
+                           const uint8_t *pus, size_t pus_len)
+{
+    uint8_t out[QETH_MAX_CTRL] = { 0 };
+    const size_t hdr = MPC_TH_SIZE + MPC_RRH_SIZE_SHORT + MPC_PH_SIZE;
+    size_t data_len = MPC_PUK_SIZE + pus_len;
+    uint8_t *rrh = out + MPC_TH_SIZE;
+    uint8_t *ph = rrh + MPC_RRH_SIZE_SHORT;
+    uint8_t *puk = out + hdr;
+
+    stl_be_p(out, MPC_TH_FIRST4);
+    stl_be_p(out + 8, MPC_TH_SIZE);
+    stl_be_p(out + 0x0c, hdr + data_len);
+    stw_be_p(out + 0x10, 0x0ffc);
+    stw_be_p(out + 0x12, 1);
+
+    rrh[4] = rrh_type;
+    rrh[5] = rrh_proto;
+    stw_be_p(rrh + 6, 1);
+    stl_be_p(rrh + 8, seq);
+    stl_be_p(rrh + 0x0c, ackseq);
+    stw_be_p(rrh + 0x10, MPC_RRH_SIZE_SHORT);
+    stw_be_p(rrh + 0x12, data_len);
+    stl_be_p(rrh + 0x14, data_len << 8 | MPC_TOKEN_X5);
+    stl_be_p(rrh + 0x18, token);
+
+    stl_be_p(ph, 0x01000000 | data_len);
+    stl_be_p(ph + 4, hdr);
+
+    stw_be_p(puk, MPC_PUK_SIZE);
+    puk[2] = puk_what;
+    puk[3] = puk_type;
+    stw_be_p(puk + 4, pus_len);
+    memcpy(puk + MPC_PUK_SIZE, pus, pus_len);
+
+    qeth_queue_response(s, qeth_peer_with_role(s, QETH_ROLE_READ), out,
+                        hdr + data_len);
+}
+
+static void qeth_process_puk(QethCcwDevice *s, SubchDev *sch,
+                             const uint8_t *rrh, const uint8_t *puk,
+                             size_t len)
+{
+    uint8_t pus[256];
+    size_t n = 0, l;
+    const uint8_t *p;
+    uint32_t req_seq = ldl_be_p(rrh + 8);
+    uint8_t what = puk[2], type = puk[3];
+
+    trace_qeth_mpc(rrh[4], rrh[5], what, type, len);
+
+    if (what == MPC_PUK_WHAT_43 && type == MPC_PUK_ACTIVE) {
+        /* DM_ACT */
+        n += qeth_pus_token(pus + n, 0x04, s->guest_ulp_conn);
+        qeth_mpc_reply(s, MPC_RRH_TYPE_ULP, MPC_PROTO_ULP, s->guest_cm_conn,
+                       ++s->ulp_seq, req_seq, MPC_PUK_WHAT_43,
+                       MPC_PUK_ACTIVE, pus, n);
         return;
     }
-    memcpy(s->response, buf, len);
-    s->response_len = len;
+    if (type == MPC_PUK_TAKEDOWN || type == MPC_PUK_DISABLE) {
+        if (rrh[4] == MPC_RRH_TYPE_ULP) {
+            s->lan_online = false;
+        }
+        return;     /* no response */
+    }
 
-    switch (len) {
-    case QETH_MPC_CM_ENABLE_SIZE:
-        memcpy(s->response + 0x53, "QCMF", 4);
+    if (rrh[4] == MPC_RRH_TYPE_CM && type == MPC_PUK_ENABLE) {
+        p = qeth_find_pus(puk, len, 0x01, &l);
+        if (!p || l < 0x0b) {
+            goto bad;
+        }
+        s->guest_cm_filter = ldl_be_p(p + 7);
+        n += qeth_pus_filter(pus + n, MPC_PROTO_UNKNOWN, QETH_TOKEN_CM_FILTER);
+        pus[n + 1] = 0x0c;              /* PUS 02: eight null bytes */
+        pus[n + 2] = 0x04;
+        pus[n + 3] = 0x02;
+        memset(pus + n + 4, 0, 8);
+        n += 0x0c;
+        qeth_mpc_reply(s, MPC_RRH_TYPE_CM, MPC_PROTO_UNKNOWN,
+                       s->guest_issuer_token, 0, 0, MPC_PUK_WHAT_41,
+                       MPC_PUK_ENABLE, pus, n);
+    } else if (rrh[4] == MPC_RRH_TYPE_CM && type == MPC_PUK_SETUP) {
+        p = qeth_find_pus(puk, len, 0x04, &l);
+        if (!p || l < 9) {
+            goto bad;
+        }
+        s->guest_cm_conn = ldl_be_p(p + 5);
+        n += qeth_pus_token(pus + n, 0x04, s->guest_cm_conn);
+        n += qeth_pus_token(pus + n, 0x08, QETH_TOKEN_CM_CONN);
+        stl_be_p(pus + n, 0x00080407);  /* PUS 07 */
+        stl_be_p(pus + n + 4, 0x40000000);
+        n += 8;
+        qeth_mpc_reply(s, MPC_RRH_TYPE_CM, MPC_PROTO_UNKNOWN,
+                       s->guest_issuer_token, 0, 0, MPC_PUK_WHAT_41,
+                       MPC_PUK_CONFIRM, pus, n);
+    } else if (rrh[4] == MPC_RRH_TYPE_ULP && type == MPC_PUK_ENABLE) {
+        const uint8_t *pus0a;
+        size_t l0a, rsp_l0a;
+
+        p = qeth_find_pus(puk, len, 0x01, &l);
+        pus0a = qeth_find_pus(puk, len, 0x0a, &l0a);
+        if (!p || l < 0x0b || !pus0a || l0a < 0x14 || l0a > 64) {
+            goto bad;
+        }
+        s->layer3 = p[4] == MPC_PROT_LAYER3;
+        s->guest_ulp_filter = ldl_be_p(p + 7);
+        trace_qeth_l3("ulp-enable", s->layer3 ? "layer 3" : "layer 2");
+        /* The response repeats the requested protocol (layer 2 or 3) */
+        n += qeth_pus_filter(pus + n, p[4], QETH_TOKEN_ULP_FILTER);
+        rsp_l0a = MAX(l0a, (size_t)0x18);
+        memset(pus + n, 0, rsp_l0a);
+        memcpy(pus + n, pus0a, l0a);
+        stw_be_p(pus + n, rsp_l0a);
+        stw_be_p(pus + n + 8, s->layer3 ? QETH_MTU_LAYER3 : QETH_MTU_LAYER2);
+        pus[n + 0x14] = QETH_LINK_TYPE_10GBE;
+        n += rsp_l0a;
+        qeth_mpc_reply(s, MPC_RRH_TYPE_ULP, MPC_PROTO_ULP, s->guest_cm_conn,
+                       ++s->ulp_seq, req_seq, MPC_PUK_WHAT_41,
+                       MPC_PUK_ENABLE, pus, n);
+    } else if (rrh[4] == MPC_RRH_TYPE_ULP && type == MPC_PUK_SETUP) {
+        const uint8_t *pus06, *pus0b;
+        size_t l06, l0b;
+
+        p = qeth_find_pus(puk, len, 0x04, &l);
+        pus06 = qeth_find_pus(puk, len, 0x06, &l06);
+        pus0b = qeth_find_pus(puk, len, 0x0b, &l0b);
+        if (!p || l < 9 || !pus06 || l06 < 6 || !pus0b || l0b > 64) {
+            goto bad;
+        }
+        s->guest_ulp_conn = ldl_be_p(p + 5);
+        n += qeth_pus_token(pus + n, 0x04, s->guest_ulp_conn);
+        n += qeth_pus_token(pus + n, 0x08, QETH_TOKEN_ULP_CONN);
+        stl_be_p(pus + n, 0x00080407);  /* PUS 07 echoes PUS 06 */
+        memcpy(pus + n + 4, pus06 + 4, 2);
+        stw_be_p(pus + n + 6, 0);
+        n += 8;
+        memcpy(pus + n, pus0b, l0b);
+        n += l0b;
+        qeth_mpc_reply(s, MPC_RRH_TYPE_ULP, MPC_PROTO_ULP, s->guest_cm_conn,
+                       ++s->ulp_seq, req_seq, MPC_PUK_WHAT_41,
+                       MPC_PUK_CONFIRM, pus, n);
+    } else {
+        qeth_unhandled(sch, "mpc puk", rrh[4] << 16 | what << 8 | type);
+    }
+    return;
+
+bad:
+    qeth_unhandled(sch, "malformed mpc puk", rrh[4] << 16 | what << 8 | type);
+}
+
+/* Layer-3 address tables */
+
+static int qeth_find_ip4(QethCcwDevice *s, uint32_t addr)
+{
+    unsigned int i;
+
+    for (i = 0; i < s->nr_ip4; i++) {
+        if (s->ip4[i].addr == addr) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int qeth_find_ip6(QethCcwDevice *s, const uint8_t *addr)
+{
+    unsigned int i;
+
+    for (i = 0; i < s->nr_ip6; i++) {
+        if (!memcmp(s->ip6[i], addr, 16)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int qeth_find_mc(QethCcwDevice *s, const uint8_t *mac)
+{
+    unsigned int i;
+
+    for (i = 0; i < s->nr_mc; i++) {
+        if (!memcmp(s->mc[i], mac, ETH_ALEN)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void qeth_ip4_str(uint32_t ip, char *buf, size_t len)
+{
+    snprintf(buf, len, "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 0xff,
+             (ip >> 8) & 0xff, ip & 0xff);
+}
+
+static void qeth_send_arp(QethCcwDevice *s, uint16_t op, uint32_t sender_ip,
+                          const uint8_t *target_mac, uint32_t target_ip)
+{
+    static const uint8_t broadcast[ETH_ALEN] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    };
+    uint8_t f[ETH_HDR + ARP_PACKET];
+    const uint8_t *dst = op == ARP_REPLY ? target_mac : broadcast;
+
+    memcpy(f, dst, ETH_ALEN);
+    memcpy(f + 6, s->conf.macaddr.a, ETH_ALEN);
+    stw_be_p(f + 12, ETHERTYPE_ARP);
+    stw_be_p(f + 14, 1);                    /* Ethernet */
+    stw_be_p(f + 16, ETHERTYPE_IPV4);
+    f[18] = ETH_ALEN;
+    f[19] = 4;
+    stw_be_p(f + 20, op);
+    memcpy(f + 22, s->conf.macaddr.a, ETH_ALEN);
+    stl_be_p(f + 28, sender_ip);
+    if (op == ARP_REPLY) {
+        memcpy(f + 32, target_mac, ETH_ALEN);
+    } else {
+        memset(f + 32, 0, ETH_ALEN);
+    }
+    stl_be_p(f + 38, target_ip);
+    qemu_send_packet(qemu_get_queue(s->nic), f, sizeof(f));
+}
+
+static QethArpEntry *qeth_arp_lookup(QethCcwDevice *s, uint32_t ip)
+{
+    int i;
+
+    for (i = 0; i < QETH_ARP_ENTRIES; i++) {
+        if (s->arp[i].used && s->arp[i].ip == ip) {
+            s->arp[i].used = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            return &s->arp[i];
+        }
+    }
+    return NULL;
+}
+
+static void qeth_flush_pending(QethCcwDevice *s, uint32_t ip,
+                               const uint8_t *mac)
+{
+    GList *l = s->pending.head;
+
+    while (l) {
+        GList *next = l->next;
+        QethPending *p = l->data;
+
+        if (p->ip == ip) {
+            memcpy(p->frame, mac, ETH_ALEN);
+            qemu_send_packet(qemu_get_queue(s->nic), p->frame, p->len);
+            g_queue_delete_link(&s->pending, l);
+            g_free(p->frame);
+            g_free(p);
+        }
+        l = next;
+    }
+}
+
+static void qeth_arp_learn(QethCcwDevice *s, uint32_t ip, const uint8_t *mac)
+{
+    QethArpEntry *e = qeth_arp_lookup(s, ip);
+    char ipstr[16];
+    int i;
+
+    if (!e) {
+        e = &s->arp[0];
+        for (i = 0; i < QETH_ARP_ENTRIES; i++) {
+            if (s->arp[i].used < e->used) {
+                e = &s->arp[i];
+            }
+        }
+        e->ip = ip;
+        qeth_ip4_str(ip, ipstr, sizeof(ipstr));
+        trace_qeth_l3("arp learn", ipstr);
+    }
+    memcpy(e->mac, mac, ETH_ALEN);
+    e->used = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    qeth_flush_pending(s, ip, mac);
+}
+
+static void qeth_arp_reset(QethCcwDevice *s)
+{
+    QethPending *p;
+
+    memset(s->arp, 0, sizeof(s->arp));
+    while ((p = g_queue_pop_head(&s->pending))) {
+        g_free(p->frame);
+        g_free(p);
+    }
+    s->arp_last_request = 0;
+    s->arp_last_ip = 0;
+}
+
+static void qeth_l3_reset(QethCcwDevice *s)
+{
+    s->nr_ip4 = 0;
+    s->nr_ip6 = 0;
+    s->nr_mc = 0;
+    memset(s->assists_enabled, 0, sizeof(s->assists_enabled));
+    qeth_arp_reset(s);
+}
+
+/* IPA commands */
+
+static uint32_t qeth_assists_supported(QethCcwDevice *s, uint16_t prot)
+{
+    if (!s->layer3) {
+        return IPA_ASSISTS_L2;
+    }
+    return prot == IPA_PROT_IPV6 ? IPA_ASSISTS_V6 : IPA_ASSISTS_V4;
+}
+
+static uint32_t *qeth_assists_enabled(QethCcwDevice *s, uint16_t prot)
+{
+    return &s->assists_enabled[prot == IPA_PROT_IPV6];
+}
+
+static uint16_t qeth_ipa_setip(QethCcwDevice *s, uint16_t prot,
+                               const uint8_t *data, size_t avail, bool set,
+                               int *data_size)
+{
+    char ipstr[16];
+
+    if (prot == IPA_PROT_IPV4) {
+        uint32_t addr, flags;
+        int i;
+
+        if (avail < 12) {
+            return IPA_RC_UNSUPPORTED_SUBCMD;
+        }
+        addr = ldl_be_p(data);
+        flags = ldl_be_p(data + 8);
+        *data_size = 12;
+        qeth_ip4_str(addr, ipstr, sizeof(ipstr));
+        trace_qeth_l3(set ? "setip" : "delip", ipstr);
+        i = qeth_find_ip4(s, addr);
+        if (!set) {
+            if (i < 0) {
+                return IPA_RC_UNREGISTERED_ADDR;
+            }
+            s->ip4[i] = s->ip4[--s->nr_ip4];
+            return IPA_RC_SUCCESS;
+        }
+        if (flags != IPA_SETDELIP_DEFAULT && flags != IPA_SETIP_VIPA &&
+            flags != IPA_SETIP_TAKEOVER) {
+            return IPA_RC_UNSUPPORTED_SUBCMD;
+        }
+        if (i >= 0) {
+            return IPA_RC_IP_ADDR_ALREADY_USED;
+        }
+        if (s->nr_ip4 == QETH_MAX_IP4) {
+            return IPA_RC_IP_ADDR_TABLE_FULL;
+        }
+        s->ip4[s->nr_ip4++] = (QethIp4) { .addr = addr, .flags = flags };
+        if (!(flags & IPA_SETIP_VIPA) && s->nic) {
+            /* Announce the address (gratuitous ARP) */
+            qeth_send_arp(s, ARP_REQUEST, addr, NULL, addr);
+        }
+        return IPA_RC_SUCCESS;
+    }
+    if (prot == IPA_PROT_IPV6) {
+        int i;
+
+        if (avail < 36) {
+            return IPA_RC_UNSUPPORTED_SUBCMD;
+        }
+        *data_size = 36;
+        trace_qeth_l3(set ? "setip" : "delip", "ipv6");
+        i = qeth_find_ip6(s, data);
+        if (!set) {
+            if (i < 0) {
+                return IPA_RC_UNREGISTERED_ADDR;
+            }
+            memcpy(s->ip6[i], s->ip6[--s->nr_ip6], 16);
+            return IPA_RC_SUCCESS;
+        }
+        if (i >= 0) {
+            return IPA_RC_IP_ADDR_ALREADY_USED;
+        }
+        if (s->nr_ip6 == QETH_MAX_IP6) {
+            return IPA_RC_IP_ADDR_TABLE_FULL;
+        }
+        memcpy(s->ip6[s->nr_ip6++], data, 16);
+        return IPA_RC_SUCCESS;
+    }
+    return IPA_RC_INVALID_IP_VERSION;
+}
+
+static uint16_t qeth_ipa_setadp(QethCcwDevice *s, uint8_t *sap, size_t avail,
+                                int *data_size)
+{
+    uint32_t cmd;
+    uint8_t *data = sap + IPA_SETADP_HDR_SIZE;
+    uint16_t rc = IPA_RC_SUCCESS;
+    size_t len = 0;
+
+    if (avail < IPA_SETADP_HDR_SIZE) {
+        return IPA_RC_UNSUPPORTED_SUBCMD;
+    }
+    cmd = ldl_be_p(sap + 12);
+    stl_be_p(sap, IPA_SETADP_SUPPORTED);
+    switch (cmd) {
+    case IPA_SETADP_QUERY:
+        len = 20;
+        memset(data, 0, len);
+        stl_be_p(data, 1);                      /* LAN types */
+        data[4] = QETH_LINK_TYPE_10GBE;
+        stl_be_p(data + 8, IPA_SETADP_SUPPORTED);
         break;
-    case QETH_MPC_CM_SETUP_SIZE:
-        memcpy(s->response + 0x5a, "QCMC", 4);
+    case IPA_SETADP_ALTER_MAC:
+        if (avail < IPA_SETADP_HDR_SIZE + 12 || ldl_be_p(data) != 0) {
+            rc = IPA_RC_UNSUPPORTED_SUBCMD;     /* only READ_MAC */
+            break;
+        }
+        len = 18;
+        stl_be_p(data + 4, ETH_ALEN);
+        stl_be_p(data + 8, 1);
+        memcpy(data + 12, s->conf.macaddr.a, ETH_ALEN);
+        sap[20] |= IPA_SETADP_VIRTUAL_MAC;
         break;
-    case QETH_MPC_ULP_ENABLE_SIZE:
-        memcpy(s->response + 0x53, "QULF", 4);
-        stw_be_p(s->response + 0x57, 0);
-        stw_be_p(s->response + 0x5f, 1500);
+    case IPA_SETADP_CARD_INFO:
+        len = 12;
+        memset(data, 0, len);
+        data[0] = 0x91;                         /* 10G fibre */
+        stw_be_p(data + 2, 0x0003);             /* full duplex */
+        stl_be_p(data + 4, 0x00000008);         /* 10 Gb/s */
         break;
-    case QETH_MPC_ULP_SETUP_SIZE:
-        memcpy(s->response + 0x5a, "QULC", 4);
-        break;
-    case QETH_MPC_DM_ACT_SIZE:
+    case IPA_SETADP_PROMISC:
+    case IPA_SETADP_ACCESS_CTRL:
         break;
     default:
-        if (len >= 0x54 && s->response[0x18] == 0xc1) {
-            uint8_t command = s->response[0x40];
+        rc = IPA_RC_UNSUPPORTED_SUBCMD;
+        break;
+    }
+    stw_be_p(sap + 16, rc);
+    if (rc == IPA_RC_SUCCESS && len) {
+        stw_be_p(sap + 8, IPA_SETADP_HDR_SIZE - 8 + len);
+        *data_size = IPA_SETADP_HDR_SIZE + len;
+    }
+    return rc;
+}
 
-            s->response[0x41] = 0;       /* host reply */
-            stw_be_p(s->response + 0x44, 0);
-            stl_be_p(s->response + 0x4c, 0);
-            stl_be_p(s->response + 0x50, 0);
-            if (command == QETH_IPA_QIPASSIST) {
-                stl_be_p(s->response + 0x4c, QETH_IPA_SETADAPTER_CAP);
-                stl_be_p(s->response + 0x50, QETH_IPA_SETADAPTER_CAP);
-            } else if (command == QETH_IPA_SETADAPTERPARMS && len >= 0x6c) {
-                uint32_t subcommand = ldl_be_p(s->response + 0x60);
+static void qeth_process_ipa(QethCcwDevice *s, SubchDev *sch,
+                             const uint8_t *req, size_t len,
+                             uint32_t offrrh, uint32_t offph,
+                             uint32_t offdata, uint32_t lendata)
+{
+    uint8_t out[QETH_MAX_CTRL];
+    uint8_t *ipa = out + offdata;
+    uint8_t *data = ipa + IPA_HDR_SIZE;
+    size_t avail = lendata > IPA_HDR_SIZE ? lendata - IPA_HDR_SIZE : 0;
+    size_t room = sizeof(out) - offdata - IPA_HDR_SIZE;
+    int ipa_size = IPA_HDR_SIZE, data_size = -1;
+    uint16_t prot, rc = IPA_RC_SUCCESS;
+    uint32_t sub = 0;
+    uint8_t cmd;
 
-                stw_be_p(s->response + 0x64, 0);
-                if (subcommand == QETH_IPA_SETADP_QUERY && len >= 0x80) {
-                    stl_be_p(s->response + 0x6c, 1);
-                    s->response[0x70] = QETH_LINK_TYPE_10GBE;
-                    stl_be_p(s->response + 0x74,
-                             QETH_IPA_SETADP_READ_MAC);
-                } else if (subcommand == QETH_IPA_SETADP_READ_MAC &&
-                           len >= 0x7e) {
-                    s->response[0x68] |= QETH_SETADP_VIRTUAL_MAC;
-                    stl_be_p(s->response + 0x6c, 0);
-                    stl_be_p(s->response + 0x70, ETH_ALEN);
-                    stl_be_p(s->response + 0x74, 1);
-                    memcpy(s->response + 0x78, s->conf.macaddr.a, ETH_ALEN);
-                }
-            }
-            if (command == QETH_IPA_STARTLAN) {
-                s->lan_online = true;
-            } else if (command == QETH_IPA_STOPLAN) {
-                s->lan_online = false;
-            }
+    if (lendata < IPA_HDR_SIZE_SHORT || offdata + lendata > len) {
+        qeth_unhandled(sch, "short ipa", lendata);
+        return;
+    }
+    memset(out, 0, sizeof(out));
+    memcpy(out, req, len);
+    cmd = ipa[0];
+    prot = lduw_be_p(ipa + 10);
+
+    switch (cmd) {
+    case IPA_CMD_STARTLAN:
+        s->lan_online = true;
+        *qeth_assists_enabled(s, IPA_PROT_IPV4) |= IPA_SETADAPTERPARMS;
+        *qeth_assists_enabled(s, IPA_PROT_IPV6) |= IPA_SETADAPTERPARMS;
+        ipa_size = IPA_HDR_SIZE_SHORT;
+        data_size = 0;
+        if (s->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
+        break;
+    case IPA_CMD_STOPLAN:
+        s->lan_online = false;
+        break;
+    case IPA_CMD_QIPASSIST:
+        *qeth_assists_enabled(s, prot) |= IPA_SETADAPTERPARMS;
+        data_size = 0;
+        break;
+    case IPA_CMD_SETASSPARMS:
+    {
+        uint32_t assist;
+        uint16_t sas_len;
+
+        if (avail < 12) {
+            rc = IPA_RC_UNSUPPORTED_SUBCMD;
+            break;
+        }
+        assist = ldl_be_p(data);
+        sas_len = lduw_be_p(data + 4);
+        sub = assist << 16 | lduw_be_p(data + 6);
+        if (!(assist & qeth_assists_supported(s, prot))) {
+            rc = IPA_RC_NOTSUPP;
+            break;
+        }
+        switch (lduw_be_p(data + 6)) {
+        case IPA_ASS_START:
+            *qeth_assists_enabled(s, prot) |= assist;
+            break;
+        case IPA_ASS_STOP:
+            *qeth_assists_enabled(s, prot) &= ~assist;
+            break;
+        case 0x0003: case 0x0004: case 0x0005: case 0x0006: case 0x0008:
+            break;
+        default:
+            rc = IPA_RC_UNSUPPORTED_SUBCMD;
+            break;
+        }
+        if (rc == IPA_RC_SUCCESS) {
+            stw_be_p(data + 8, IPA_RC_SUCCESS);
+            data_size = MIN((size_t)sas_len + 4, room);
         }
         break;
     }
+    case IPA_CMD_SETIP:
+    case IPA_CMD_DELIP:
+        rc = qeth_ipa_setip(s, prot, data, avail, cmd == IPA_CMD_SETIP,
+                            &data_size);
+        break;
+    case IPA_CMD_SETIPM:
+    case IPA_CMD_DELIPM:
+        if (avail >= 6) {
+            int i = qeth_find_mc(s, data);
+
+            if (cmd == IPA_CMD_SETIPM && i < 0 && s->nr_mc < QETH_MAX_MC) {
+                memcpy(s->mc[s->nr_mc++], data, ETH_ALEN);
+            } else if (cmd == IPA_CMD_DELIPM && i >= 0) {
+                memcpy(s->mc[i], s->mc[--s->nr_mc], ETH_ALEN);
+            }
+        }
+        if (cmd == IPA_CMD_SETIPM) {
+            data_size = MIN((size_t)24, room);
+        }
+        break;
+    case IPA_CMD_SETRTG:
+        data[0] = 0;
+        data_size = 1;
+        break;
+    case IPA_CMD_SETADAPTERPARMS:
+        sub = avail >= 16 ? ldl_be_p(data + 12) : 0;
+        if (room < IPA_SETADP_HDR_SIZE + 20) {
+            rc = IPA_RC_UNSUPPORTED_SUBCMD;
+            break;
+        }
+        rc = qeth_ipa_setadp(s, data, MAX(avail, (size_t)IPA_SETADP_HDR_SIZE),
+                             &data_size);
+        break;
+    case IPA_CMD_SET_DIAG_ASS:
+        break;
+    case IPA_CMD_CREATE_ADDR:
+        memcpy(data, s->conf.macaddr.a, ETH_ALEN);
+        data[0] |= 0x02;
+        data[6] = 0xff;
+        data[7] = 0xfe;
+        data_size = 8;
+        break;
+    case IPA_CMD_SETVMAC:
+    case IPA_CMD_DELVMAC:
+    case IPA_CMD_SETGMAC:
+    case IPA_CMD_DELGMAC:
+    case IPA_CMD_SETVLAN:
+    case IPA_CMD_DELVLAN:
+        break;
+    default:
+        qeth_unhandled(sch, "ipa command", cmd);
+        rc = IPA_RC_NOTSUPP;
+        break;
+    }
+    trace_qeth_ipa(cmd, prot, lduw_be_p(ipa + 2), sub, rc);
+
+    ipa[1] = IPA_INITIATOR_HOST;
+    stw_be_p(ipa + 4, rc);
+    stl_be_p(ipa + 12, qeth_assists_supported(s, prot));
+    *qeth_assists_enabled(s, prot) &= qeth_assists_supported(s, prot);
+    if (lendata >= IPA_HDR_SIZE && ipa_size == IPA_HDR_SIZE) {
+        stl_be_p(ipa + 16, *qeth_assists_enabled(s, prot));
+    }
+
+    /* Adjust the PDU lengths when the response is shorter or longer */
+    if (ipa_size != IPA_HDR_SIZE || data_size >= 0) {
+        size_t new_data = ipa_size + (data_size >= 0 ? data_size : avail);
+        size_t new_len = offdata + new_data;
+
+        if (new_len > sizeof(out)) {
+            qeth_unhandled(sch, "ipa response too long", new_len);
+            return;
+        }
+        stl_be_p(out + 0x0c, new_len);
+        stw_be_p(out + offrrh + 0x12, new_data);
+        stl_be_p(out + offrrh + 0x14,
+                 new_data << 8 | out[offrrh + 0x17]);
+        stl_be_p(out + offrrh + offph,
+                 (out[offrrh + offph] << 24) | new_data);
+        len = new_len;
+    }
+    stl_be_p(out + 4, 0xffffffff);
+    stw_be_p(out + 0x10, 0x0ffc);
+    out[offrrh + 5] = MPC_PROTO_UNKNOWN;
+    stl_be_p(out + offrrh + 0x18, s->guest_ulp_conn);
+
+    qeth_queue_response(s, qeth_peer_with_role(s, QETH_ROLE_READ), out, len);
 }
 
-static void qeth_build_rcd(QethCcwDevice *s, SubchDev *sch, uint8_t out[96])
+/*
+ * MPC control traffic written to the write subchannel: transport header,
+ * request/response header and a PDU header locating the payload, which is
+ * either a CM/ULP/DM PUK with structured fields or an IPA command.
+ */
+static void qeth_process_mpc(QethCcwDevice *s, SubchDev *sch,
+                             const uint8_t *req, size_t len)
 {
-    int peer = qeth_peer_index(s, sch);
+    uint32_t offrrh, offdata, lendata;
+    uint16_t offph;
+    const uint8_t *rrh;
 
-    memset(out, 0, 96);
+    if (len < MPC_TH_SIZE) {
+        goto bad;
+    }
+    offrrh = ldl_be_p(req + 8);
+    if (offrrh > len || len - offrrh < MPC_RRH_SIZE_SHORT) {
+        goto bad;
+    }
+    rrh = req + offrrh;
+    offph = lduw_be_p(rrh + 0x10);
+    if (offph > len - offrrh || len - offrrh - offph < MPC_PH_SIZE) {
+        goto bad;
+    }
+    lendata = ldl_be_p(rrh + offph) & 0x00ffffff;
+    offdata = ldl_be_p(rrh + offph + 4);
+    if (offdata > len || lendata > len - offdata) {
+        goto bad;
+    }
+    if (rrh[4] == MPC_RRH_TYPE_IPA) {
+        qeth_process_ipa(s, sch, req, len, offrrh, offph, offdata, lendata);
+        return;
+    }
+    if (lendata < MPC_PUK_SIZE) {
+        goto bad;
+    }
+    qeth_process_puk(s, sch, rrh, req + offdata, lendata);
+    return;
+
+bad:
+    qeth_unhandled(sch, "malformed mpc", len);
+}
+
+/* Self-description */
+
+/*
+ * Self-describing component text: type, model, manufacturer, plant and
+ * sequence number, all in EBCDIC (26 bytes).
+ */
+static void qeth_sdc(uint8_t *out, const char *type, const char *model,
+                     const char *serial)
+{
+    char text[27];
+    int i;
+
+    snprintf(text, sizeof(text), "%-6.6s%-3.3sIBMZZ%-12.12s", type, model,
+             serial);
+    for (i = 0; i < 26; i++) {
+        uint8_t c = text[i];
+
+        out[i] = c >= '0' && c <= '9' ? 0xf0 + (c - '0') :
+                 c >= 'A' && c <= 'I' ? 0xc1 + (c - 'A') :
+                 c >= 'J' && c <= 'R' ? 0xd1 + (c - 'J') :
+                 c >= 'S' && c <= 'Z' ? 0xe2 + (c - 'S') : 0x40;
+    }
+}
+
+/*
+ * Read Configuration Data: device NED, control-unit NED, token NED and the
+ * general NEQ, with the control-unit logical address (CULA) in the
+ * control-unit NED tag and in the general NEQ interface identifier.
+ */
+static void qeth_build_rcd(QethCcwDevice *s, SubchDev *sch,
+                           uint8_t out[QETH_RCD_SIZE])
+{
+    memset(out, 0, QETH_RCD_SIZE);
+
+    out[0] = QETH_NED_FLAGS;                /* device NED */
+    out[1] = QETH_NED_TYPE_DEVICE;
+    out[2] = QETH_NED_CLASS_COMM;
+    qeth_sdc(out + 4, "001732", "001", "000000000001");
     out[30] = s->chpid;
-    out[31] = peer >= 0 ? s->peer[peer]->devno : 0;
+    out[31] = sch->devno;
+
+    out[32] = QETH_NED_FLAGS;               /* control-unit NED */
+    out[33] = QETH_NED_TYPE_CU;
+    qeth_sdc(out + 36, "001730", "001", "000000000002");
     out[62] = s->chpid;
-    out[63] = s->peer[0]->devno;
+    out[63] = QETH_CULA;
+
+    out[64] = QETH_NED_FLAGS | QETH_NED_TOKEN;  /* token NED */
+    out[66] = QETH_NED_CLASS_COMM;
+    qeth_sdc(out + 68, "001730", "002", "000000000003");
+    out[94] = s->chpid;
+    out[95] = QETH_CULA;
+
+    out[96] = QETH_NEQ_GENERAL;             /* general NEQ */
+    out[98] = s->chpid;
+    out[99] = QETH_CULA;
+}
+
+/*
+ * Read Node Identifier: node descriptor of the adapter followed by a
+ * model-dependent node qualifier carrying the CHPID and the CULA.  A
+ * non-zero node selector in the preceding Set Interface Identifier asks
+ * for the node descriptor only.
+ */
+static size_t qeth_build_rni(QethCcwDevice *s, uint8_t out[QETH_RNI_SIZE])
+{
+    memset(out, 0, QETH_RNI_SIZE);
+    out[2] = QETH_NED_CLASS_COMM;
+    out[3] = 0xff;
+    qeth_sdc(out + 4, "001730", "001", "000000000002");
+    out[30] = s->chpid;
+    if (s->sii & 0x00030000) {
+        return 32;
+    }
+    out[32] = 0x20;                         /* model-dependent NQ */
+    out[34] = s->chpid;
+    out[35] = QETH_CULA;
+    return QETH_RNI_SIZE;
 }
 
 static int qeth_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     QethCcwDevice *s = sch->driver_data;
+    int peer = qeth_peer_index(s, sch);
     uint8_t buf[QETH_MAX_CTRL];
     size_t len;
 
+    trace_qeth_ccw(sch->devno, ccw.cmd_code, ccw.count, ccw.flags);
     switch (ccw.cmd_code) {
     case QETH_CMD_WRITE:
         len = MIN((size_t)ccw.count, sizeof(buf));
         if (qeth_read_ccw(sch, buf, len)) {
-            return qeth_unit_check(sch, 0x80);
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
         }
-        if (len >= 4 && ldl_be_p(buf) == 0x00008000) {
-            qeth_make_idx_response(s, sch, buf, len);
-        } else if (len >= 4 && ldl_be_p(buf) == 0x00e00000) {
-            qeth_make_mpc_response(s, buf, len);
+        qeth_trace_data(sch, "from-guest", buf, len);
+        if (len >= 4 && ldl_be_p(buf) == QETH_IDX_REQ) {
+            qeth_process_idx(s, sch, buf, len);
+        } else if (len >= 4 && ldl_be_p(buf) == MPC_TH_FIRST4) {
+            qeth_process_mpc(s, sch, buf, len);
         } else {
-            return qeth_unit_check(sch, 0x80);
+            qeth_unhandled(sch, "control write", len >= 4 ? ldl_be_p(buf) : 0);
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
         }
-        qeth_deliver_response(s);
         return 0;
     case QETH_CMD_READ:
-        if (s->response_len) {
-            int ret = qeth_copy_response(sch, s->response, s->response_len);
+    {
+        GByteArray *rsp = g_queue_pop_head(&s->responses[peer]);
+        int ret;
 
-            s->response_len = 0;
-            return ret;
+        if (!rsp) {
+            s->read_pending[peer] = true;
+            return CSS_CCW_PENDING;
         }
-        s->pending_read = sch;
-        return CSS_CCW_PENDING;
+        ret = qeth_copy_response(sch, rsp->data, rsp->len);
+        g_byte_array_unref(rsp);
+        return ret;
+    }
     case QETH_CMD_RCD:
     {
-        uint8_t rcd[96];
+        uint8_t rcd[QETH_RCD_SIZE];
 
         qeth_build_rcd(s, sch, rcd);
         return qeth_copy_response(sch, rcd, sizeof(rcd));
     }
     case QETH_CMD_SII:
+        len = MIN((size_t)ccw.count, sizeof(buf));
+        if (len < 4 || qeth_read_ccw(sch, buf, len)) {
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
+        }
+        qeth_trace_data(sch, "from-guest", buf, len);
+        s->sii = ldl_be_p(buf);
         return 0;
     case QETH_CMD_RNI:
-        memset(buf, 0, 32);
-        return qeth_copy_response(sch, buf, 32);
+    {
+        uint8_t rni[QETH_RNI_SIZE];
+
+        len = qeth_build_rni(s, rni);
+        s->sii = 0;
+        return qeth_copy_response(sch, rni, len);
+    }
     case QETH_CMD_EQ:
         len = MIN((size_t)ccw.count, sizeof(buf));
-        if (qeth_read_ccw(sch, buf, len) ||
-            s390_qdio_establish(&s->qdio, buf, len)) {
-            return qeth_unit_check(sch, 0x80);
+        if (qeth_read_ccw(sch, buf, len)) {
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
+        }
+        qeth_trace_data(sch, "from-guest", buf, len);
+        if (s390_qdio_establish(&s->qdio, buf, len)) {
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
         }
         s->data_sch = sch;
-        s->role[qeth_peer_index(s, sch)] = QETH_ROLE_DATA;
+        s->role[peer] = QETH_ROLE_DATA;
         return 0;
     case QETH_CMD_AQ:
         if (!s->qdio.established || s->data_sch != sch) {
-            return qeth_unit_check(sch, 0x80);
+            return qeth_unit_check(sch, ccw.cmd_code, 0x80);
         }
         s->qdio.active = true;
         return CSS_CCW_PENDING;
@@ -324,16 +1318,17 @@ static int qeth_ccw_cb(SubchDev *sch, CCW1 ccw)
     case QETH_CMD_SENSE_ID:
         return -ENOSYS;
     default:
-        return qeth_unit_check(sch, 0x80);
+        return qeth_unit_check(sch, ccw.cmd_code, 0x80);
     }
 }
 
 static void qeth_cancel(SubchDev *sch)
 {
     QethCcwDevice *s = sch->driver_data;
+    int peer = qeth_peer_index(s, sch);
 
-    if (s->pending_read == sch) {
-        s->pending_read = NULL;
+    if (peer >= 0) {
+        s->read_pending[peer] = false;
     }
     if (s->data_sch == sch) {
         s->qdio.active = false;
@@ -346,6 +1341,8 @@ static int qeth_siga(SubchDev *sch, uint8_t function, uint32_t output_mask,
     QethCcwDevice *s = sch->driver_data;
     unsigned int i;
 
+    trace_qeth_siga(sch->devno, function, output_mask, input_mask,
+                    sch != s->data_sch || !s->qdio.active ? 1 : 0);
     if (sch != s->data_sch || !s->qdio.active) {
         return 1;
     }
@@ -378,18 +1375,22 @@ static void qeth_ssqd(SubchDev *sch, void *descriptor)
 {
     uint8_t *d = descriptor;
 
-    d[0] = 0xc0;
+    d[0] = 0xc0;    /* QDIO capable, descriptor valid */
     stw_be_p(d + 2, sch->schid);
     d[4] = 0;
-    d[6] = 0x64; /* SIGA input/output needed, auto-sync on output PCI */
+    /* SIGA input/output needed, auto-sync on output PCI */
+    d[6] = 0x80 | 0x64;
     d[9] = 1;
     d[11] = 4;
+    stw_be_p(d + 14, 0x6000);
 }
 
 static const S390QdioOps qeth_qdio_ops = {
     .siga = qeth_siga,
     .ssqd = qeth_ssqd,
 };
+
+/* Data path */
 
 static int qeth_read_sbal_record(uint64_t sbal, uint8_t **record,
                                  size_t *record_len, bool *pci)
@@ -424,6 +1425,139 @@ static int qeth_read_sbal_record(uint64_t sbal, uint8_t **record,
     return -EINVAL;
 }
 
+static bool qeth_ip4_multicast(uint32_t ip)
+{
+    return (ip >> 28) == 0xe;
+}
+
+/*
+ * Layer-3 transmit: build the Ethernet frame for an IP packet.  Unicast
+ * destinations are resolved through the adapter's ARP cache; unresolved
+ * packets wait for the ARP reply.
+ */
+static void qeth_l3_transmit(QethCcwDevice *s, const uint8_t *hdr,
+                             const uint8_t *pkt, size_t len)
+{
+    g_autofree uint8_t *f = NULL;
+    uint8_t cast = hdr[1] & QETH_HDR3_CAST_MASK;
+    bool v6 = (hdr[1] & QETH_HDR3_IPV6) || (len && (pkt[0] >> 4) == 6);
+    uint32_t dst, nexthop;
+    QethArpEntry *e;
+    QethPending *p;
+    char ipstr[16];
+    int64_t now;
+
+    if (hdr[1] & QETH_HDR3_PASSTHRU) {
+        if (len >= ETH_HDR) {
+            qemu_send_packet(qemu_get_queue(s->nic), pkt, len);
+        }
+        return;
+    }
+    if (len < (v6 ? 40 : 20)) {
+        trace_qeth_l3("tx drop", "short packet");
+        return;
+    }
+    f = g_malloc(ETH_HDR + len);
+    memcpy(f + 6, s->conf.macaddr.a, ETH_ALEN);
+    stw_be_p(f + 12, v6 ? ETHERTYPE_IPV6 : ETHERTYPE_IPV4);
+    memcpy(f + ETH_HDR, pkt, len);
+
+    if (v6) {
+        const uint8_t *d6 = pkt + 24;
+
+        if (d6[0] == 0xff) {                /* 33:33 + low 32 bits */
+            f[0] = 0x33;
+            f[1] = 0x33;
+            memcpy(f + 2, d6 + 12, 4);
+            qemu_send_packet(qemu_get_queue(s->nic), f, ETH_HDR + len);
+        } else {
+            trace_qeth_l3("tx drop", "ipv6 unicast resolution unsupported");
+        }
+        return;
+    }
+
+    dst = ldl_be_p(pkt + 16);
+    if (cast == QETH_CAST_BROADCAST || dst == 0xffffffff) {
+        memset(f, 0xff, ETH_ALEN);
+    } else if (cast == QETH_CAST_MULTICAST || qeth_ip4_multicast(dst)) {
+        f[0] = 0x01;
+        f[1] = 0x00;
+        f[2] = 0x5e;
+        f[3] = (dst >> 16) & 0x7f;
+        f[4] = dst >> 8;
+        f[5] = dst;
+    } else {
+        nexthop = ldl_be_p(hdr + 0x1c);
+        if (!nexthop) {
+            nexthop = dst;
+        }
+        e = qeth_arp_lookup(s, nexthop);
+        if (!e) {
+            /* Queue until the next hop is resolved */
+            if (g_queue_get_length(&s->pending) >= QETH_PENDING_MAX) {
+                p = g_queue_pop_head(&s->pending);
+                g_free(p->frame);
+                g_free(p);
+            }
+            p = g_new(QethPending, 1);
+            p->ip = nexthop;
+            p->len = ETH_HDR + len;
+            p->frame = g_steal_pointer(&f);
+            g_queue_push_tail(&s->pending, p);
+            now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (s->arp_last_ip != nexthop ||
+                now - s->arp_last_request >= QETH_ARP_RETRY_MS) {
+                s->arp_last_ip = nexthop;
+                s->arp_last_request = now;
+                qeth_ip4_str(nexthop, ipstr, sizeof(ipstr));
+                trace_qeth_l3("arp request", ipstr);
+                qeth_send_arp(s, ARP_REQUEST, ldl_be_p(pkt + 12), NULL,
+                              nexthop);
+            }
+            return;
+        }
+        memcpy(f, e->mac, ETH_ALEN);
+    }
+    qemu_send_packet(qemu_get_queue(s->nic), f, ETH_HDR + len);
+}
+
+/*
+ * Drain an output buffer.  A buffer holds one or more packets, each led by
+ * a 32-byte qeth header whose type selects layer-2 frames or layer-3 IP
+ * packets.
+ */
+static void qeth_tx_buffer(QethCcwDevice *s, unsigned int queue,
+                           unsigned int index, const uint8_t *buf,
+                           size_t len)
+{
+    size_t off = 0;
+
+    while (len - off >= QETH_HDR_SIZE) {
+        const uint8_t *hdr = buf + off;
+        size_t pkt_len;
+
+        if (hdr[0] == QETH_HDR_LAYER2) {
+            pkt_len = lduw_be_p(hdr + 6);
+        } else if (hdr[0] == QETH_HDR_LAYER3) {
+            pkt_len = lduw_be_p(hdr + 8);
+        } else {
+            trace_qeth_tx(queue, index, len, hdr[0], 0);
+            return;
+        }
+        trace_qeth_tx(queue, index, len, hdr[0], pkt_len);
+        if (pkt_len > len - off - QETH_HDR_SIZE) {
+            return;
+        }
+        if (hdr[0] == QETH_HDR_LAYER2) {
+            qemu_send_packet(qemu_get_queue(s->nic), hdr + QETH_HDR_SIZE,
+                             pkt_len);
+        } else {
+            qeth_l3_transmit(s, hdr, hdr + QETH_HDR_SIZE, pkt_len);
+        }
+        off += QETH_HDR_SIZE + pkt_len;
+    }
+}
+
 static void qeth_tx_bh(void *opaque)
 {
     QethCcwDevice *s = opaque;
@@ -453,14 +1587,7 @@ static void qeth_tx_bh(void *opaque)
                 qeth_read_sbal_record(sbal, &record, &len, &pci)) {
                 break;
             }
-            if (len >= 32 && record[0] == 0x02) {
-                uint16_t pkt_len = lduw_be_p(record + 6);
-
-                if (pkt_len <= len - 32) {
-                    qemu_send_packet(qemu_get_queue(s->nic), record + 32,
-                                     pkt_len);
-                }
-            }
+            qeth_tx_buffer(s, qn, index, record, len);
             if (s390_qdio_set_state(q, index,
                                     S390_QDIO_SLSB_OUTPUT_EMPTY)) {
                 break;
@@ -483,11 +1610,11 @@ static bool qeth_can_receive(NetClientState *nc)
                                   S390_QDIO_SLSB_INPUT_EMPTY, &index);
 }
 
-static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+/* Place one packet with its qeth header into the next empty input buffer */
+static ssize_t qeth_rx_deliver(QethCcwDevice *s, const uint8_t *header,
+                               const uint8_t *buf, size_t len)
 {
-    QethCcwDevice *s = qemu_get_nic_opaque(nc);
     S390QdioQueue *q = &s->qdio.input[0];
-    uint8_t header[32] = { 0 };
     uint8_t index;
     uint64_t sbal;
     size_t offset = 0;
@@ -498,10 +1625,9 @@ static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
         s390_qdio_get_sbal(q, index, &sbal)) {
         return 0;
     }
-    header[0] = 0x02;
-    stw_be_p(header + 6, len);
 
-    for (i = 0; i < S390_QDIO_MAX_ELEMENTS && offset < len + 32; i++) {
+    for (i = 0; i < S390_QDIO_MAX_ELEMENTS && offset < len + QETH_HDR_SIZE;
+         i++) {
         uint8_t elem[16];
         uint32_t capacity, amount;
         uint64_t addr;
@@ -512,15 +1638,16 @@ static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
         }
         capacity = ldl_be_p(elem + 4);
         addr = ldq_be_p(elem + 8);
-        amount = MIN((size_t)capacity, len + 32 - offset);
-        header_part = offset < 32 ? MIN((size_t)amount, 32 - offset) : 0;
+        amount = MIN((size_t)capacity, len + QETH_HDR_SIZE - offset);
+        header_part = offset < QETH_HDR_SIZE ?
+                      MIN((size_t)amount, QETH_HDR_SIZE - offset) : 0;
         if (header_part &&
             s390_qdio_write(addr, header + offset, header_part)) {
             goto error;
         }
         if (amount > header_part &&
             s390_qdio_write(addr + header_part,
-                            buf + offset + header_part - 32,
+                            buf + offset + header_part - QETH_HDR_SIZE,
                             amount - header_part)) {
             goto error;
         }
@@ -529,7 +1656,7 @@ static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
             elem[0] |= 0x04;
         }
         offset += amount;
-        if (offset == len + 32) {
+        if (offset == len + QETH_HDR_SIZE) {
             elem[0] = (elem[0] & ~0x0c) | 0x0c |
                       S390_QDIO_EFLAGS_LAST_ENTRY;
         } else {
@@ -540,7 +1667,7 @@ static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
             goto error;
         }
     }
-    if (offset != len + 32 ||
+    if (offset != len + QETH_HDR_SIZE ||
         s390_qdio_set_state(q, index, S390_QDIO_SLSB_INPUT_PRIMED)) {
         goto error;
     }
@@ -551,6 +1678,130 @@ error:
     s390_qdio_set_state(q, index, S390_QDIO_SLSB_ERROR);
     css_inject_qdio_pci(s->data_sch);
     return 0;
+}
+
+static void qeth_l3_rx_arp(QethCcwDevice *s, const uint8_t *arp, size_t len)
+{
+    uint32_t sender_ip, target_ip;
+    uint16_t op;
+    int i;
+
+    if (len < ARP_PACKET || lduw_be_p(arp) != 1 ||
+        lduw_be_p(arp + 2) != ETHERTYPE_IPV4 || arp[4] != ETH_ALEN ||
+        arp[5] != 4) {
+        return;
+    }
+    op = lduw_be_p(arp + 6);
+    sender_ip = ldl_be_p(arp + 14);
+    target_ip = ldl_be_p(arp + 24);
+    i = qeth_find_ip4(s, target_ip);
+
+    if (sender_ip && (op == ARP_REPLY || i >= 0 ||
+                      qeth_arp_lookup(s, sender_ip))) {
+        qeth_arp_learn(s, sender_ip, arp + 8);
+    }
+    if (op == ARP_REQUEST && i >= 0 && sender_ip != target_ip) {
+        qeth_send_arp(s, ARP_REPLY, target_ip, arp + 8, sender_ip);
+    }
+}
+
+/*
+ * Layer-3 receive: the adapter answers ARP itself, delivers IP packets for
+ * the registered addresses, broadcast and registered multicast groups with
+ * a type-1 qeth header, and drops everything else.
+ */
+static ssize_t qeth_l3_receive(QethCcwDevice *s, const uint8_t *buf,
+                               size_t len)
+{
+    static const uint8_t broadcast[ETH_ALEN] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    };
+    uint8_t header[QETH_HDR_SIZE] = { 0 };
+    const uint8_t *pkt = buf + ETH_HDR;
+    size_t pkt_len = len - ETH_HDR;
+    uint16_t type;
+    uint8_t cast;
+
+    if (len < ETH_HDR) {
+        return len;
+    }
+    type = lduw_be_p(buf + 12);
+    if (!memcmp(buf, broadcast, ETH_ALEN)) {
+        cast = QETH_CAST_BROADCAST;
+    } else if (buf[0] & 1) {
+        cast = QETH_CAST_MULTICAST;
+    } else if (!memcmp(buf, s->conf.macaddr.a, ETH_ALEN)) {
+        cast = QETH_CAST_UNICAST;
+    } else {
+        return len;
+    }
+
+    switch (type) {
+    case ETHERTYPE_ARP:
+        qeth_l3_rx_arp(s, pkt, pkt_len);
+        return len;
+    case ETHERTYPE_IPV4:
+    {
+        uint32_t dst;
+
+        if (pkt_len < 20 || (pkt[0] >> 4) != 4) {
+            return len;
+        }
+        pkt_len = MIN(pkt_len, (size_t)lduw_be_p(pkt + 2));
+        dst = ldl_be_p(pkt + 16);
+        if (cast == QETH_CAST_MULTICAST && qeth_find_mc(s, buf) < 0) {
+            return len;
+        }
+        if (cast == QETH_CAST_UNICAST && qeth_find_ip4(s, dst) < 0) {
+            return len;
+        }
+        if (dst == 0xffffffff) {
+            cast = QETH_CAST_BROADCAST;
+        }
+        break;
+    }
+    case ETHERTYPE_IPV6:
+        if (pkt_len < 40 || (pkt[0] >> 4) != 6) {
+            return len;
+        }
+        pkt_len = MIN(pkt_len, (size_t)lduw_be_p(pkt + 4) + 40);
+        if (cast == QETH_CAST_MULTICAST && qeth_find_mc(s, buf) < 0) {
+            return len;
+        }
+        if (cast == QETH_CAST_UNICAST && qeth_find_ip6(s, pkt + 24) < 0) {
+            return len;
+        }
+        cast |= QETH_HDR3_IPV6;
+        break;
+    default:
+        return len;
+    }
+
+    header[0] = QETH_HDR_LAYER3;
+    header[1] = cast;
+    stw_be_p(header + 8, pkt_len);
+    if (!qeth_rx_deliver(s, header, pkt, pkt_len)) {
+        return 0;
+    }
+    return len;
+}
+
+static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+{
+    QethCcwDevice *s = qemu_get_nic_opaque(nc);
+    uint8_t header[QETH_HDR_SIZE] = { 0 };
+    ssize_t ret;
+
+    if (s->layer3) {
+        ret = qeth_l3_receive(s, buf, len);
+        trace_qeth_rx(len, QETH_HDR_LAYER3, ret);
+        return ret;
+    }
+    header[0] = QETH_HDR_LAYER2;
+    stw_be_p(header + 6, len);
+    ret = qeth_rx_deliver(s, header, buf, len);
+    trace_qeth_rx(len, QETH_HDR_LAYER2, ret);
+    return ret;
 }
 
 static NetClientInfo qeth_net_info = {
@@ -568,12 +1819,31 @@ static void qeth_setup_peer(QethCcwDevice *s, SubchDev *sch)
     sch->id.cu_model = QETH_CU_MODEL;
     sch->id.dev_type = QETH_DEV_TYPE;
     sch->id.dev_model = QETH_DEV_MODEL;
-    sch->id.ciw[0] = (CIW) { .type = 0, .command = QETH_CMD_RCD, .count = 96 };
-    sch->id.ciw[1] = (CIW) { .type = 1, .command = QETH_CMD_SII, .count = 4 };
-    sch->id.ciw[2] = (CIW) { .type = 2, .command = QETH_CMD_RNI, .count = 32 };
-    sch->id.ciw[3] = (CIW) { .type = 3, .command = QETH_CMD_EQ, .count = 4096 };
-    sch->id.ciw[4] = (CIW) { .type = 4, .command = QETH_CMD_AQ, .count = 0 };
+    sch->id.ciw[0] = (CIW) { .type = QETH_CIW_VALID | 0,
+                             .command = QETH_CMD_RCD, .count = QETH_RCD_SIZE };
+    sch->id.ciw[1] = (CIW) { .type = QETH_CIW_VALID | 1,
+                             .command = QETH_CMD_SII, .count = 4 };
+    sch->id.ciw[2] = (CIW) { .type = QETH_CIW_VALID | 2,
+                             .command = QETH_CMD_RNI, .count = QETH_RNI_SIZE };
+    sch->id.ciw[3] = (CIW) { .type = QETH_CIW_VALID | 3,
+                             .command = QETH_CMD_EQ, .count = 4096 };
+    sch->id.ciw[4] = (CIW) { .type = QETH_CIW_VALID | 4,
+                             .command = QETH_CMD_AQ, .count = 0 };
     css_sch_build_virtual_schib(sch, s->chpid, QETH_CHPID_TYPE);
+    /*
+     * Channel-subsystem addressing of the adapter: unit address from the
+     * device number and a valid full link address on the single path whose
+     * low byte is the control-unit logical address.  z/OS VTAM refuses a
+     * QDIO TRLE ("QDIO CULA UNAVAILABLE") when the subchannel description
+     * carries no valid link address.
+     */
+    sch->topology = (CssDeviceTopology) {
+        .valid = true,
+        .unit_address = sch->devno,
+        .fla_valid_mask = 0x80,
+        .fla = { QETH_LINK_ADDRESS << 8 | QETH_CULA },
+        .path_cu_number = { ((sch->devno & 0x00f0) << 4) | s->chpid },
+    };
     sch->curr_status.pmcw.flags |= PMCW_FLAGS_MASK_QF;
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = qeth_ccw_cb;
@@ -599,7 +1869,11 @@ static void qeth_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "qeth-ccw base devno leaves no room for three peers");
         return;
     }
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
+        g_queue_init(&s->responses[i]);
+    }
+    g_queue_init(&s->pending);
+    for (i = 0; i < QETH_PEERS; i++) {
         if (id.valid) {
             id.devid = base_devno + i;
         }
@@ -618,13 +1892,13 @@ static void qeth_realize(DeviceState *dev, Error **errp)
         }
     }
     cdev->sch = s->peer[0];
-    chpid = base_devno >> 8;
+    chpid = s->chpid_prop == UINT16_MAX ? base_devno >> 8 : s->chpid_prop;
     if (chpid > MAX_CHPID) {
         error_setg(&local_err, "No available CHPID for qeth-ccw");
         goto fail;
     }
     s->chpid = chpid;
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         qeth_setup_peer(s, s->peer[i]);
     }
     if (!cdk->realize(cdev, &local_err)) {
@@ -637,7 +1911,7 @@ static void qeth_realize(DeviceState *dev, Error **errp)
                           &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
     s->tx_bh = qemu_bh_new(qeth_tx_bh, s);
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         css_generate_sch_crws(s->peer[i]->cssid, s->peer[i]->ssid,
                               s->peer[i]->schid, dev->hotplugged, 1);
     }
@@ -645,7 +1919,7 @@ static void qeth_realize(DeviceState *dev, Error **errp)
 
 fail:
     error_propagate(errp, local_err);
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         SubchDev *sch = s->peer[i];
 
         if (sch) {
@@ -663,6 +1937,8 @@ static void qeth_unrealize(DeviceState *dev)
     QethCcwDevice *s = QETH_CCW(dev);
     int i;
 
+    qeth_flush_responses(s);
+    qeth_arp_reset(s);
     if (s->tx_bh) {
         qemu_bh_delete(s->tx_bh);
         s->tx_bh = NULL;
@@ -671,7 +1947,7 @@ static void qeth_unrealize(DeviceState *dev)
         qemu_del_nic(s->nic);
         s->nic = NULL;
     }
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         SubchDev *sch = s->peer[i];
 
         if (sch) {
@@ -689,13 +1965,15 @@ static void qeth_reset_hold(Object *obj, ResetType type)
     QethCcwDevice *s = QETH_CCW(obj);
     int i;
 
-    s->pending_read = NULL;
-    s->response_len = 0;
+    qeth_flush_responses(s);
     s->data_sch = NULL;
     s->lan_online = false;
+    s->layer3 = false;
+    s->ulp_seq = 0;
+    qeth_l3_reset(s);
     s390_qdio_reset(&s->qdio);
     memset(s->role, 0, sizeof(s->role));
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < QETH_PEERS; i++) {
         if (s->peer[i]) {
             css_reset_sch(s->peer[i]);
         }
@@ -704,6 +1982,7 @@ static void qeth_reset_hold(Object *obj, ResetType type)
 
 static const Property qeth_properties[] = {
     DEFINE_NIC_PROPERTIES(QethCcwDevice, conf),
+    DEFINE_PROP_UINT16("chpid", QethCcwDevice, chpid_prop, UINT16_MAX),
 };
 
 static const VMStateDescription vmstate_qeth = {

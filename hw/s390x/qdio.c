@@ -11,6 +11,7 @@
 #include "system/memory.h"
 #include "hw/s390x/qdio.h"
 #include "qemu/bswap.h"
+#include "trace.h"
 
 int s390_qdio_read(uint64_t addr, void *buf, size_t len)
 {
@@ -56,6 +57,7 @@ int s390_qdio_establish(S390QdioState *s, const uint8_t *qdr, size_t len)
     unsigned int i;
 
     if (len < 64 || qdr[0] != 0 || qdr[3] != 0) {
+        trace_qdio_establish(0, 0, 0, 0, 0, -EINVAL);
         return -EINVAL;
     }
     iq = qdr[5];
@@ -65,6 +67,7 @@ int s390_qdio_establish(S390QdioState *s, const uint8_t *qdr, size_t len)
     if (iq != 1 || oq < 1 || oq > S390_QDIO_MAX_QUEUES ||
         iqsz != 8 || oqsz != 8 ||
         len < 64 + (size_t)(iq + oq) * 32) {
+        trace_qdio_establish(iq, oq, iqsz, oqsz, ldq_be_p(qdr + 48), -EINVAL);
         return -EINVAL;
     }
 
@@ -92,6 +95,7 @@ int s390_qdio_establish(S390QdioState *s, const uint8_t *qdr, size_t len)
         return -EFAULT;
     }
     s->established = true;
+    trace_qdio_establish(iq, oq, iqsz, oqsz, s->qiba, 0);
     return 0;
 }
 

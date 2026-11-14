@@ -575,6 +575,9 @@ static QemuOptsList qemu_qeth_opts = {
         },{
             .name = "mac",
             .type = QEMU_OPT_STRING,
+        },{
+            .name = "chpid",
+            .type = QEMU_OPT_NUMBER,
         },
         { /* end of list */ }
     },
@@ -1676,6 +1679,17 @@ static bool qeth_add(const char *optarg, Error **errp)
     mac = qemu_opt_get(opts, "mac");
     if (mac && !qemu_opt_set(device_opts, "mac", mac, errp)) {
         goto fail;
+    }
+    if (qemu_opt_get(opts, "chpid")) {
+        uint64_t chpid = qemu_opt_get_number(opts, "chpid", 0);
+
+        if (chpid > UINT8_MAX) {
+            error_setg(errp, "Parameter 'chpid' must be between 0 and 255");
+            goto fail;
+        }
+        if (!qemu_opt_set_number(device_opts, "chpid", chpid, errp)) {
+            goto fail;
+        }
     }
 
     index++;

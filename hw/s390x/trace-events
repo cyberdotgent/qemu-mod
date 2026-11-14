@@ -62,3 +62,19 @@ sclp_write_event(uint8_t type, uint16_t len, uint16_t rc) "type=0x%02x len=%u rc
 eckd_unimplemented(uint16_t devno, const char *what, uint8_t code, uint8_t modifier) "ECKD-UNIMPLEMENTED: devno=0x%04x %s=0x%02x modifier=0x%02x"
 eckd_accepted_ignored(uint16_t devno, const char *what, uint8_t code) "ECKD-IGNORED: devno=0x%04x %s=0x%02x accepted without effect"
 sclp_unimplemented_command(uint32_t code) "SCLP-UNIMPLEMENTED: command=0x%08x"
+
+# qeth-ccw.c
+qeth_ccw(uint16_t devno, uint8_t cmd, uint16_t count, uint8_t flags) "devno 0x%04x cmd 0x%02x count %u flags 0x%02x"
+qeth_ctrl_data(uint16_t devno, const char *dir, uint32_t offset, const char *hex) "devno 0x%04x %s +0x%03x %s"
+qeth_idx(uint16_t devno, uint16_t type, uint8_t port, uint32_t token) "devno 0x%04x type 0x%04x port 0x%02x issuer token 0x%08x"
+qeth_mpc(uint8_t rrh_type, uint8_t rrh_proto, uint8_t puk_what, uint8_t puk_type, uint32_t len) "rrh type 0x%02x proto 0x%02x puk what 0x%02x type 0x%02x len %u"
+qeth_ipa(uint8_t cmd, uint16_t prot, uint16_t seqno, uint32_t subcmd, uint16_t rc) "cmd 0x%02x prot %u seqno %u subcmd 0x%x rc 0x%04x"
+qeth_unit_check(uint16_t devno, uint8_t cmd, uint8_t sense) "devno 0x%04x cmd 0x%02x sense 0x%02x"
+qeth_unhandled(uint16_t devno, const char *what, uint32_t value) "devno 0x%04x %s 0x%x"
+qeth_siga(uint16_t devno, uint8_t function, uint32_t output_mask, uint32_t input_mask, int cc) "devno 0x%04x fc 0x%02x out 0x%08x in 0x%08x cc %d"
+qeth_tx(uint8_t queue, uint8_t index, uint32_t len, uint8_t hdr_type, uint32_t pkt_len) "queue %u buffer %u len %u header type %u packet %u"
+qeth_rx(uint32_t len, uint8_t hdr_type, int ret) "len %u header type %u ret %d"
+qeth_l3(const char *what, const char *detail) "%s %s"
+
+# qdio.c
+qdio_establish(uint8_t iq, uint8_t oq, uint8_t iqdsz, uint8_t oqdsz, uint64_t qiba, int ret) "input queues %u output queues %u input desc size %u output desc size %u qib 0x%" PRIx64 " ret %d"

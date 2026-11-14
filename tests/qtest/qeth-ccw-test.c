@@ -23,6 +23,22 @@ static char *qom_get_string(QTestState *qts, const char *path,
     return value;
 }
 
+static int64_t qom_get_int(QTestState *qts, const char *path,
+                           const char *property)
+{
+    QDict *response = qtest_qmp(
+        qts,
+        "{'execute': 'qom-get', 'arguments': "
+        " {'path': %s, 'property': %s}}",
+        path, property);
+    int64_t value;
+
+    g_assert(qdict_haskey(response, "return"));
+    value = qdict_get_int(response, "return");
+    qobject_unref(response);
+    return value;
+}
+
 static void test_configuration(void)
 {
     g_autofree char *dev_id = NULL;
@@ -49,13 +65,15 @@ static void test_qeth_shortcut(void)
 
     qts = qtest_init(
         "-nodefaults -netdev user,id=net0 "
-        "-qeth devno=0400,netdev=net0,mac=52:54:00:12:34:61");
+        "-qeth devno=0400,netdev=net0,mac=52:54:00:12:34:61,chpid=0xf0");
     dev_id = qom_get_string(qts, "/machine/peripheral/qeth0", "dev_id");
     mac = qom_get_string(qts, "/machine/peripheral/qeth0", "mac");
     netdev = qom_get_string(qts, "/machine/peripheral/qeth0", "netdev");
     g_assert_cmpstr(dev_id, ==, "fe.0.0400");
     g_assert_cmpstr(mac, ==, "52:54:00:12:34:61");
     g_assert_cmpstr(netdev, ==, "net0");
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/qeth0", "chpid"),
+                    ==, 0xf0);
     qtest_quit(qts);
 }
 
