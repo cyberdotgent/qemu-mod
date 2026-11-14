@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Run the zero-data-length ECKD record status test."""
+"""Run the ECKD record semantics test under KVM."""
 
 import pathlib
 import struct
@@ -36,6 +36,16 @@ def create_image(path):
                 end += 8
                 image[end:end + 4] = b"good"
                 end += 4
+            elif cylinder == 0 and head == 1:
+                # Gapped record labels distinguish physical order from R + 1.
+                struct.pack_into(">HHBBH", image, end, 0, 1, 1, 0, 4)
+                end += 8
+                image[end:end + 4] = b"skip"
+                end += 4
+                struct.pack_into(">HHBBH", image, end, 0, 1, 3, 0, 4)
+                end += 8
+                image[end:end + 4] = b"next"
+                end += 4
             elif cylinder == 0 and head == 2:
                 struct.pack_into(">HHBBH", image, end, 0, 2, 0, 0, 4)
                 end += 8
@@ -66,7 +76,8 @@ def main():
         result = subprocess.run([
             qemu,
             "-machine", "s390-ccw-virtio",
-            "-cpu", "max",
+            "-accel", "kvm",
+            "-cpu", "host",
             "-nodefaults",
             "-display", "none",
             "-monitor", "none",

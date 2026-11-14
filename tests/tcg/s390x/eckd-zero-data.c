@@ -310,6 +310,102 @@ int main(void)
     }
 
     /*
+     * Locate Record's search argument is the complete CCHHR, not merely R.
+     * The seek address names track 0/0, while this search argument names
+     * track 0/1.  Record 1 exists on both tracks, so accepting only its R
+     * byte would incorrectly complete normally instead of reporting NRF.
+     */
+    locate[3] = 1;
+    locate[11] = 1;
+    locate[12] = 1;
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_DEFINE_EXTENT,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(define_extent),
+        .cda = addr32(define_extent),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_LOCATE,
+        .count = sizeof(locate),
+        .cda = addr32(locate),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 58;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND |
+                           SCSW_DSTAT_UCHK)) {
+        return 59;
+    }
+    memset(sense, 0, sizeof(sense));
+    ccws[0] = (Ccw1) {
+        .cmd_code = CCW_CMD_BASIC_SENSE,
+        .count = sizeof(sense),
+        .cda = addr32(sense),
+    };
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 60;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        sense[0] || sense[1] != 0x20) {
+        return 61;
+    }
+
+    /*
+     * Data orientation leaves the device after the located record.  Track
+     * 0/1 contains R1 followed physically by R3, with no R2.  The following
+     * Read Data must therefore return R3 rather than looking up numeric R2.
+     */
+    define_extent[15] = 1;
+    locate[0] = 0x86;
+    locate[7] = 1;
+    locate[10] = 0;
+    locate[11] = 1;
+    locate[12] = 1;
+    ccws[0] = (Ccw1) {
+        .cmd_code = ECKD_CMD_DEFINE_EXTENT,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(define_extent),
+        .cda = addr32(define_extent),
+    };
+    ccws[1] = (Ccw1) {
+        .cmd_code = ECKD_CMD_LOCATE,
+        .flags = CCW_FLAG_CC,
+        .count = sizeof(locate),
+        .cda = addr32(locate),
+    };
+    ccws[2] = (Ccw1) {
+        .cmd_code = ECKD_CMD_READ,
+        .flags = CCW_FLAG_SLI,
+        .count = sizeof(data),
+        .cda = addr32(data),
+    };
+    memset(data, 0, sizeof(data));
+    irb = (Irb) { 0 };
+    if (ssch(schid, &orb)) {
+        return 62;
+    }
+    consume_io_int();
+    if (tsch(schid, &irb) || irb.scsw.cstat ||
+        irb.scsw.dstat != (SCSW_DSTAT_CHEND | SCSW_DSTAT_DEVEND) ||
+        irb.scsw.count != sizeof(data) - 4 ||
+        data[0] != 'n' || data[1] != 'e' ||
+        data[2] != 'x' || data[3] != 't') {
+        return 63;
+    }
+    define_extent[15] = 0;
+    locate[0] = 0x06;
+    locate[3] = 2;
+    locate[7] = 0;
+    locate[11] = 0;
+    locate[12] = 0;
+
+    /*
      * A multitrack operation that reaches the end of its defined extent
      * reports file protected, not end of cylinder.  z/OS relies on this
      * distinction while scanning catalog and library extents during NIP.

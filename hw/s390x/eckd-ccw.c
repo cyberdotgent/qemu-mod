@@ -398,6 +398,21 @@ static const CkdImageRecord *eckd_next_record(const CkdImage *image,
     return NULL;
 }
 
+static const CkdImageRecord *eckd_find_cchhr(const CkdImage *image,
+                                              const uint8_t *cchhr)
+{
+    unsigned int i;
+
+    for (i = 0; i < image->record_count; i++) {
+        const CkdImageRecord *record = &image->records[i];
+
+        if (!memcmp(image->track + record->header_offset, cchhr, 5)) {
+            return record;
+        }
+    }
+    return NULL;
+}
+
 static const CkdImageRecord *eckd_current_record(EckdCcwDevice *eckd,
                                                  bool multitrack)
 {
@@ -711,14 +726,17 @@ static int eckd_define_extent(EckdCcwDevice *eckd, const CCW1 *ccw,
 static int eckd_locate(EckdCcwDevice *eckd, const CCW1 *ccw,
                        const uint8_t *buf, size_t length, bool extended)
 {
+    const CkdImageRecord *record;
     uint16_t cylinder;
     uint16_t head;
+    uint8_t orientation;
     uint8_t operation;
 
     if (length < 16) {
         return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
     }
     operation = buf[0] & 0x3f;
+    orientation = buf[0] & 0xc0;
     eckd->locate_operation = operation;
     eckd->locate_count = buf[3];
     cylinder = lduw_be_p(buf + 4);
@@ -749,10 +767,23 @@ static int eckd_locate(EckdCcwDevice *eckd, const CCW1 *ccw,
      * search_count_advance instead of treating both cases as merely a record
      * number.
      */
-    if ((buf[0] & 0xc0) == 0x00) {
+    if (orientation == 0x00 || orientation == 0x80) {
+        /*
+         * The seek address chooses a track, while the search argument names
+         * a physical count field on that track.  Record numbers are labels,
+         * so matching only R can silently select data from the wrong CCHH.
+         */
+        record = eckd_find_cchhr(&eckd->image, buf + 8);
+        if (!record) {
+            return eckd_no_record(eckd);
+        }
+        eckd->record = record->number;
+    }
+    if (orientation == 0x00) {
         eckd->search_count_advance = true;
-    } else if ((buf[0] & 0xc0) == 0x80) {
-        eckd->record++;
+    } else if (orientation == 0x80) {
+        record = eckd_next_record(&eckd->image, record);
+        eckd->record = record ? record->number : UINT8_MAX + 1;
     }
     return 0;
 }
