@@ -135,7 +135,7 @@ int main(void)
 
     if (run_ccw(schid, &orb, ECKD_CMD_SNSS, 40) ||
         data[0] || data[1] != 0x05 || data[2] != 0x24 || data[3] != 1 ||
-        data[38] || data[39] != 3) {
+        data[38] != 0x0a || data[39] != 0x80) {
         return 7;
     }
 
