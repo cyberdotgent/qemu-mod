@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "trace.h"
 #include "qemu/thread.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
@@ -248,6 +249,7 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
 
     /* convert EBCDIC SCLP contents to ASCII console message */
     ascii_put(buffer, mdbo->mto.message, len);
+    trace_sclp_lm_message(len);
     rc = write_console_data(event, (uint8_t *)NEWLINE, 1);
     if (rc < 0) {
         return rc;
@@ -286,6 +288,8 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
     len = be16_to_cpu(data->mdb.header.length) - sizeof(data->mdb.header);
     mdbo = data->mdb.mdbo;
     while (len > 0) {
+        trace_sclp_lm_mdb_object(be16_to_cpu(mdbo->type),
+                                 be16_to_cpu(mdbo->length));
         switch (be16_to_cpu(mdbo->type)) {
         case MESSAGE_TEXT:
             /* message text object */

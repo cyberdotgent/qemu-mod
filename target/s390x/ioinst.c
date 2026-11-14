@@ -886,6 +886,7 @@ static void ioinst_handle_chsc_sda(ChscReq *req, ChscResp *res)
         }
         break;
     default:
+        trace_ioinst_chsc_sda_unimplemented(oc);
         resp_code = 0x0003;
         goto out;
     }
@@ -1153,6 +1154,8 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
         ioinst_handle_chsc_ssqd(req, res);
         break;
     default:
+        trace_ioinst_chsc_unimplemented(command, len, be32_to_cpu(req->param0),
+                                        be32_to_cpu(req->param1));
         ioinst_handle_chsc_invalid(res);
         break;
     }

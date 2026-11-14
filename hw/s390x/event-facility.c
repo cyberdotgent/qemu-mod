@@ -17,6 +17,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "trace.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 
@@ -143,6 +144,8 @@ static uint16_t handle_write_event_buf(SCLPEventFacility *ef,
             break;
         }
     }
+    trace_sclp_write_event(event_buf->type, be16_to_cpu(event_buf->length),
+                           rc);
     return rc;
 }
 

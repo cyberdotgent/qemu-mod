@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "trace.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
@@ -372,6 +373,7 @@ int sclp_service_call_protected(S390CPU *cpu, uint64_t sccb, uint32_t code)
                          be16_to_cpu(header.length));
 
     if (!sclp_command_code_valid(code)) {
+        trace_sclp_unimplemented_command(code);
         work_sccb->h.response_code = cpu_to_be16(SCLP_RC_INVALID_SCLP_COMMAND);
         goto out_write;
     }
@@ -440,6 +442,7 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     work_sccb->h = header;
 
     if (!sclp_command_code_valid(code)) {
+        trace_sclp_unimplemented_command(code);
         work_sccb->h.response_code = cpu_to_be16(SCLP_RC_INVALID_SCLP_COMMAND);
         goto out_write;
     }

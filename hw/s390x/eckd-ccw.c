@@ -447,6 +447,20 @@ static const CkdImageRecord *eckd_current_record(EckdCcwDevice *eckd,
     return record;
 }
 
+/*
+ * Reject a command, order or mode that this model does not implement.  Each
+ * rejection is traced explicitly: guests probe optional storage-control
+ * functions, and an unimplemented one is a candidate for behaviour that
+ * differs from real hardware.
+ */
+static int eckd_reject_unimplemented(EckdCcwDevice *eckd, const char *what,
+                                     uint8_t code, uint8_t modifier)
+{
+    trace_eckd_unimplemented(CCW_DEVICE(eckd)->sch->devno, what, code,
+                             modifier);
+    return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+}
+
 static int eckd_no_record(EckdCcwDevice *eckd)
 {
     SubchDev *sch = CCW_DEVICE(eckd)->sch;
@@ -676,7 +690,9 @@ static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
             eckd->rssd_length = 256;
             break;
         default:
-            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+            return eckd_reject_unimplemented(eckd, "psf-prsd-suborder",
+                                             eckd->psf_order,
+                                             eckd->psf_suborder);
         }
         return 0;
     case 0xb0: /* Set Interface Identifier */
@@ -701,9 +717,13 @@ static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
         return 0;
     case 0x1b: /* Set Special Intercept Condition */
     case 0x1d: /* Set Subsystem Characteristics */
+        /* Accepted without effect: also a candidate for divergence. */
+        trace_eckd_accepted_ignored(CCW_DEVICE(eckd)->sch->devno, "psf-order",
+                                    eckd->psf_order);
         return 0;
     default:
-        return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        return eckd_reject_unimplemented(eckd, "psf-order", eckd->psf_order,
+                                         eckd->psf_suborder);
     }
 }
 
@@ -1653,7 +1673,8 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
             memset(eckd->pgid, 0, sizeof(eckd->pgid));
             return 0;
         default:
-            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+            return eckd_reject_unimplemented(eckd, "spid-function", buf[0],
+                                             0);
         }
     case CMD_SNSS:
         /*
@@ -1687,7 +1708,7 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
         eckd->rssd_length = 0;
         return ret;
     default:
-        return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        return eckd_reject_unimplemented(eckd, "ccw", ccw.cmd_code, 0);
     }
 }
 

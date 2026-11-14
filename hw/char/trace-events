@@ -158,3 +158,7 @@ stm32f2xx_usart_receive(char *id, uint8_t chr) " %s receiving '%c'"
 # riscv_htif.c
 htif_uart_write_to_host(uint8_t device, uint8_t cmd, uint64_t payload) "device: %u cmd: %02u payload: %016" PRIx64
 htif_uart_unknown_device_command(uint8_t device, uint8_t cmd, uint64_t payload) "device: %u cmd: %02u payload: %016" PRIx64
+
+# sclpconsole-lm.c
+sclp_lm_mdb_object(uint16_t type, uint16_t len) "type=0x%04x len=%u"
+sclp_lm_message(int len) "len=%d"
