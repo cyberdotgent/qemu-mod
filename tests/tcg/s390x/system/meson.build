@@ -101,7 +101,18 @@ tests += {
 # C tests using the minilib runtime
 setup_c = {'cflags': [cflags], 'qemu_args': qemu_args}
 tests += {
-  'chsc-sci.c': setup_c,
+  'chsc-sci.c': {
+    'cflags': [cflags],
+    'qemu_args': ['-accel', 'kvm'] + qemu_args,
+  },
+  'chsc-sci-token.c': {
+    'cflags': [cflags],
+    'qemu_args': ['-accel', 'kvm', '-machine',
+                  'chsc-config-token=000102030405060708090a0b0c0d0e0f' +
+                  '101112131415161718191a1b1c1d1e1f' +
+                  '202122232425262728292a2b2c2d2e2f' +
+                  '303132333435363738393a3b3c3d3e3f'] + qemu_args,
+  },
   'decimal.c': setup_c,
   'diag204.c': setup_c,
   'edat.c': setup_c,

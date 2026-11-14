@@ -34,6 +34,21 @@ QEMU places a device at the first free subchannel in the specified subchannel
 set. If a device is hotunplugged and later replugged, it may appear at a
 different subchannel. (This is similar to how z/VM works.)
 
+Configuration token
+-------------------
+
+The optional ``chsc-config-token`` machine property supplies the 64-byte
+current configuration token returned by CHSC Store Configuration Information.
+Its value is exactly 128 hexadecimal digits.  When present, QEMU also returns
+the same value as the target configuration token and marks the configuration
+and current token valid.  The value should remain stable while the virtual I/O
+configuration is unchanged.  For example::
+
+    -machine s390-ccw-virtio,chsc-config-token=<128 hexadecimal digits>
+
+If the property is omitted, QEMU retains its legacy basic-mode response
+without a configuration token.
+
 
 Examples
 --------

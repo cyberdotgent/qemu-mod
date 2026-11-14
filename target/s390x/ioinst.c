@@ -17,6 +17,7 @@
 #include "hw/s390x/ioinst.h"
 #include "trace.h"
 #include "hw/s390x/s390-pci-bus.h"
+#include "hw/s390x/s390-virtio-ccw.h"
 #include "target/s390x/kvm/pv.h"
 #include "hw/s390x/ap-bridge.h"
 
@@ -796,8 +797,13 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
 
 #define CHSC_SCI_0_FMT  0x0f000000
 #define CHSC_SCI_0_RES  0xf0ffffff
+#define CHSC_SCI_BASIC_RESP_LEN 0x0138
+#define CHSC_SCI_TOKEN_RESP_LEN 0x08d8
+#define CHSC_SCI_CURRENT_TOKEN  0x0028
+#define CHSC_SCI_TARGET_TOKEN   0x0068
 static void ioinst_handle_chsc_sci(ChscReq *req, ChscResp *res)
 {
+    S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
     uint32_t param0 = be32_to_cpu(req->param0);
 
     if (param0 & CHSC_SCI_0_FMT) {
@@ -819,11 +825,23 @@ static void ioinst_handle_chsc_sci(ChscReq *req, ChscResp *res)
     /*
      * Store Configuration Information in basic (non-MIF) mode.  The M bit
      * and CSSID/SSID fields are rejected because QEMU does not model MIF.
-     * Byte 2 identifies the response format; all other fields are zero.
+     * Preserve the legacy short response unless a configuration token was
+     * explicitly supplied for the virtual channel subsystem.
      */
-    memset(res->data, 0, 0x0138 - CHSC_MIN_RESP_LEN);
-    res->data[2] = 0x01;
-    res->len = cpu_to_be16(0x0138);
+    if (ms->chsc_config_token_set) {
+        memset(res->data, 0, CHSC_SCI_TOKEN_RESP_LEN - CHSC_MIN_RESP_LEN);
+        /* Configuration valid and current-configuration token present. */
+        res->data[1] = 0x0a;
+        memcpy(res->data + CHSC_SCI_CURRENT_TOKEN,
+               ms->chsc_config_token, sizeof(ms->chsc_config_token));
+        memcpy(res->data + CHSC_SCI_TARGET_TOKEN,
+               ms->chsc_config_token, sizeof(ms->chsc_config_token));
+        res->len = cpu_to_be16(CHSC_SCI_TOKEN_RESP_LEN);
+    } else {
+        memset(res->data, 0, CHSC_SCI_BASIC_RESP_LEN - CHSC_MIN_RESP_LEN);
+        res->data[2] = 0x01;
+        res->len = cpu_to_be16(CHSC_SCI_BASIC_RESP_LEN);
+    }
     res->code = cpu_to_be16(0x0001);
     res->param = 0;
 }

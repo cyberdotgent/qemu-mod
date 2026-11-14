@@ -821,6 +821,65 @@ static void machine_set_loadparm(Object *obj, Visitor *v,
     g_free(val);
 }
 
+static void machine_get_chsc_config_token(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+    static const char hex[] = "0123456789abcdef";
+    g_autofree char *str = NULL;
+    unsigned int i;
+
+    if (!ms->chsc_config_token_set) {
+        str = g_strdup("");
+    } else {
+        str = g_malloc(2 * sizeof(ms->chsc_config_token) + 1);
+        for (i = 0; i < sizeof(ms->chsc_config_token); i++) {
+            str[2 * i] = hex[ms->chsc_config_token[i] >> 4];
+            str[2 * i + 1] = hex[ms->chsc_config_token[i] & 0xf];
+        }
+        str[2 * sizeof(ms->chsc_config_token)] = '\0';
+    }
+    visit_type_str(v, name, &str, errp);
+}
+
+static void machine_set_chsc_config_token(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+    uint8_t token[sizeof(ms->chsc_config_token)];
+    g_autofree char *str = NULL;
+    unsigned int i;
+
+    if (!visit_type_str(v, name, &str, errp)) {
+        return;
+    }
+    if (phase_check(PHASE_MACHINE_READY)) {
+        error_setg(errp, "CHSC configuration token cannot be changed after "
+                   "machine startup");
+        return;
+    }
+    if (strlen(str) != 2 * sizeof(token)) {
+        error_setg(errp, "CHSC configuration token must contain exactly "
+                   "%zu hexadecimal digits", 2 * sizeof(token));
+        return;
+    }
+    for (i = 0; i < sizeof(token); i++) {
+        int high = g_ascii_xdigit_value(str[2 * i]);
+        int low = g_ascii_xdigit_value(str[2 * i + 1]);
+
+        if (high < 0 || low < 0) {
+            error_setg(errp, "CHSC configuration token contains a non-hex "
+                       "character at offset %u", 2 * i + (high >= 0));
+            return;
+        }
+        token[i] = high << 4 | low;
+    }
+    memcpy(ms->chsc_config_token, token, sizeof(token));
+    ms->chsc_config_token_set = true;
+}
+
 static void machine_get_ipl(Object *obj, Visitor *v,
                             const char *name, void *opaque, Error **errp)
 {
@@ -1019,6 +1078,12 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             "Up to 8 chars in set of [A-Za-z0-9. ] (lower case chars converted"
             " to upper case) to pass to machine loader, boot manager,"
             " and guest kernel");
+
+    object_class_property_add(oc, "chsc-config-token", "str", &str_type_info,
+                              machine_get_chsc_config_token,
+                              machine_set_chsc_config_token, NULL, NULL);
+    object_class_property_set_description(oc, "chsc-config-token",
+            "64-byte CHSC configuration token as 128 hexadecimal digits");
 
     object_class_property_add(oc, "ipl", "str", &str_type_info,
                               machine_get_ipl, machine_set_ipl, NULL, NULL);

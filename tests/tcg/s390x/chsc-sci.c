@@ -60,6 +60,27 @@ int main(void)
     ChscResponse *response;
 
     response = run(sizeof(ChscRequest), 0);
+#ifdef CHSC_SCI_EXTENDED
+    if (!response || response->length != 0x08d8 ||
+        response->code != 0x0001 || response->param ||
+        response->data[1] != 0x0a || response->data[2]) {
+        return 1;
+    }
+    for (unsigned int i = 0; i < 0x08d8 - sizeof(*response); i++) {
+        uint8_t expected = 0;
+
+        if (i == 1) {
+            expected = 0x0a;
+        } else if (i >= 0x28 && i < 0x68) {
+            expected = i - 0x28;
+        } else if (i >= 0x68 && i < 0xa8) {
+            expected = i - 0x68;
+        }
+        if (response->data[i] != expected) {
+            return 2;
+        }
+    }
+#else
     if (!response || response->length != 0x0138 ||
         response->code != 0x0001 || response->param ||
         response->data[2] != 0x01) {
@@ -70,6 +91,7 @@ int main(void)
             return 2;
         }
     }
+#endif
 
     response = run(sizeof(ChscRequest) + 8, 0);
     if (!response || response->length != sizeof(*response) ||
