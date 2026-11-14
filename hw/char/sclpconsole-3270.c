@@ -50,6 +50,7 @@ struct SCLPConsole3270 {
     uint32_t incoming_len;
     uint8_t read_command;
     uint8_t parse_state;
+    bool client_attached;
 };
 
 static bool sclp_3270_can_handle_event(uint8_t type)
@@ -105,10 +106,6 @@ static int sclp_3270_send_record(SCLPConsole3270 *console,
     size_t i, out = 0;
     int written;
 
-    if (!qemu_chr_fe_backend_connected(&console->chr)) {
-        return 0;
-    }
-
     wire = g_malloc(2 * (len + 1) + 2);
     wire[out++] = command;
     if (command == TN_IAC) {
@@ -151,9 +148,19 @@ static int sclp_3270_write_event_data(SCLPEvent *event,
         return SCLP_RC_INVALID_FUNCTION;
     }
 
+    /*
+     * Without an attached terminal the console is not in a state to
+     * perform the operation: reject it with "improper state" rather than
+     * an equipment check, which would send the guest into console
+     * recovery and make it retry indefinitely.
+     */
+    if (!console->client_attached) {
+        return SCLP_RC_ADAPTER_IN_RESERVED_STATE;
+    }
     if (sclp_3270_send_record(console, remote, payload + 1,
                               payload_len - 1) < 0) {
-        return SCLP_RC_CONTAINED_EQUIPMENT_CHECK;
+        console->client_attached = false;
+        return SCLP_RC_ADAPTER_IN_RESERVED_STATE;
     }
 
     if (sclp_3270_is_read(command)) {
@@ -279,6 +286,24 @@ static void sclp_3270_chr_read(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+static void sclp_3270_chr_event(void *opaque, QEMUChrEvent event)
+{
+    SCLPConsole3270 *console = opaque;
+
+    switch (event) {
+    case CHR_EVENT_OPENED:
+        console->client_attached = true;
+        break;
+    case CHR_EVENT_CLOSED:
+        console->client_attached = false;
+        console->incoming_len = 0;
+        console->parse_state = SCLP_3270_PARSE_DATA;
+        break;
+    default:
+        break;
+    }
+}
+
 static int sclp_3270_init(SCLPEvent *event)
 {
     static bool console_available;
@@ -291,7 +316,8 @@ static int sclp_3270_init(SCLPEvent *event)
     console_available = true;
 
     qemu_chr_fe_set_handlers(&console->chr, sclp_3270_chr_can_read,
-                             sclp_3270_chr_read, NULL, NULL, console,
+                             sclp_3270_chr_read, sclp_3270_chr_event, NULL,
+                             console,
                              NULL, true);
     return 0;
 }

@@ -180,6 +180,16 @@ tests += {
                 '{ sleep 1; printf \'D IPLINFO\\n\'; sleep 1; } | exec "$@"',
                 'sh'],
   },
+  # Integrated 3270 console whose socket has no client attached (KVM).
+  'sclp-3270-noclient.c': {
+    'cflags': [ccw_cflags],
+    'qemu_args': ['-accel', 'kvm', '-cpu', 'host',
+                  '-monitor', 'none', '-display', 'none', '-nodefaults',
+                  '-action', 'panic=exit-failure', '-serial', 'stdio',
+                  '-chardev',
+                  'socket,id=sysg,host=127.0.0.1,port=0,server=on,wait=off',
+                  '-device', 'sclp3270console,chardev=sysg', '-kernel'],
+  },
   # mtm-3907 maps -serial #0 to the line-mode console (KVM, 3907 hosts).
   'sclp-line-console-mtm.c': {
     'cflags': [ccw_cflags],
