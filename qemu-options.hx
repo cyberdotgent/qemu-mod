@@ -1149,6 +1149,32 @@ SRST
     different ports.
 ERST
 
+DEF("qeth", HAS_ARG, QEMU_OPTION_qeth,
+    "-qeth [devno=ccw-address,]hostdev=tapdev|netdev=id[,mac=macaddr]\n"
+    "                add an OSA-Express QETH adapter attached to a host tap\n"
+    "                interface or to an existing network backend\n",
+    QEMU_ARCH_S390X)
+SRST
+``-qeth [devno=ccw-address,]hostdev=tapdev|netdev=id[,mac=macaddr]``
+    Add an emulated OSA-Express QETH adapter (``qeth-ccw``), which occupies
+    three consecutive device numbers starting at ``devno``. A three- or
+    four-digit hexadecimal ``devno`` such as ``400`` or ``0400`` means
+    ``fe.0.0400``; if it is omitted, automatic allocation begins at ``0400``.
+
+    ``hostdev`` attaches the adapter to the existing host tap interface
+    ``tapdev``, which must already exist and be usable by the user running
+    QEMU (for example a persistent tap owned by that user); QEMU runs no
+    configuration scripts. This is equivalent to::
+
+        -netdev tap,id=qeth-netdevN,ifname=tapdev,script=,downscript=
+        -device qeth-ccw,id=qethN,netdev=qeth-netdevN,devno=ccw-address
+
+    Alternatively, ``netdev`` attaches the adapter to a network backend
+    defined with ``-netdev``. ``mac`` sets the adapter MAC address. The
+    option can be repeated, and it suppresses the default network
+    interface.
+ERST
+
 DEF("sclp3270", HAS_ARG, QEMU_OPTION_sclp3270,
     "-sclp3270 [port=]port\n"
     "                add the SCLP integrated 3270 console, listening on the\n"

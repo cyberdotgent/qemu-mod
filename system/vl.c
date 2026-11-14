@@ -559,6 +559,27 @@ static QemuOptsList qemu_sclp3270_opts = {
     },
 };
 
+static QemuOptsList qemu_qeth_opts = {
+    .name = "qeth",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_qeth_opts.head),
+    .desc = {
+        {
+            .name = "devno",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "hostdev",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "netdev",
+            .type = QEMU_OPT_STRING,
+        },{
+            .name = "mac",
+            .type = QEMU_OPT_STRING,
+        },
+        { /* end of list */ }
+    },
+};
+
 static QemuOptsList qemu_dev3215_opts = {
     .name = "dev3215",
     .head = QTAILQ_HEAD_INITIALIZER(qemu_dev3215_opts.head),
@@ -1574,6 +1595,96 @@ static bool sclp3270_add(const char *optarg, Error **errp)
 fail:
     qemu_opts_del(device_opts);
     qemu_opts_del(chardev_opts);
+    qemu_opts_del(opts);
+    return false;
+}
+
+/*
+ * -qeth [devno=N,](hostdev=TAP|netdev=ID)[,mac=MAC]: an OSA-Express QETH
+ * adapter (three subchannels from devno) attached either to the existing
+ * host tap interface TAP, i.e. the expanded
+ *   -netdev tap,id=qeth-netdevK,ifname=TAP,script=,downscript=
+ *   -device qeth-ccw,id=qethK,netdev=qeth-netdevK,devno=fe.0.N
+ * or to an already defined -netdev ID.
+ */
+static bool qeth_add(const char *optarg, Error **errp)
+{
+    static unsigned int index;
+    g_autofree char *netdev_id = NULL;
+    g_autofree char *device_id = NULL;
+    g_autofree char *normalized_devno = NULL;
+    QemuOpts *opts = NULL;
+    QemuOpts *netdev_opts = NULL;
+    QemuOpts *device_opts = NULL;
+    const char *hostdev;
+    const char *netdev;
+    const char *devno;
+    const char *mac;
+    unsigned int short_devno;
+    int consumed;
+
+    opts = qemu_opts_parse(&qemu_qeth_opts, optarg, false, errp);
+    if (!opts) {
+        return false;
+    }
+
+    if (qemu_opts_id(opts)) {
+        error_setg(errp, "Parameter 'id' is not supported");
+        goto fail;
+    }
+    hostdev = qemu_opt_get(opts, "hostdev");
+    netdev = qemu_opt_get(opts, "netdev");
+    if (!hostdev == !netdev) {
+        error_setg(errp, "Exactly one of 'hostdev' and 'netdev' is required");
+        goto fail;
+    }
+
+    device_id = g_strdup_printf("qeth%u", index);
+    if (hostdev) {
+        netdev_id = g_strdup_printf("qeth-netdev%u", index);
+        netdev_opts = qemu_opts_create(qemu_find_opts("netdev"), netdev_id,
+                                       1, errp);
+        if (!netdev_opts ||
+            !qemu_opt_set(netdev_opts, "type", "tap", errp) ||
+            !qemu_opt_set(netdev_opts, "ifname", hostdev, errp) ||
+            !qemu_opt_set(netdev_opts, "script", "", errp) ||
+            !qemu_opt_set(netdev_opts, "downscript", "", errp)) {
+            goto fail;
+        }
+        netdev = netdev_id;
+    }
+
+    device_opts = qemu_opts_create(qemu_find_opts("device"), device_id,
+                                   1, errp);
+    if (!device_opts ||
+        !qemu_opt_set(device_opts, "driver", "qeth-ccw", errp) ||
+        !qemu_opt_set(device_opts, "netdev", netdev, errp)) {
+        goto fail;
+    }
+
+    devno = qemu_opt_get(opts, "devno");
+    if (devno) {
+        if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&
+            !devno[consumed] && short_devno <= UINT16_MAX) {
+            normalized_devno = g_strdup_printf("fe.0.%04x", short_devno);
+            devno = normalized_devno;
+        }
+        if (!qemu_opt_set(device_opts, "devno", devno, errp)) {
+            goto fail;
+        }
+    }
+    mac = qemu_opt_get(opts, "mac");
+    if (mac && !qemu_opt_set(device_opts, "mac", mac, errp)) {
+        goto fail;
+    }
+
+    index++;
+    qemu_opts_del(opts);
+    return true;
+
+fail:
+    qemu_opts_del(device_opts);
+    qemu_opts_del(netdev_opts);
     qemu_opts_del(opts);
     return false;
 }
@@ -3976,6 +4087,16 @@ void qemu_init(int argc, char **argv)
                 Error *err = NULL;
 
                 if (!dev3270_add(optarg, &err)) {
+                    error_report_err(err);
+                    exit(1);
+                }
+                break;
+            }
+            case QEMU_OPTION_qeth: {
+                Error *err = NULL;
+
+                default_net = 0;
+                if (!qeth_add(optarg, &err)) {
                     error_report_err(err);
                     exit(1);
                 }

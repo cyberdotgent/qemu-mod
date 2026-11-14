@@ -40,6 +40,25 @@ static void test_configuration(void)
     qtest_quit(qts);
 }
 
+static void test_qeth_shortcut(void)
+{
+    g_autofree char *dev_id = NULL;
+    g_autofree char *mac = NULL;
+    g_autofree char *netdev = NULL;
+    QTestState *qts;
+
+    qts = qtest_init(
+        "-nodefaults -netdev user,id=net0 "
+        "-qeth devno=0400,netdev=net0,mac=52:54:00:12:34:61");
+    dev_id = qom_get_string(qts, "/machine/peripheral/qeth0", "dev_id");
+    mac = qom_get_string(qts, "/machine/peripheral/qeth0", "mac");
+    netdev = qom_get_string(qts, "/machine/peripheral/qeth0", "netdev");
+    g_assert_cmpstr(dev_id, ==, "fe.0.0400");
+    g_assert_cmpstr(mac, ==, "52:54:00:12:34:61");
+    g_assert_cmpstr(netdev, ==, "net0");
+    qtest_quit(qts);
+}
+
 static void test_auto_configuration(void)
 {
     g_autofree char *dev_id0 = NULL;
@@ -62,5 +81,6 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/qeth-ccw/configuration", test_configuration);
     qtest_add_func("/qeth-ccw/auto-configuration", test_auto_configuration);
+    qtest_add_func("/qeth-ccw/qeth-shortcut", test_qeth_shortcut);
     return g_test_run();
 }

@@ -13,7 +13,21 @@ For example::
   -netdev user,id=qnet \
   -device qeth-ccw,netdev=qnet,devno=fe.0.0600,mac=52:54:00:12:34:60
 
-This creates devices ``0600``, ``0601``, and ``0602``.  The three subchannels
+This creates devices ``0600``, ``0601``, and ``0602``.
+
+The ``-qeth`` shorthand creates the adapter together with its backend.
+``hostdev`` attaches it to an existing host tap interface, without running
+any configuration scripts::
+
+  -qeth devno=0400,hostdev=tap0
+
+The tap must already exist and be usable by the user running QEMU, for
+example a persistent tap created with ``ip tuntap add dev tap0 mode tap user
+$USER`` or a ``systemd-networkd`` ``.netdev`` unit with ``Kind=tap`` and
+``User=``. Alternatively, ``netdev=ID`` attaches it to a backend defined with
+``-netdev``, and ``mac`` sets the adapter MAC address::
+
+  -netdev user,id=qnet -qeth devno=0400,netdev=qnet  The three subchannels
 report control-unit type/model ``1731/01``, device type/model ``1732/01``,
 and an OSD channel path.
 
