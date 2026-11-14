@@ -22,7 +22,7 @@ Read [build-and-transfer.md](references/build-and-transfer.md) for cross/native 
 
 ## Working in this checkout
 
-Use rg to locate subsystem code, apply_patch for local edits, and focused tests proportional to the change. For unfamiliar QEMU routing, read `.agents/skills/qemu-codebase/SKILL.md` if available. Known entry points: `hw/s390x/eckd-ccw.c`, `hw/s390x/ckd-image.c`, `target/s390x/ioinst.c`, `target/s390x/kvm/kvm.c`, `hw/s390x/s390-virtio-ccw.c`, `hw/s390x/sclp.c`, and `hw/char/*3270*`.
+Use grep/rg via the Bash tool (or an Explore agent for broad sweeps, when delegation is authorized) to locate subsystem code, the Read/Edit/Write tools for local edits, and focused tests proportional to the change. For unfamiliar QEMU routing, invoke the `qemu-codebase` skill (`.agents/skills/qemu-codebase/SKILL.md`). Known entry points: `hw/s390x/eckd-ccw.c`, `hw/s390x/ckd-image.c`, `target/s390x/ioinst.c`, `target/s390x/kvm/kvm.c`, `hw/s390x/s390-virtio-ccw.c`, `hw/s390x/sclp.c`, and `hw/char/*3270*`.
 
 Existing tracked edits, untracked `.debug` dumps/build trees and dirty ROM submodules may belong to the user or other agents. Preserve them. Coordinate ownership before editing shared files. For simultaneous research, one agent owns the live VM while others inspect static code. Use subagents when explicitly requested/authorized; skill use alone does not authorize new delegation.
 
