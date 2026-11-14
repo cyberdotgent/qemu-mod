@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 
-MEMORY_MB = 4096
+MEMORY_MB = 8192
 SKIP = 77
 
 
