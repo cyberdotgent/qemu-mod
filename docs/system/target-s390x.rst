@@ -16,6 +16,32 @@ distributions built for the z13.
 Device support
 ==============
 
+z/OS compatibility handshake under KVM
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set ``QEMU_S390_ZOS_COMPAT=1`` in QEMU's environment to enable an
+optional z/OS control-block adjustment at KVM STSI exits.  This reproduces
+the result of the compatibility handshake which some emulators perform
+at ``STNSM 0x950,0xff``; it is not an architectural instruction side effect.
+The default is disabled.
+
+The hook reads the CVT pointer at guest address 0x10, the ECVT pointer at
+CVT+0x8c, and the level halfword at ECVT+0x1dc.  For levels at least
+0x0102 it clears the byte at SVT+0x560, where the SVT pointer is at guest
+address 0xb4c.  Null, out-of-range, or inaccessible pointers cause no
+adjustment.  Accesses use the current guest address translation and do
+not inject guest exceptions.  Each STSI exit retries the check, allowing
+initialization to publish the pointers after earlier STSI calls.
+
+For example::
+
+  QEMU_S390_ZOS_COMPAT=1 qemu-system-s390x -accel kvm -cpu host ...
+
+This hook does not intercept STNSM itself.  It requires an STSI exit after
+the guest initializes the byte and before the guest consumes it; validate
+that ordering for the guest release being used.  A successful change is
+reported in QEMU's diagnostic output.
+
 QEMU will not emulate most of the traditional devices found under LPAR or
 z/VM; virtio devices (especially using virtio-ccw) make up the bulk of
 the available devices. Passthrough of host devices via vfio-pci, vfio-ccw,
