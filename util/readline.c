@@ -532,6 +532,18 @@ void readline_handle_byte(ReadLineState *rs, int ch)
     readline_update(rs);
 }
 
+/*
+ * Redraw the prompt and the line being edited from scratch, e.g. after
+ * unrelated output has been written to the terminal.
+ */
+void readline_redisplay(ReadLineState *rs)
+{
+    rs->printf_func(rs->opaque, "%s", rs->prompt);
+    rs->last_cmd_buf_index = 0;
+    rs->last_cmd_buf_size = 0;
+    readline_update(rs);
+}
+
 void readline_start(ReadLineState *rs, const char *prompt, int read_password,
                     ReadLineFunc *readline_func, void *opaque)
 {

@@ -1,14 +1,16 @@
 /*
- * SCLP line-mode console output framing and operator input echo.
+ * SCLP line-mode console output framing and interactive line editing.
  *
- * The guest writes message "ONE", reads one operator command and writes
- * message "TWO".  The meson wrapper types "ab<DEL>c" followed by CR LF with
- * echo enabled and checks the exact host output:
+ * The guest writes message "ONE", reads two operator commands and writes
+ * message "TWO".  With echo enabled, the meson wrapper types
  *
- *   "ONE\n" "ab" "\b \b" "c" "\n" "TWO\n"
+ *   "ab" DEL "c" CR LF          -> first command  "ac"
+ *   Up Left "x" CR              -> second command "axc" (history recall,
+ *                                  cursor movement, insertion)
  *
- * i.e. each message ends its own line, input starts on a fresh line, the
- * erase character removes a byte, and CR LF ends the command exactly once.
+ * The guest checks both commands (so CR LF ends a command exactly once and
+ * editing happens before delivery); the wrapper checks that each message
+ * occupies its own line.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -56,7 +58,7 @@ typedef struct OperatorCommand {
     SCCBHeader h;
     EventBufferHeader event;
     uint8_t gds[4 * 3 + 2 * 2];
-    uint8_t text[2];
+    uint8_t text[3];
 } __attribute__((packed)) OperatorCommand;
 
 static union {
@@ -103,11 +105,34 @@ static int write_message(const uint8_t text[3])
            msg->h.response_code != SCLP_RC_NORMAL_COMPLETION;
 }
 
+static int read_command(const uint8_t *expected, unsigned int len)
+{
+    OperatorCommand *command = &sccb.command;
+    unsigned int i;
+
+    consume_sclp_int();
+    memset(&sccb, 0, sizeof(sccb));
+    command->h.length = PAGE_SIZE;
+    if (service_call(SCLP_CMD_READ_EVENT_DATA) ||
+        command->h.response_code != SCLP_RC_NORMAL_COMPLETION ||
+        command->event.length != sizeof(command->event) +
+                                 sizeof(command->gds) + len) {
+        return 1;
+    }
+    for (i = 0; i < len; i++) {
+        if (command->text[i] != expected[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void)
 {
     static const uint8_t one[] = { 0xd6, 0xd5, 0xc5 };   /* "ONE" */
     static const uint8_t two[] = { 0xe3, 0xe6, 0xd6 };   /* "TWO" */
-    OperatorCommand *command = &sccb.command;
+    static const uint8_t ac[] = { 0x81, 0x83 };          /* "ac" */
+    static const uint8_t axc[] = { 0x81, 0xa7, 0x83 };   /* "axc" */
 
     memset(&sccb, 0, sizeof(sccb));
     sccb.wem.h.length = sizeof(sccb.wem);
@@ -122,17 +147,11 @@ int main(void)
         return 2;
     }
 
-    /* The wrapper types the command once "ONE" has been written. */
-    consume_sclp_int();
-    memset(&sccb, 0, sizeof(sccb));
-    command->h.length = PAGE_SIZE;
-    if (service_call(SCLP_CMD_READ_EVENT_DATA) ||
-        command->h.response_code != SCLP_RC_NORMAL_COMPLETION) {
+    /* The wrapper types the commands once "ONE" has been written. */
+    if (read_command(ac, sizeof(ac))) {
         return 3;
     }
-    /* "ac": the erase removed "b". */
-    if (command->event.length != sizeof(*command) - sizeof(command->h) ||
-        command->text[0] != 0x81 || command->text[1] != 0x83) {
+    if (read_command(axc, sizeof(axc))) {
         return 4;
     }
 

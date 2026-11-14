@@ -18,6 +18,7 @@
 #include "qemu/thread.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/readline.h"
 #include "chardev/char-fe.h"
 
 #include "hw/s390x/sclp.h"
@@ -52,6 +53,7 @@ struct SCLPConsoleLM {
     CharFrontend chr;
     bool echo;                  /* immediate echo of input if true        */
     bool last_was_cr;           /* swallow the LF of a CR LF pair         */
+    ReadLineState *rs;          /* line editor for echoed operator input  */
     uint32_t write_errors;      /* errors writing to char layer           */
     uint32_t length;            /* length of byte stream in buffer        */
     uint8_t buf[SIZE_CONSOLE_BUFFER];
@@ -96,6 +98,43 @@ static void echo_output(SCLPConsoleLM *scon, const void *buf, int len)
     }
 }
 
+static void G_GNUC_PRINTF(2, 3) lm_readline_printf(void *opaque,
+                                                   const char *fmt, ...)
+{
+    SCLPConsoleLM *scon = opaque;
+    g_autofree char *str = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    str = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    echo_output(scon, str, strlen(str));
+}
+
+static void lm_readline_flush(void *opaque)
+{
+}
+
+static void lm_readline_completion(void *opaque, const char *cmdline)
+{
+    /* No completion: Tab offers nothing. */
+}
+
+/*
+ * A complete operator command from the line editor.  The editor has
+ * already echoed the line end; hand the command to the guest.
+ */
+static void lm_readline_command(void *opaque, const char *str,
+                                void *readline_opaque)
+{
+    SCLPConsoleLM *scon = opaque;
+
+    scon->length = MIN(strlen(str), MAX_COMMAND_LEN);
+    memcpy(scon->buf, str, scon->length);
+    scon->event.event_pending = true;
+    sclp_service_interrupt(0);
+}
+
 static void chr_read(void *opaque, const uint8_t *buf, int size)
 {
     SCLPConsoleLM *scon = opaque;
@@ -106,6 +145,16 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
     scon->last_was_cr = *buf == '\r';
     if (*buf == '\n' && after_cr) {
         /* CR LF from a terminal or socket client is a single line end. */
+        return;
+    }
+    if (scon->rs) {
+        /*
+         * Echoed (interactive) input is edited locally, like on a real
+         * line-mode console, and only delivered to the guest on Enter:
+         * cursor keys, Home/End, Insert-style editing, Backspace/Delete,
+         * ^U/^W and command history all act on the local line.
+         */
+        readline_handle_byte(scon->rs, *buf);
         return;
     }
     if (*buf == '\r' || *buf == '\n') {
@@ -260,8 +309,8 @@ static int write_console_data(SCLPEvent *event, const uint8_t *buf, int len)
 static int process_mdb(SCLPEvent *event, MDBO *mdbo)
 {
     SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
-    bool partial_input = scon->echo && scon->length &&
-                         !event->event_pending;
+    bool partial_input = scon->rs ? scon->rs->cmd_buf_size > 0 :
+                         scon->echo && scon->length && !event->event_pending;
     int rc;
     int len;
     QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER];
@@ -299,7 +348,11 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
         return rc;
     }
     if (partial_input) {
-        rc = write_console_data(event, scon->buf, scon->length);
+        if (scon->rs) {
+            readline_redisplay(scon->rs);
+        } else {
+            rc = write_console_data(event, scon->buf, scon->length);
+        }
     }
     return rc;
 }
@@ -391,6 +444,11 @@ static int console_init(SCLPEvent *event)
     }
     console_available = true;
 
+    if (scon->echo) {
+        scon->rs = readline_init(lm_readline_printf, lm_readline_flush, scon,
+                                 lm_readline_completion);
+        readline_start(scon->rs, "", 0, lm_readline_command, scon);
+    }
     qemu_chr_fe_set_handlers(&scon->chr, chr_can_read,
                              chr_read, NULL, NULL, scon, NULL, true);
 
@@ -399,13 +457,16 @@ static int console_init(SCLPEvent *event)
 
 static void console_reset(DeviceState *dev)
 {
-   SCLPEvent *event = SCLP_EVENT(dev);
-   SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
+    SCLPEvent *event = SCLP_EVENT(dev);
+    SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
-   event->event_pending = false;
-   scon->length = 0;
-   scon->last_was_cr = false;
-   scon->write_errors = 0;
+    event->event_pending = false;
+    scon->length = 0;
+    scon->last_was_cr = false;
+    scon->write_errors = 0;
+    if (scon->rs) {
+        readline_restart(scon->rs);
+    }
 }
 
 static const Property console_properties[] = {

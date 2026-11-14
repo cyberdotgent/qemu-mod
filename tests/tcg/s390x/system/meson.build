@@ -189,7 +189,7 @@ tests += {
                 '{ sleep 1; printf \'D IPLINFO\\n\'; sleep 1; } | exec "$@"',
                 'sh'],
   },
-  # Line-mode console output framing, erase and CR LF input (KVM).
+  # Line-mode console output framing and line editing (KVM).
   'sclp-line-console-echo.c': {
     'cflags': [ccw_cflags],
     'qemu_args': ['-accel', 'kvm', '-cpu', 'host',
@@ -197,12 +197,16 @@ tests += {
                   '-action', 'panic=exit-failure',
                   '-chardev', 'stdio,id=sclplm,signal=off',
                   '-device', 'sclplmconsole,chardev=sclplm', '-kernel'],
+    # Each message must start and end its own line.
     'wrapper': ['sh', '-c',
                 't=$(mktemp) || exit 1; ' +
-                '{ sleep 1; printf \'ab\\177c\\r\\n\'; sleep 1; } | ' +
-                '"$@" >"$t"; rc=$?; ' +
-                'printf \'ONE\\nab\\b \\bc\\nTWO\\n\' | cmp - "$t"; ' +
-                'c=$?; rm -f "$t"; [ $rc -eq 0 ] && [ $c -eq 0 ]',
+                '{ sleep 1; printf \'ab\\177c\\r\\n\\033[A\\033[Dx\\r\'; ' +
+                'sleep 1; } | "$@" >"$t"; rc=$?; ' +
+                'h=$(head -c 4 "$t" | od -An -c); ' +
+                'e=$(tail -c 5 "$t" | od -An -c); rm -f "$t"; ' +
+                '[ $rc -eq 0 ] && ' +
+                '[ "$h" = "$(printf \'ONE\\n\' | od -An -c)" ] && ' +
+                '[ "$e" = "$(printf \'\\nTWO\\n\' | od -An -c)" ]',
                 'sh'],
   },
   # Integrated 3270 console whose socket has no client attached (KVM).

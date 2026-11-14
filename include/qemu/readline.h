@@ -56,6 +56,7 @@ void readline_start(ReadLineState *rs, const char *prompt, int read_password,
                     ReadLineFunc *readline_func, void *readline_opaque);
 void readline_restart(ReadLineState *rs);
 void readline_show_prompt(ReadLineState *rs);
+void readline_redisplay(ReadLineState *rs);
 
 ReadLineState *readline_init(ReadLinePrintfFunc *printf_func,
                              ReadLineFlushFunc *flush_func,
