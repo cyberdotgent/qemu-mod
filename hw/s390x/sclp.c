@@ -120,6 +120,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
     MachineState *machine = MACHINE(qdev_get_machine());
     int cpu_count;
     int rnmax;
+    uint64_t increment;
     int required_len = SCCB_REQ_LEN(ReadInfo, machine->possible_cpus->len);
     int offset_cpu = s390_has_feat(S390_FEAT_EXTENDED_LENGTH_SCCB) ?
                      offsetof(ReadInfo, entries) :
@@ -169,14 +170,28 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
 
     read_info->mha_pow = s390_get_mha_pow();
     read_info->hmfai = cpu_to_be32(s390_get_hmfai());
-    read_info->rnsize = 1;
+    increment = s390_mtm_storage_increment();
+    if (increment) {
+        /* Host-mirrored LPAR personality: report the host's increment. */
+        uint64_t increment_mb = increment >> 20;
+
+        if (increment_mb <= 0xff) {
+            read_info->rnsize = increment_mb;
+        } else {
+            read_info->rnsize = 0;
+            read_info->rnsize2 = cpu_to_be32(increment_mb);
+        }
+    } else {
+        increment = 1 * MiB;
+        read_info->rnsize = 1;
+    }
 
     /*
      * We don't support standby memory. maxram_size is used for sizing the
      * memory device region, which is not exposed through SCLP but through
      * diag500.
      */
-    rnmax = machine->ram_size >> 20;
+    rnmax = machine->ram_size / increment;
     if (rnmax < 0x10000) {
         read_info->rnmax = cpu_to_be16(rnmax);
     } else {

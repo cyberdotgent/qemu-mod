@@ -31,6 +31,7 @@
 #include "hw/s390x/event-facility.h"
 #include "ipl.h"
 #include "hw/s390x/s390-virtio-ccw.h"
+#include "hw/s390x/ebcdic.h"
 #include "hw/s390x/css-bridge.h"
 #include "hw/s390x/ap-bridge.h"
 #include "migration/register.h"
@@ -1200,6 +1201,235 @@ static void ccw_machine_11_2_class_options(MachineClass *mc)
 {
 }
 DEFINE_CCW_MACHINE_AS_LATEST(11, 2);
+
+/*
+ * Host-mirrored LPAR personalities ("mtm-XXXX").
+ *
+ * These machines present a KVM guest as a logical partition of the IBM
+ * machine type it physically runs on, instead of as a generic virtual
+ * s390x machine.  Machine-level identity (type, model, manufacturer, plant
+ * and the serial/sequence number) is the host's: under KVM, STIDP and
+ * SYSIB 1.1.1/1.2.x already reflect the real machine, so the host serial is
+ * reused as-is.  The partition identity in SYSIB 2.2.2 is replaced by the
+ * configured virtual partition (default number 1, name QEMUKVM), and the
+ * SCLP storage increment mirrors the host's memory block size, as reported
+ * by Linux.  The host's machine type must match the personality.
+ */
+
+#define MTM_SYSINFO_PATH "/proc/sysinfo"
+#define MTM_BLOCK_SIZE_PATH "/sys/devices/system/memory/block_size_bytes"
+#define MTM_DEFAULT_LPAR_NAME "QEMUKVM"
+#define MTM_DEFAULT_LPAR_NUMBER 1
+
+static S390CcwMachineState *mtm_machine(void)
+{
+    Object *obj = qdev_get_machine();
+    S390CcwMachineState *ms;
+
+    if (!obj || !object_dynamic_cast(obj, TYPE_S390_CCW_MACHINE)) {
+        return NULL;
+    }
+    ms = S390_CCW_MACHINE(obj);
+    return S390_CCW_MACHINE_GET_CLASS(ms)->mtm ? ms : NULL;
+}
+
+bool s390_mtm_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8])
+{
+    S390CcwMachineState *ms = mtm_machine();
+
+    if (!ms) {
+        return false;
+    }
+    *number = ms->lpar_number;
+    memset(name_ebcdic, 0x40, 8);
+    ebcdic_put(name_ebcdic, ms->lpar_name, strlen(ms->lpar_name));
+    return true;
+}
+
+uint64_t s390_mtm_storage_increment(void)
+{
+    S390CcwMachineState *ms = mtm_machine();
+
+    return ms ? ms->storage_increment : 0;
+}
+
+/* Return the trimmed value of a "Key: value" line of /proc/sysinfo. */
+static char *mtm_sysinfo_value(const char *sysinfo, const char *key)
+{
+    g_auto(GStrv) lines = g_strsplit(sysinfo, "\n", -1);
+    size_t keylen = strlen(key);
+
+    for (int i = 0; lines[i]; i++) {
+        if (!strncmp(lines[i], key, keylen) && lines[i][keylen] == ':') {
+            return g_strstrip(g_strdup(lines[i] + keylen + 1));
+        }
+    }
+    return NULL;
+}
+
+static void mtm_check_host(S390CcwMachineState *ms, uint16_t mtm,
+                           Error **errp)
+{
+    MachineState *machine = MACHINE(ms);
+    g_autofree char *sysinfo = NULL;
+    g_autofree char *type = NULL;
+    g_autofree char *block = NULL;
+    g_autoptr(GError) gerr = NULL;
+    char expected[8];
+    uint64_t increment;
+
+    if (!kvm_enabled()) {
+        error_setg(errp, "machine mtm-%04x requires KVM", mtm);
+        return;
+    }
+    if (!g_file_get_contents(MTM_SYSINFO_PATH, &sysinfo, NULL, &gerr)) {
+        error_setg(errp, "cannot read %s: %s", MTM_SYSINFO_PATH,
+                   gerr->message);
+        return;
+    }
+    type = mtm_sysinfo_value(sysinfo, "Type");
+    snprintf(expected, sizeof(expected), "%04x", mtm);
+    if (!type || strcmp(type, expected)) {
+        error_setg(errp, "machine mtm-%s mirrors its host, but the host "
+                   "machine type is %s", expected, type ? type : "unknown");
+        return;
+    }
+
+    if (!g_file_get_contents(MTM_BLOCK_SIZE_PATH, &block, NULL, &gerr)) {
+        error_setg(errp, "cannot read %s: %s", MTM_BLOCK_SIZE_PATH,
+                   gerr->message);
+        return;
+    }
+    increment = g_ascii_strtoull(g_strstrip(block), NULL, 16);
+    if (increment < MiB || !is_power_of_2(increment)) {
+        error_setg(errp, "unusable host storage increment 0x%" PRIx64,
+                   increment);
+        return;
+    }
+    if (machine->ram_size % increment) {
+        error_setg(errp, "memory size must be a multiple of the host storage "
+                   "increment (%" PRIu64 " MiB)", increment / MiB);
+        return;
+    }
+    ms->storage_increment = increment;
+}
+
+static void mtm_3907_init(MachineState *machine)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(machine);
+    S390CPU *cpu;
+
+    mtm_check_host(ms, 0x3907, &error_fatal);
+    ccw_machine_11_2_instance_options(machine);
+    ccw_init(machine);
+
+    cpu = S390_CPU(first_cpu);
+    if (cpu && cpu->model && cpu->model->def &&
+        cpu->model->def->type != 0x3907) {
+        error_report("machine mtm-3907 requires a 3907 CPU model "
+                     "(e.g. -cpu host or z14ZR1), not %s",
+                     cpu->model->def->name);
+        exit(1);
+    }
+}
+
+static char *mtm_get_lpar_name(Object *obj, Error **errp)
+{
+    return g_strdup(S390_CCW_MACHINE(obj)->lpar_name);
+}
+
+static void mtm_set_lpar_name(Object *obj, const char *value, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+    size_t len = strlen(value);
+
+    /* Partition names: 1-8 characters from A-Z, 0-9, #, $ and @. */
+    if (!len || len > 8 || !g_ascii_isalpha(value[0]) ||
+        strspn(value, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$@") != len) {
+        error_setg(errp, "lpar-name must be 1-8 characters A-Z, 0-9, #, $ "
+                   "or @, starting with a letter");
+        return;
+    }
+    g_free(ms->lpar_name);
+    ms->lpar_name = g_strdup(value);
+}
+
+static void mtm_get_lpar_number(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    uint16_t value = S390_CCW_MACHINE(obj)->lpar_number;
+
+    visit_type_uint16(v, name, &value, errp);
+}
+
+static void mtm_set_lpar_number(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    uint16_t value;
+
+    if (!visit_type_uint16(v, name, &value, errp)) {
+        return;
+    }
+    if (!value || value > 0xff) {
+        error_setg(errp, "lpar-number must be between 1 and 255");
+        return;
+    }
+    S390_CCW_MACHINE(obj)->lpar_number = value;
+}
+
+static void mtm_instance_init(Object *obj)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    ms->lpar_name = g_strdup(MTM_DEFAULT_LPAR_NAME);
+    ms->lpar_number = MTM_DEFAULT_LPAR_NUMBER;
+}
+
+static void mtm_instance_finalize(Object *obj)
+{
+    g_free(S390_CCW_MACHINE(obj)->lpar_name);
+}
+
+static void mtm_3907_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    S390CcwMachineClass *s390mc = S390_CCW_MACHINE_CLASS(mc);
+
+    compat_props_add(mc->compat_props, hw_compat_s390x, hw_compat_s390x_len);
+    ccw_machine_11_2_class_options(mc);
+    mc->desc = "IBM z14 ZR1 (3907) LPAR personality, mirrored from the "
+               "KVM host";
+    mc->init = mtm_3907_init;
+    mc->default_cpu_type = S390_CPU_TYPE_NAME("host");
+    /* One storage increment of a typical z14 LPAR (1 GiB memory blocks). */
+    mc->default_ram_size = 1 * GiB;
+    s390mc->mtm = 0x3907;
+
+    object_class_property_add_str(oc, "lpar-name", mtm_get_lpar_name,
+                                  mtm_set_lpar_name);
+    object_class_property_set_description(oc, "lpar-name",
+        "Partition name reported in SYSIB 2.2.2 (default QEMUKVM)");
+    object_class_property_add(oc, "lpar-number", "uint16", &uint16_type_info,
+                              mtm_get_lpar_number, mtm_set_lpar_number,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "lpar-number",
+        "Partition number reported in SYSIB 2.2.2 (default 1)");
+}
+
+static const TypeInfo mtm_3907_info = {
+    .name = MACHINE_TYPE_NAME("mtm-3907"),
+    .parent = TYPE_S390_CCW_MACHINE,
+    .instance_init = mtm_instance_init,
+    .instance_finalize = mtm_instance_finalize,
+    .class_init = mtm_3907_class_init,
+    .secure = true,
+};
+
+static void mtm_register(void)
+{
+    type_register_static(&mtm_3907_info);
+}
+type_init(mtm_register)
 
 static void ccw_machine_11_1_instance_options(MachineState *machine)
 {

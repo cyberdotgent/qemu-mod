@@ -44,6 +44,11 @@ struct S390CcwMachineState {
     bool chsc_config_token_set;
     uint8_t chsc_config_token[64];
 
+    /* Host-mirrored LPAR personality (machine types mtm-XXXX) */
+    char *lpar_name;
+    uint16_t lpar_number;
+    uint64_t storage_increment;
+
     SCLPDevice *sclp;
 };
 
@@ -60,6 +65,16 @@ static inline uint64_t s390_get_memory_limit(S390CcwMachineState *s390ms)
 #define S390_TOPO_FC_MASK 0xffUL
 void s390_handle_ptf(S390CPU *cpu, uint8_t r1, uintptr_t ra);
 
+/*
+ * Host-mirrored LPAR personality.  s390_mtm_lpar_identity() returns false
+ * for machines without one; otherwise it provides the partition number and
+ * the blank-padded EBCDIC partition name to report in SYSIB 2.2.2.
+ * s390_mtm_storage_increment() returns the SCLP storage increment in bytes,
+ * or 0 to keep the default.
+ */
+bool s390_mtm_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8]);
+uint64_t s390_mtm_storage_increment(void);
+
 struct S390CcwMachineClass {
     /*< private >*/
     MachineClass parent_class;
@@ -69,6 +84,8 @@ struct S390CcwMachineClass {
     bool use_cpi;
     bool use_certs;
     bool use_secure;
+    /* Machine type of a host-mirrored LPAR personality, 0 if none */
+    uint16_t mtm;
 };
 
 #endif

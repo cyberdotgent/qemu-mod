@@ -1879,12 +1879,56 @@ static void insert_stsi_3_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
     }
 }
 
+/*
+ * For a host-mirrored LPAR personality, KVM has stored the host partition's
+ * SYSIB 2.2.2.  Keep its CPU and capability data, but report the configured
+ * virtual partition number and name, including the extended name when the
+ * host provides one.
+ */
+#define SYSIB_222_VSNE_OFFSET 79
+#define SYSIB_222_EXT_NAME_OFFSET 256
+#define SYSIB_222_EXT_NAME_LEN 256
+
+static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
+{
+    uint8_t name[8];
+    uint16_t number;
+    union {
+        SysIB_222 sysib;
+        uint8_t raw[sizeof(SysIB_222)];
+    } u;
+
+    if (s390_is_pv() || !s390_mtm_lpar_identity(&number, name)) {
+        return;
+    }
+    if (s390_cpu_virt_mem_read(cpu, addr, ar, &u, sizeof(u))) {
+        return;
+    }
+    u.sysib.lpar_num = cpu_to_be16(number);
+    memcpy(u.sysib.name, name, sizeof(u.sysib.name));
+    if (u.raw[SYSIB_222_VSNE_OFFSET]) {
+        S390CcwMachineState *ms = S390_CCW_MACHINE(qdev_get_machine());
+
+        /* Extended name, UTF-8 encoded (2), zero padded. */
+        u.raw[SYSIB_222_VSNE_OFFSET] = 2;
+        memset(u.raw + SYSIB_222_EXT_NAME_OFFSET, 0, SYSIB_222_EXT_NAME_LEN);
+        memcpy(u.raw + SYSIB_222_EXT_NAME_OFFSET, ms->lpar_name,
+               strlen(ms->lpar_name));
+    }
+    s390_cpu_virt_mem_write(cpu, addr, ar, &u, sizeof(u));
+}
+
 static int handle_stsi(S390CPU *cpu)
 {
     CPUState *cs = CPU(cpu);
     struct kvm_run *run = cs->kvm_run;
 
     switch (run->s390_stsi.fc) {
+    case 2:
+        if (run->s390_stsi.sel1 == 2 && run->s390_stsi.sel2 == 2) {
+            insert_stsi_2_2_2(cpu, run->s390_stsi.addr, run->s390_stsi.ar);
+        }
+        return 0;
     case 3:
         if (run->s390_stsi.sel1 != 2 || run->s390_stsi.sel2 != 2) {
             return 0;

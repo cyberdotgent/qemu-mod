@@ -193,6 +193,10 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../eckd-zero-data.py')],
   },
+  'mtm-3907.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../mtm-3907.py')],
+  },
   'eckd-topology.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../eckd-topology.py')],
