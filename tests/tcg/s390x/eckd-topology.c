@@ -109,7 +109,7 @@ int main(void)
     desc = response->data;
     if (desc[0] != 0xc0 || desc[1] != 0x05 ||
         desc[2] != 0x0a || desc[3] != 0x85 || desc[4] != 0x80 ||
-        desc[5] != 0x80 || desc[6] || desc[7] || desc[8] != 0x0a ||
+        desc[5] != 0x80 || desc[6] || desc[7] || desc[8] != 0x01 ||
         desc[16] != 0x12 || desc[17] != 0x34) {
         return 4;
     }
@@ -123,7 +123,7 @@ int main(void)
     if (desc[0] != 0xc0 || desc[1] != 0x80 ||
         desc[2] != 0x0a || desc[3] != 0x85 ||
         desc[4] || desc[5] != 1 || desc[6] || desc[7] ||
-        desc[8] != 0x0a || desc[16] || desc[17] != 2) {
+        desc[8] != 0x01 || desc[16] || desc[17] != 2) {
         return 6;
     }
 

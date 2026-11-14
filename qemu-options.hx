@@ -1206,9 +1206,9 @@ ERST
 
 DEF("dev3390", HAS_ARG, QEMU_OPTION_dev3390,
     "-dev3390 file=file[,devno=ccw-address][,format=format][,readonly=on|off][,id=id]\n"
-    "         [,unit-address=n,unit-address-limit=n,subsystem-id=n,lcu-queue-number=n,path-cu-number=n]\n"
+    "         [,unit-address=n,unit-address-limit=n,subsystem-id=n,lcu-queue-number=n,path-cu-number=n,chpid=n]\n"
     "-dev3390 drive=node[,devno=ccw-address][,id=id]\n"
-    "         [,unit-address=n,unit-address-limit=n,subsystem-id=n,lcu-queue-number=n,path-cu-number=n]\n"
+    "         [,unit-address=n,unit-address-limit=n,subsystem-id=n,lcu-queue-number=n,path-cu-number=n,chpid=n]\n"
     "                add an emulated 2107/3390 ECKD disk\n",
     QEMU_ARCH_S390X)
 SRST
@@ -1227,8 +1227,9 @@ SRST
     topology and must be specified together. ``unit-address-limit`` is the
     highest unit address reported by SNSS. ``interface-id`` selects the ECKD
     interface (the default is zero), and ``fla`` optionally supplies the
-    full-link address for the device's first channel path. Existing command
-    lines retain the legacy device-number-derived topology.
+    full-link address for the device's first channel path. ``chpid`` overrides
+    the device-number-derived channel-path identifier. Existing command lines
+    retain the legacy device-number-derived topology.
 ERST
 
 DEF("device", HAS_ARG, QEMU_OPTION_device,

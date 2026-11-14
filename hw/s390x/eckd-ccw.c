@@ -104,6 +104,7 @@ struct EckdCcwDevice {
     uint16_t lcu_queue_number;
     uint16_t path_cu_number;
     uint16_t fla;
+    uint16_t chpid;
 
     bool extent_defined;
     uint16_t extent_begin_cylinder;
@@ -1692,7 +1693,7 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     }
     sch->driver_data = eckd;
     cdev->sch = sch;
-    chpid = sch->devno >> 8;
+    chpid = eckd->chpid == UINT16_MAX ? sch->devno >> 8 : eckd->chpid;
     if (chpid > MAX_CHPID) {
         error_setg(&local_err, "No available CHPID for eckd-ccw");
         goto fail_sch;
@@ -1759,6 +1760,7 @@ static const Property eckd_properties[] = {
     DEFINE_PROP_UINT16("path-cu-number", EckdCcwDevice, path_cu_number,
                        UINT16_MAX),
     DEFINE_PROP_UINT16("fla", EckdCcwDevice, fla, UINT16_MAX),
+    DEFINE_PROP_UINT16("chpid", EckdCcwDevice, chpid, UINT16_MAX),
 };
 
 static void eckd_class_init(ObjectClass *klass, const void *data)

@@ -40,7 +40,7 @@ def main():
             f"file={image},format=raw,devno=0A85,unit-address=5,"
             "unit-address-limit=0x24,subsystem-id=3,interface-id=0,"
             "lcu-queue-number=1,"
-            "path-cu-number=2,fla=0x1234",
+            "path-cu-number=2,fla=0x1234,chpid=1",
             "-kernel", guest,
         ], timeout=30)
         return result.returncode

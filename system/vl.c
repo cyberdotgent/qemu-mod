@@ -610,6 +610,7 @@ static QemuOptsList qemu_dev3390_opts = {
         { .name = "lcu-queue-number", .type = QEMU_OPT_STRING },
         { .name = "path-cu-number", .type = QEMU_OPT_STRING },
         { .name = "fla", .type = QEMU_OPT_STRING },
+        { .name = "chpid", .type = QEMU_OPT_STRING },
         { .name = "id", .type = QEMU_OPT_STRING },
         { /* end of list */ }
     },
@@ -1754,7 +1755,7 @@ static bool dev3390_add(const char *optarg, Error **errp)
     const char *file, *drive, *format, *devno, *id;
     static const char * const topology_options[] = {
         "unit-address", "unit-address-limit", "subsystem-id", "interface-id",
-        "lcu-queue-number", "path-cu-number", "fla",
+        "lcu-queue-number", "path-cu-number", "fla", "chpid",
     };
     unsigned int short_devno;
     int consumed;
