@@ -6,19 +6,34 @@ Current default compatibility behavior: `-machine mtm-3907 -accel kvm -cpu host`
 
 The hook checks PSA0x10 -> CVT+0x8c -> ECVT+0x1dc level>=0x0102 and clears `[PSA0xb4c]+0x560`. This is an emulator compatibility side effect, not architectural STSI/STNSM behavior. It reproduces the result of Hercules's STNSM0x950/ff adjustment without copying code. Prior natural-STSI KVM IPL reached JES2, jobs, VTAM and TSO; see research `oracles/hercules-np05-svt560-clear.md`, `boot/master-scheduler/svt560-zero-test.md`, and the later STSI validation report. Do not repeat superseded missing-DASD, UCBTYP, or negative-breakpoint hypotheses without new evidence.
 
-Useful launch fragments (include the full required DASD/3270 configuration separately):
+Under `mtm-3907`, SCLP Read SCP Info and CHSC characteristics may also be patched to real z14 ZR1 LPAR values (`s390_mtm_patch_read_info`, `s390_mtm_chsc_characteristics`). Check `git log`/`git status` for whether that work is committed or still a working-tree overlay before relying on it or reporting provenance. The machine also exposes `lpar-name` (SYSIB 2.2.2, default `QEMUKVM`).
+
+## SCLP consoles
+
+Source and `tests/tcg/s390x/system/meson.build` are authoritative; re-check them if this drifts.
+
+- **Line-mode operator console** `sclplmconsole` (event type 0x02, message/MDB framing): properties `chardev`, `echo` (default on; use `echo=off` for scripted input), `write_errors`. Input is delivered per line on CR/LF. z/OS operator messages appear here; `VARY CN(*),ACTIVATE` enabled input/output in prior runs.
+- **Integrated 3270 console** `sclp3270console` (event type 0x1b): property `chardev` only. It writes TN3270 records (TELNET-quoted, EOR-terminated) and relies on the chardev for negotiation, so attach it to `socket,...,server=on,wait=off,tn3270=on` and connect `s3270`/`c3270`. With no client attached (chardev open/close events) or a failed write, any command other than NOP is answered 0x05F0 "improper state" and the buffer is left unaccepted, instead of an equipment check that would loop guest console recovery. NOP is always accepted.
+- **Serial mapping:** on `mtm-3907` (`line_mode_console_first`), `-serial` #0 becomes `sclplmconsole` and #1 the VT220 `sclpconsole`; generic `s390-ccw-virtio` keeps VT220 first. So `-serial unix:RUN/lm.sock,server=on,wait=off` alone gives the z/OS line console under `mtm-3907`; add `-device sclplmconsole,...` explicitly only when you need `echo=off` or a non-mtm machine.
+- **Tracing:** `-trace 'sclp_*'` covers `sclp_write_event` (type/len/rc for every write event), `sclp_unimplemented_command`, `sclp_lm_mdb_object` and `sclp_lm_message`; ECKD/CHSC equivalents are `eckd_unimplemented`, `eckd_accepted_ignored`, `ioinst_chsc_*unimplemented`. Use these to tell "message never sent" from "sent and dropped" before patching console code. Send trace output to a file (`-D RUN/trace.log`), not the console.
+- **KVM tests:** `sclp-3270.c` (ringbuf), `sclp-3270-noclient.c` (listening socket, no client → 0x05F0), `sclp-line-console.c` and `sclp-line-console-mtm.c` (scripted `D IPLINFO` input via a wrapper). Run on CHUNGUS with KVM only; `sclp-3270.c` and `sclp-line-console.c` meson args omit `-accel kvm`, so add `-accel kvm -cpu host` explicitly rather than letting them fall back to TCG.
+
+Useful launch fragments (include the full required DASD/3270 configuration separately; replace RUN, ports and sockets with unique values):
 
 ```
 -machine mtm-3907 -accel kvm -cpu host -smp 1 -m 32G
 -L /home/friedkiwi/qemu-mod/share/qemu -snapshot -S
--chardev stdio,id=sclplm,signal=off
+-chardev socket,id=sclplm,path=RUN/lm.sock,server=on,wait=off
 -device sclplmconsole,chardev=sclplm,echo=off
--monitor unix:/tmp/UNIQUE_RUN/monitor.sock,server=on,wait=off
+-chardev socket,id=sysg,host=127.0.0.1,port=UNIQUE_TN_PORT,server=on,wait=off,tn3270=on
+-device sclp3270console,chardev=sysg
+-monitor unix:RUN/monitor.sock,server=on,wait=off
 -gdb tcp:127.0.0.1:UNIQUE_PORT
+-D RUN/trace.log -trace 'sclp_*'
 -ipl 0A80 -loadparm 0A82CS
 ```
 
-Attach a3270 console and press Enter before releasing the processor with monitor `cont`. For the line console, `VARY CN(*),ACTIVATE` enabled input/output in prior runs. `D A,L` demonstrates active jobs; `L TSO` on the VTAM welcome terminal reached `IKJ56700A ENTER USERID`. A logon prompt does not prove authenticated TSO usage. Preserve transcripts and list residual nonfatal errors explicitly.
+Attach the 3270 console(s) and press Enter before releasing the processor with monitor `cont`. Drive the line console with `socat - UNIX-CONNECT:RUN/lm.sock`. `D A,L` demonstrates active jobs; `L TSO` on the VTAM welcome terminal reached `IKJ56700A ENTER USERID`. A logon prompt does not prove authenticated TSO usage. Preserve transcripts and list residual nonfatal errors explicitly.
 
 Tools: the Bash tool for local and ssh/scp commands; Read/Edit/Write for local files; remote native gdb, socat and s3270; local gdb-multiarch and s390x-linux-gnu-objdump/readelf. Remote rg was absent in earlier sessions, so fall back to grep.
 
