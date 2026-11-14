@@ -1099,6 +1099,8 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     }
     /* Page boundary? */
     if (addr & 0xfff) {
+        trace_ioinst_chsc_rejected("specification: request not page aligned",
+                                   addr, 0, 0, env->psw.addr, env->psw.mask);
         s390_program_interrupt(env, PGM_SPECIFICATION, ra);
         return;
     }
@@ -1110,6 +1112,8 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     if (s390_is_pv()) {
         s390_cpu_pv_mem_read(cpu, addr, buf, sizeof(ChscReq));
     } else if (s390_cpu_virt_mem_read(cpu, addr, reg, buf, sizeof(ChscReq))) {
+        trace_ioinst_chsc_rejected("access: request not readable", addr, 0, 0,
+                                   env->psw.addr, env->psw.mask);
         s390_cpu_virt_mem_handle_exc(cpu, ra);
         return;
     }
@@ -1117,6 +1121,9 @@ void ioinst_handle_chsc(S390CPU *cpu, uint32_t ipb, uintptr_t ra)
     len = be16_to_cpu(req->len);
     /* Length field valid? */
     if ((len < 16) || (len > 4088) || (len & 7)) {
+        trace_ioinst_chsc_rejected("operand: invalid request length", addr,
+                                   len, be16_to_cpu(req->command),
+                                   env->psw.addr, env->psw.mask);
         s390_program_interrupt(env, PGM_OPERAND, ra);
         return;
     }
