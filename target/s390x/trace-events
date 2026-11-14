@@ -9,6 +9,7 @@ ioinst_stcps(uint64_t addr, uint32_t active0) "IOINST: stcps addr=0x%" PRIx64 " 
 ioinst_chp_id(const char *insn, int cssid, int chpid) "IOINST: %s (%x.%02x)"
 ioinst_chsc_cmd(uint16_t cmd, uint16_t len, uint32_t param0, uint32_t param1) "IOINST: chsc command 0x%04x, len 0x%04x, param0 0x%08x, param1 0x%08x"
 ioinst_chsc_unimplemented(uint16_t cmd, uint16_t len, uint32_t param0, uint32_t param1) "IOINST-UNIMPLEMENTED: chsc command 0x%04x, len 0x%04x, param0 0x%08x, param1 0x%08x"
+ioinst_msch_rejected(const char *reason, uint64_t reg1, uint16_t flags, uint32_t chars) "IOINST-REJECTED: msch %s schid-reg=0x%" PRIx64 " pmcw-flags=0x%04x pmcw-chars=0x%08x"
 ioinst_chsc_rejected(const char *reason, uint64_t addr, uint16_t len, uint16_t cmd, uint64_t psw_addr, uint64_t psw_mask) "IOINST-REJECTED: chsc %s addr=0x%" PRIx64 " len=0x%04x command=0x%04x psw=0x%" PRIx64 "/0x%" PRIx64
 ioinst_chsc_sda_unimplemented(uint16_t oc) "IOINST-UNIMPLEMENTED: chsc set-domain-attributes operation code 0x%04x"
 

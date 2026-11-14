@@ -142,23 +142,25 @@ void ioinst_handle_hsch(S390CPU *cpu, uint64_t reg1, uintptr_t ra)
     setcc(cpu, css_do_hsch(sch));
 }
 
-static int ioinst_schib_valid(SCHIB *schib)
+static const char *ioinst_schib_invalid_reason(SCHIB *schib)
 {
-    if ((be16_to_cpu(schib->pmcw.flags) & PMCW_FLAGS_MASK_INVALID) ||
-        (be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_INVALID)) {
-        return 0;
+    if (be16_to_cpu(schib->pmcw.flags) & PMCW_FLAGS_MASK_INVALID) {
+        return "reserved PMCW flag bits set";
     }
-    /* Disallow extended measurements for now. */
+    if (be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_INVALID) {
+        return "reserved PMCW characteristics bits set";
+    }
+    /* The extended-I/O-measurement-word facility is not provided. */
     if (be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_XMWME) {
-        return 0;
+        return "extended measurement words not installed";
     }
     /* for MB format 1 bits 26-31 of word 11 must be 0 */
     /* MBA uses words 10 and 11, it means align on 2**6 */
     if ((be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_MBFC) &&
         (be64_to_cpu(schib->mba) & 0x03fUL)) {
-        return 0;
+        return "misaligned format-1 measurement block address";
     }
-    return 1;
+    return NULL;
 }
 
 void ioinst_handle_msch(S390CPU *cpu, uint64_t reg1, uint32_t ipb, uintptr_t ra)
@@ -181,10 +183,22 @@ void ioinst_handle_msch(S390CPU *cpu, uint64_t reg1, uint32_t ipb, uintptr_t ra)
         s390_cpu_virt_mem_handle_exc(cpu, ra);
         return;
     }
-    if (ioinst_disassemble_sch_ident(reg1, &m, &cssid, &ssid, &schid) ||
-        !ioinst_schib_valid(&schib)) {
+    if (ioinst_disassemble_sch_ident(reg1, &m, &cssid, &ssid, &schid)) {
+        trace_ioinst_msch_rejected("invalid subchannel identification",
+                                   reg1, 0, 0);
         s390_program_interrupt(env, PGM_OPERAND, ra);
         return;
+    }
+    {
+        const char *reason = ioinst_schib_invalid_reason(&schib);
+
+        if (reason) {
+            trace_ioinst_msch_rejected(reason, reg1,
+                                       be16_to_cpu(schib.pmcw.flags),
+                                       be32_to_cpu(schib.pmcw.chars));
+            s390_program_interrupt(env, PGM_OPERAND, ra);
+            return;
+        }
     }
     trace_ioinst_sch_id("msch", cssid, ssid, schid);
     sch = css_find_subch(m, cssid, ssid, schid);
