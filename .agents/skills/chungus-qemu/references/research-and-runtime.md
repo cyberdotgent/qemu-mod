@@ -24,8 +24,21 @@ Trace with `-trace 'qeth_*' -trace 'qdio_*'` (`qeth_ctrl_data` dumps raw
 IDX/MPC/IPA). Unattended tooling lives in `~/qeth-dev` on CHUNGUS:
 `run-zos.sh RUN` (sockets, scripted s3270, tcpdump), `zcmd RUN "cmd"`,
 `screen.sh PORT`, `stop-zos.sh RUN`, and `linux-qeth-test.sh RUN` (Linux
-qeth_l2/qeth_l3 regression with the host kernel and initramfs). The
-bring-up history is in zos-research `investigations/qeth-layer3.md`.
+qeth_l2/qeth_l3 regression with the host kernel and initramfs, IPv4 and
+IPv6), `zos-ipv4-regress.sh RUN QEMU QETH_OPTS` and `tn3270-check.sh HOST`
+(accepts `[fd70::174]`). Every QEMU using `tap0` must hold
+`~/qeth-dev/tap0.lock` (flock). Never use `pkill -f`/`pgrep -f` patterns that
+also match the invoking ssh command line.
+
+IPv6 testbed: `~/zos25-ipv6.sh` boots the image with persistent qcow2
+overlays (`~/z1090/overlays/ipv6/`, with `pristine/` and `configured/`
+copies; base volumes stay untouched) and `-qeth devno=0400,hostdev=tap0,datadevs=2`
+(the testbed's TRLE lists a second data device, so the 3-device adapter fails
+there). Guest IPv6 address fd70::174, gateway fd70::1. Unattended:
+`~/qeth-dev/ipv6/test-ipv6.sh RUN [QEMU]` (boot, evidence, IPv4/IPv6 ping and
+TN3270 checks, orderly shutdown), `reset-overlay.sh --to-configured`. Details
+and member texts: zos-research `investigations/ipv6-testbed.md`. The bring-up
+history is in zos-research `investigations/qeth-layer3.md`.
 
 ## SCLP consoles
 
