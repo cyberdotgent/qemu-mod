@@ -12,7 +12,7 @@ Read the repository's applicable AGENTS.md and inspect the current Git state bef
 - Local source: `/home/friedkiwi/src/qemu` (amd64 host).
 - Remote: `friedkiwi@chungus.lan.cyber.gent`, SSH key authentication, native s390x Linux/KVM.
 - Remote source normally `/home/friedkiwi/src/qemu`, native binary `build/qemu-system-s390x`.
-- Installed launch binary: `/home/friedkiwi/qemu-mod/bin/qemu-system-s390x`; firmware directory `/home/friedkiwi/qemu-mod/share/qemu`.
+- Install location (since 2026-11-15): `/kvm/bin` (`qemu-system-s390x` plus `qemu-img`, `qemu-io`, `qemu-nbd`, `qemu-pr-helper`, `qemu-bridge-helper`, `qemu-edid`), firmware `/kvm/share/qemu` (found relative to the binary, no `-L` needed). Always install the latest validated builds there. `/home/friedkiwi/qemu-mod/{bin,share}` is the old location and keeps older backups only.
 - Research Git repo: `/home/friedkiwi/src/zos-research`, outside QEMU. Inspect its current notes rather than trusting historical hypotheses. No remote was configured there; verify before promising a push.
 - Disks: `/home/friedkiwi/z1090/disks`. Use `-snapshot` for experimental IPLs. Do not modify base volumes or commit snapshot writes.
 - Execute **KVM only**, never TCG, including test wrappers. Building cross targets does not authorize executing them through binfmt/QEMU user emulation. Bare-metal guest tests run via `qemu-system-s390x -accel kvm -cpu host -kernel TEST`; never execute their ELF directly as Linux programs.

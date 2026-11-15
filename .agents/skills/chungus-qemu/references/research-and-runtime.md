@@ -54,7 +54,7 @@ Useful launch fragments (include the full required DASD/3270 configuration separ
 
 ```
 -machine mtm-3907 -accel kvm -cpu host -smp 1 -m 32G
--L /home/friedkiwi/qemu-mod/share/qemu -snapshot -S
+-L /kvm/share/qemu -snapshot -S
 -chardev socket,id=sclplm,path=RUN/lm.sock,server=on,wait=off
 -device sclplmconsole,chardev=sclplm,echo=off
 -chardev socket,id=sysg,host=127.0.0.1,port=UNIQUE_TN_PORT,server=on,wait=off,tn3270=on

@@ -59,20 +59,20 @@ sha256sum build-s390x-kvm/qemu-system-s390x
 ssh friedkiwi@chungus.lan.cyber.gent 'chmod 0755 REMOTE_STAGE/qemu-system-s390x; sha256sum REMOTE_STAGE/qemu-system-s390x; file REMOTE_STAGE/qemu-system-s390x; REMOTE_STAGE/qemu-system-s390x --version'
 ```
 
-Replace placeholders before running. Test the staged binary with KVM and required firmware (`-L /home/friedkiwi/qemu-mod/share/qemu`). A binary copied without matching firmware/data files may start but fail later. Check shared-library compatibility on CHUNGUS. The local amd64 host cannot validate KVM execution of this s390x binary.
+Replace placeholders before running. Test the staged binary with KVM and required firmware (`-L /kvm/share/qemu`). A binary copied without matching firmware/data files may start but fail later. Check shared-library compatibility on CHUNGUS. The local amd64 host cannot validate KVM execution of this s390x binary.
 
 Tests live under `tests/tcg/s390x` for historical naming; select explicit KVM wrappers/arguments. Current compatibility fixture is `stsi-zos-compat.c` on `mtm-3907`, plus generic-machine disabled fixture. Build them as bare-metal guests and launch via `-kernel`. `mtm-3907` validates host3907 and requires a memory size aligned to the host storage increment; existing tests use8192M, not128M. Inspect current meson entries and wrappers rather than guessing commands.
 
 ## Install only when deployment is authorized
 
-The expected installed path is `/home/friedkiwi/qemu-mod/bin/qemu-system-s390x`. Record source hash/provenance and tests first. On the remote host use explicit validated paths, make a uniquely named backup of the current file, install a staged replacement beside the destination, and rename it over the destination atomically. Do not truncate/overwrite the running executable in place.
+Install into `/kvm/bin`: `qemu-system-s390x` and the tools (`ninja qemu-system-s390x qemu-img qemu-io qemu-nbd qemu-pr-helper qemu-bridge-helper qemu-edid`; keep them from the same tree), with firmware in `/kvm/share/qemu` (the relocatable binary finds `../share/qemu`; update it when the s390-ccw firmware changes). Record source hash/provenance and tests first. On the remote host use explicit validated paths, make a uniquely named backup of the current file, install a staged replacement beside the destination, and rename it over the destination atomically. Do not truncate/overwrite the running executable in place.
 
 Example remote shell fragment, after replacing STAGED_BINARY and UNIQUE_BACKUP:
 
 ```
 set -eu
 src=STAGED_BINARY
-dst=/home/friedkiwi/qemu-mod/bin/qemu-system-s390x
+dst=/kvm/bin/qemu-system-s390x
 backup=UNIQUE_BACKUP
 test -f "$src"
 test ! -e "$backup"
