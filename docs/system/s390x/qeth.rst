@@ -4,8 +4,7 @@ QETH network adapters
 ``qeth-ccw`` provides an emulated OSA-Express (OSD) network adapter.  It
 connects the s390x channel subsystem's CCW and QDIO interfaces to a normal
 QEMU network backend.  The guest chooses layer-2 or layer-3 operation when it
-starts the adapter, so the same device serves Linux in either mode and z/OS
-Communications Server, which uses layer 3.
+starts the adapter, so the same device serves guests using either mode.
 
 The adapter occupies three consecutive CCW device numbers.  ``devno`` selects
 the first device; the guest assigns the read, write and QDIO data roles when
@@ -45,8 +44,16 @@ link-layer work of a real OSA on the guest's behalf: it registers the IP
 addresses the guest sets (``SETIP``), announces them with a gratuitous ARP,
 answers ARP requests for them, resolves next hops through its own ARP cache,
 maps broadcast and multicast destinations, and adds or removes the Ethernet
-header.  The adapter's MAC address is the one the network sees.  Unicast IPv6
-destinations are not resolved in layer-3 mode (IPv6 multicast is passed).
+header.  The adapter's MAC address is the one the network sees.
+
+For IPv6 in layer-3 mode a guest either resolves neighbours itself and hands
+the adapter complete Ethernet frames (passthru, as Linux does), or hands it
+plain IPv6 packets.  For the latter the adapter keeps a neighbour cache: it
+solicits unknown next hops, learns from neighbour solicitations and
+advertisements, answers solicitations for the guest's registered addresses
+and announces newly registered addresses.  Solicited-node and all-nodes
+multicast for the registered addresses is accepted without explicit
+registration.
 
 Linux configuration
 -------------------
@@ -63,19 +70,14 @@ The ``layer2`` attribute of the group device selects the mode before the
 device is set online.  The interface name depends on the guest's
 predictable-interface-name policy.  DHCP can then be run in the usual way.
 
-z/OS configuration
-------------------
+Other guests
+------------
 
-z/OS uses the adapter through a VTAM TRLE and a TCP/IP ``MPCIPA`` device
-(``IPAQENET`` link or ``INTERFACE`` statement).  The TRLE's ``READ``,
-``WRITE`` and ``DATAPATH`` device numbers must match the adapter, for example
-a TRLE with ``READ=(0400),WRITE=(0401),DATAPATH=(0402)`` and::
-
-  -qeth devno=0400,hostdev=tap0
-
-Give the host side of the tap an address in the z/OS interface's subnet (or
-the z/OS default gateway) to reach the z/OS TCP/IP stack, for example TN3270
-on port 23.
+Guests that define the adapter by its read, write and data device numbers
+must use the adapter's device numbers: with ``devno=0400`` the read device is
+``0400``, the write device ``0401`` and the data device ``0402``.  Give the
+host side of the tap an address in the guest interface's subnet (or the
+guest's default gateway) to reach the guest's TCP/IP stack.
 
 Tracing
 -------
@@ -89,10 +91,10 @@ Implementation scope
 --------------------
 
 The model implements IDX, the MPC CM/ULP/DM exchanges, the IPA commands used
-by Linux and z/OS (assist negotiation, address registration, adapter
+by the supported guests (assist negotiation, address registration, adapter
 parameters), self-description (Read Configuration Data, Read Node
 Identifier), format-0 QDIO queues, SIGA, SSQD, conventional
 program-controlled interrupts, and Ethernet or IP transport.  It does not
 currently implement QDIO thin interrupts, QEBSM, VLANs, checksum or
-segmentation offloads, IPv6 neighbour discovery in layer-3 mode, multiple
-data devices per adapter, or migration of an active adapter.
+segmentation offloads, multiple data devices per adapter, or migration of an
+active adapter.

@@ -13,8 +13,9 @@
  *    adapter owns the link layer: it registers the guest's IP addresses
  *    (SETIP), answers and resolves ARP on the guest's behalf, maps
  *    broadcast and multicast destinations, and adds or strips the Ethernet
- *    header.  This is the mode used by z/OS Communications Server (MPCIPA /
- *    IPAQENET) and by the Linux qeth_l3 driver.
+ *    header.  For IPv6 the adapter also answers and resolves neighbour
+ *    discovery for guests that hand it plain IPv6 packets, while guests
+ *    that resolve neighbours themselves pass complete Ethernet frames.
  *
  * Protocol layouts follow the Linux qeth driver and the architecture as
  * observed on working OSA implementations.
@@ -26,6 +27,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/css-bridge.h"
 #include "hw/s390x/qeth-ccw.h"
+#include "net/checksum.h"
 #include "net/eth.h"
 #include "net/net.h"
 #include "qapi/error.h"
@@ -197,6 +199,7 @@
 #define QETH_ARP_ENTRIES         64
 #define QETH_PENDING_MAX         32
 #define QETH_ARP_RETRY_MS        1000
+#define QETH_ND_ENTRIES          64
 
 #define ETH_HDR                  14
 #define ETHERTYPE_IPV4           0x0800
@@ -205,6 +208,15 @@
 #define ARP_PACKET               28
 #define ARP_REQUEST              1
 #define ARP_REPLY                2
+#define IP6_HDR                  40
+#define IP6_NEXT_ICMP6           58
+#define ICMP6_ND_SOLICIT         135
+#define ICMP6_ND_ADVERT          136
+#define ICMP6_ND_SIZE            24     /* type .. target address */
+#define ICMP6_ND_OPT_SRC_LL      1
+#define ICMP6_ND_OPT_TGT_LL      2
+#define ICMP6_NA_SOLICITED       0x40
+#define ICMP6_NA_OVERRIDE        0x20
 
 typedef enum QethPeerRole {
     QETH_ROLE_NONE,
@@ -224,8 +236,16 @@ typedef struct QethArpEntry {
     int64_t used;
 } QethArpEntry;
 
+typedef struct QethNdEntry {
+    uint8_t ip[16];
+    uint8_t mac[ETH_ALEN];
+    int64_t used;
+} QethNdEntry;
+
 typedef struct QethPending {
+    bool v6;
     uint32_t ip;
+    uint8_t ip6[16];
     size_t len;
     uint8_t *frame;     /* Ethernet frame, destination MAC not yet set */
 } QethPending;
@@ -271,6 +291,9 @@ struct QethCcwDevice {
     GQueue pending;
     int64_t arp_last_request;
     uint32_t arp_last_ip;
+    QethNdEntry nd[QETH_ND_ENTRIES];
+    int64_t nd_last_request;
+    uint8_t nd_last_ip[16];
 };
 
 static int qeth_peer_index(QethCcwDevice *s, SubchDev *sch)
@@ -412,7 +435,7 @@ static void qeth_flush_responses(QethCcwDevice *s)
  * IDX ACTIVATE: the read and write subchannels identify themselves and
  * list the data device(s).  The response echoes the request with a
  * positive response code in the low two bits of byte 8 (the high bits keep
- * the request type, as z/OS VTAM checks), no port name required, the
+ * the request type, which guests check), no port name required, the
  * adapter's issuer token, function level 0x0201 and a microcode level.
  */
 static void qeth_process_idx(QethCcwDevice *s, SubchDev *sch,
@@ -744,7 +767,7 @@ static void qeth_flush_pending(QethCcwDevice *s, uint32_t ip,
         GList *next = l->next;
         QethPending *p = l->data;
 
-        if (p->ip == ip) {
+        if (!p->v6 && p->ip == ip) {
             memcpy(p->frame, mac, ETH_ALEN);
             qemu_send_packet(qemu_get_queue(s->nic), p->frame, p->len);
             g_queue_delete_link(&s->pending, l);
@@ -782,12 +805,178 @@ static void qeth_arp_reset(QethCcwDevice *s)
     QethPending *p;
 
     memset(s->arp, 0, sizeof(s->arp));
+    memset(s->nd, 0, sizeof(s->nd));
     while ((p = g_queue_pop_head(&s->pending))) {
         g_free(p->frame);
         g_free(p);
     }
     s->arp_last_request = 0;
     s->arp_last_ip = 0;
+    s->nd_last_request = 0;
+    memset(s->nd_last_ip, 0, sizeof(s->nd_last_ip));
+}
+
+/*
+ * IPv6 neighbour discovery on the guest's behalf.  The adapter keeps a
+ * neighbour cache for plain (non-passthru) IPv6 packets from the guest,
+ * learns it from solicitations and advertisements, answers solicitations
+ * for the guest's registered addresses with its own MAC address and
+ * solicits unknown next hops itself.
+ */
+
+static void qeth_ip6_str(const uint8_t *ip, char *buf, size_t len)
+{
+    snprintf(buf, len, "%x:%x:%x:%x:%x:%x:%x:%x",
+             lduw_be_p(ip), lduw_be_p(ip + 2), lduw_be_p(ip + 4),
+             lduw_be_p(ip + 6), lduw_be_p(ip + 8), lduw_be_p(ip + 10),
+             lduw_be_p(ip + 12), lduw_be_p(ip + 14));
+}
+
+static bool qeth_ip6_unspecified(const uint8_t *ip)
+{
+    static const uint8_t zero[16];
+
+    return !memcmp(ip, zero, 16);
+}
+
+/* Ethernet multicast address of an IPv6 multicast group */
+static void qeth_ip6_mc_mac(const uint8_t *group, uint8_t *mac)
+{
+    mac[0] = 0x33;
+    mac[1] = 0x33;
+    memcpy(mac + 2, group + 12, 4);
+}
+
+/* Solicited-node multicast group of an address */
+static void qeth_ip6_solicited_node(const uint8_t *ip, uint8_t *group)
+{
+    static const uint8_t prefix[13] = {
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff
+    };
+
+    memcpy(group, prefix, sizeof(prefix));
+    memcpy(group + 13, ip + 13, 3);
+}
+
+/*
+ * Send an ICMPv6 neighbour solicitation or advertisement carrying the
+ * adapter's MAC address in the source or target link-layer option.
+ */
+static void qeth_send_nd(QethCcwDevice *s, uint8_t type, uint8_t flags,
+                         const uint8_t *src_ip, const uint8_t *dst_ip,
+                         const uint8_t *dst_mac, const uint8_t *target)
+{
+    uint8_t f[ETH_HDR + IP6_HDR + ICMP6_ND_SIZE + 8] = { 0 };
+    uint8_t *ip6 = f + ETH_HDR;
+    uint8_t *icmp = ip6 + IP6_HDR;
+    const size_t icmp_len = ICMP6_ND_SIZE + 8;
+    uint32_t sum;
+
+    memcpy(f, dst_mac, ETH_ALEN);
+    memcpy(f + 6, s->conf.macaddr.a, ETH_ALEN);
+    stw_be_p(f + 12, ETHERTYPE_IPV6);
+    ip6[0] = 0x60;
+    stw_be_p(ip6 + 4, icmp_len);
+    ip6[6] = IP6_NEXT_ICMP6;
+    ip6[7] = 255;                           /* hop limit */
+    memcpy(ip6 + 8, src_ip, 16);
+    memcpy(ip6 + 24, dst_ip, 16);
+    icmp[0] = type;
+    icmp[4] = flags;
+    memcpy(icmp + 8, target, 16);
+    icmp[24] = type == ICMP6_ND_SOLICIT ? ICMP6_ND_OPT_SRC_LL :
+                                          ICMP6_ND_OPT_TGT_LL;
+    icmp[25] = 1;                           /* in units of 8 bytes */
+    memcpy(icmp + 26, s->conf.macaddr.a, ETH_ALEN);
+
+    /* Pseudo-header: addresses, upper-layer length, next header */
+    sum = net_checksum_add(32, ip6 + 8) + icmp_len + IP6_NEXT_ICMP6 +
+          net_checksum_add(icmp_len, icmp);
+    stw_be_p(icmp + 2, net_checksum_finish(sum));
+    qemu_send_packet(qemu_get_queue(s->nic), f, sizeof(f));
+}
+
+static void qeth_send_ns(QethCcwDevice *s, const uint8_t *src_ip,
+                         const uint8_t *target)
+{
+    uint8_t group[16], mac[ETH_ALEN];
+
+    qeth_ip6_solicited_node(target, group);
+    qeth_ip6_mc_mac(group, mac);
+    qeth_send_nd(s, ICMP6_ND_SOLICIT, 0, src_ip, group, mac, target);
+}
+
+/* Advertise a registered address, to a solicitor or to all nodes */
+static void qeth_send_na(QethCcwDevice *s, const uint8_t *target,
+                         const uint8_t *dst_ip, const uint8_t *dst_mac)
+{
+    static const uint8_t all_nodes[16] = {
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01
+    };
+    uint8_t mac[ETH_ALEN];
+
+    if (!dst_ip) {
+        qeth_ip6_mc_mac(all_nodes, mac);
+        qeth_send_nd(s, ICMP6_ND_ADVERT, ICMP6_NA_OVERRIDE, target,
+                     all_nodes, mac, target);
+        return;
+    }
+    qeth_send_nd(s, ICMP6_ND_ADVERT, ICMP6_NA_SOLICITED | ICMP6_NA_OVERRIDE,
+                 target, dst_ip, dst_mac, target);
+}
+
+static QethNdEntry *qeth_nd_lookup(QethCcwDevice *s, const uint8_t *ip)
+{
+    int i;
+
+    for (i = 0; i < QETH_ND_ENTRIES; i++) {
+        if (s->nd[i].used && !memcmp(s->nd[i].ip, ip, 16)) {
+            s->nd[i].used = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            return &s->nd[i];
+        }
+    }
+    return NULL;
+}
+
+static void qeth_nd_learn(QethCcwDevice *s, const uint8_t *ip,
+                          const uint8_t *mac)
+{
+    QethNdEntry *e;
+    GList *l;
+    char ipstr[40];
+    int i;
+
+    if (qeth_ip6_unspecified(ip) || ip[0] == 0xff || (mac[0] & 1)) {
+        return;
+    }
+    e = qeth_nd_lookup(s, ip);
+    if (!e) {
+        e = &s->nd[0];
+        for (i = 0; i < QETH_ND_ENTRIES; i++) {
+            if (s->nd[i].used < e->used) {
+                e = &s->nd[i];
+            }
+        }
+        memcpy(e->ip, ip, 16);
+        qeth_ip6_str(ip, ipstr, sizeof(ipstr));
+        trace_qeth_l3("nd learn", ipstr);
+    }
+    memcpy(e->mac, mac, ETH_ALEN);
+    e->used = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+    for (l = s->pending.head; l;) {
+        GList *next = l->next;
+        QethPending *p = l->data;
+
+        if (p->v6 && !memcmp(p->ip6, ip, 16)) {
+            memcpy(p->frame, mac, ETH_ALEN);
+            qemu_send_packet(qemu_get_queue(s->nic), p->frame, p->len);
+            g_queue_delete_link(&s->pending, l);
+            g_free(p->frame);
+            g_free(p);
+        }
+        l = next;
+    }
 }
 
 static void qeth_l3_reset(QethCcwDevice *s)
@@ -858,13 +1047,15 @@ static uint16_t qeth_ipa_setip(QethCcwDevice *s, uint16_t prot,
         return IPA_RC_SUCCESS;
     }
     if (prot == IPA_PROT_IPV6) {
+        char ip6str[40];
         int i;
 
         if (avail < 36) {
             return IPA_RC_UNSUPPORTED_SUBCMD;
         }
         *data_size = 36;
-        trace_qeth_l3(set ? "setip" : "delip", "ipv6");
+        qeth_ip6_str(data, ip6str, sizeof(ip6str));
+        trace_qeth_l3(set ? "setip" : "delip", ip6str);
         i = qeth_find_ip6(s, data);
         if (!set) {
             if (i < 0) {
@@ -880,6 +1071,10 @@ static uint16_t qeth_ipa_setip(QethCcwDevice *s, uint16_t prot,
             return IPA_RC_IP_ADDR_TABLE_FULL;
         }
         memcpy(s->ip6[s->nr_ip6++], data, 16);
+        if (s->nic) {
+            /* Announce the address (unsolicited neighbour advertisement) */
+            qeth_send_na(s, data, NULL, NULL);
+        }
         return IPA_RC_SUCCESS;
     }
     return IPA_RC_INVALID_IP_VERSION;
@@ -1431,6 +1626,66 @@ static bool qeth_ip4_multicast(uint32_t ip)
 }
 
 /*
+ * Layer-3 IPv6 transmit of a plain IPv6 packet (the frame has its source
+ * MAC and type set): multicast maps to 33:33:xx:xx:xx:xx; unicast goes to
+ * the next hop from the qeth header, or the destination, resolved through
+ * the neighbour cache.  Unresolved packets wait for the advertisement.
+ */
+static void qeth_l3_transmit6(QethCcwDevice *s, const uint8_t *hdr,
+                              const uint8_t *pkt, uint8_t *frame, size_t len)
+{
+    const uint8_t *dst = pkt + 24, *src = pkt + 8;
+    const uint8_t *nexthop = hdr + 16;
+    QethNdEntry *e;
+    QethPending *p;
+    char ipstr[40];
+    int64_t now;
+
+    if (dst[0] == 0xff) {
+        qeth_ip6_mc_mac(dst, frame);
+        qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+        g_free(frame);
+        return;
+    }
+    if (qeth_ip6_unspecified(nexthop) || nexthop[0] == 0xff) {
+        nexthop = dst;
+    }
+    e = qeth_nd_lookup(s, nexthop);
+    if (e) {
+        memcpy(frame, e->mac, ETH_ALEN);
+        qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+        g_free(frame);
+        return;
+    }
+
+    /* Queue until the next hop is resolved */
+    if (g_queue_get_length(&s->pending) >= QETH_PENDING_MAX) {
+        p = g_queue_pop_head(&s->pending);
+        g_free(p->frame);
+        g_free(p);
+    }
+    p = g_new0(QethPending, 1);
+    p->v6 = true;
+    memcpy(p->ip6, nexthop, 16);
+    p->len = len;
+    p->frame = frame;
+    g_queue_push_tail(&s->pending, p);
+
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (memcmp(s->nd_last_ip, nexthop, 16) ||
+        now - s->nd_last_request >= QETH_ARP_RETRY_MS) {
+        memcpy(s->nd_last_ip, nexthop, 16);
+        s->nd_last_request = now;
+        if (qeth_ip6_unspecified(src) && s->nr_ip6) {
+            src = s->ip6[0];
+        }
+        qeth_ip6_str(nexthop, ipstr, sizeof(ipstr));
+        trace_qeth_l3("nd solicit", ipstr);
+        qeth_send_ns(s, src, nexthop);
+    }
+}
+
+/*
  * Layer-3 transmit: build the Ethernet frame for an IP packet.  Unicast
  * destinations are resolved through the adapter's ARP cache; unresolved
  * packets wait for the ARP reply.
@@ -1463,16 +1718,7 @@ static void qeth_l3_transmit(QethCcwDevice *s, const uint8_t *hdr,
     memcpy(f + ETH_HDR, pkt, len);
 
     if (v6) {
-        const uint8_t *d6 = pkt + 24;
-
-        if (d6[0] == 0xff) {                /* 33:33 + low 32 bits */
-            f[0] = 0x33;
-            f[1] = 0x33;
-            memcpy(f + 2, d6 + 12, 4);
-            qemu_send_packet(qemu_get_queue(s->nic), f, ETH_HDR + len);
-        } else {
-            trace_qeth_l3("tx drop", "ipv6 unicast resolution unsupported");
-        }
+        qeth_l3_transmit6(s, hdr, pkt, g_steal_pointer(&f), ETH_HDR + len);
         return;
     }
 
@@ -1706,6 +1952,75 @@ static void qeth_l3_rx_arp(QethCcwDevice *s, const uint8_t *arp, size_t len)
 }
 
 /*
+ * IPv6 multicast frames the guest wants without registering them: all
+ * nodes, and the solicited-node groups of its registered addresses.
+ */
+static bool qeth_ip6_mc_wanted(QethCcwDevice *s, const uint8_t *mac)
+{
+    static const uint8_t all_nodes[ETH_ALEN] = { 0x33, 0x33, 0, 0, 0, 1 };
+    unsigned int i;
+
+    if (!memcmp(mac, all_nodes, ETH_ALEN)) {
+        return true;
+    }
+    if (mac[0] != 0x33 || mac[1] != 0x33 || mac[2] != 0xff) {
+        return false;
+    }
+    for (i = 0; i < s->nr_ip6; i++) {
+        if (!memcmp(s->ip6[i] + 13, mac + 3, 3)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Received neighbour discovery: learn link-layer addresses from
+ * solicitations and advertisements, and answer solicitations for the
+ * guest's addresses.  The packet is still delivered to the guest.
+ */
+static void qeth_l3_rx_nd(QethCcwDevice *s, const uint8_t *frame,
+                          const uint8_t *pkt, size_t len)
+{
+    const uint8_t *icmp = pkt + IP6_HDR, *src = pkt + 8;
+    const uint8_t *target = icmp + 8, *ll = NULL;
+    size_t off;
+    char ipstr[40];
+
+    if (len < IP6_HDR + ICMP6_ND_SIZE || pkt[7] != 255 ||
+        (icmp[0] != ICMP6_ND_SOLICIT && icmp[0] != ICMP6_ND_ADVERT)) {
+        return;
+    }
+    for (off = IP6_HDR + ICMP6_ND_SIZE; off + 8 <= len && pkt[off + 1];
+         off += pkt[off + 1] * 8) {
+        if (pkt[off] == (icmp[0] == ICMP6_ND_SOLICIT ? ICMP6_ND_OPT_SRC_LL :
+                                                       ICMP6_ND_OPT_TGT_LL)) {
+            ll = pkt + off + 2;
+        }
+    }
+
+    if (icmp[0] == ICMP6_ND_ADVERT) {
+        if (qeth_find_ip6(s, target) < 0) {
+            qeth_nd_learn(s, target, ll ? ll : frame + 6);
+        }
+        return;
+    }
+    if (!qeth_ip6_unspecified(src)) {
+        qeth_nd_learn(s, src, ll ? ll : frame + 6);
+    }
+    if (qeth_find_ip6(s, target) < 0) {
+        return;
+    }
+    qeth_ip6_str(target, ipstr, sizeof(ipstr));
+    trace_qeth_l3("nd advertise", ipstr);
+    if (qeth_ip6_unspecified(src)) {
+        qeth_send_na(s, target, NULL, NULL);    /* duplicate detection */
+    } else {
+        qeth_send_na(s, target, src, ll ? ll : frame + 6);
+    }
+}
+
+/*
  * Layer-3 receive: the adapter answers ARP itself, delivers IP packets for
  * the registered addresses, broadcast and registered multicast groups with
  * a type-1 qeth header, and drops everything else.
@@ -1761,15 +2076,19 @@ static ssize_t qeth_l3_receive(QethCcwDevice *s, const uint8_t *buf,
         break;
     }
     case ETHERTYPE_IPV6:
-        if (pkt_len < 40 || (pkt[0] >> 4) != 6) {
+        if (pkt_len < IP6_HDR || (pkt[0] >> 4) != 6) {
             return len;
         }
-        pkt_len = MIN(pkt_len, (size_t)lduw_be_p(pkt + 4) + 40);
-        if (cast == QETH_CAST_MULTICAST && qeth_find_mc(s, buf) < 0) {
+        pkt_len = MIN(pkt_len, (size_t)lduw_be_p(pkt + 4) + IP6_HDR);
+        if (cast == QETH_CAST_MULTICAST && qeth_find_mc(s, buf) < 0 &&
+            !qeth_ip6_mc_wanted(s, buf)) {
             return len;
         }
         if (cast == QETH_CAST_UNICAST && qeth_find_ip6(s, pkt + 24) < 0) {
             return len;
+        }
+        if (pkt[6] == IP6_NEXT_ICMP6) {
+            qeth_l3_rx_nd(s, buf, pkt, pkt_len);
         }
         cast |= QETH_HDR3_IPV6;
         break;
@@ -1833,9 +2152,10 @@ static void qeth_setup_peer(QethCcwDevice *s, SubchDev *sch)
     /*
      * Channel-subsystem addressing of the adapter: unit address from the
      * device number and a valid full link address on the single path whose
-     * low byte is the control-unit logical address.  z/OS VTAM refuses a
-     * QDIO TRLE ("QDIO CULA UNAVAILABLE") when the subchannel description
-     * carries no valid link address.
+     * low byte is the control-unit logical address.  Guests that look up
+     * the control-unit logical address of a QDIO device through the
+     * subchannel description refuse the device without a valid link
+     * address.
      */
     sch->topology = (CssDeviceTopology) {
         .valid = true,
