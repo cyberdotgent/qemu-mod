@@ -1151,13 +1151,17 @@ ERST
 
 DEF("qeth", HAS_ARG, QEMU_OPTION_qeth,
     "-qeth [devno=ccw-address,]hostdev=tapdev|netdev=id[,mac=macaddr][,chpid=id]\n"
+    "                [,datadevs=n]\n"
     "                add an OSA-Express QETH adapter attached to a host tap\n"
     "                interface or to an existing network backend\n",
     QEMU_ARCH_S390X)
 SRST
-``-qeth [devno=ccw-address,]hostdev=tapdev|netdev=id[,mac=macaddr][,chpid=id]``
+``-qeth [devno=ccw-address,]hostdev=tapdev|netdev=id[,mac=macaddr][,chpid=id][,datadevs=n]``
     Add an emulated OSA-Express QETH adapter (``qeth-ccw``), which occupies
-    three consecutive device numbers starting at ``devno``. A three- or
+    consecutive device numbers starting at ``devno``: read, write and
+    ``datadevs`` data devices (default 1, at most 8), so three device
+    numbers by default. A guest uses one data device per interface it runs
+    over the adapter, for example separate IPv4 and IPv6 interfaces. A three- or
     four-digit hexadecimal ``devno`` such as ``400`` or ``0400`` means
     ``fe.0.0400``; if it is omitted, automatic allocation begins at ``0400``.
 

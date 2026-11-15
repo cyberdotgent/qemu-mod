@@ -77,6 +77,23 @@ static void test_qeth_shortcut(void)
     qtest_quit(qts);
 }
 
+static void test_data_devices(void)
+{
+    g_autofree char *dev_id = NULL;
+    QTestState *qts;
+
+    /* Two data devices occupy 0400-0403; the next adapter starts at 0404 */
+    qts = qtest_init(
+        "-nodefaults -netdev user,id=net0 -netdev user,id=net1 "
+        "-qeth netdev=net0,datadevs=2 "
+        "-device qeth-ccw,id=qeth1,netdev=net1");
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/qeth0",
+                                "data-devices"), ==, 2);
+    dev_id = qom_get_string(qts, "/machine/peripheral/qeth1", "dev_id");
+    g_assert_cmpstr(dev_id, ==, "fe.0.0404");
+    qtest_quit(qts);
+}
+
 static void test_auto_configuration(void)
 {
     g_autofree char *dev_id0 = NULL;
@@ -100,5 +117,6 @@ int main(int argc, char **argv)
     qtest_add_func("/qeth-ccw/configuration", test_configuration);
     qtest_add_func("/qeth-ccw/auto-configuration", test_auto_configuration);
     qtest_add_func("/qeth-ccw/qeth-shortcut", test_qeth_shortcut);
+    qtest_add_func("/qeth-ccw/data-devices", test_data_devices);
     return g_test_run();
 }

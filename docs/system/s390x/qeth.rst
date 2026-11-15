@@ -6,15 +6,16 @@ connects the s390x channel subsystem's CCW and QDIO interfaces to a normal
 QEMU network backend.  The guest chooses layer-2 or layer-3 operation when it
 starts the adapter, so the same device serves guests using either mode.
 
-The adapter occupies three consecutive CCW device numbers.  ``devno`` selects
-the first device; the guest assigns the read, write and QDIO data roles when
-it activates the adapter.  If ``devno`` is omitted, automatic allocation
-begins at ``0400``.  For example::
+The adapter occupies consecutive CCW device numbers: a read and a write
+device and, by default, one QDIO data device.  ``devno`` selects the first
+device; the guest assigns the read, write and data roles when it activates
+the adapter.  If ``devno`` is omitted, automatic allocation begins at
+``0400``.  For example::
 
   -netdev user,id=qnet \
   -device qeth-ccw,netdev=qnet,devno=fe.0.0600,mac=52:54:00:12:34:60
 
-This creates devices ``0600``, ``0601``, and ``0602``.  The three subchannels
+This creates devices ``0600``, ``0601``, and ``0602``.  The subchannels
 report control-unit type/model ``1731/01``, device type/model ``1732/01``,
 and an OSD channel path.  The channel path ID defaults to the high byte of the
 device number; ``chpid`` selects another one.
@@ -33,6 +34,22 @@ $USER`` or a ``systemd-networkd`` ``.netdev`` unit with ``Kind=tap`` and
 path::
 
   -netdev user,id=qnet -qeth devno=0400,netdev=qnet,chpid=0xf0
+
+Multiple data devices
+---------------------
+
+A guest can run several interfaces over one adapter, each set up as its own
+ULP connection with its own data device and QDIO queues while sharing the
+read and write devices and the network backend; some guests use separate
+interfaces, and therefore separate data devices, for IPv4 and IPv6.  The
+``data-devices`` property (``datadevs`` with ``-qeth``, at most 8) adds data
+devices after the write device::
+
+  -qeth devno=0400,hostdev=tap0,datadevs=2
+
+creates devices ``0400`` to ``0403``.  Received packets go to the connection
+that registered the destination address or multicast group; broadcasts go to
+every connection with IPv4 addresses.
 
 Layer 2 and layer 3
 -------------------
@@ -75,7 +92,7 @@ Other guests
 
 Guests that define the adapter by its read, write and data device numbers
 must use the adapter's device numbers: with ``devno=0400`` the read device is
-``0400``, the write device ``0401`` and the data device ``0402``.  Give the
+``0400``, the write device ``0401`` and the data devices start at ``0402``.  Give the
 host side of the tap an address in the guest interface's subnet (or the
 guest's default gateway) to reach the guest's TCP/IP stack.
 
@@ -96,5 +113,4 @@ parameters), self-description (Read Configuration Data, Read Node
 Identifier), format-0 QDIO queues, SIGA, SSQD, conventional
 program-controlled interrupts, and Ethernet or IP transport.  It does not
 currently implement QDIO thin interrupts, QEBSM, VLANs, checksum or
-segmentation offloads, multiple data devices per adapter, or migration of an
-active adapter.
+segmentation offloads, or migration of an active adapter.

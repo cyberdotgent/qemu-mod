@@ -578,6 +578,9 @@ static QemuOptsList qemu_qeth_opts = {
         },{
             .name = "chpid",
             .type = QEMU_OPT_NUMBER,
+        },{
+            .name = "datadevs",
+            .type = QEMU_OPT_NUMBER,
         },
         { /* end of list */ }
     },
@@ -1603,8 +1606,9 @@ fail:
 }
 
 /*
- * -qeth [devno=N,](hostdev=TAP|netdev=ID)[,mac=MAC]: an OSA-Express QETH
- * adapter (three subchannels from devno) attached either to the existing
+ * -qeth [devno=N,](hostdev=TAP|netdev=ID)[,mac=MAC][,chpid=C][,datadevs=D]:
+ * an OSA-Express QETH adapter (read, write and D data subchannels, default
+ * one, from devno) attached either to the existing
  * host tap interface TAP, i.e. the expanded
  *   -netdev tap,id=qeth-netdevK,ifname=TAP,script=,downscript=
  *   -device qeth-ccw,id=qethK,netdev=qeth-netdevK,devno=fe.0.N
@@ -1688,6 +1692,18 @@ static bool qeth_add(const char *optarg, Error **errp)
             goto fail;
         }
         if (!qemu_opt_set_number(device_opts, "chpid", chpid, errp)) {
+            goto fail;
+        }
+    }
+    if (qemu_opt_get(opts, "datadevs")) {
+        uint64_t datadevs = qemu_opt_get_number(opts, "datadevs", 0);
+
+        if (datadevs < 1 || datadevs > 8) {
+            error_setg(errp, "Parameter 'datadevs' must be between 1 and 8");
+            goto fail;
+        }
+        if (!qemu_opt_set_number(device_opts, "data-devices", datadevs,
+                                 errp)) {
             goto fail;
         }
     }
