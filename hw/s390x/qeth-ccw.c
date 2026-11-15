@@ -104,7 +104,7 @@
 #define MPC_RRH_TYPE_IPA         0xc1
 #define MPC_PROTO_ULP            0x02
 #define MPC_PROTO_UNKNOWN        0x7e
-#define MPC_PROT_LAYER3          0x03
+#define MPC_PROT_LAYER2          0x08
 #define MPC_PUK_WHAT_41          0x41
 #define MPC_PUK_WHAT_43          0x43
 #define MPC_PUK_ENABLE           0x02
@@ -834,7 +834,8 @@ static void qeth_process_puk(QethCcwDevice *s, SubchDev *sch,
             qeth_unhandled(sch, "no free ulp connection", qeth_nr_conns(s));
             return;
         }
-        c->layer3 = p[4] == MPC_PROT_LAYER3;
+        /* Layer 2 is protocol 0x08; TCP/IP protocols are layer 3 */
+        c->layer3 = p[4] != MPC_PROT_LAYER2;
         c->guest_ulp_filter = ldl_be_p(p + 7);
         trace_qeth_conn(qeth_conn_index(s, c), "enable", p[4]);
         trace_qeth_l3("ulp-enable", c->layer3 ? "layer 3" : "layer 2");
