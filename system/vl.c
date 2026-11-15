@@ -1390,14 +1390,13 @@ static int device_init_func(void *opaque, QemuOpts *opts, Error **errp)
     return 0;
 }
 
-static bool dev3270_add(const char *optarg, Error **errp)
+static bool dev3270_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *chardev_id = NULL;
     g_autofree char *device_id = NULL;
     g_autofree char *normalized_devno = NULL;
     g_autofree char *port_str = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *chardev_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *devno;
@@ -1406,11 +1405,6 @@ static bool dev3270_add(const char *optarg, Error **errp)
     uint64_t port;
     uint64_t chpid;
     uint64_t value;
-
-    opts = qemu_opts_parse(&qemu_dev3270_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
 
     if (qemu_opts_id(opts)) {
         error_setg(errp, "Parameter 'id' is not supported");
@@ -1530,6 +1524,13 @@ fail:
     return false;
 }
 
+static bool dev3270_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_dev3270_opts, optarg, false, errp);
+
+    return opts && dev3270_add_opts(opts, errp);
+}
+
 /*
  * -sclp3270 port=N: the SCLP integrated 3270 console (event type 0x1b) on a
  * loopback TN3270 listener, i.e. the expanded
@@ -1539,22 +1540,17 @@ fail:
  * There is a single integrated console per machine, so the option may be
  * given only once.
  */
-static bool sclp3270_add(const char *optarg, Error **errp)
+static bool sclp3270_add_opts(QemuOpts *opts, Error **errp)
 {
     static bool added;
     g_autofree char *port_str = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *chardev_opts = NULL;
     QemuOpts *device_opts = NULL;
     uint64_t port;
 
     if (added) {
         error_setg(errp, "-sclp3270 may only be specified once");
-        return false;
-    }
-
-    opts = qemu_opts_parse(&qemu_sclp3270_opts, optarg, true, errp);
-    if (!opts) {
+        qemu_opts_del(opts);
         return false;
     }
 
@@ -1605,6 +1601,13 @@ fail:
     return false;
 }
 
+static bool sclp3270_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_sclp3270_opts, optarg, true, errp);
+
+    return opts && sclp3270_add_opts(opts, errp);
+}
+
 /*
  * -qeth [devno=N,](hostdev=TAP|netdev=ID)[,mac=MAC][,chpid=C][,datadevs=D]:
  * an OSA-Express QETH adapter (read, write and D data subchannels, default
@@ -1614,13 +1617,12 @@ fail:
  *   -device qeth-ccw,id=qethK,netdev=qeth-netdevK,devno=fe.0.N
  * or to an already defined -netdev ID.
  */
-static bool qeth_add(const char *optarg, Error **errp)
+static bool qeth_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *netdev_id = NULL;
     g_autofree char *device_id = NULL;
     g_autofree char *normalized_devno = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *netdev_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *hostdev;
@@ -1629,11 +1631,6 @@ static bool qeth_add(const char *optarg, Error **errp)
     const char *mac;
     unsigned int short_devno;
     int consumed;
-
-    opts = qemu_opts_parse(&qemu_qeth_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
 
     if (qemu_opts_id(opts)) {
         error_setg(errp, "Parameter 'id' is not supported");
@@ -1719,13 +1716,19 @@ fail:
     return false;
 }
 
-static bool dev3215_add(const char *optarg, Error **errp)
+static bool qeth_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_qeth_opts, optarg, false, errp);
+
+    return opts && qeth_add_opts(opts, errp);
+}
+
+static bool dev3215_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *generated_chardev_id = NULL;
     g_autofree char *generated_device_id = NULL;
     g_autofree char *normalized_devno = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *chardev_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *chardev;
@@ -1734,10 +1737,6 @@ static bool dev3215_add(const char *optarg, Error **errp)
     unsigned int short_devno;
     int consumed;
 
-    opts = qemu_opts_parse(&qemu_dev3215_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
     chardev = qemu_opt_get(opts, "chardev");
     devno = qemu_opt_get(opts, "devno");
     id = qemu_opts_id(opts);
@@ -1796,14 +1795,20 @@ fail:
     return false;
 }
 
-static bool dev9336_add(const char *optarg, Error **errp)
+static bool dev3215_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_dev3215_opts, optarg, false, errp);
+
+    return opts && dev3215_add_opts(opts, errp);
+}
+
+static bool dev9336_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *generated_drive_id = NULL;
     g_autofree char *generated_device_id = NULL;
     g_autofree char *normalized_devno = NULL;
     g_autofree char *blocks_str = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *drive_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *file;
@@ -1814,11 +1819,6 @@ static bool dev9336_add(const char *optarg, Error **errp)
     uint64_t blocks;
     unsigned int short_devno;
     int consumed;
-
-    opts = qemu_opts_parse(&qemu_dev9336_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
 
     file = qemu_opt_get(opts, "file");
     drive = qemu_opt_get(opts, "drive");
@@ -1895,23 +1895,25 @@ fail:
     return false;
 }
 
-static bool dev3590_add(const char *optarg, Error **errp)
+static bool dev9336_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_dev9336_opts, optarg, false, errp);
+
+    return opts && dev9336_add_opts(opts, errp);
+}
+
+static bool dev3590_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *generated_drive_id = NULL;
     g_autofree char *generated_device_id = NULL;
     g_autofree char *normalized_devno = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *drive_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *file, *drive, *devno, *ident, *id;
     unsigned int short_devno;
     int consumed;
 
-    opts = qemu_opts_parse(&qemu_dev3590_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
     file = qemu_opt_get(opts, "file");
     drive = qemu_opt_get(opts, "drive");
     devno = qemu_opt_get(opts, "devno");
@@ -1972,13 +1974,19 @@ fail:
     return false;
 }
 
-static bool dev3390_add(const char *optarg, Error **errp)
+static bool dev3590_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_dev3590_opts, optarg, false, errp);
+
+    return opts && dev3590_add_opts(opts, errp);
+}
+
+static bool dev3390_add_opts(QemuOpts *opts, Error **errp)
 {
     static unsigned int index;
     g_autofree char *generated_drive_id = NULL;
     g_autofree char *generated_device_id = NULL;
     g_autofree char *normalized_devno = NULL;
-    QemuOpts *opts = NULL;
     QemuOpts *drive_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *file, *drive, *format, *devno, *id;
@@ -1989,10 +1997,6 @@ static bool dev3390_add(const char *optarg, Error **errp)
     unsigned int short_devno;
     int consumed;
 
-    opts = qemu_opts_parse(&qemu_dev3390_opts, optarg, false, errp);
-    if (!opts) {
-        return false;
-    }
     file = qemu_opt_get(opts, "file");
     drive = qemu_opt_get(opts, "drive");
     format = qemu_opt_get(opts, "format");
@@ -2060,6 +2064,13 @@ fail:
     qemu_opts_del(drive_opts);
     qemu_opts_del(opts);
     return false;
+}
+
+static bool dev3390_add(const char *optarg, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_parse(&qemu_dev3390_opts, optarg, false, errp);
+
+    return opts && dev3390_add_opts(opts, errp);
 }
 
 static int chardev_init_func(void *opaque, QemuOpts *opts, Error **errp)
@@ -3148,6 +3159,51 @@ static void qemu_record_config_group(const char *group, QDict *dict,
 }
 
 /*
+ * s390x device shorthands in a config file: a section such as
+ *   [dev3390 "res"]
+ *     file = "/images/C5RES1.qcow2"
+ *     format = "qcow2"
+ *     devno = "0A80"
+ * is equivalent to "-dev3390 id=res,file=...,format=qcow2,devno=0A80".
+ * Returns false if the group is not a shorthand.
+ */
+static bool qemu_parse_shorthand_group(const char *group, QDict *qdict,
+                                       Error **errp)
+{
+    static const struct {
+        QemuOptsList *list;
+        bool (*add)(QemuOpts *opts, Error **errp);
+    } shorthands[] = {
+        { &qemu_dev3215_opts, dev3215_add_opts },
+        { &qemu_dev3270_opts, dev3270_add_opts },
+        { &qemu_sclp3270_opts, sclp3270_add_opts },
+        { &qemu_dev3390_opts, dev3390_add_opts },
+        { &qemu_dev3590_opts, dev3590_add_opts },
+        { &qemu_dev9336_opts, dev9336_add_opts },
+        { &qemu_qeth_opts, qeth_add_opts },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(shorthands); i++) {
+        QemuOpts *opts;
+
+        if (!g_str_equal(group, shorthands[i].list->name)) {
+            continue;
+        }
+        opts = qemu_opts_from_qdict(shorthands[i].list, qdict, errp);
+        if (!opts) {
+            return true;
+        }
+        if (shorthands[i].list == &qemu_qeth_opts) {
+            default_net = 0;
+        }
+        shorthands[i].add(opts, errp);
+        return true;
+    }
+    return false;
+}
+
+/*
  * Parse non-QemuOpts config file groups, pass the rest to
  * qemu_config_do_parse.
  */
@@ -3155,6 +3211,9 @@ static void qemu_parse_config_group(const char *group, QDict *qdict,
                                     void *opaque, Error **errp)
 {
     QObject *crumpled;
+    if (qemu_parse_shorthand_group(group, qdict, errp)) {
+        return;
+    }
     if (is_qemuopts_group(group)) {
         qemu_config_do_parse(group, qdict, opaque, errp);
         return;

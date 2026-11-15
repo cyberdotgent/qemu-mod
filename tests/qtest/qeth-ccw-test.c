@@ -94,6 +94,43 @@ static void test_data_devices(void)
     qtest_quit(qts);
 }
 
+static void test_readconfig(void)
+{
+    static const char config[] =
+        "[netdev \"net0\"]\n"
+        "  type = \"user\"\n"
+        "[qeth]\n"
+        "  devno = \"0500\"\n"
+        "  netdev = \"net0\"\n"
+        "  mac = \"52:54:00:12:34:62\"\n"
+        "  datadevs = \"2\"\n";
+    g_autofree char *path = NULL;
+    g_autofree char *dev_id = NULL;
+    g_autofree char *mac = NULL;
+    g_autofree char *args = NULL;
+    g_autoptr(GError) err = NULL;
+    QTestState *qts;
+    int fd;
+
+    /* The -qeth shorthand as a config file section */
+    fd = g_file_open_tmp("qeth-ccw-test-XXXXXX.conf", &path, &err);
+    g_assert_no_error(err);
+    g_assert_true(g_file_set_contents(path, config, -1, &err));
+    g_assert_no_error(err);
+    close(fd);
+
+    args = g_strdup_printf("-nodefaults -readconfig %s", path);
+    qts = qtest_init(args);
+    dev_id = qom_get_string(qts, "/machine/peripheral/qeth0", "dev_id");
+    mac = qom_get_string(qts, "/machine/peripheral/qeth0", "mac");
+    g_assert_cmpstr(dev_id, ==, "fe.0.0500");
+    g_assert_cmpstr(mac, ==, "52:54:00:12:34:62");
+    g_assert_cmpint(qom_get_int(qts, "/machine/peripheral/qeth0",
+                                "data-devices"), ==, 2);
+    qtest_quit(qts);
+    unlink(path);
+}
+
 static void test_auto_configuration(void)
 {
     g_autofree char *dev_id0 = NULL;
@@ -118,5 +155,6 @@ int main(int argc, char **argv)
     qtest_add_func("/qeth-ccw/auto-configuration", test_auto_configuration);
     qtest_add_func("/qeth-ccw/qeth-shortcut", test_qeth_shortcut);
     qtest_add_func("/qeth-ccw/data-devices", test_data_devices);
+    qtest_add_func("/qeth-ccw/readconfig", test_readconfig);
     return g_test_run();
 }

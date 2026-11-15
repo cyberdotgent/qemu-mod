@@ -57,6 +57,7 @@ or vfio-ap is also available.
    s390x/3590
    s390x/3390
    s390x/qeth
+   s390x/config
    s390x/vfio-ccw
    s390x/pcidevices
 
