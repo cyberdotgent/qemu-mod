@@ -44,6 +44,8 @@ typedef struct S390QdioState {
     S390QdioQueue output[S390_QDIO_MAX_QUEUES];
 } S390QdioState;
 
+extern const VMStateDescription vmstate_s390_qdio;
+
 int s390_qdio_establish(S390QdioState *s, const uint8_t *qdr, size_t len);
 void s390_qdio_reset(S390QdioState *s);
 int s390_qdio_read(uint64_t addr, void *buf, size_t len);

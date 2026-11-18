@@ -37,6 +37,8 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "qemu/error-report.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 #define QETH_CU_TYPE             0x1731
@@ -289,7 +291,7 @@ typedef struct QethPending {
 struct QethCcwDevice {
     CcwDevice parent_obj;
     SubchDev *peer[QETH_MAX_PEERS];
-    QethPeerRole role[QETH_MAX_PEERS];
+    uint8_t role[QETH_MAX_PEERS];       /* QethPeerRole */
     unsigned int nr_peers;
     uint8_t data_devices;
     uint8_t chpid;
@@ -298,6 +300,7 @@ struct QethCcwDevice {
     NICConf conf;
     NICState *nic;
     QEMUBH *tx_bh;
+    VMChangeStateEntry *vmstate_change;
 
     /* Control responses queued per subchannel, and outstanding READs */
     GQueue responses[QETH_MAX_PEERS];
@@ -326,6 +329,10 @@ struct QethCcwDevice {
     QethNdEntry nd[QETH_ND_ENTRIES];
     int64_t nd_last_request;
     uint8_t nd_last_ip[16];
+
+    /* Queued control responses, serialized for migration */
+    uint8_t *migration_responses;
+    uint32_t migration_responses_len;
 };
 
 static int qeth_peer_index(QethCcwDevice *s, SubchDev *sch)
@@ -2470,6 +2477,44 @@ static ssize_t qeth_receive(NetClientState *nc, const uint8_t *buf, size_t len)
     return ret;
 }
 
+/*
+ * Resume the data and control paths when the VM starts running, in
+ * particular after migration: transmit what the guest primed while the
+ * backend could not run, retry received packets that waited for input
+ * buffers and answer an outstanding READ from the restored responses.
+ */
+static void qeth_vm_state_change(void *opaque, bool running, RunState state)
+{
+    QethCcwDevice *s = opaque;
+    unsigned int i;
+
+    if (!running) {
+        return;
+    }
+    for (i = 0; i < s->nr_peers; i++) {
+        GByteArray *rsp;
+        SubchDev *sch = s->peer[i];
+
+        if (!s->read_pending[i] || g_queue_is_empty(&s->responses[i])) {
+            continue;
+        }
+        s->read_pending[i] = false;
+        rsp = g_queue_pop_head(&s->responses[i]);
+        css_virtual_ccw_complete(sch,
+            qeth_copy_response(sch, rsp->data, rsp->len) ? -EFAULT : 0);
+        g_byte_array_unref(rsp);
+    }
+    for (i = 0; i < qeth_nr_conns(s); i++) {
+        if (s->conn[i].in_use && s->conn[i].qdio.active) {
+            qemu_bh_schedule(s->tx_bh);
+            if (s->nic) {
+                qemu_flush_queued_packets(qemu_get_queue(s->nic));
+            }
+            break;
+        }
+    }
+}
+
 static NetClientInfo qeth_net_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
@@ -2519,6 +2564,8 @@ static void qeth_setup_peer(QethCcwDevice *s, SubchDev *sch)
     sch->disable_cb = qeth_cancel;
     sch->irb_cb = build_irb_virtual;
     sch->qdio_ops = &qeth_qdio_ops;
+    /* Outstanding READs and active queues are resumed after migration. */
+    sch->ccw_async_migratable = true;
 }
 
 static void qeth_realize(DeviceState *dev, Error **errp)
@@ -2588,6 +2635,8 @@ static void qeth_realize(DeviceState *dev, Error **errp)
                           &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
     s->tx_bh = qemu_bh_new(qeth_tx_bh, s);
+    s->vmstate_change = qemu_add_vm_change_state_handler(qeth_vm_state_change,
+                                                         s);
     for (i = 0; i < s->nr_peers; i++) {
         css_generate_sch_crws(s->peer[i]->cssid, s->peer[i]->ssid,
                               s->peer[i]->schid, dev->hotplugged, 1);
@@ -2616,6 +2665,10 @@ static void qeth_unrealize(DeviceState *dev)
 
     qeth_flush_responses(s);
     qeth_arp_reset(s);
+    if (s->vmstate_change) {
+        qemu_del_vm_change_state_handler(s->vmstate_change);
+        s->vmstate_change = NULL;
+    }
     if (s->tx_bh) {
         qemu_bh_delete(s->tx_bh);
         s->tx_bh = NULL;
@@ -2663,9 +2716,281 @@ static const Property qeth_properties[] = {
     DEFINE_PROP_UINT8("data-devices", QethCcwDevice, data_devices, 1),
 };
 
+/* Migration */
+
+static const VMStateDescription vmstate_qeth_conn = {
+    .name = "qeth-ccw/conn",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(in_use, QethConn),
+        VMSTATE_BOOL(activated, QethConn),
+        VMSTATE_INT32(data_peer, QethConn),
+        VMSTATE_UINT32(guest_ulp_filter, QethConn),
+        VMSTATE_UINT32(guest_ulp_conn, QethConn),
+        VMSTATE_BOOL(layer3, QethConn),
+        VMSTATE_BOOL(lan_online, QethConn),
+        VMSTATE_UINT32_ARRAY(assists_enabled, QethConn, 2),
+        VMSTATE_STRUCT(qdio, QethConn, 1, vmstate_s390_qdio, S390QdioState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_qeth_ip4 = {
+    .name = "qeth-ccw/ip4",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(addr, QethIp4),
+        VMSTATE_UINT32(flags, QethIp4),
+        VMSTATE_INT32(conn, QethIp4),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_qeth_ip6 = {
+    .name = "qeth-ccw/ip6",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(addr, QethIp6, 16),
+        VMSTATE_INT32(conn, QethIp6),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_qeth_mc = {
+    .name = "qeth-ccw/mc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(mac, QethMc, ETH_ALEN),
+        VMSTATE_INT32(conn, QethMc),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_qeth_arp = {
+    .name = "qeth-ccw/arp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ip, QethArpEntry),
+        VMSTATE_UINT8_ARRAY(mac, QethArpEntry, ETH_ALEN),
+        VMSTATE_INT64(used, QethArpEntry),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_qeth_nd = {
+    .name = "qeth-ccw/nd",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(ip, QethNdEntry, 16),
+        VMSTATE_UINT8_ARRAY(mac, QethNdEntry, ETH_ALEN),
+        VMSTATE_INT64(used, QethNdEntry),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/*
+ * Queued control responses: per peer subchannel a count byte, then each
+ * response as a 16-bit big-endian length and its data.
+ */
+static int qeth_pre_save(void *opaque)
+{
+    QethCcwDevice *s = opaque;
+    g_autoptr(GByteArray) blob = g_byte_array_new();
+    unsigned int i;
+
+    for (i = 0; i < s->nr_peers; i++) {
+        uint8_t count = g_queue_get_length(&s->responses[i]);
+        GList *l;
+
+        g_byte_array_append(blob, &count, 1);
+        for (l = s->responses[i].head; l; l = l->next) {
+            GByteArray *rsp = l->data;
+            uint8_t len[2];
+
+            stw_be_p(len, rsp->len);
+            g_byte_array_append(blob, len, 2);
+            g_byte_array_append(blob, rsp->data, rsp->len);
+        }
+    }
+    g_free(s->migration_responses);
+    s->migration_responses_len = blob->len;
+    s->migration_responses = (uint8_t *)g_byte_array_free(
+        g_steal_pointer(&blob), false);
+    return 0;
+}
+
+static void qeth_post_save(void *opaque)
+{
+    QethCcwDevice *s = opaque;
+
+    g_clear_pointer(&s->migration_responses, g_free);
+    s->migration_responses_len = 0;
+}
+
+static bool qeth_load_responses(QethCcwDevice *s)
+{
+    const uint8_t *p = s->migration_responses;
+    size_t left = s->migration_responses_len;
+    unsigned int i, n;
+
+    for (i = 0; i < s->nr_peers; i++) {
+        if (left < 1 || p[0] > QETH_RESPONSES_MAX) {
+            return false;
+        }
+        n = *p++;
+        left--;
+        while (n--) {
+            GByteArray *rsp;
+            size_t len;
+
+            if (left < 2) {
+                return false;
+            }
+            len = lduw_be_p(p);
+            p += 2;
+            left -= 2;
+            if (len > left || len > QETH_MAX_CTRL) {
+                return false;
+            }
+            rsp = g_byte_array_sized_new(len);
+            g_byte_array_append(rsp, p, len);
+            g_queue_push_tail(&s->responses[i], rsp);
+            p += len;
+            left -= len;
+        }
+    }
+    return left == 0;
+}
+
+static int qeth_pre_load(void *opaque)
+{
+    QethCcwDevice *s = opaque;
+
+    /* The incoming state replaces whatever the destination set up. */
+    qeth_flush_responses(s);
+    qeth_arp_reset(s);
+    return 0;
+}
+
+static int qeth_post_load(void *opaque, int version_id)
+{
+    QethCcwDevice *s = opaque;
+    unsigned int i, n = qeth_nr_conns(s);
+    bool ok;
+
+    ok = qeth_load_responses(s);
+    g_clear_pointer(&s->migration_responses, g_free);
+    s->migration_responses_len = 0;
+    if (!ok) {
+        error_report("qeth-ccw: malformed control responses in the "
+                     "migration stream");
+        return -EINVAL;
+    }
+
+    if (s->nr_ip4 > QETH_MAX_IP4 || s->nr_ip6 > QETH_MAX_IP6 ||
+        s->nr_mc > QETH_MAX_MC || s->last_enabled < 0 ||
+        s->last_enabled >= QETH_MAX_DATA) {
+        return -EINVAL;
+    }
+    for (i = 0; i < s->nr_peers; i++) {
+        if (s->role[i] > QETH_ROLE_DATA) {
+            return -EINVAL;
+        }
+        /* A READ is only outstanding while its channel program is. */
+        if (!s->peer[i]->ccw_async_pending) {
+            s->read_pending[i] = false;
+        }
+    }
+    for (i = n; i < QETH_MAX_PEERS; i++) {
+        s->read_pending[i] = false;
+    }
+    for (i = 0; i < QETH_MAX_DATA; i++) {
+        QethConn *c = &s->conn[i];
+
+        if (c->data_peer < -1 || c->data_peer >= (int)s->nr_peers ||
+            (i >= n && c->in_use)) {
+            return -EINVAL;
+        }
+    }
+    for (i = 0; i < s->nr_ip4; i++) {
+        if (s->ip4[i].conn < 0 || s->ip4[i].conn >= n) {
+            return -EINVAL;
+        }
+    }
+    for (i = 0; i < s->nr_ip6; i++) {
+        if (s->ip6[i].conn < 0 || s->ip6[i].conn >= n) {
+            return -EINVAL;
+        }
+    }
+    for (i = 0; i < s->nr_mc; i++) {
+        if (s->mc[i].conn < 0 || s->mc[i].conn >= n) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The adapter state: the peer subchannels (including outstanding READs on
+ * the control subchannels and the active-queues channel program of each
+ * data subchannel), the IDX roles, the MPC tokens and sequence numbers,
+ * every ULP connection with its mode, LAN state, assists and QDIO queue
+ * descriptors, the layer-3 address tables and ARP/ND caches, and queued
+ * control responses.  QDIO buffers and their states are guest storage.
+ * Frames held back for ARP or ND resolution are not migrated; the guest
+ * retransmits them.
+ */
 static const VMStateDescription vmstate_qeth = {
     .name = TYPE_QETH_CCW,
-    .unmigratable = 1,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = qeth_pre_save,
+    .post_save = qeth_post_save,
+    .pre_load = qeth_pre_load,
+    .post_load = qeth_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_EQUAL(data_devices, QethCcwDevice),
+        VMSTATE_ARRAY_OF_POINTER_TO_STRUCT(peer, QethCcwDevice,
+                                           QETH_MAX_PEERS, 1,
+                                           vmstate_subch_dev, SubchDev),
+        VMSTATE_UINT8_ARRAY(role, QethCcwDevice, QETH_MAX_PEERS),
+        VMSTATE_BOOL_ARRAY(read_pending, QethCcwDevice, QETH_MAX_PEERS),
+        VMSTATE_UINT32(sii, QethCcwDevice),
+        VMSTATE_UINT32(guest_issuer_token, QethCcwDevice),
+        VMSTATE_UINT32(guest_cm_filter, QethCcwDevice),
+        VMSTATE_UINT32(guest_cm_conn, QethCcwDevice),
+        VMSTATE_UINT32(ulp_seq, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(conn, QethCcwDevice, QETH_MAX_DATA, 1,
+                             vmstate_qeth_conn, QethConn),
+        VMSTATE_INT32(last_enabled, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(ip4, QethCcwDevice, QETH_MAX_IP4, 1,
+                             vmstate_qeth_ip4, QethIp4),
+        VMSTATE_UINT32(nr_ip4, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(ip6, QethCcwDevice, QETH_MAX_IP6, 1,
+                             vmstate_qeth_ip6, QethIp6),
+        VMSTATE_UINT32(nr_ip6, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(mc, QethCcwDevice, QETH_MAX_MC, 1,
+                             vmstate_qeth_mc, QethMc),
+        VMSTATE_UINT32(nr_mc, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(arp, QethCcwDevice, QETH_ARP_ENTRIES, 1,
+                             vmstate_qeth_arp, QethArpEntry),
+        VMSTATE_INT64(arp_last_request, QethCcwDevice),
+        VMSTATE_UINT32(arp_last_ip, QethCcwDevice),
+        VMSTATE_STRUCT_ARRAY(nd, QethCcwDevice, QETH_ND_ENTRIES, 1,
+                             vmstate_qeth_nd, QethNdEntry),
+        VMSTATE_INT64(nd_last_request, QethCcwDevice),
+        VMSTATE_UINT8_ARRAY(nd_last_ip, QethCcwDevice, 16),
+        VMSTATE_UINT32(migration_responses_len, QethCcwDevice),
+        VMSTATE_VBUFFER_ALLOC_UINT32(migration_responses, QethCcwDevice, 1,
+                                     NULL, migration_responses_len),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 static void qeth_class_init(ObjectClass *klass, const void *data)

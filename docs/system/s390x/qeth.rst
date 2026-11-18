@@ -112,5 +112,22 @@ by the supported guests (assist negotiation, address registration, adapter
 parameters), self-description (Read Configuration Data, Read Node
 Identifier), format-0 QDIO queues, SIGA, SSQD, conventional
 program-controlled interrupts, and Ethernet or IP transport.  It does not
-currently implement QDIO thin interrupts, QEBSM, VLANs, checksum or
-segmentation offloads, or migration of an active adapter.
+currently implement QDIO thin interrupts, QEBSM, VLANs, or checksum or
+segmentation offloads.
+
+Migration
+---------
+
+An active adapter migrates (live migration, snapshots with RAM state): the
+peer subchannels with their outstanding control READs and the active-queues
+channel program of each data subchannel, the IDX roles, the MPC tokens and
+sequence numbers, every ULP connection with its layer-2/3 mode, LAN state,
+assists and QDIO queue descriptors and cursors, the layer-3 address and
+multicast tables, the ARP and neighbour caches, and queued control
+responses.  The QDIO buffers and their states (SLSBs) are guest storage and
+migrate with it.  When the VM starts running on the destination, the adapter
+transmits what the guest primed meanwhile, accepts packets queued by the
+backend and answers an outstanding READ, so the guest continues without
+re-initialising the interface.  Frames held back in layer-3 mode while the
+adapter resolves their next hop are dropped; the guest retransmits them.
+The destination must use the same ``data-devices`` value.

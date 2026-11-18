@@ -10,6 +10,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "hw/s390x/qdio.h"
+#include "migration/vmstate.h"
 #include "qemu/bswap.h"
 #include "trace.h"
 
@@ -32,6 +33,68 @@ int s390_qdio_write(uint64_t addr, const void *buf, size_t len)
                                MEMTXATTRS_UNSPECIFIED, buf, len) ==
            MEMTX_OK ? 0 : -EFAULT;
 }
+
+/*
+ * Device-side QDIO state: the queue descriptors taken from the QDR at
+ * Establish Queues and the adapter's scan cursor per queue.  The QIB,
+ * SLIBs, SLs, SBALs and SLSBs live in guest storage and migrate with it.
+ */
+static const VMStateDescription vmstate_s390_qdio_queue = {
+    .name = "s390_qdio_queue",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(sliba, S390QdioQueue),
+        VMSTATE_UINT64(sla, S390QdioQueue),
+        VMSTATE_UINT64(slsba, S390QdioQueue),
+        VMSTATE_UINT8(slib_key, S390QdioQueue),
+        VMSTATE_UINT8(sl_key, S390QdioQueue),
+        VMSTATE_UINT8(sbal_key, S390QdioQueue),
+        VMSTATE_UINT8(slsb_key, S390QdioQueue),
+        VMSTATE_UINT8(cursor, S390QdioQueue),
+        VMSTATE_UINT32(mask, S390QdioQueue),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int s390_qdio_post_load(void *opaque, int version_id)
+{
+    S390QdioState *s = opaque;
+    unsigned int i;
+
+    if (s->input_count > S390_QDIO_MAX_QUEUES ||
+        s->output_count > S390_QDIO_MAX_QUEUES ||
+        (s->active && !s->established)) {
+        return -EINVAL;
+    }
+    for (i = 0; i < S390_QDIO_MAX_QUEUES; i++) {
+        if (s->input[i].cursor >= S390_QDIO_MAX_BUFFERS ||
+            s->output[i].cursor >= S390_QDIO_MAX_BUFFERS) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+const VMStateDescription vmstate_s390_qdio = {
+    .name = "s390_qdio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = s390_qdio_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(established, S390QdioState),
+        VMSTATE_BOOL(active, S390QdioState),
+        VMSTATE_UINT64(qiba, S390QdioState),
+        VMSTATE_UINT8(qib_key, S390QdioState),
+        VMSTATE_UINT8(input_count, S390QdioState),
+        VMSTATE_UINT8(output_count, S390QdioState),
+        VMSTATE_STRUCT_ARRAY(input, S390QdioState, S390_QDIO_MAX_QUEUES, 1,
+                             vmstate_s390_qdio_queue, S390QdioQueue),
+        VMSTATE_STRUCT_ARRAY(output, S390QdioState, S390_QDIO_MAX_QUEUES, 1,
+                             vmstate_s390_qdio_queue, S390QdioQueue),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 void s390_qdio_reset(S390QdioState *s)
 {
