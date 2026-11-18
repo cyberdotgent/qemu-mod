@@ -22,20 +22,45 @@ allocated starting at ``0300``.
 
 The supported geometry is 15 tracks per cylinder and up to 65,520 cylinders,
 covering named 3390-1, 3390-2, 3390-3, 3390-9, 3390-27, and 3390-54 sizes.
-Geometry comes from the CKD byte-stream length rather than from the outer
-container's allocated size.
 
 Locate Record count and data orientations match the complete CCHHR search
 argument against physical count fields on the selected track.  Data
 orientation advances to the next count field in track order; CKD record
 numbers are labels and need not be consecutive.
 
+Volume size
+-----------
+
+The image is a 512-byte device header followed by one 56,832-byte track slot
+per track, so a volume of *n* cylinders needs 512 + *n* × 852,480 bytes. The
+number of cylinders comes from the header's 16-bit little-endian
+``high_cylinder`` field at offset 18:
+
+* If ``high_cylinder`` is nonzero and the file sequence byte at offset 17 is
+  zero, ``high_cylinder`` is the number of cylinders (one-origin, 1 to
+  65,520). The backend may be longer than the volume needs; the trailing
+  bytes are ignored and never written. This allows block storage which rounds
+  volume sizes up, such as LVM logical volumes, ZFS volumes, or Ceph RBD
+  images. A backend shorter than the volume is refused.
+* If ``high_cylinder`` is zero, the volume size is derived from the backend
+  length, which must be exactly 512 + *n* × 852,480 bytes.
+
+This is the single-file form Hercules accepts: Hercules writes
+``high_cylinder`` = 0 for a single-file volume, and also accepts a nonzero
+``high_cylinder`` equal to the cylinder count. In a member of a multi-file
+Hercules volume the file sequence byte is nonzero and ``high_cylinder`` is
+the zero-origin number of the member's last cylinder; such members are
+refused. Hercules itself requires the exact length, so trailing bytes must
+be cut off before an image is used with Hercules.
+
+Images should be created with ``high_cylinder`` set.
+
 Image creation
 --------------
 
 ``work/ckd-qcow2-init.py`` in the source checkout is a dasdinit-like
-development tool which creates a qcow2 container holding a CKD64 image. For
-example::
+development tool which creates a qcow2 container holding a preformatted
+CKD64 image. For example::
 
   python3 work/ckd-qcow2-init.py dosres.qcow2 3390-3 DOSRES
   python3 work/ckd-qcow2-init.py archive.qcow2 3390-54 ARCHIV

@@ -100,6 +100,8 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp)
     CkdDeviceHeader header;
     int64_t length;
     uint64_t data_length;
+    uint64_t cylinder_size;
+    uint16_t high_cylinder;
 
     memset(image, 0, sizeof(*image));
     length = blk_getlength(blk);
@@ -131,29 +133,67 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp)
         return false;
     }
 
+    cylinder_size = (uint64_t)image->heads * image->track_size;
     data_length = length - CKD_IMAGE_HEADER_SIZE;
-    if (data_length % ((uint64_t)image->heads * image->track_size)) {
-        error_setg(errp, "CKD image length does not contain whole cylinders");
-        return false;
-    }
-    image->cylinders = data_length / ((uint64_t)image->heads *
-                                      image->track_size);
-    if (!image->cylinders || image->cylinders > CKD_3390_MAX_CYLINDERS) {
-        error_setg(errp, "CKD cylinder count %u is outside 1..%u",
-                   image->cylinders, CKD_3390_MAX_CYLINDERS);
-        return false;
-    }
+    high_cylinder = le16_to_cpu(header.high_cylinder);
 
-    /*
-     * Hercules also accepts old single-file images whose header contains a
-     * nonzero file sequence and a one-origin cylinder count in high_cylinder.
-     * A real multi-file member uses the zero-origin number of its last
-     * cylinder instead, so it cannot satisfy this size-derived check.
-     */
-    if ((header.file_sequence || le16_to_cpu(header.high_cylinder)) &&
-        le16_to_cpu(header.high_cylinder) != image->cylinders) {
-        error_setg(errp, "multi-file CKD images are unsupported");
-        return false;
+    if (!header.file_sequence && high_cylinder) {
+        /*
+         * The header defines the volume size: high_cylinder holds the
+         * one-origin cylinder count, as in the single-file form Hercules
+         * accepts (see below).  The backend may be larger, because block
+         * storage rounds volume sizes up; the trailing bytes are never
+         * read or written.
+         */
+        image->cylinders = high_cylinder;
+        if (image->cylinders > CKD_3390_MAX_CYLINDERS) {
+            error_setg(errp, "CKD cylinder count %u is outside 1..%u",
+                       image->cylinders, CKD_3390_MAX_CYLINDERS);
+            return false;
+        }
+        if (data_length < image->cylinders * cylinder_size) {
+            error_setg(errp, "CKD image is too short for %u cylinders: "
+                       "%" PRId64 " bytes, at least %" PRIu64 " required",
+                       image->cylinders, length,
+                       CKD_IMAGE_HEADER_SIZE +
+                       image->cylinders * cylinder_size);
+            return false;
+        }
+    } else {
+        /*
+         * Legacy header without a cylinder count: the length defines the
+         * volume size and must be exact.
+         */
+        if (data_length % cylinder_size) {
+            error_setg(errp, "CKD image length does not contain whole "
+                       "cylinders");
+            return false;
+        }
+        image->cylinders = data_length / cylinder_size;
+        if (!image->cylinders || image->cylinders > CKD_3390_MAX_CYLINDERS) {
+            error_setg(errp, "CKD cylinder count %u is outside 1..%u",
+                       image->cylinders, CKD_3390_MAX_CYLINDERS);
+            return false;
+        }
+
+        /*
+         * Hercules writes high_cylinder = 0 for the only (or last) file of
+         * a volume.  In a member of a multi-file volume, file_sequence is
+         * nonzero and high_cylinder is the zero-origin number of the last
+         * cylinder in that file, so the file holds one cylinder more than
+         * high_cylinder says.  Hercules also accepts an old single-file
+         * form whose high_cylinder is the one-origin cylinder count derived
+         * from the length, whatever its file_sequence (ckddasd.c,
+         * "fileseq == 1 && highcyl == cyls").  Accept only that form here;
+         * slack is not tolerated with a nonzero file_sequence, because a
+         * first multi-file member would then pass as a volume one cylinder
+         * smaller.
+         */
+        if ((header.file_sequence || high_cylinder) &&
+            high_cylinder != image->cylinders) {
+            error_setg(errp, "multi-file CKD images are unsupported");
+            return false;
+        }
     }
 
     image->blk = blk;
