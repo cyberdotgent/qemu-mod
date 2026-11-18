@@ -53,7 +53,28 @@ the zero-origin number of the member's last cylinder; such members are
 refused. Hercules itself requires the exact length, so trailing bytes must
 be cut off before an image is used with Hercules.
 
-Images should be created with ``high_cylinder`` set.
+Images should be created with ``high_cylinder`` set. Track slots which are
+entirely zero read as empty tracks, so a new volume needs only the header::
+
+  # 3390-3: 3,339 cylinders (0x0d0b), at least 2,846,431,232 bytes
+  truncate -s 2715M dosres.ckd
+  printf 'CKD_P064\x0f\0\0\0\0\xde\0\0\x90\0\x0b\x0d' |
+      dd of=dosres.ckd conv=notrunc
+
+The guest then initialises the volume, for example with ICKDSF or
+``dasdfmt``.
+
+Unformatted tracks
+------------------
+
+A track slot that contains only zero bytes is presented as a freshly
+initialised empty track: a home address with the slot's cylinder and head,
+a standard record zero (key length 0, data length 8, zero data), and the
+end-of-track marker. This is the layout Hercules uses for its CCKD null
+track format 1 and the layout ICKDSF leaves on an initialised track. The
+first write to the track stores the complete track in the slot. A slot which
+is neither all zero nor a valid track is reported to the guest as an invalid
+track.
 
 Image creation
 --------------

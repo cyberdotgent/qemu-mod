@@ -12,6 +12,7 @@
 
 #include "hw/s390x/ckd-image.h"
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
 #include "qemu/memalign.h"
 #include "system/block-backend.h"
 #include "system/block-backend-io.h"
@@ -19,6 +20,7 @@
 #define CKD_TRACK_HEADER_SIZE 5
 #define CKD_RECORD_HEADER_SIZE 8
 #define CKD_END_TRACK_SIZE 8
+#define CKD_R0_DATA_SIZE 8
 #define CKD_3390_HEADS 15
 #define CKD_3390_MAX_CYLINDERS 65520
 #define CKD_3390_TRACK_SIZE 56832
@@ -44,6 +46,33 @@ static bool ckd_is_eot(const uint8_t *p)
         }
     }
     return true;
+}
+
+/*
+ * Build an empty track in place of an all-zero slot: home address, a
+ * standard record zero (key length 0, data length 8, zero data) and the
+ * end-of-track marker.  This is the track ICKDSF leaves after initialising
+ * it, the track eckd-ccw writes for Write Home Address/Erase, and Hercules'
+ * CCKD null track format 1 (CKD_NULLTRK_FMT1, cckd_null_trk()).  Hercules'
+ * default null format 0 also has an end-of-file R1, which an unformatted
+ * track does not have.
+ */
+static void ckd_image_build_empty_track(CkdImage *image, uint16_t cylinder,
+                                        uint16_t head)
+{
+    uint8_t *p = image->track;
+
+    p[0] = 0;
+    stw_be_p(p + 1, cylinder);
+    stw_be_p(p + 3, head);
+    p += CKD_TRACK_HEADER_SIZE;
+    stw_be_p(p, cylinder);
+    stw_be_p(p + 2, head);
+    p[4] = 0;
+    p[5] = 0;
+    stw_be_p(p + 6, CKD_R0_DATA_SIZE);
+    p += CKD_RECORD_HEADER_SIZE + CKD_R0_DATA_SIZE;
+    memset(p, 0xff, CKD_END_TRACK_SIZE);
 }
 
 static int ckd_image_parse_track(CkdImage *image, uint16_t cylinder,
@@ -226,7 +255,17 @@ int ckd_image_load_track(CkdImage *image, uint16_t cylinder, uint16_t head)
     offset = CKD_IMAGE_HEADER_SIZE + track_number * image->track_size;
     ret = blk_pread(image->blk, offset, image->track_size, image->track, 0);
     if (ret < 0) {
+        image->track_loaded = false;
         return ret;
+    }
+    /*
+     * A slot that was never written (sparse file, thin volume, or a new
+     * volume of which only the header was written) reads as zeros.  Present
+     * it as an empty track so the guest can read and format it; the slot
+     * itself is only written when the guest writes the track.
+     */
+    if (buffer_is_zero(image->track, image->track_size)) {
+        ckd_image_build_empty_track(image, cylinder, head);
     }
     ret = ckd_image_parse_track(image, cylinder, head);
     if (ret < 0) {

@@ -243,6 +243,11 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../eckd-zero-data.py')],
   },
+  # Runs under TCG unless ECKD_TEST_ACCEL says otherwise.
+  'eckd-blank.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../eckd-blank.py')],
+  },
   'native-ipl.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../native-ipl.py')],
