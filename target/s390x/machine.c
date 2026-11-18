@@ -37,6 +37,8 @@ static int cpu_post_load(void *opaque, int version_id)
     }
 
     if (tcg_enabled()) {
+        /* The condition code travels in the PSW, see cpu_pre_save(). */
+        cpu->env.cc_op = (cpu->env.psw.mask >> 44) & 3;
         /* Rearm the CKC timer if necessary */
         tcg_s390_tod_updated(CPU(cpu), RUN_ON_CPU_NULL);
     }
@@ -62,6 +64,12 @@ static int cpu_pre_save(void *opaque)
         if (cpu->env.tx_depth) {
             s390_tx_abort(&cpu->env);
         }
+        /*
+         * TCG keeps the condition code in cc_op/cc_src/cc_dst/cc_vr, not in
+         * env.psw.mask; only the PSW is migrated.  Fold the current
+         * condition code into it, cpu_post_load() takes it back out.
+         */
+        cpu->env.psw.mask = s390_cpu_get_psw_mask(&cpu->env);
         tcg_s390_tod_updated(CPU(cpu), RUN_ON_CPU_NULL);
     }
 
