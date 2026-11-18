@@ -25,8 +25,8 @@ static void test_ipl_short_address(void)
 {
     QTestState *qts = qtest_init(
         "-nodefaults "
-        "-drive if=none,id=d,file=null-co://,format=raw "
-        "-device virtio-blk-ccw,drive=d,devno=fe.0.1000 "
+        "-blockdev driver=null-co,node-name=d,size=1048576 "
+        "-device fba-ccw,drive=d,devno=fe.0.1000 "
         "-ipl 1000 -loadparm ab.1");
 
     assert_machine_string(qts, "ipl", "1000");
@@ -38,10 +38,10 @@ static void test_ipl_full_address(void)
 {
     QTestState *qts = qtest_init(
         "-nodefaults "
-        "-drive if=none,id=d0,file=null-co://,format=raw "
-        "-drive if=none,id=d1,file=null-co://,format=raw "
-        "-device virtio-blk-ccw,drive=d0,devno=fe.0.1000 "
-        "-device virtio-blk-ccw,drive=d1,devno=fe.1.1000 "
+        "-blockdev driver=null-co,node-name=d0,size=1048576 "
+        "-blockdev driver=null-co,node-name=d1,size=1048576 "
+        "-device fba-ccw,drive=d0,devno=fe.0.1000 "
+        "-device fba-ccw,drive=d1,devno=fe.1.1000 "
         "-ipl fe.0.1000");
 
     assert_machine_string(qts, "ipl", "fe.0.1000");
@@ -100,6 +100,11 @@ static void test_ipl_errors(void)
         "-device", "virtio-blk-ccw,drive=d,devno=fe.0.1000,bootindex=1",
         "-ipl", "1000", NULL
     };
+    const char *const virtio[] = {
+        "-drive", "if=none,id=d,file=null-co://,format=raw",
+        "-device", "virtio-blk-ccw,drive=d,devno=fe.0.1000",
+        "-ipl", "1000", NULL
+    };
     const char *const ambiguous[] = {
         "-drive", "if=none,id=d0,file=null-co://,format=raw",
         "-drive", "if=none,id=d1,file=null-co://,format=raw",
@@ -115,6 +120,8 @@ static void test_ipl_errors(void)
     assert_qemu_fails(missing, "IPL device 1000 was not found");
     assert_qemu_fails(unsupported, "does not support IPL");
     assert_qemu_fails(bootindex, "cannot be combined with a bootindex");
+    assert_qemu_fails(virtio, "virtio device 1000 does not support; "
+                      "use bootindex instead");
     assert_qemu_fails(ambiguous, "is ambiguous");
     assert_qemu_fails(kernel, "-ipl and -kernel cannot be used together");
 }
