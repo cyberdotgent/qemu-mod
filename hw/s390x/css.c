@@ -199,6 +199,55 @@ static const VMStateDescription vmstate_schdev_orb = {
     }
 };
 
+static void ccw_dstream_set_handler(CcwDataStream *cds);
+
+static bool vmstate_schdev_async_needed(void *opaque)
+{
+    SubchDev *s = opaque;
+
+    return s->ccw_async_pending;
+}
+
+static int vmstate_schdev_async_post_load(void *opaque, int version_id)
+{
+    SubchDev *s = opaque;
+
+    /* The data stream of the pending CCW resumes where it stopped. */
+    if ((s->cds.flags & (CDS_F_MIDA | CDS_F_STREAM_BROKEN)) ||
+        s->cds.at_byte > s->cds.count) {
+        return -EINVAL;
+    }
+    ccw_dstream_set_handler(&s->cds);
+    return 0;
+}
+
+/*
+ * A CCW a device completes asynchronously (CSS_CCW_PENDING) is part of
+ * the subchannel state of devices which can resume it after migration
+ * (SubchDev.ccw_async_migratable): the channel program stays active, and
+ * the device completes the CCW on the destination through the restored
+ * data stream.
+ */
+static const VMStateDescription vmstate_schdev_async = {
+    .name = "s390_subch_dev/async",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_schdev_async_needed,
+    .post_load = vmstate_schdev_async_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(ccw_async_pending, SubchDev),
+        VMSTATE_UINT8(cds.flags, SubchDev),
+        VMSTATE_UINT8(cds.at_idaw, SubchDev),
+        VMSTATE_UINT16(cds.at_byte, SubchDev),
+        VMSTATE_UINT16(cds.count, SubchDev),
+        VMSTATE_UINT32(cds.cda_orig, SubchDev),
+        VMSTATE_UINT64(cds.cda, SubchDev),
+        VMSTATE_BOOL(cds.do_skip, SubchDev),
+        VMSTATE_UINT32(ccw_tic_cnt, SubchDev),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static int subch_dev_post_load(void *opaque, int version_id);
 static int subch_dev_pre_save(void *opaque);
 
@@ -231,6 +280,7 @@ const VMStateDescription vmstate_subch_dev = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_schdev_orb,
+        &vmstate_schdev_async,
         NULL
     }
 };
@@ -368,7 +418,7 @@ static int subch_dev_pre_save(void *opaque)
 {
     SubchDev *s = opaque;
 
-    if (s->ccw_async_pending) {
+    if (s->ccw_async_pending && !s->ccw_async_migratable) {
         return -EBUSY;
     }
 
@@ -1001,6 +1051,15 @@ err:
     return ret;
 }
 
+static void ccw_dstream_set_handler(CcwDataStream *cds)
+{
+    if (!(cds->flags & CDS_F_IDA)) {
+        cds->op_handler = ccw_dstream_rw_noflags;
+    } else {
+        cds->op_handler = ccw_dstream_rw_ida;
+    }
+}
+
 void ccw_dstream_init(CcwDataStream *cds, CCW1 const *ccw, ORB const *orb)
 {
     /*
@@ -1021,11 +1080,7 @@ void ccw_dstream_init(CcwDataStream *cds, CCW1 const *ccw, ORB const *orb)
          (ccw->cmd_code & 0x03) == 0x02 /* read */ ||
          (ccw->cmd_code & 0x0f) == 0x0c /* read backwards */);
     ccw_dstream_rewind(cds);
-    if (!(cds->flags & CDS_F_IDA)) {
-        cds->op_handler = ccw_dstream_rw_noflags;
-    } else {
-        cds->op_handler = ccw_dstream_rw_ida;
-    }
+    ccw_dstream_set_handler(cds);
 }
 
 static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,

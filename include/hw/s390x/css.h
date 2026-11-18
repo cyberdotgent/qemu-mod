@@ -167,6 +167,20 @@ struct SubchDev {
     void *driver_data;
     ESW esw;
     bool ccw_async_pending;
+    /*
+     * A CCW the device completes asynchronously (its ccw_cb returned
+     * CSS_CCW_PENDING) blocks migration of the subchannel (pre_save fails
+     * with -EBUSY) unless the device sets this flag.  A device opting in
+     * (usually when it sets up the subchannel) promises to
+     *  - include the subchannel in its vmstate (VMSTATE_CCW_DEVICE or
+     *    vmstate_subch_dev), which then carries the pending state and the
+     *    data stream of the pending CCW (subsection s390_subch_dev/async),
+     *  - migrate whatever it needs itself to finish that CCW, and
+     *  - finish it on the destination with css_virtual_ccw_complete()
+     *    once the VM runs (from a VM change state handler or a later
+     *    event, not from post_load), writing data through sch->cds.
+     */
+    bool ccw_async_migratable;
     const S390QdioOps *qdio_ops;
     CssDeviceTopology topology;
 };
