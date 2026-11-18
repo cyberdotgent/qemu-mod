@@ -113,6 +113,12 @@ static int read_command(const uint8_t *expected, unsigned int len)
                                  sizeof(command->gds) + len) {
         return 1;
     }
+    /* MDS message unit, CP-MSU and text command GDS IDs (big-endian) */
+    if (command->gds[2] != 0x13 || command->gds[3] != 0x10 ||
+        command->gds[6] != 0x12 || command->gds[7] != 0x12 ||
+        command->gds[10] != 0x13 || command->gds[11] != 0x20) {
+        return 1;
+    }
     for (i = 0; i < len; i++) {
         if (command->text[i] != expected[i]) {
             return 1;

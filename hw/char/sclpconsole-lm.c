@@ -287,13 +287,14 @@ static int read_event_data(SCLPEvent *event, EventBufferHeader *evt_buf_hdr,
     cpmsu_len = sizeof(GdsVector) + text_command_len;
     mdmsu_len = sizeof(GdsVector) + cpmsu_len;
 
-    oc->message_unit.mdmsu.gds_id = GDS_ID_MDSMU;
+    /* The GDS IDs are big-endian, like the lengths. */
+    oc->message_unit.mdmsu.gds_id = cpu_to_be16(GDS_ID_MDSMU);
     oc->message_unit.mdmsu.length = cpu_to_be16(mdmsu_len);
 
-    oc->message_unit.cpmsu.gds_id = GDS_ID_CPMSU;
+    oc->message_unit.cpmsu.gds_id = cpu_to_be16(GDS_ID_CPMSU);
     oc->message_unit.cpmsu.length = cpu_to_be16(cpmsu_len);
 
-    oc->message_unit.text_command.gds_id = GDS_ID_TEXTCMD;
+    oc->message_unit.text_command.gds_id = cpu_to_be16(GDS_ID_TEXTCMD);
     oc->message_unit.text_command.length = cpu_to_be16(text_command_len);
 
     oc->message_unit.self_def_text_message.key = GDS_KEY_SELFDEFTEXTMSG;
@@ -334,7 +335,9 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
     int rc;
     int len;
     int i;
-    QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER];
+    int start = partial_input ? 1 : 0;
+    /* the message, a line end, and one before it when input is pending */
+    QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER + 2];
 
     len = be16_to_cpu(mdbo->length);
     len -= sizeof(mdbo->length) + sizeof(mdbo->type)
@@ -345,8 +348,8 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
     assert(len <= SIZE_BUFFER);
 
     /* convert EBCDIC SCLP contents to an ISO 8859-1 console message */
-    ascii_put_cp(scon->codepage, buffer, mdbo->mto.message, len);
-    for (i = 0; i < len; i++) {
+    ascii_put_cp(scon->codepage, buffer + start, mdbo->mto.message, len);
+    for (i = start; i < start + len; i++) {
         /* A message is one line: show control characters as blanks. */
         if (buffer[i] < 0x20 || (buffer[i] >= 0x7f && buffer[i] < 0xa0)) {
             buffer[i] = ' ';
@@ -358,19 +361,16 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
      * Each message is a complete line: terminate it, so that the cursor
      * (and operator input) starts on a fresh line.  If the operator is in
      * the middle of typing a command, finish that line first and repeat
-     * the partial input after the message.
+     * the partial input after the message.  The line is written in one
+     * piece: a backend without a client (a socket nobody is connected to)
+     * fails the write, but still logs it, and the log must keep the line
+     * ends.
      */
     if (partial_input) {
-        rc = write_console_data(event, (uint8_t *)NEWLINE, 1);
-        if (rc < 0) {
-            return rc;
-        }
+        buffer[0] = '\n';
     }
-    rc = write_console_data(event, buffer, len);
-    if (rc < 0) {
-        return rc;
-    }
-    rc = write_console_data(event, (uint8_t *)NEWLINE, 1);
+    buffer[start + len] = '\n';
+    rc = write_console_data(event, buffer, start + len + 1);
     if (rc < 0) {
         return rc;
     }
