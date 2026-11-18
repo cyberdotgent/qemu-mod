@@ -62,6 +62,61 @@ static void test_ipl_fba(void)
     qtest_quit(qts);
 }
 
+static void assert_device_string(QTestState *qts, const char *path,
+                                 const char *property, const char *expected)
+{
+    QDict *response = qtest_qmp(
+        qts, "{'execute': 'qom-get', 'arguments': "
+             " {'path': %s, 'property': %s}}", path, property);
+
+    g_assert(qdict_haskey(response, "return"));
+    g_assert_cmpstr(qdict_get_str(response, "return"), ==, expected);
+    qobject_unref(response);
+}
+
+/*
+ * A device loadparm on the -ipl device takes precedence over the machine
+ * loadparm and becomes the machine loadparm (reported through SCLP).
+ */
+static void test_ipl_device_loadparm(void)
+{
+    QTestState *qts = qtest_init(
+        "-nodefaults "
+        "-blockdev driver=null-co,node-name=d0,size=1048576 "
+        "-blockdev driver=null-co,node-name=d1,size=1048576 "
+        "-device fba-ccw,drive=d0,devno=fe.0.1000,id=ipl0,loadparm=sys1 "
+        "-device fba-ccw,drive=d1,devno=fe.0.1001 "
+        "-ipl 1000 -loadparm other");
+
+    assert_device_string(qts, "/machine/peripheral/ipl0", "loadparm",
+                         "SYS1    ");
+    assert_machine_string(qts, "loadparm", "SYS1    ");
+    qtest_quit(qts);
+
+    /* Without a device loadparm, the machine loadparm applies. */
+    qts = qtest_init(
+        "-nodefaults "
+        "-blockdev driver=null-co,node-name=d0,size=1048576 "
+        "-device fba-ccw,drive=d0,devno=fe.0.1000 "
+        "-ipl 1000 -loadparm other");
+    assert_machine_string(qts, "loadparm", "OTHER   ");
+    qtest_quit(qts);
+}
+
+/* The order of loadparm and bootindex on -device does not matter. */
+static void test_bootindex_loadparm_order(void)
+{
+    QTestState *qts = qtest_init(
+        "-nodefaults "
+        "-drive if=none,id=d0,file=null-co://,format=raw "
+        "-device virtio-blk-ccw,drive=d0,devno=fe.0.0100,id=vd0,"
+        "loadparm=2,bootindex=1");
+
+    assert_device_string(qts, "/machine/peripheral/vd0", "loadparm",
+                         "2       ");
+    qtest_quit(qts);
+}
+
 static void assert_qemu_fails(const char *const extra_argv[],
                               const char *message)
 {
@@ -121,6 +176,18 @@ static void test_ipl_errors(void)
     const char *const kernel[] = {
         "-ipl", "1000", "-kernel", "does-not-matter", NULL
     };
+    const char *const loadparm_not_ipl[] = {
+        "-blockdev", "driver=null-co,node-name=d0,size=1048576",
+        "-blockdev", "driver=null-co,node-name=d1,size=1048576",
+        "-device", "fba-ccw,drive=d0,devno=fe.0.1000",
+        "-device", "fba-ccw,drive=d1,devno=fe.0.1001,loadparm=x",
+        "-ipl", "1000", NULL
+    };
+    const char *const loadparm_no_bootindex[] = {
+        "-drive", "if=none,id=d,file=null-co://,format=raw",
+        "-device", "virtio-blk-ccw,drive=d,devno=fe.0.1000,loadparm=x",
+        NULL
+    };
 
     assert_qemu_fails(invalid, "Invalid IPL device address");
     assert_qemu_fails(missing, "IPL device 1000 was not found");
@@ -131,6 +198,11 @@ static void test_ipl_errors(void)
     assert_qemu_fails(virtio_unsupported, "does not support IPL");
     assert_qemu_fails(ambiguous, "is ambiguous");
     assert_qemu_fails(kernel, "-ipl and -kernel cannot be used together");
+    assert_qemu_fails(loadparm_not_ipl,
+                      "loadparm is only valid for boot devices (a bootindex, "
+                      "or the -ipl device); CCW device fe.0.1001 has neither");
+    assert_qemu_fails(loadparm_no_bootindex,
+                      "loadparm is only valid for boot devices");
 }
 
 static void test_ins_list_load(void)
@@ -248,6 +320,9 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/short-address", test_ipl_short_address);
     qtest_add_func("/s390x/ipl/full-address", test_ipl_full_address);
     qtest_add_func("/s390x/ipl/fba", test_ipl_fba);
+    qtest_add_func("/s390x/ipl/device-loadparm", test_ipl_device_loadparm);
+    qtest_add_func("/s390x/ipl/bootindex-loadparm-order",
+                   test_bootindex_loadparm_order);
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     qtest_add_func("/s390x/ipl/properties", test_ipl_properties);

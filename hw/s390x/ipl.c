@@ -619,12 +619,57 @@ static int s390_ipl_find_ccw_device(Object *obj, void *opaque)
     return 0;
 }
 
+typedef struct S390IPLLoadparmCheck {
+    S390CcwMachineState *ms;
+    Error **errp;
+} S390IPLLoadparmCheck;
+
+/*
+ * A device loadparm only means something on a device that can be the IPL
+ * device: the -ipl device, or one with a bootindex.  The check is made once
+ * the machine is complete, so the order of the device properties does not
+ * matter.
+ */
+static int s390_ipl_check_loadparm(Object *obj, void *opaque)
+{
+    S390IPLLoadparmCheck *check = opaque;
+    CcwDevice *ccw = (CcwDevice *)object_dynamic_cast(obj, TYPE_CCW_DEVICE);
+    Error *err = NULL;
+    int64_t index;
+
+    if (!ccw || !memcmp(ccw->loadparm, NO_LOADPARM, LOADPARM_LEN) ||
+        DEVICE(ccw) == check->ms->ipl_device) {
+        return 0;
+    }
+    index = object_property_get_int(obj, "bootindex", &err);
+    if (err) {
+        error_free(err);
+        index = -1;
+    }
+    if (index >= 0) {
+        return 0;
+    }
+    if (ccw->sch) {
+        error_setg(check->errp, "loadparm is only valid for boot devices "
+                   "(a bootindex, or the -ipl device); CCW device "
+                   "%x.%x.%04x has neither", ccw->sch->cssid,
+                   ccw->sch->ssid, ccw->sch->devno);
+    } else {
+        error_setg(check->errp, "loadparm is only valid for boot devices "
+                   "(a bootindex, or the -ipl device)");
+    }
+    return 1;
+}
+
 void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
 {
     S390IPLDeviceSearch search = { .ms = ms };
+    S390IPLLoadparmCheck check = { .ms = ms, .errp = errp };
     g_autofree char *address = NULL;
 
     if (!ms->ipl_devno_set) {
+        object_child_foreach_recursive(object_get_root(),
+                                       s390_ipl_check_loadparm, &check);
         return;
     }
     if (MACHINE(ms)->kernel_filename) {
@@ -669,6 +714,19 @@ void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
         return;
     }
     ms->ipl_device = DEVICE(object_ref(search.match));
+
+    /*
+     * The device loadparm takes precedence over the machine loadparm, as
+     * for bootindex boots.  A channel-program IPL has no firmware that
+     * picks it up from the IPL parameter block, and the guest reads the
+     * load parameter through SCLP as well, so make it the machine
+     * loadparm: SCLP, DIAG 308 and the machine property then agree.
+     */
+    if (memcmp(search.match->loadparm, NO_LOADPARM, LOADPARM_LEN)) {
+        memcpy(ms->loadparm, search.match->loadparm, LOADPARM_LEN);
+    }
+    object_child_foreach_recursive(object_get_root(),
+                                   s390_ipl_check_loadparm, &check);
 }
 
 bool s390_ipl_build_ccw_iplb(CcwDevice *dev, IplParameterBlock *iplb,

@@ -29,10 +29,19 @@ FBA (``fba-ccw``) and tape (``3590-ccw``) devices and assigned vfio-ccw
 devices do. Virtio devices are refused: they are booted by the s390-ccw
 firmware and must be selected with ``bootindex`` instead.
 
-The load parameter of an ``-ipl`` boot is the machine ``loadparm``
-(``-loadparm``). It is reported to the guest through SCLP and in the IPL
-parameter block stored by DIAG 308. The ``loadparm`` property of a device
-needs a ``bootindex``, which ``-ipl`` excludes, so it does not apply here.
+The load parameter of an ``-ipl`` boot is the ``loadparm`` property of the
+selected device if it has one, otherwise the machine ``loadparm``
+(``-loadparm``). The device value takes precedence, as for ``bootindex``
+boots, and replaces the machine ``loadparm`` when the machine starts, so the
+machine property, SCLP and the IPL parameter block stored by DIAG 308 all
+report the load parameter in effect. Either spelling selects a per-device
+load parameter::
+
+ qemu-system-s390x ... -device eckd-ccw,drive=dasd,devno=fe.0.0a80,loadparm=0A82M \
+                   -ipl a80
+
+A device ``loadparm`` is only valid on the ``-ipl`` device or on a device with
+a ``bootindex``; QEMU refuses to start if another device has one.
 
 Finding the IPL-capable devices
 -------------------------------
@@ -197,8 +206,10 @@ IPL using entry number 3.
 
 If a ``loadparm`` is specified on both the machine and a device, the per-device
 value will superseded the machine value.  Per-device ``loadparm`` values are
-only used for devices with an assigned ``bootindex``. The machine ``loadparm``
-is used when attempting to boot without a ``bootindex``.
+only valid for devices with an assigned ``bootindex`` (or for the ``-ipl``
+device, see above); the order of the ``bootindex`` and ``loadparm``
+properties does not matter. The machine ``loadparm`` is used when attempting
+to boot without a ``bootindex``.
 
 
 Booting from a network device

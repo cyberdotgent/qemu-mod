@@ -62,14 +62,11 @@ static void ccw_device_set_loadparm(Object *obj, Visitor *v,
 {
     CcwDevice *dev = CCW_DEVICE(obj);
     g_autofree char *val = NULL;
-    int index;
 
-    index = object_property_get_int(obj, "bootindex", NULL);
-
-    if (index < 0) {
-        error_setg(errp, "LOADPARM is only valid for boot devices!");
-    }
-
+    /*
+     * Whether the device is a boot device (bootindex or -ipl) is checked
+     * when the machine is complete, see s390_ipl_validate_ipl_device().
+     */
     if (!visit_type_str(v, name, &val, errp)) {
         return;
     }
