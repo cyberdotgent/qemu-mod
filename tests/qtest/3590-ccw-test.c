@@ -96,6 +96,37 @@ static char *migrate_from_file(QTestState *to, const char *path)
     return wait_migration(to);
 }
 
+
+/* Create a qcow2 image that can hold internal snapshots */
+static char *create_snapshot_image(void)
+{
+    const char *qemu_img = g_getenv("QTEST_QEMU_IMG");
+    g_autofree char *cmd = NULL;
+    char *path = NULL;
+    int fd;
+
+    if (!qemu_img) {
+        return NULL;
+    }
+    fd = g_file_open_tmp("qemu-snap-XXXXXX.qcow2", &path, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    cmd = g_strdup_printf("%s create -q -f qcow2 %s 16M", qemu_img, path);
+    g_assert_cmpint(system(cmd), ==, 0);
+    return path;
+}
+
+/* savevm + loadvm in the same process; loadvm runs post_load drained */
+static void snapshot_roundtrip(QTestState *qts)
+{
+    g_autofree char *save = qtest_hmp(qts, "savevm s1");
+    g_autofree char *load = NULL;
+
+    g_assert_cmpstr(save, ==, "");
+    load = qtest_hmp(qts, "loadvm s1");
+    g_assert_cmpstr(load, ==, "");
+}
+
 static char *qom_get_string(QTestState *qts, const char *path,
                             const char *property)
 {
@@ -370,6 +401,27 @@ static void test_migration_writable_growing(void)
     unlink(path);
 }
 
+static void test_snapshot(void)
+{
+    g_autofree char *path = create_aws_image();
+    g_autofree char *disk = create_snapshot_image();
+    QTestState *qts;
+
+    if (!disk) {
+        g_test_skip("QTEST_QEMU_IMG not set");
+        unlink(path);
+        return;
+    }
+    qts = qtest_initf("-nodefaults -dev3590 file=%s,devno=580,id=tape0 "
+                      "-drive if=none,id=snap,file=%s,format=qcow2",
+                      path, disk);
+    snapshot_roundtrip(qts);
+    g_assert_false(tape_tray_open(qts));
+    qtest_quit(qts);
+    unlink(path);
+    unlink(disk);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -386,6 +438,7 @@ int main(int argc, char **argv)
                    test_migration_no_medium);
     qtest_add_func("/3590-ccw/migration-other-medium",
                    test_migration_other_medium);
+    qtest_add_func("/3590-ccw/snapshot", test_snapshot);
     qtest_add_func("/3590-ccw/migration-writable-growing",
                    test_migration_writable_growing);
     return g_test_run();

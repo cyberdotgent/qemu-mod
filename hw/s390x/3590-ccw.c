@@ -721,7 +721,6 @@ static int tape3590_post_load(void *opaque, int version_id)
 {
     Tape3590CcwDevice *tape = opaque;
     SubchDev *sch = CCW_DEVICE(tape)->sch;
-    Error *local_err = NULL;
 
     if (sch->id.cu_type != tape->identity->cu_type ||
         sch->id.dev_type != tape->identity->dev_type ||
@@ -748,8 +747,7 @@ static int tape3590_post_load(void *opaque, int version_id)
     /*
      * The medium is supplied by the management layer.  A read-only volume
      * must be the same image as on the source; a writable one may have
-     * grown after the destination opened it, so only the position check
-     * applies, once the VM runs.
+     * grown after the destination opened it.
      */
     if (!blk_is_writable(tape->blk) &&
         tape->local_length != tape->medium.length) {
@@ -758,18 +756,13 @@ static int tape3590_post_load(void *opaque, int version_id)
                      sch->devno, tape->local_length, tape->medium.length);
         return -EINVAL;
     }
-    if (blk_is_writable(tape->blk)) {
-        /*
-         * The destination's view of a medium the source wrote to is only
-         * current once the block layer reactivates it for the running VM.
-         */
-        tape->restore_pending = true;
-        return 0;
-    }
-    if (!aws_tape_restore(&tape->medium, tape->blk, &local_err)) {
-        error_reportf_err(local_err, "3590-ccw %04x: ", sch->devno);
-        return -EINVAL;
-    }
+    /*
+     * Checking the position reads the medium, which post_load must not
+     * do: loadvm loads the state with the block layer drained, and the
+     * destination of a migration sees a medium the source wrote to only
+     * once the block layer reactivates it.  Check it when the VM runs.
+     */
+    tape->restore_pending = true;
     return 0;
 }
 

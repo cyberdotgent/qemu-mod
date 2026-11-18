@@ -126,6 +126,54 @@ static void test_migration_mismatch(void)
     g_assert_cmpstr(status, ==, "failed");
 }
 
+
+/* Create a qcow2 image that can hold internal snapshots */
+static char *create_snapshot_image(void)
+{
+    const char *qemu_img = g_getenv("QTEST_QEMU_IMG");
+    g_autofree char *cmd = NULL;
+    char *path = NULL;
+    int fd;
+
+    if (!qemu_img) {
+        return NULL;
+    }
+    fd = g_file_open_tmp("qemu-snap-XXXXXX.qcow2", &path, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    cmd = g_strdup_printf("%s create -q -f qcow2 %s 16M", qemu_img, path);
+    g_assert_cmpint(system(cmd), ==, 0);
+    return path;
+}
+
+/* savevm + loadvm in the same process; loadvm runs post_load drained */
+static void snapshot_roundtrip(QTestState *qts)
+{
+    g_autofree char *save = qtest_hmp(qts, "savevm s1");
+    g_autofree char *load = NULL;
+
+    g_assert_cmpstr(save, ==, "");
+    load = qtest_hmp(qts, "loadvm s1");
+    g_assert_cmpstr(load, ==, "");
+}
+
+static void test_snapshot(void)
+{
+    g_autofree char *disk = create_snapshot_image();
+    QTestState *qts;
+
+    if (!disk) {
+        g_test_skip("QTEST_QEMU_IMG not set");
+        return;
+    }
+    qts = qtest_initf("-nodefaults -netdev user,id=net0 "
+                      "-device qeth-ccw,id=qeth0,netdev=net0,devno=fe.0.0600 "
+                      "-drive if=none,id=snap,file=%s,format=qcow2", disk);
+    snapshot_roundtrip(qts);
+    qtest_quit(qts);
+    unlink(disk);
+}
+
 static void test_configuration(void)
 {
     g_autofree char *dev_id = NULL;
@@ -245,5 +293,6 @@ int main(int argc, char **argv)
     qtest_add_func("/qeth-ccw/readconfig", test_readconfig);
     qtest_add_func("/qeth-ccw/migration", test_migration);
     qtest_add_func("/qeth-ccw/migration-mismatch", test_migration_mismatch);
+    qtest_add_func("/qeth-ccw/snapshot", test_snapshot);
     return g_test_run();
 }
