@@ -30,6 +30,8 @@ tests = {
   'test-mul64': [],
   # all code tested by test-int128 is inside int128.h
   'test-int128': [],
+  # all code tested by test-ebcdic is inside hw/s390x/ebcdic.h
+  'test-ebcdic': [],
   'rcutorture': [],
   'test-rcu-list': [],
   'test-rcu-simpleq': [],

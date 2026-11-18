@@ -53,6 +53,8 @@ struct SCLPConsoleLM {
     CharFrontend chr;
     bool echo;                  /* immediate echo of input if true        */
     bool last_was_cr;           /* swallow the LF of a CR LF pair         */
+    uint32_t codepage;          /* EBCDIC code page of the guest           */
+    Utf8Decoder utf8;           /* input from the character device         */
     ReadLineState *rs;          /* line editor for echoed operator input  */
     uint32_t write_errors;      /* errors writing to char layer           */
     uint32_t length;            /* length of byte stream in buffer        */
@@ -87,14 +89,27 @@ static int chr_can_read(void *opaque)
     return 1;
 }
 
+/*
+ * The console works in ISO 8859-1, the character set the EBCDIC code page
+ * maps onto; the character device carries UTF-8.  Write ISO 8859-1 text
+ * to the character device, as UTF-8.
+ */
+static int write_latin1(SCLPConsoleLM *scon, const uint8_t *buf, int len)
+{
+    g_autofree uint8_t *utf8 = g_malloc(len * 2);
+    int n = latin1_to_utf8(utf8, buf, len);
+
+    /*
+     * XXX this blocks entire thread. Rewrite to use
+     * qemu_chr_fe_write and background I/O callbacks
+     */
+    return qemu_chr_fe_write_all(&scon->chr, utf8, n);
+}
+
 static void echo_output(SCLPConsoleLM *scon, const void *buf, int len)
 {
     if (scon->echo) {
-        /*
-         * XXX this blocks entire thread. Rewrite to use
-         * qemu_chr_fe_write and background I/O callbacks
-         */
-        qemu_chr_fe_write_all(&scon->chr, buf, len);
+        write_latin1(scon, buf, len);
     }
 }
 
@@ -139,8 +154,15 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
 {
     SCLPConsoleLM *scon = opaque;
     bool after_cr = scon->last_was_cr;
+    int c;
 
     assert(size == 1);
+
+    c = utf8_decode_latin1(&scon->utf8, *buf);
+    if (c < 0) {
+        return;
+    }
+    buf = &(uint8_t){ c };
 
     scon->last_was_cr = *buf == '\r';
     if (*buf == '\n' && after_cr) {
@@ -216,7 +238,7 @@ static int get_console_data(SCLPEvent *event, uint8_t *buf, size_t *size,
         return 1;
     }
 
-    ebcdic_put(buf, (char *)&cons->buf, len);
+    ebcdic_put_cp(cons->codepage, buf, (char *)&cons->buf, len);
     *size = len;
     cons->length = 0;
     /* data provided and no more data pending */
@@ -301,9 +323,7 @@ static int write_console_data(SCLPEvent *event, const uint8_t *buf, int len)
         return len;
     }
 
-    /* XXX this blocks entire thread. Rewrite to use
-     * qemu_chr_fe_write and background I/O callbacks */
-    return qemu_chr_fe_write_all(&scon->chr, buf, len);
+    return write_latin1(scon, buf, len);
 }
 
 static int process_mdb(SCLPEvent *event, MDBO *mdbo)
@@ -313,6 +333,7 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
                          scon->echo && scon->length && !event->event_pending;
     int rc;
     int len;
+    int i;
     QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER];
 
     len = be16_to_cpu(mdbo->length);
@@ -323,8 +344,14 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
 
     assert(len <= SIZE_BUFFER);
 
-    /* convert EBCDIC SCLP contents to ASCII console message */
-    ascii_put(buffer, mdbo->mto.message, len);
+    /* convert EBCDIC SCLP contents to an ISO 8859-1 console message */
+    ascii_put_cp(scon->codepage, buffer, mdbo->mto.message, len);
+    for (i = 0; i < len; i++) {
+        /* A message is one line: show control characters as blanks. */
+        if (buffer[i] < 0x20 || (buffer[i] >= 0x7f && buffer[i] < 0xa0)) {
+            buffer[i] = ' ';
+        }
+    }
     trace_sclp_lm_message(len);
 
     /*
@@ -442,6 +469,11 @@ static int console_init(SCLPEvent *event)
         error_report("Multiple line-mode operator consoles are not supported");
         return -1;
     }
+    if (!ebcdic_codepage_valid(scon->codepage)) {
+        error_report("sclplmconsole: unsupported codepage %u "
+                     "(supported: 37, 500)", scon->codepage);
+        return -1;
+    }
     console_available = true;
 
     if (scon->echo) {
@@ -463,6 +495,7 @@ static void console_reset(DeviceState *dev)
     event->event_pending = false;
     scon->length = 0;
     scon->last_was_cr = false;
+    scon->utf8.pending = 0;
     scon->write_errors = 0;
     if (scon->rs) {
         readline_restart(scon->rs);
@@ -473,6 +506,11 @@ static const Property console_properties[] = {
     DEFINE_PROP_CHR("chardev", SCLPConsoleLM, chr),
     DEFINE_PROP_UINT32("write_errors", SCLPConsoleLM, write_errors, 0),
     DEFINE_PROP_BOOL("echo", SCLPConsoleLM, echo, true),
+    /*
+     * EBCDIC code page of the guest's console: 37 (z/OS, z/VSE, z/VM) or
+     * 500 (Linux on LPAR or KVM decodes the line-mode console as 500).
+     */
+    DEFINE_PROP_UINT32("codepage", SCLPConsoleLM, codepage, EBCDIC_CP037),
 };
 
 static void console_class_init(ObjectClass *klass, const void *data)

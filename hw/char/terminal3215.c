@@ -46,6 +46,8 @@ struct Terminal3215 {
     bool attention_pending;
     bool saw_cr;
     bool input_overflow;
+    uint32_t codepage;
+    Utf8Decoder utf8;
     CCW1 pending_ccw;
 
     uint8_t input[TERM3215_MAX_RECORD_SIZE];
@@ -187,7 +189,8 @@ static void terminal3215_finish_line(Terminal3215 *t)
     was_empty = t->record_count == 0;
     tail = (t->record_head + t->record_count) %
            TERM3215_MAX_QUEUED_RECORDS;
-    ebcdic_put(t->records[tail], (char *)t->input, t->input_len);
+    ebcdic_put_cp(t->codepage, t->records[tail], (char *)t->input,
+                  t->input_len);
     t->record_len[tail] = t->input_len;
     t->record_count++;
     trace_terminal3215_input(terminal3215_sch(t)->devno, t->input_len,
@@ -215,8 +218,13 @@ static void terminal3215_read(void *opaque, const uint8_t *buf, int size)
     int i;
 
     for (i = 0; i < size; i++) {
-        uint8_t ch = buf[i];
+        int decoded = utf8_decode_latin1(&t->utf8, buf[i]);
+        uint8_t ch;
 
+        if (decoded < 0) {
+            continue;
+        }
+        ch = decoded;
         if (ch == '\n' && t->saw_cr) {
             t->saw_cr = false;
             continue;
@@ -236,11 +244,14 @@ static void terminal3215_read(void *opaque, const uint8_t *buf, int size)
                     qemu_chr_fe_write_all(&t->chr, erase, 3);
                 }
             }
-        } else if (ch >= 0x20) {
+        } else if (ch >= 0x20 && (ch < 0x7f || ch >= 0xa0)) {
             if (t->input_len < sizeof(t->input)) {
                 t->input[t->input_len++] = ch;
                 if (t->echo) {
-                    qemu_chr_fe_write_all(&t->chr, &ch, 1);
+                    uint8_t utf8[2];
+
+                    qemu_chr_fe_write_all(&t->chr, utf8,
+                                          latin1_to_utf8(utf8, &ch, 1));
                 }
             } else {
                 t->input_overflow = true;
@@ -306,6 +317,7 @@ static int terminal3215_write(Terminal3215 *t, const CCW1 *ccw)
                        (uint16_t)TERM3215_MAX_RECORD_SIZE);
     g_autofree uint8_t *ebcdic = g_malloc(len);
     g_autofree uint8_t *ascii = g_malloc(len);
+    g_autofree uint8_t *utf8 = g_malloc(len * 2);
     int ret;
     int i;
 
@@ -313,14 +325,15 @@ static int terminal3215_write(Terminal3215 *t, const CCW1 *ccw)
     if (ret < 0) {
         return ret;
     }
-    ascii_put(ascii, (char *)ebcdic, len);
+    ascii_put_cp(t->codepage, ascii, (char *)ebcdic, len);
     for (i = 0; i < len; i++) {
         if (ascii[i] != '\r' && ascii[i] != '\n' &&
-            (ascii[i] < 0x20 || ascii[i] == 0x7f)) {
+            (ascii[i] < 0x20 || (ascii[i] >= 0x7f && ascii[i] < 0xa0))) {
             ascii[i] = ' ';
         }
     }
-    if (len && qemu_chr_fe_write_all(&t->chr, ascii, len) < 0) {
+    if (len && qemu_chr_fe_write_all(&t->chr, utf8,
+                                     latin1_to_utf8(utf8, ascii, len)) < 0) {
         return terminal3215_unit_check(t,
                                        TERM3215_SENSE_EQUIPMENT_CHECK);
     }
@@ -418,6 +431,7 @@ static void terminal3215_reset_hold(Object *obj, ResetType type)
     t->saw_cr = false;
     t->input_overflow = false;
     t->input_len = 0;
+    t->utf8.pending = 0;
     t->record_head = 0;
     t->record_count = 0;
     t->record_offset = 0;
@@ -434,6 +448,11 @@ static void terminal3215_realize(DeviceState *dev, Error **errp)
 
     if (!qemu_chr_fe_backend_connected(&t->chr)) {
         error_setg(errp, "3215-ccw requires a 'chardev' property");
+        return;
+    }
+    if (!ebcdic_codepage_valid(t->codepage)) {
+        error_setg(errp, "3215-ccw: unsupported codepage %u "
+                   "(supported: 37, 500)", t->codepage);
         return;
     }
     sch = css_create_sch(cdev->devno, errp);
@@ -553,6 +572,8 @@ static const VMStateDescription terminal3215_vmstate = {
 static const Property terminal3215_properties[] = {
     DEFINE_PROP_CHR("chardev", Terminal3215, chr),
     DEFINE_PROP_BOOL("echo", Terminal3215, echo, false),
+    /* EBCDIC code page of the guest: 37 (default) or 500. */
+    DEFINE_PROP_UINT32("codepage", Terminal3215, codepage, EBCDIC_CP037),
 };
 
 static void terminal3215_class_init(ObjectClass *klass, const void *data)

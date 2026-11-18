@@ -209,6 +209,22 @@ tests += {
                 '[ "$e" = "$(printf \'\\nTWO\\n\' | od -An -c)" ]',
                 'sh'],
   },
+  # Line-mode console with code page 500: EBCDIC <-> UTF-8 on the chardev.
+  'sclp-line-console-codepage.c': {
+    'cflags': [ccw_cflags],
+    'qemu_args': ['-monitor', 'none', '-display', 'none', '-nodefaults',
+                  '-action', 'panic=exit-failure',
+                  '-chardev', 'stdio,id=sclplm,signal=off',
+                  '-device', 'sclplmconsole,chardev=sclplm,echo=off,codepage=500',
+                  '-kernel'],
+    'wrapper': ['sh', '-c',
+                't=$(mktemp) || exit 1; ' +
+                '{ sleep 1; printf \'|!\\302\\254\\n\'; sleep 1; } | ' +
+                '"$@" >"$t"; rc=$?; o=$(od -An -c "$t"); rm -f "$t"; ' +
+                '[ $rc -eq 0 ] && ' +
+                '[ "$o" = "$(printf \'[]\\302\\242\\n\' | od -An -c)" ]',
+                'sh'],
+  },
   # Integrated 3270 console whose socket has no client attached (KVM).
   'sclp-3270-noclient.c': {
     'cflags': [ccw_cflags],
