@@ -60,6 +60,7 @@ static struct SnapshotState {
     Coroutine *co;
     QemuCoSleep target_close_wait;
     IOThread *iothread;
+    bool savevm_end_active;
 } snap_state;
 
 static bool savevm_aborted(void)
@@ -76,6 +77,8 @@ SaveVMInfo *qmp_query_savevm(Error **errp)
 {
     SaveVMInfo *info = g_malloc0(sizeof(*info));
     struct SnapshotState *s = &snap_state;
+
+    info->savevm_end_active = s->savevm_end_active;
 
     if (s->state != SAVE_STATE_DONE) {
         info->has_bytes = true;
@@ -498,6 +501,7 @@ static void coroutine_fn wait_for_close_co(void *opaque)
                                 "qmp_savevm_end");
             /* we cannot assume the snapshot finished in this case, so leave the
              * state alone - caller has to figure something out */
+            snap_state.savevm_end_active = false;
             return;
         }
     } else {
@@ -511,6 +515,8 @@ static void coroutine_fn wait_for_close_co(void *opaque)
         snap_state.state = SAVE_STATE_DONE;
     }
 
+    snap_state.savevm_end_active = false;
+
     DPRINTF("savevm-end: cleanup done\n");
 }
 
@@ -520,6 +526,13 @@ void qmp_savevm_end(Error **errp)
         error_setg(errp, "VM snapshot not started\n");
         return;
     }
+
+    if (snap_state.savevm_end_active) {
+        error_setg(errp, "savevm-end handler already running");
+        return;
+    }
+
+    snap_state.savevm_end_active = true;
 
     Coroutine *wait_for_close = qemu_coroutine_create(wait_for_close_co, NULL);
 

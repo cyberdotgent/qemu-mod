@@ -348,11 +348,15 @@
 #
 # @bytes: total amount of data transfered
 #
+# @savevm-end-active: Whether a @savevm-end handler is currently
+#     active.
+#
 # Since: 1.3
 ##
 { 'struct': 'SaveVMInfo',
   'data': {'*status': 'str', '*error': 'str',
-           '*total-time': 'int', '*bytes': 'int'} }
+           '*total-time': 'int', '*bytes': 'int',
+           'savevm-end-active': 'bool'} }
 
 ##
 # @query-savevm:
