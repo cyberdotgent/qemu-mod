@@ -1826,6 +1826,12 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     if (!sch->last_cmd_valid) {
         eckd->program_write_count = eckd->image.write_count;
     }
+    /*
+     * The commands work on the cached current track.  If it was
+     * invalidated, read it again first; a failure leaves a track without
+     * records, and the command reports what it finds (or does not).
+     */
+    ckd_image_revalidate(&eckd->image);
     ret = eckd_ccw_cmd(sch, ccw);
     if (eckd->image.write_count != eckd->program_write_count &&
         css_ccw_ends_program(sch, &ccw, ret) &&
@@ -1853,12 +1859,51 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->update_active = false;
     eckd->update_done = false;
     eckd->read_active = false;
+    /*
+     * The device loses its orientation, and the image may have been
+     * replaced or reverted while the guest was reset (loadvm, PVE
+     * rollback): do not serve the old track from the cache.
+     */
+    ckd_image_drop_track(&eckd->image);
     /* Writes of a program cut short by the reset are still hardened. */
     ckd_image_flush(&eckd->image);
     if (ec->parent_phases.hold) {
         ec->parent_phases.hold(obj, type);
     }
 }
+
+/*
+ * Every change of the block graph below the device (blockdev-reopen, a
+ * mirror or commit job completing, a snapshot being loaded) drains it, and
+ * so do stop/cont and migration: whatever happens inside the drained
+ * section may change the image, so the cached track must be read again.
+ */
+static void eckd_drained_begin(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    ckd_image_invalidate(&eckd->image);
+}
+
+static void eckd_drained_end(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    ckd_image_invalidate(&eckd->image);
+}
+
+static void eckd_resize_cb(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    ckd_image_invalidate(&eckd->image);
+}
+
+static const BlockDevOps eckd_block_ops = {
+    .drained_begin = eckd_drained_begin,
+    .drained_end = eckd_drained_end,
+    .resize_cb = eckd_resize_cb,
+};
 
 static void eckd_realize(DeviceState *dev, Error **errp)
 {
@@ -1907,6 +1952,7 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     }
     eckd->format_track = g_malloc0(ECKD_TRACK_SIZE);
     eckd->write_record = g_malloc(ECKD_MAX_RECORD_SIZE);
+    blk_set_dev_ops(eckd->blk, &eckd_block_ops, eckd);
 
     sch = css_create_sch_at(cdev->devno, ECKD_AUTO_DEVNO, errp);
     if (!sch) {
@@ -1951,6 +1997,7 @@ fail_sch:
     cdev->sch = NULL;
     g_free(sch);
 fail_image:
+    blk_set_dev_ops(eckd->blk, NULL, NULL);
     g_clear_pointer(&eckd->write_record, g_free);
     g_clear_pointer(&eckd->format_track, g_free);
     ckd_image_close(&eckd->image);
@@ -1960,6 +2007,7 @@ static void eckd_unrealize(DeviceState *dev)
 {
     EckdCcwDevice *eckd = ECKD_CCW(dev);
 
+    blk_set_dev_ops(eckd->blk, NULL, NULL);
     ckd_image_close(&eckd->image);
     g_clear_pointer(&eckd->write_record, g_free);
     g_clear_pointer(&eckd->format_track, g_free);

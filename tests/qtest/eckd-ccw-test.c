@@ -311,6 +311,55 @@ static void test_io_2g_boundary(void)
     unlink(image);
 }
 
+static void update_r1(const char *path, const uint8_t *data)
+{
+    int fd = open(path, O_WRONLY);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(pwrite(fd, data, ECKD_R1_LENGTH, ECKD_R1_OFFSET), ==,
+                    ECKD_R1_LENGTH);
+    close(fd);
+}
+
+/*
+ * The device caches the current track.  When the image changes behind it
+ * (here: rewritten by another process, as after a snapshot revert or by a
+ * second system sharing the volume), a reset and every drained section
+ * (stop/cont, block graph changes, loadvm) must drop the cached copy.
+ */
+static void test_track_cache_invalidation(void)
+{
+    uint8_t pattern[3][ECKD_R1_LENGTH];
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+
+    for (int i = 0; i < ECKD_R1_LENGTH; i++) {
+        pattern[0][i] = 0x10 + i;
+        pattern[1][i] = 0x60 + i;
+        pattern[2][i] = 0xb0 + i;
+    }
+    path = create_ckd_image_r1(pattern[0]);
+    qts = eckd_prog_start(image, path);
+    eckd_read_ipl_check(qts, CCW_PROG_DATA, pattern[0]);
+
+    /* System reset: the guest program is IPLed again. */
+    update_r1(path, pattern[1]);
+    qtest_qmp_assert_success(qts, "{'execute': 'system_reset'}");
+    qtest_qmp_eventwait(qts, "RESET");
+    eckd_read_ipl_check(qts, CCW_PROG_DATA, pattern[1]);
+
+    /* stop and cont drain the block backend. */
+    update_r1(path, pattern[2]);
+    qtest_qmp_assert_success(qts, "{'execute': 'stop'}");
+    qtest_qmp_assert_success(qts, "{'execute': 'cont'}");
+    eckd_read_ipl_check(qts, CCW_PROG_DATA, pattern[2]);
+
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -327,6 +376,8 @@ int main(int argc, char **argv)
     qtest_add_func("/eckd-ccw/multi-file-rejected", test_multi_file_rejected);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
+        qtest_add_func("/eckd-ccw/io/track-cache-invalidation",
+                       test_track_cache_invalidation);
     }
     return g_test_run();
 }

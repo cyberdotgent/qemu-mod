@@ -279,6 +279,7 @@ int ckd_image_load_track(CkdImage *image, uint16_t cylinder, uint16_t head)
     image->loaded_cylinder = cylinder;
     image->loaded_head = head;
     image->track_loaded = true;
+    image->track_stale = false;
     return 0;
 }
 
@@ -317,6 +318,7 @@ int ckd_image_store_track(CkdImage *image, uint16_t cylinder, uint16_t head,
     image->loaded_cylinder = cylinder;
     image->loaded_head = head;
     image->track_loaded = true;
+    image->track_stale = false;
     return 0;
 }
 
@@ -331,6 +333,50 @@ const CkdImageRecord *ckd_image_find_record(const CkdImage *image,
         }
     }
     return NULL;
+}
+
+/*
+ * The backend may have changed behind the device (block graph change,
+ * snapshot revert, another writer): forget the cached track contents.  The
+ * parsed records still describe the device's orientation; the caller
+ * reads the track again with ckd_image_revalidate() before it uses them.
+ */
+void ckd_image_invalidate(CkdImage *image)
+{
+    if (image->track_loaded) {
+        image->track_stale = true;
+    }
+    image->track_loaded = false;
+}
+
+/*
+ * Read the track that was cached before ckd_image_invalidate() again.  On
+ * failure the track has no records, as if it could not be read at all.
+ */
+int ckd_image_revalidate(CkdImage *image)
+{
+    int ret;
+
+    if (!image->track_stale) {
+        return 0;
+    }
+    image->track_stale = false;
+    ret = ckd_image_load_track(image, image->loaded_cylinder,
+                               image->loaded_head);
+    if (ret < 0) {
+        image->record_count = 0;
+        image->used_length = 0;
+    }
+    return ret;
+}
+
+/* Forget the cached track and the records parsed from it (device reset). */
+void ckd_image_drop_track(CkdImage *image)
+{
+    image->track_loaded = false;
+    image->track_stale = false;
+    image->record_count = 0;
+    image->used_length = 0;
 }
 
 /*

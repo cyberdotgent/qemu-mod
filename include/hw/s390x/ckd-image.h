@@ -41,6 +41,11 @@ typedef struct CkdImage {
     uint16_t loaded_cylinder;
     uint16_t loaded_head;
     bool track_loaded;
+    /*
+     * The track at loaded_cylinder/loaded_head was cached, but the backend
+     * may have changed since: ckd_image_revalidate() reads it again.
+     */
+    bool track_stale;
     uint32_t used_length;
     unsigned int record_count;
     CkdImageRecord records[CKD_IMAGE_MAX_RECORDS];
@@ -54,5 +59,8 @@ int ckd_image_store_track(CkdImage *image, uint16_t cylinder, uint16_t head,
 const CkdImageRecord *ckd_image_find_record(const CkdImage *image,
                                             uint8_t number);
 int ckd_image_flush(CkdImage *image);
+void ckd_image_invalidate(CkdImage *image);
+int ckd_image_revalidate(CkdImage *image);
+void ckd_image_drop_track(CkdImage *image);
 
 #endif
