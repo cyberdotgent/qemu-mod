@@ -31,6 +31,7 @@
 #define IS_ESC  1
 #define IS_CSI  2
 #define IS_SS3  3
+#define IS_CSI_MORE 4   /* CSI with more than one parameter */
 
 void readline_show_prompt(ReadLineState *rs)
 {
@@ -394,6 +395,56 @@ static void readline_clear_screen(ReadLineState *rs)
     readline_show_prompt(rs);
 }
 
+/*
+ * The final byte of a cursor or editing key sequence: CSI (ESC [) in
+ * normal cursor key mode, SS3 (ESC O) in application mode.  Home and End
+ * are CSI H/F or SS3 H/F (xterm), CSI 1~/4~ (VT220, Linux console) or
+ * CSI 7~/8~ (rxvt).  Modifier parameters (CSI 1;5H) are ignored.
+ */
+static void readline_key(ReadLineState *rs, int ch)
+{
+    switch (ch) {
+    case 'A':
+        readline_up_char(rs);
+        break;
+    case 'B': /* fallthrough */
+    case 'E':
+        readline_down_char(rs);
+        break;
+    case 'C':
+        readline_forward_char(rs);
+        break;
+    case 'D':
+        readline_backward_char(rs);
+        break;
+    case 'H':
+        readline_bol(rs);
+        break;
+    case 'F':
+        readline_eol(rs);
+        break;
+    case '~':
+        switch (rs->esc_param) {
+        case 1: /* fallthrough */
+        case 7:
+            readline_bol(rs);
+            break;
+        case 3:
+            readline_delete_char(rs);
+            break;
+        case 4: /* fallthrough */
+        case 8:
+            readline_eol(rs);
+            break;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 /* return true if command handled */
 void readline_handle_byte(ReadLineState *rs, int ch)
 {
@@ -474,56 +525,30 @@ void readline_handle_byte(ReadLineState *rs, int ch)
         break;
     case IS_CSI:
         switch (ch) {
-        case 'A': /* fallthrough */
-        case 'F':
-            readline_up_char(rs);
-            break;
-        case 'B': /* fallthrough */
-        case 'E':
-            readline_down_char(rs);
-            break;
-        case 'D':
-            readline_backward_char(rs);
-            break;
-        case 'C':
-            readline_forward_char(rs);
-            break;
         case '0' ... '9':
             rs->esc_param = rs->esc_param * 10 + (ch - '0');
             goto the_end;
-        case '~':
-            switch (rs->esc_param) {
-            case 1:
-                readline_bol(rs);
-                break;
-            case 3:
-                readline_delete_char(rs);
-                break;
-            case 4:
-                readline_eol(rs);
-                break;
-            default:
-                break;
-            }
-            break;
+        case ';':
+            /* Keep the first parameter, skip the modifiers. */
+            rs->esc_state = IS_CSI_MORE;
+            goto the_end;
         default:
+            readline_key(rs, ch);
             break;
         }
         rs->esc_state = IS_NORM;
         /* fallthrough */
     the_end:
         break;
-    case IS_SS3:
-        switch (ch) {
-        case 'F':
-            readline_eol(rs);
-            break;
-        case 'H':
-            readline_bol(rs);
-            break;
-        default:
-            break;
+    case IS_CSI_MORE:
+        if (!qemu_isdigit(ch) && ch != ';') {
+            readline_key(rs, ch);
+            rs->esc_state = IS_NORM;
         }
+        break;
+    case IS_SS3:
+        rs->esc_param = 0;
+        readline_key(rs, ch);
         rs->esc_state = IS_NORM;
         break;
     default:

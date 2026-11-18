@@ -52,6 +52,7 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
   'test-envlist': [],
+  'test-readline': [],
 }
 
 if have_system or have_tools
