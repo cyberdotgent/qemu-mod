@@ -563,6 +563,16 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
         qemu_devices_reset(type);
         s390_crypto_reset();
 
+        /*
+         * Loading a snapshot replaces the machine state right after this
+         * reset, so there is nothing to IPL.  A channel-program IPL would
+         * even hang: its I/O waits for block devices that are drained for
+         * the load.
+         */
+        if (type == RESET_TYPE_SNAPSHOT_LOAD && s390_ipl_native()) {
+            break;
+        }
+
         /* configure and start the ipl CPU only */
         run_on_cpu(cs, s390_do_cpu_ipl, RUN_ON_CPU_NULL);
         break;
