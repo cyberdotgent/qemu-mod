@@ -17,7 +17,7 @@ Device support
 ==============
 
 z/OS compatibility handshake under KVM
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The ``mtm-3907`` machine automatically enables a z/OS control-block
 adjustment at KVM STSI exits.  This reproduces
