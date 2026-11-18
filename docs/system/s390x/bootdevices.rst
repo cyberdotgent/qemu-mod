@@ -8,9 +8,9 @@ The ``-ipl`` option provides an operator-style way to select one CCW device by
 its device number, without adding a ``bootindex`` property to the device. For
 example::
 
- qemu-system-s390x -drive if=none,id=dr1,file=guest.qcow2 \
-                   -device virtio-blk-ccw,drive=dr1,devno=fe.0.1000 \
-                   -ipl 1000 -loadparm 2
+ qemu-system-s390x -blockdev driver=file,node-name=dasd,filename=sysres.3390 \
+                   -device eckd-ccw,drive=dasd,devno=fe.0.0a80 \
+                   -ipl a80 -loadparm 0A82M
 
 Device numbers are hexadecimal. A short address containing one to four digits
 is accepted when it uniquely identifies a device. The full QEMU CCW address
@@ -22,11 +22,56 @@ It accepts the same value and validation rules. ``-ipl`` cannot be combined
 with ``-kernel`` or with device ``bootindex`` properties. It selects one device
 only, so there is no fallback boot chain.
 
-The selected device must implement direct CCW IPL. QEMU currently supports
-direct selection of virtio block, virtio network, and assigned vfio-ccw
-devices. A future emulated DASD, FBA, tape, or card-reader device can opt in by
-providing the CCW IPL-parameter-block operation; the command-line syntax and
-selection code do not need device-specific changes.
+QEMU performs the IPL itself, as a channel program (an implied Read IPL CCW)
+on the selected subchannel; no firmware is loaded into guest storage. The
+selected device must support this, which the emulated DASD (``eckd-ccw``),
+FBA (``fba-ccw``) and tape (``3590-ccw``) devices and assigned vfio-ccw
+devices do. Virtio devices are refused: they are booted by the s390-ccw
+firmware and must be selected with ``bootindex`` instead.
+
+The load parameter of an ``-ipl`` boot is the machine ``loadparm``
+(``-loadparm``). It is reported to the guest through SCLP and in the IPL
+parameter block stored by DIAG 308. The ``loadparm`` property of a device
+needs a ``bootindex``, which ``-ipl`` excludes, so it does not apply here.
+
+Finding the IPL-capable devices
+-------------------------------
+
+Every CCW device type has two read-only properties that tell whether, and how,
+a device of that type can be IPLed:
+
+``iplable`` (bool)
+  ``on`` if the device can be an IPL device.
+
+``ipl-method`` (string)
+  ``ccw``: QEMU performs a channel-program IPL; select the device with
+  ``-ipl``. ``firmware``: the s390-ccw firmware boots the device; select it
+  with ``bootindex``. ``none``: the device cannot be IPLed.
+
+The values depend only on the device type, so a management layer can read
+them without starting a guest. They are reported as the property default, in
+the ``default-value`` member of ``device-list-properties``::
+
+ { "execute": "device-list-properties",
+   "arguments": { "typename": "eckd-ccw" } }
+ { "return": [ ...
+     { "name": "iplable", "type": "bool", "default-value": true, ... },
+     { "name": "ipl-method", "type": "string", "default-value": "ccw", ... },
+     ... ] }
+
+and as ``(default: ...)`` in ``-device <type>,help``, for example
+``qemu-system-s390x -machine none -device virtio-blk-ccw,help``::
+
+  ipl-method=<string>    - How the device is IPLed: ... (default: firmware)
+  iplable=<bool>         - Whether the device can be an IPL (boot) device (read-only) (default: on)
+
+The SCSI disk types (``scsi-hd``, ``scsi-cd`` and ``scsi-block``) are not CCW
+devices, but they can be booted with ``bootindex`` when they are attached to a
+``virtio-scsi-ccw`` controller, so they report ``iplable=on`` and
+``ipl-method=firmware`` as well. The controller itself reports
+``iplable=off``. Other device types do not have these properties. Of those,
+only virtio PCI devices on zPCI (such as ``virtio-blk-pci``) can be booted,
+with ``bootindex``.
 
 HMC list-directed loads
 -----------------------

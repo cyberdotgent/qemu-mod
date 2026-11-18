@@ -54,6 +54,18 @@ static inline CcwDevice *to_ccw_dev_fast(DeviceState *d)
 
 OBJECT_DECLARE_TYPE(CcwDevice, CCWDeviceClass, CCW_DEVICE)
 
+/*
+ * How a CCW device can be IPLed.  Exposed through the read-only "iplable"
+ * and "ipl-method" properties, see docs/system/s390x/bootdevices.rst.
+ */
+typedef enum CcwIplMethod {
+    CCW_IPL_METHOD_NONE,        /* not an IPL device */
+    CCW_IPL_METHOD_CCW,         /* channel-program IPL by QEMU: -ipl */
+    CCW_IPL_METHOD_FIRMWARE,    /* by the s390-ccw firmware: bootindex */
+} CcwIplMethod;
+
+CcwIplMethod ccw_device_class_ipl_method(CCWDeviceClass *k);
+
 extern const PropertyInfo ccw_loadparm;
 
 #define DEFINE_PROP_CCW_LOADPARM(_n, _s, _f) \

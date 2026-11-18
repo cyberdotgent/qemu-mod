@@ -38,6 +38,8 @@
 #include "system/blockdev.h"
 #include "hw/block/block.h"
 #include "hw/core/qdev-properties.h"
+#include "qobject/qbool.h"
+#include "qobject/qstring.h"
 #include "hw/core/qdev-properties-system.h"
 #include "system/dma.h"
 #include "system/system.h"
@@ -3239,10 +3241,49 @@ static void scsi_property_add_specifics(DeviceClass *dc)
     }
 }
 
+static bool scsi_property_get_iplable(Object *obj, Error **errp)
+{
+    return true;
+}
+
+static char *scsi_property_get_ipl_method(Object *obj, Error **errp)
+{
+    return g_strdup("firmware");
+}
+
+/*
+ * On s390x, SCSI disks behind a virtio-scsi controller are IPLed by the
+ * s390-ccw firmware (bootindex).  Report it like the CCW devices do, with
+ * the value as the default so that it is visible without creating a VM;
+ * see docs/system/s390x/bootdevices.rst.
+ */
+static void scsi_disk_add_ipl_properties(ObjectClass *oc)
+{
+    ObjectProperty *op;
+
+    op = object_class_property_add_bool(oc, "iplable",
+                                        scsi_property_get_iplable, NULL);
+    op->defval = QOBJECT(qbool_from_bool(true));
+    object_class_property_set_description(oc, "iplable",
+            "Whether the device can be an IPL (boot) device (read-only, "
+            "s390x only)");
+
+    op = object_class_property_add_str(oc, "ipl-method",
+                                       scsi_property_get_ipl_method, NULL);
+    op->defval = QOBJECT(qstring_from_str("firmware"));
+    object_class_property_set_description(oc, "ipl-method",
+            "How the device is IPLed: firmware (s390-ccw firmware, "
+            "bootindex, behind virtio-scsi) (read-only, s390x only)");
+}
+
 static void scsi_disk_base_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SCSIDiskClass *sdc = SCSI_DISK_BASE_CLASS(klass);
+
+    if (target_s390x()) {
+        scsi_disk_add_ipl_properties(klass);
+    }
 
     dc->fw_name = "disk";
     device_class_set_legacy_reset(dc, scsi_disk_reset);

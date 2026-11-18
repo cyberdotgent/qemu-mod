@@ -7,6 +7,8 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "qobject/qlist.h"
+#include "qobject/qbool.h"
 #include <glib/gstdio.h>
 
 static void assert_machine_string(QTestState *qts, const char *property,
@@ -105,6 +107,10 @@ static void test_ipl_errors(void)
         "-device", "virtio-blk-ccw,drive=d,devno=fe.0.1000",
         "-ipl", "1000", NULL
     };
+    const char *const virtio_unsupported[] = {
+        "-device", "virtio-rng-ccw,devno=fe.0.1000",
+        "-ipl", "1000", NULL
+    };
     const char *const ambiguous[] = {
         "-drive", "if=none,id=d0,file=null-co://,format=raw",
         "-drive", "if=none,id=d1,file=null-co://,format=raw",
@@ -122,6 +128,7 @@ static void test_ipl_errors(void)
     assert_qemu_fails(bootindex, "cannot be combined with a bootindex");
     assert_qemu_fails(virtio, "virtio device 1000 does not support; "
                       "use bootindex instead");
+    assert_qemu_fails(virtio_unsupported, "does not support IPL");
     assert_qemu_fails(ambiguous, "is ambiguous");
     assert_qemu_fails(kernel, "-ipl and -kernel cannot be used together");
 }
@@ -165,6 +172,76 @@ static void test_ins_list_load(void)
     g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
+/* Find a property of a device type, as device-list-properties reports it */
+static QDict *find_device_property(QTestState *qts, const char *type,
+                                   const char *name)
+{
+    QDict *response = qtest_qmp(
+        qts, "{'execute': 'device-list-properties', "
+             " 'arguments': {'typename': %s}}", type);
+    QDict *found = NULL;
+    const QListEntry *entry;
+
+    g_assert(qdict_haskey(response, "return"));
+    QLIST_FOREACH_ENTRY(qdict_get_qlist(response, "return"), entry) {
+        QDict *prop = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (g_str_equal(qdict_get_str(prop, "name"), name)) {
+            found = qobject_ref(prop);
+            break;
+        }
+    }
+    qobject_unref(response);
+    return found;
+}
+
+static void test_ipl_properties(void)
+{
+    static const struct {
+        const char *type;
+        bool iplable;
+        const char *method;
+    } cases[] = {
+        { "eckd-ccw", true, "ccw" },
+        { "fba-ccw", true, "ccw" },
+        { "3590-ccw", true, "ccw" },
+        { "vfio-ccw", true, "ccw" },
+        { "virtio-blk-ccw", true, "firmware" },
+        { "virtio-net-ccw", true, "firmware" },
+        { "scsi-hd", true, "firmware" },
+        { "scsi-cd", true, "firmware" },
+        { "virtio-scsi-ccw", false, "none" },
+        { "virtio-rng-ccw", false, "none" },
+        { "qeth-ccw", false, "none" },
+        { "x-terminal3270", false, "none" },
+    };
+    /* The device types are introspected without a machine or any device */
+    QTestState *qts = qtest_init("-machine none");
+
+    for (int i = 0; i < ARRAY_SIZE(cases); i++) {
+        QDict *prop;
+
+        if (!qtest_has_device(cases[i].type)) {
+            continue;
+        }
+
+        prop = find_device_property(qts, cases[i].type, "iplable");
+        g_assert_nonnull(prop);
+        g_assert_cmpstr(qdict_get_str(prop, "type"), ==, "bool");
+        g_assert_cmpint(qdict_get_bool(prop, "default-value"), ==,
+                        cases[i].iplable);
+        qobject_unref(prop);
+
+        prop = find_device_property(qts, cases[i].type, "ipl-method");
+        g_assert_nonnull(prop);
+        g_assert_cmpstr(qdict_get_str(prop, "type"), ==, "string");
+        g_assert_cmpstr(qdict_get_str(prop, "default-value"), ==,
+                        cases[i].method);
+        qobject_unref(prop);
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -173,5 +250,6 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/fba", test_ipl_fba);
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
+    qtest_add_func("/s390x/ipl/properties", test_ipl_properties);
     return g_test_run();
 }

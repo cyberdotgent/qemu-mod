@@ -622,7 +622,6 @@ static int s390_ipl_find_ccw_device(Object *obj, void *opaque)
 void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
 {
     S390IPLDeviceSearch search = { .ms = ms };
-    CCWDeviceClass *ccw_dc;
     g_autofree char *address = NULL;
 
     if (!ms->ipl_devno_set) {
@@ -656,15 +655,15 @@ void s390_ipl_validate_ipl_device(S390CcwMachineState *ms, Error **errp)
         return;
     }
 
-    if (object_dynamic_cast(OBJECT(search.match), TYPE_VIRTIO_CCW_DEVICE)) {
+    switch (ccw_device_class_ipl_method(CCW_DEVICE_GET_CLASS(search.match))) {
+    case CCW_IPL_METHOD_CCW:
+        break;
+    case CCW_IPL_METHOD_FIRMWARE:
         error_setg(errp, "-ipl performs a channel-program IPL, which virtio "
                    "device %s does not support; use bootindex instead",
                    address);
         return;
-    }
-
-    ccw_dc = CCW_DEVICE_GET_CLASS(search.match);
-    if (!ccw_dc->build_iplb) {
+    case CCW_IPL_METHOD_NONE:
         error_setg(errp, "CCW device %s (%s) does not support IPL", address,
                    object_get_typename(OBJECT(search.match)));
         return;
