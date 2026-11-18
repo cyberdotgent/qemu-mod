@@ -897,9 +897,18 @@ static inline int cds_check_len(CcwDataStream *cds, int len)
     return cds->flags & CDS_F_STREAM_BROKEN ? -EINVAL : len;
 }
 
+/*
+ * Check that @len bytes starting at @addr lie within the 31-bit (format-1
+ * CCW) or 24-bit (format-0 CCW) address range.  The last byte transferred
+ * is at @addr + @len - 1: a buffer that ends exactly at the 2 GiB (or
+ * 16 MiB) boundary is addressable.  With @len == 0 only @addr itself is
+ * checked.
+ */
 static inline bool cds_ccw_addrs_ok(hwaddr addr, int len, bool ccw_fmt1)
 {
-    return (addr + len) < (ccw_fmt1 ? (1UL << 31) : (1UL << 24));
+    hwaddr limit = ccw_fmt1 ? (1ULL << 31) : (1ULL << 24);
+
+    return addr < limit && len <= limit - addr;
 }
 
 static int ccw_dstream_rw_noflags(CcwDataStream *cds, void *buff, int len,
