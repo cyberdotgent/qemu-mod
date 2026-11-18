@@ -37,6 +37,7 @@ struct RemoteObject {
     Object parent;
 
     Notifier machine_done;
+    bool counted;               /* counted in nr_devs, notifier added */
 
     int32_t fd;
     char *devid;
@@ -131,19 +132,32 @@ static void remote_object_machine_done(Notifier *notifier, void *data)
 
 static void remote_object_init(Object *obj)
 {
-    RemoteObjectClass *k = REMOTE_OBJECT_GET_CLASS(obj);
     RemoteObject *o = REMOTE_OBJECT(obj);
-
-    if (k->nr_devs >= k->max_devs) {
-        error_report("Reached maximum number of devices: %u", k->max_devs);
-        return;
-    }
 
     o->ioc = NULL;
     o->fd = -1;
     o->devid = NULL;
+}
+
+/*
+ * Only an object that is actually created (-object, object-add) takes a
+ * device slot and waits for the machine: instances made just to look at
+ * the properties (qom-list-properties) are finalized right away and must
+ * leave no notifier behind.
+ */
+static void remote_object_complete(UserCreatable *uc, Error **errp)
+{
+    RemoteObjectClass *k = REMOTE_OBJECT_GET_CLASS(uc);
+    RemoteObject *o = REMOTE_OBJECT(uc);
+
+    if (k->nr_devs >= k->max_devs) {
+        error_setg(errp, "Reached maximum number of devices: %u",
+                   k->max_devs);
+        return;
+    }
 
     k->nr_devs++;
+    o->counted = true;
 
     o->machine_done.notify = remote_object_machine_done;
     qemu_add_machine_init_done_notifier(&o->machine_done);
@@ -165,13 +179,19 @@ static void remote_object_finalize(Object *obj)
 
     object_unref(OBJECT(o->ioc));
 
-    k->nr_devs--;
+    if (o->counted) {
+        qemu_remove_machine_init_done_notifier(&o->machine_done);
+        k->nr_devs--;
+    }
     g_free(o->devid);
 }
 
 static void remote_object_class_init(ObjectClass *klass, const void *data)
 {
     RemoteObjectClass *k = REMOTE_OBJECT_CLASS(klass);
+    UserCreatableClass *ucc = USER_CREATABLE_CLASS(klass);
+
+    ucc->complete = remote_object_complete;
 
     /*
      * Limit number of supported devices to 1. This is done to avoid devices
