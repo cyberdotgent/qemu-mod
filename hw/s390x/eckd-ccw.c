@@ -12,6 +12,7 @@
 #include "hw/s390x/ebcdic.h"
 #include "hw/s390x/eckd-ccw.h"
 #include "hw/s390x/ipl.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/module.h"
@@ -2032,6 +2033,146 @@ static const Property eckd_properties[] = {
     DEFINE_PROP_UINT16("chpid", EckdCcwDevice, chpid, UINT16_MAX),
 };
 
+/*
+ * Migration state.  eckd-ccw I/O is synchronous: when the device state is
+ * saved, no CCW is executing.  A channel program may still be suspended,
+ * so the multi-CCW contexts (Define Extent, Locate Record, format-write,
+ * write, update and read domains) are part of the state; the large
+ * format-write and record buffers go into subsections that are sent only
+ * while their domain is active.
+ *
+ * The cached track itself is not migrated: the destination reads it again
+ * from the (shared or mirrored) image before the next CCW uses it.
+ */
+static int eckd_post_load(void *opaque, int version_id)
+{
+    EckdCcwDevice *eckd = opaque;
+    CkdImage *image = &eckd->image;
+
+    if (eckd->format_used > ECKD_TRACK_SIZE ||
+        eckd->write_used > ECKD_MAX_RECORD_SIZE ||
+        eckd->write_expected > ECKD_MAX_RECORD_SIZE ||
+        eckd->rssd_length > sizeof(eckd->rssd_data)) {
+        return -EINVAL;
+    }
+    image->record_count = 0;
+    image->used_length = 0;
+    image->track_stale = image->track_loaded || image->track_stale;
+    image->track_loaded = false;
+    if (image->track_stale &&
+        (image->loaded_cylinder >= image->cylinders ||
+         image->loaded_head >= image->heads)) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static bool eckd_format_needed(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    return eckd->format_active;
+}
+
+static const VMStateDescription vmstate_eckd_format = {
+    .name = TYPE_ECKD_CCW "/format",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = eckd_format_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER_POINTER_UNSAFE(format_track, EckdCcwDevice, 0,
+                                      ECKD_TRACK_SIZE),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool eckd_write_needed(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    return eckd->write_active;
+}
+
+static const VMStateDescription vmstate_eckd_write = {
+    .name = TYPE_ECKD_CCW "/write",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = eckd_write_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER_POINTER_UNSAFE(write_record, EckdCcwDevice, 0,
+                                      ECKD_MAX_RECORD_SIZE),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_eckd_ccw = {
+    .name = TYPE_ECKD_CCW,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = eckd_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_CCW_DEVICE(parent_obj, EckdCcwDevice),
+        VMSTATE_UINT32_EQUAL(image.cylinders, EckdCcwDevice),
+        VMSTATE_BOOL(extent_defined, EckdCcwDevice),
+        VMSTATE_UINT16(extent_begin_cylinder, EckdCcwDevice),
+        VMSTATE_UINT16(extent_begin_head, EckdCcwDevice),
+        VMSTATE_UINT16(extent_end_cylinder, EckdCcwDevice),
+        VMSTATE_UINT16(extent_end_head, EckdCcwDevice),
+        VMSTATE_UINT8(file_mask, EckdCcwDevice),
+        VMSTATE_UINT16(cylinder, EckdCcwDevice),
+        VMSTATE_UINT16(head, EckdCcwDevice),
+        VMSTATE_UINT16(record, EckdCcwDevice),
+        VMSTATE_UINT8(locate_count, EckdCcwDevice),
+        VMSTATE_UINT8(locate_operation, EckdCcwDevice),
+        VMSTATE_UINT16(locate_length, EckdCcwDevice),
+        VMSTATE_BOOL(positioned, EckdCcwDevice),
+        VMSTATE_BOOL(search_match, EckdCcwDevice),
+        VMSTATE_BOOL(search_count_advance, EckdCcwDevice),
+        VMSTATE_UINT32(search_index, EckdCcwDevice),
+        VMSTATE_BOOL(search_index_seen, EckdCcwDevice),
+        VMSTATE_BOOL(reserved, EckdCcwDevice),
+        VMSTATE_BOOL(fenced, EckdCcwDevice),
+        VMSTATE_UINT8_ARRAY(pgid, EckdCcwDevice, 11),
+        VMSTATE_UINT8(psf_order, EckdCcwDevice),
+        VMSTATE_UINT8(psf_suborder, EckdCcwDevice),
+        VMSTATE_UINT16(rssd_length, EckdCcwDevice),
+        VMSTATE_UINT8_ARRAY(rssd_data, EckdCcwDevice, 512),
+        VMSTATE_UINT32(format_used, EckdCcwDevice),
+        VMSTATE_UINT16(format_cylinder, EckdCcwDevice),
+        VMSTATE_UINT16(format_head, EckdCcwDevice),
+        VMSTATE_BOOL(format_active, EckdCcwDevice),
+        VMSTATE_UINT32(write_expected, EckdCcwDevice),
+        VMSTATE_UINT32(write_used, EckdCcwDevice),
+        VMSTATE_BOOL(write_active, EckdCcwDevice),
+        VMSTATE_UINT8(update_command, EckdCcwDevice),
+        VMSTATE_UINT8(update_record, EckdCcwDevice),
+        VMSTATE_UINT32(update_offset, EckdCcwDevice),
+        VMSTATE_UINT32(update_expected, EckdCcwDevice),
+        VMSTATE_UINT32(update_used, EckdCcwDevice),
+        VMSTATE_BOOL(update_active, EckdCcwDevice),
+        VMSTATE_BOOL(update_done, EckdCcwDevice),
+        VMSTATE_UINT64(program_write_count, EckdCcwDevice),
+        VMSTATE_UINT8(update_done_record, EckdCcwDevice),
+        VMSTATE_UINT8(read_command, EckdCcwDevice),
+        VMSTATE_UINT8(read_record, EckdCcwDevice),
+        VMSTATE_UINT32(read_length, EckdCcwDevice),
+        VMSTATE_UINT32(read_used, EckdCcwDevice),
+        VMSTATE_BOOL(read_advance, EckdCcwDevice),
+        VMSTATE_BOOL(read_active, EckdCcwDevice),
+        VMSTATE_UINT16(image.loaded_cylinder, EckdCcwDevice),
+        VMSTATE_UINT16(image.loaded_head, EckdCcwDevice),
+        VMSTATE_BOOL(image.track_loaded, EckdCcwDevice),
+        VMSTATE_BOOL(image.track_stale, EckdCcwDevice),
+        VMSTATE_UINT64(image.write_count, EckdCcwDevice),
+        VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_eckd_format,
+        &vmstate_eckd_write,
+        NULL
+    },
+};
+
 static void eckd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2042,6 +2183,7 @@ static void eckd_class_init(ObjectClass *klass, const void *data)
     dc->realize = eckd_realize;
     dc->unrealize = eckd_unrealize;
     dc->hotpluggable = false;
+    dc->vmsd = &vmstate_eckd_ccw;
     device_class_set_props(dc, eckd_properties);
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
     cdk->build_iplb = s390_ipl_build_ccw_iplb;

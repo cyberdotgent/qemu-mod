@@ -247,23 +247,34 @@ static void test_multi_file_rejected(void)
 #define ECKD_R1_OFFSET (CKD_HEADER_SIZE + 5 + 16 + 8)
 #define GIB2 0x80000000u
 
-/* A one-cylinder image whose track 0 holds R0 and a 64-byte R1. */
-static char *create_ckd_image_r1(const uint8_t *data)
+/* Format track 0/@head of @path with R0 and a 64-byte R1 holding @data. */
+static void ckd_write_r1(const char *path, uint16_t head, const uint8_t *data)
 {
-    char *path = create_ckd64_image();
     uint8_t track[5 + 16 + 8 + ECKD_R1_LENGTH + 8] = { 0 };
     uint8_t *r1 = track + 5 + 16;
     int fd = open(path, O_WRONLY);
 
     g_assert_cmpint(fd, >=, 0);
-    stw_be_p(track + 5 + 6, 8);         /* R0: data length 8 */
-    r1[4] = 1;                          /* R1: record number 1, key 0 */
+    stw_be_p(track + 3, head);          /* home address */
+    stw_be_p(track + 5 + 2, head);      /* R0 count field */
+    stw_be_p(track + 5 + 6, 8);
+    stw_be_p(r1 + 2, head);             /* R1: record number 1, key 0 */
+    r1[4] = 1;
     stw_be_p(r1 + 6, ECKD_R1_LENGTH);
     memcpy(r1 + 8, data, ECKD_R1_LENGTH);
     memset(r1 + 8 + ECKD_R1_LENGTH, 0xff, 8);
-    g_assert_cmpint(pwrite(fd, track, sizeof(track), CKD_HEADER_SIZE), ==,
-                    sizeof(track));
+    g_assert_cmpint(pwrite(fd, track, sizeof(track),
+                           CKD_HEADER_SIZE + (int64_t)head * CKD_TRACK_SIZE),
+                    ==, sizeof(track));
     close(fd);
+}
+
+/* A one-cylinder image whose track 0 holds R0 and a 64-byte R1. */
+static char *create_ckd_image_r1(const uint8_t *data)
+{
+    char *path = create_ckd64_image();
+
+    ckd_write_r1(path, 0, data);
     return path;
 }
 
@@ -360,6 +371,84 @@ static void test_track_cache_invalidation(void)
     unlink(image);
 }
 
+static void wait_migration_completed(QTestState *qts)
+{
+    for (int i = 0; i < 6000; i++) {
+        QDict *rsp = qtest_qmp(qts, "{'execute': 'query-migrate'}");
+        QDict *ret = qdict_get_qdict(rsp, "return");
+        const char *status = qdict_haskey(ret, "status") ?
+                             qdict_get_str(ret, "status") : "none";
+        bool done = !strcmp(status, "completed");
+
+        g_assert_cmpstr(status, !=, "failed");
+        qobject_unref(rsp);
+        if (done) {
+            return;
+        }
+        g_usleep(10000);
+    }
+    g_assert_not_reached();
+}
+
+/*
+ * The device's orientation survives a migration: a channel program seeks
+ * to track 0/1 on the source, the next one reads the following record on
+ * the destination without seeking again.
+ */
+static void test_migration_orientation(void)
+{
+    uint8_t pattern[2][ECKD_R1_LENGTH];
+    uint8_t ckd[8 + ECKD_R1_LENGTH], seek[6] = { 0, 0, 0, 0, 0, 1 };
+    const uint8_t count1[8] = { 0, 0, 0, 1, 1, 0, 0, ECKD_R1_LENGTH };
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    g_autofree char *sock = g_strdup_printf("%s/qemu-eckd-mig-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *uri = g_strdup_printf("unix:%s", sock);
+    g_autofree char *devices = NULL;
+    QTestState *src, *dst;
+    CcwProgIrb irb;
+
+    for (int i = 0; i < ECKD_R1_LENGTH; i++) {
+        pattern[0][i] = 0x40 + i;
+        pattern[1][i] = 0x90 + i;
+    }
+    path = create_ckd_image_r1(pattern[0]);
+    ckd_write_r1(path, 1, pattern[1]);
+    devices = g_strdup_printf(
+        "-drive if=none,id=ckd0,file=%s,format=raw "
+        "-device eckd-ccw,drive=ckd0,devno=fe.0.0200", path);
+
+    src = ccw_prog_start(image, "3G", devices);
+    qtest_memwrite(src, CCW_PROG_DATA, seek, sizeof(seek));
+    ccw_prog_set_ccw(src, 0, 0x07, 0, sizeof(seek), CCW_PROG_DATA);
+    g_assert_cmpint(ccw_prog_run(src, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+
+    dst = qtest_initf("-nodefaults -accel tcg -m 3G -kernel %s %s "
+                      "-incoming %s", image, devices, uri);
+    qtest_qmp_assert_success(src, "{'execute': 'migrate', "
+                             "'arguments': {'uri': %s}}", uri);
+    wait_migration_completed(src);
+    qtest_qmp_eventwait(dst, "RESUME");
+
+    /* Read Count, Key and Data of the next record (R1 of track 0/1). */
+    ccw_prog_set_ccw(dst, 0, 0x1e, CCW_FLAG_SLI, sizeof(ckd),
+                     CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(dst, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(dst, CCW_PROG_DATA + 0x100, ckd, sizeof(ckd));
+    g_assert_cmpmem(ckd, 8, count1, 8);
+    g_assert_cmpmem(ckd + 8, ECKD_R1_LENGTH, pattern[1], ECKD_R1_LENGTH);
+
+    qtest_quit(src);
+    qtest_quit(dst);
+    unlink(sock);
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -378,6 +467,8 @@ int main(int argc, char **argv)
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
         qtest_add_func("/eckd-ccw/io/track-cache-invalidation",
                        test_track_cache_invalidation);
+        qtest_add_func("/eckd-ccw/io/migration-orientation",
+                       test_migration_orientation);
     }
     return g_test_run();
 }
