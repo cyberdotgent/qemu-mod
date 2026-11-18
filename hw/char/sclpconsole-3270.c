@@ -32,6 +32,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SCLPConsole3270, SCLP_3270_CONSOLE)
 #define TN_DONT 0xfe
 #define TN_EOR  0xef
 
+/* Output kept for a client that attaches later (persistent console). */
+#define SCLP_3270_MAX_REPLAY (1024 * 1024)
+
 typedef enum SCLP3270ParseState {
     SCLP_3270_PARSE_DATA,
     SCLP_3270_PARSE_IAC,
@@ -51,6 +54,10 @@ struct SCLPConsole3270 {
     uint8_t read_command;
     uint8_t parse_state;
     bool client_attached;
+    bool persistent;
+    bool read_unsent;           /* read command not yet sent to a client */
+    bool replay_lost;           /* screen no longer reproducible */
+    GByteArray *replay;         /* records since the last erase */
 };
 
 static bool sclp_3270_can_handle_event(uint8_t type)
@@ -124,6 +131,61 @@ static int sclp_3270_send_record(SCLPConsole3270 *console,
     return written == out ? 0 : -EIO;
 }
 
+/*
+ * Remember an outbound record for the next client: everything since the
+ * last Erase/Write (Alternate) reproduces the screen.
+ */
+static void sclp_3270_remember(SCLPConsole3270 *console, uint8_t remote,
+                               const uint8_t *data, size_t len)
+{
+    uint8_t header[sizeof(uint32_t) + 1];
+
+    if (remote == TN3270_CMD_RDBUF || remote == TN3270_CMD_READMOD) {
+        return;
+    }
+    if (remote == TN3270_CMD_EWRITE || remote == TN3270_CMD_EWRITEA) {
+        g_byte_array_set_size(console->replay, 0);
+        console->replay_lost = false;
+    }
+    if (console->replay_lost) {
+        return;
+    }
+    if (console->replay->len + sizeof(header) + len > SCLP_3270_MAX_REPLAY) {
+        g_byte_array_set_size(console->replay, 0);
+        console->replay_lost = true;
+        return;
+    }
+    stl_be_p(header, len + 1);
+    header[sizeof(uint32_t)] = remote;
+    g_byte_array_append(console->replay, header, sizeof(header));
+    g_byte_array_append(console->replay, data, len);
+}
+
+/* A client attached: give it the screen and a read the guest started. */
+static void sclp_3270_resume(SCLPConsole3270 *console)
+{
+    size_t offset = 0;
+
+    while (!console->replay_lost &&
+           offset + sizeof(uint32_t) < console->replay->len) {
+        uint32_t len = ldl_be_p(console->replay->data + offset);
+        const uint8_t *record = console->replay->data + offset +
+                                sizeof(uint32_t);
+
+        offset += sizeof(uint32_t) + len;
+        if (sclp_3270_send_record(console, record[0], record + 1,
+                                  len - 1) < 0) {
+            return;
+        }
+    }
+    if (console->read_unsent &&
+        sclp_3270_send_record(console,
+                              sclp_3270_remote_command(console->read_command),
+                              NULL, 0) == 0) {
+        console->read_unsent = false;
+    }
+}
+
 static int sclp_3270_write_event_data(SCLPEvent *event,
                                       EventBufferHeader *event_header)
 {
@@ -146,6 +208,28 @@ static int sclp_3270_write_event_data(SCLPEvent *event,
     remote = sclp_3270_remote_command(command);
     if (!remote) {
         return SCLP_RC_INVALID_FUNCTION;
+    }
+
+    if (console->persistent) {
+        /*
+         * The console stays usable without a client: output is kept for
+         * the next one, and a read waits for it.
+         */
+        sclp_3270_remember(console, remote, payload + 1, payload_len - 1);
+        if (console->client_attached &&
+            sclp_3270_send_record(console, remote, payload + 1,
+                                  payload_len - 1) < 0) {
+            console->client_attached = false;
+        }
+        if (sclp_3270_is_read(command)) {
+            /* As with a client: attention now, the data when it answers. */
+            console->read_command = command;
+            console->read_unsent = !console->client_attached;
+            event->event_pending = true;
+            sclp_service_interrupt(0);
+        }
+        event_header->flags |= SCLP_EVENT_BUFFER_ACCEPTED;
+        return SCLP_RC_NORMAL_COMPLETION;
     }
 
     /*
@@ -293,11 +377,19 @@ static void sclp_3270_chr_event(void *opaque, QEMUChrEvent event)
     switch (event) {
     case CHR_EVENT_OPENED:
         console->client_attached = true;
+        if (console->persistent) {
+            sclp_3270_resume(console);
+        }
         break;
     case CHR_EVENT_CLOSED:
         console->client_attached = false;
         console->incoming_len = 0;
         console->parse_state = SCLP_3270_PARSE_DATA;
+        if (console->persistent && console->read_command &&
+            !console->record_len) {
+            /* The read was not answered: the next client gets it. */
+            console->read_unsent = true;
+        }
         break;
     default:
         break;
@@ -330,7 +422,10 @@ static void sclp_3270_reset(DeviceState *dev)
     console->record_len = 0;
     console->incoming_len = 0;
     console->read_command = 0;
+    console->read_unsent = false;
     console->parse_state = SCLP_3270_PARSE_DATA;
+    g_byte_array_set_size(console->replay, 0);
+    console->replay_lost = false;
 }
 
 static const VMStateDescription vmstate_sclp_3270 = {
@@ -351,7 +446,23 @@ static const VMStateDescription vmstate_sclp_3270 = {
 
 static const Property sclp_3270_properties[] = {
     DEFINE_PROP_CHR("chardev", SCLPConsole3270, chr),
+    /*
+     * on: the console accepts output and reads while no TN3270 client is
+     * attached; an attaching client gets the screen and a pending read.
+     * off: writes fail with "adapter in reserved state" without a client.
+     */
+    DEFINE_PROP_BOOL("persistent", SCLPConsole3270, persistent, true),
 };
+
+static void sclp_3270_instance_init(Object *obj)
+{
+    SCLP_3270_CONSOLE(obj)->replay = g_byte_array_new();
+}
+
+static void sclp_3270_instance_finalize(Object *obj)
+{
+    g_byte_array_unref(SCLP_3270_CONSOLE(obj)->replay);
+}
 
 static void sclp_3270_class_init(ObjectClass *klass, const void *data)
 {
@@ -375,6 +486,8 @@ static const TypeInfo sclp_3270_info = {
     .name = TYPE_SCLP_3270_CONSOLE,
     .parent = TYPE_SCLP_EVENT,
     .instance_size = sizeof(SCLPConsole3270),
+    .instance_init = sclp_3270_instance_init,
+    .instance_finalize = sclp_3270_instance_finalize,
     .class_size = sizeof(SCLPEventClass),
     .class_init = sclp_3270_class_init,
 };

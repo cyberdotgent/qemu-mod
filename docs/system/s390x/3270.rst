@@ -117,8 +117,11 @@ I/O definition for it. Add it with::
 or equivalently ``-sclp3270 3905``. Like ``-dev3270``, the shorthand creates a
 TN3270 server on the loopback interface that does not wait for a client
 connection. Connect ``x3270`` or ``c3270`` to the port. While no client is
-connected, the console reports "improper state" to the guest instead of
-accepting output. There is one integrated console per machine; use the
+connected, the console (``persistent=on``, the default) keeps accepting
+output, and an attaching client gets the screen and a read the guest started;
+with ``persistent=off`` it reports "improper state" to the guest instead of
+accepting output. The screen is not part of the migration state of this
+console. There is one integrated console per machine; use the
 expanded form for other listeners::
 
    -chardev socket,id=sysg,host=0.0.0.0,port=3905,server=on,wait=off,tn3270=on

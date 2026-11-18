@@ -5,6 +5,8 @@
  * Writing a 3270 data stream must be rejected with response code 0x05F0
  * (improper state) and the event buffer left unaccepted, rather than being
  * reported as an equipment check; a NOP still completes normally.
+ * Built with PERSISTENT_TEST, for a persistent console: the console keeps
+ * output for a later client and a read waits for one, so all complete.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -97,6 +99,22 @@ int main(void)
         ml_printf("WEM cc=%d response=%x\n", cc, sccb.wem.h.response_code);
         return 1;
     }
+
+#ifdef PERSISTENT_TEST
+    cc = write_3270(0x0d, &response, &flags); /* Erase/Write Alternate */
+    if (cc || response != SCLP_RC_NORMAL_COMPLETION ||
+        !(flags & SCLP_EVENT_ACCEPTED)) {
+        ml_printf("EWA cc=%d response=%x\n", cc, response);
+        return 2;
+    }
+    cc = write_3270(0x06, &response, &flags); /* Read Modified */
+    if (cc || response != SCLP_RC_NORMAL_COMPLETION ||
+        !(flags & SCLP_EVENT_ACCEPTED)) {
+        ml_printf("RM cc=%d response=%x\n", cc, response);
+        return 4;
+    }
+    return 0;
+#endif
 
     cc = write_3270(0x0d, &response, &flags); /* Erase/Write Alternate */
     if (cc || response != SCLP_RC_IMPROPER_STATE) {

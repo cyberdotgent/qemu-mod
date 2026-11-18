@@ -233,7 +233,8 @@ tests += {
                   '-action', 'panic=exit-failure', '-serial', 'stdio',
                   '-chardev',
                   'socket,id=sysg,host=127.0.0.1,port=0,server=on,wait=off',
-                  '-device', 'sclp3270console,chardev=sysg', '-kernel'],
+                  '-device', 'sclp3270console,chardev=sysg,persistent=off',
+                  '-kernel'],
   },
   # mtm-3907 maps -serial #0 to the line-mode console (KVM, 3907 hosts).
   'sclp-line-console-mtm.c': {
@@ -302,6 +303,19 @@ tests += {
   'tape-write.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../tape-write.py')],
+  },
+}
+tests += {
+  # The same, persistent: output and reads are accepted without a client.
+  'sclp-3270-noclient.c': {
+    'exe_name': 'sclp-3270-noclient-persistent',
+    'cflags': [ccw_cflags, '-DPERSISTENT_TEST'],
+    'qemu_args': ['-accel', 'kvm', '-cpu', 'host',
+                  '-monitor', 'none', '-display', 'none', '-nodefaults',
+                  '-action', 'panic=exit-failure', '-serial', 'stdio',
+                  '-chardev',
+                  'socket,id=sysg,host=127.0.0.1,port=0,server=on,wait=off',
+                  '-device', 'sclp3270console,chardev=sysg', '-kernel'],
   },
 }
 tests += {
