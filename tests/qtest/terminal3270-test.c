@@ -333,8 +333,8 @@ static void test_tn3270_negotiation_and_records(void)
     int port = get_free_port();
     int fd;
 
-    qts = qtest_initf("-nodefaults -dev3270 port=%d,devno=fe.0.000a",
-                      port);
+    qts = qtest_initf("-nodefaults -global x-terminal3270.persistent=off "
+                      "-dev3270 port=%d,devno=fe.0.000a", port);
     fd = connect_terminal(port);
     g_assert_false(qtest_qom_get_bool(qts, TERMINAL_PATH, "ready"));
     negotiate_terminal(qts, fd);
@@ -367,6 +367,40 @@ static void test_tn3270_negotiation_and_records(void)
     close(fd);
     wait_for_bool(qts, "connected", false);
     wait_for_int(qts, "queued-records", 0);
+    qtest_quit(qts);
+}
+
+/*
+ * A persistent terminal (the default) keeps the guest's view while no
+ * client is attached: input the guest has not read survives a reconnect,
+ * and a new client gets the banner while the guest has written nothing.
+ */
+static void test_persistent_reconnect(void)
+{
+    static const uint8_t record[] = {
+        0x7d, 0x40, 0x40, 0xc1, TN_IAC, 0xef,
+    };
+    g_autoptr(GByteArray) banner = NULL;
+    QTestState *qts;
+    int port = get_free_port();
+    int fd;
+
+    qts = qtest_initf("-nodefaults -dev3270 port=%d,devno=fe.0.000a", port);
+    fd = connect_terminal(port);
+    negotiate_terminal(qts, fd);
+    g_byte_array_unref(socket_read_record(fd));
+    g_assert_cmpint(send(fd, record, sizeof(record), 0), ==, sizeof(record));
+    wait_for_int(qts, "queued-records", 1);
+    close(fd);
+    wait_for_bool(qts, "connected", false);
+    g_assert_cmpint(qom_get_int(qts, TERMINAL_PATH, "queued-records"), ==, 1);
+
+    fd = connect_terminal(port);
+    negotiate_terminal(qts, fd);
+    banner = socket_read_record(fd);
+    g_assert_cmphex(banner->data[0], ==, 0xf5);
+    g_assert_cmpint(qom_get_int(qts, TERMINAL_PATH, "queued-records"), ==, 1);
+    close(fd);
     qtest_quit(qts);
 }
 
@@ -437,8 +471,8 @@ static void test_negotiation_retry_refusal_and_record_replacement(void)
     int fd;
     int i;
 
-    qts = qtest_initf("-nodefaults -dev3270 port=%d,devno=fe.0.000a",
-                      port);
+    qts = qtest_initf("-nodefaults -global x-terminal3270.persistent=off "
+                      "-dev3270 port=%d,devno=fe.0.000a", port);
     fd = connect_terminal(port);
     socket_read_all(fd, received, sizeof(tn3270_offer));
     socket_write_fragmented(fd, tn3270_answer, 15);
@@ -552,6 +586,8 @@ int main(int argc, char **argv)
                    test_many_terminals_share_chpid);
     qtest_add_func("/terminal3270/tn3270-negotiation-records",
                    test_tn3270_negotiation_and_records);
+    qtest_add_func("/terminal3270/persistent-reconnect",
+                   test_persistent_reconnect);
     qtest_add_func("/terminal3270/migration-reconnect",
                    test_migration_reconnect);
     qtest_add_func("/terminal3270/protocol-edge-cases",

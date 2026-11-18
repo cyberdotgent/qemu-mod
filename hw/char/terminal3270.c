@@ -20,9 +20,9 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/s390x/3270-ccw.h"
 #include "hw/s390x/ebcdic.h"
-#include "migration/misc.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 #define TN3270_MAX_RECORD_SIZE 65535
@@ -134,6 +134,9 @@ struct Terminal3270 {
     GByteArray *write_record;
     uint8_t write_command;
     GByteArray *replay;
+    bool replay_lost;           /* screen no longer reproducible from replay */
+    bool persistent;            /* keep the display while no client is attached */
+    bool read_unsent;           /* pending read not yet sent to a client */
     bool migration_disconnect;
     bool reconnect_restore;
 
@@ -146,7 +149,8 @@ struct Terminal3270 {
     uint32_t migration_write_len;
     uint8_t *migration_replay;
     uint32_t migration_replay_len;
-    NotifierWithReturn migration_notifier;
+    VMChangeStateEntry *vmstate_change;
+    bool resend_screen;         /* loaded state: give the client the screen */
 
     bool read_pending;
     CCW1 pending_ccw;
@@ -177,6 +181,23 @@ static inline SubchDev *terminal_sch(Terminal3270 *t)
 static inline CcwDataStream *terminal_cds(Terminal3270 *t)
 {
     return &terminal_sch(t)->cds;
+}
+
+/* A client is attached and has finished the TN3270 negotiation. */
+static inline bool terminal_attached(Terminal3270 *t)
+{
+    return t->connected && t->ready;
+}
+
+/*
+ * Whether the guest can use the display.  A persistent terminal stays
+ * available while no client is attached: it keeps the screen (as the
+ * replay of the data stream) for the next client, like a console
+ * controller whose display was only switched off.
+ */
+static inline bool terminal_available(Terminal3270 *t)
+{
+    return t->persistent || terminal_attached(t);
 }
 
 static bool terminal_send_record(Terminal3270 *t,
@@ -224,8 +245,6 @@ static bool terminal_send_banner(Terminal3270 *t)
                          "Connected - press Enter to signal attention");
     return terminal_send_record(t, record->data, record->len);
 }
-static int terminal_migration_notify(NotifierWithReturn *notifier,
-                                     MigrationEvent *event, Error **errp);
 
 static void terminal_timer_cancel(Terminal3270 *t)
 {
@@ -291,10 +310,18 @@ static bool terminal_lookup_type(Terminal3270 *t, const char *name)
         const TN3270Type *type = &tn3270_types[i];
 
         if (!g_ascii_strcasecmp(base, type->name)) {
-            if (t->reconnect_restore && t->terminal_type[0] &&
+            if ((t->reconnect_restore || t->persistent) &&
+                t->terminal_type[0] &&
                 g_ascii_strcasecmp(base, (char *)t->terminal_type)) {
-                terminal_clear_records(t);
+                /*
+                 * A different display model cannot show the old screen:
+                 * start over with the banner and let the guest redraw.
+                 */
+                if (!t->persistent) {
+                    terminal_clear_records(t);
+                }
                 g_byte_array_set_size(t->replay, 0);
+                t->replay_lost = false;
                 t->pos = 0;
                 t->ewa = false;
             }
@@ -309,10 +336,62 @@ static bool terminal_lookup_type(Terminal3270 *t, const char *name)
     return false;
 }
 
+/*
+ * Give an attached client the screen: the replay of the guest's output, or
+ * (@restore false, or nothing to replay) the connection banner.
+ */
+static bool terminal_send_screen(Terminal3270 *t, bool restore)
+{
+    size_t offset = 0;
+
+    if (!restore || (t->persistent && (!t->replay->len || t->replay_lost))) {
+        if (!terminal_send_banner(t)) {
+            return false;
+        }
+        if (t->persistent) {
+            /* The banner replaced whatever was left of the old screen. */
+            g_byte_array_set_size(t->replay, 0);
+            t->replay_lost = false;
+        }
+        return true;
+    }
+    while (offset + sizeof(uint32_t) <= t->replay->len) {
+        uint32_t len = ldl_be_p(t->replay->data + offset);
+
+        offset += sizeof(uint32_t);
+        if (len > t->replay->len - offset ||
+            !terminal_send_record(t, t->replay->data + offset, len)) {
+            g_byte_array_set_size(t->replay, 0);
+            break;
+        }
+        offset += len;
+    }
+    return true;
+}
+
+/* Send a read the guest started while no client was attached. */
+static void terminal_send_pending_read(Terminal3270 *t)
+{
+    uint8_t command;
+
+    if (!t->read_pending || !t->read_unsent || !terminal_attached(t)) {
+        return;
+    }
+    command = t->pending_ccw.cmd_code == TC_RDBUF ? TN3270_CMD_RDBUF :
+                                                    TN3270_CMD_READMOD;
+    if (terminal_send_record(t, &command, 1)) {
+        t->read_unsent = false;
+    }
+}
+
 static void terminal_signal_ready(Terminal3270 *t)
 {
     SubchDev *sch = terminal_sch(t);
-    size_t offset = 0;
+    /*
+     * A persistent terminal whose screen can be reproduced hands it to the
+     * new client; the guest saw no change and gets no status.
+     */
+    bool resume = t->persistent && t->replay->len && !t->replay_lost;
 
     if (t->ready) {
         return;
@@ -325,26 +404,18 @@ static void terminal_signal_ready(Terminal3270 *t)
      * output.  Real console controllers and Hercules present an initial
      * connection screen before reporting device end.
      */
-    if (!t->reconnect_restore && !terminal_send_banner(t)) {
+    if (!terminal_send_screen(t, t->reconnect_restore || resume)) {
         return;
     }
 
-    while (offset + sizeof(uint32_t) <= t->replay->len) {
-        uint32_t len = ldl_be_p(t->replay->data + offset);
-
-        offset += sizeof(uint32_t);
-        if (len > t->replay->len - offset ||
-            !terminal_send_record(t, t->replay->data + offset, len)) {
-            g_byte_array_set_size(t->replay, 0);
-            break;
-        }
-        offset += len;
-    }
     t->reconnect_restore = false;
+    terminal_send_pending_read(t);
     if (t->queued_records) {
         t->attention_pending = true;
     }
-    t->device_end_pending = true;
+    if (!resume) {
+        t->device_end_pending = true;
+    }
     terminal_try_unsolicited_status(t);
 }
 
@@ -666,6 +737,7 @@ static void terminal_start_timer(Terminal3270 *t)
 static void terminal_cancel_pending(Terminal3270 *t)
 {
     t->read_pending = false;
+    t->read_unsent = false;
     terminal_record_free(t->current_record);
     t->current_record = NULL;
     t->current_offset = 0;
@@ -695,7 +767,7 @@ static void chr_event(void *opaque, QEMUChrEvent event)
         t->peer_ttype = false;
         t->ttype_valid = false;
         t->ttype_attempts = 0;
-        if (!t->reconnect_restore) {
+        if (!t->reconnect_restore && !t->persistent) {
             t->pos = 0;
             t->ewa = false;
             g_byte_array_set_size(t->write_record, 0);
@@ -709,6 +781,19 @@ static void chr_event(void *opaque, QEMUChrEvent event)
         t->connected = false;
         t->ready = false;
         terminal_timer_cancel(t);
+        if (t->persistent && !preserving) {
+            /*
+             * The display stays available to the guest: keep the screen,
+             * the queued input and a pending read (it goes to the next
+             * client), and present no status.  Only input the client had
+             * not finished is lost.
+             */
+            t->record_len = 0;
+            if (pending) {
+                t->read_unsent = true;
+            }
+            break;
+        }
         if (pending) {
             terminal_cancel_pending(t);
         }
@@ -737,6 +822,34 @@ static void chr_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+/*
+ * After loading a state (loadvm, a snapshot) with the client still
+ * attached, the client shows a screen that no longer matches: give it the
+ * loaded one, and the loaded pending read, once the VM runs.
+ */
+static void terminal_vm_state_change(void *opaque, bool running,
+                                     RunState state)
+{
+    Terminal3270 *t = opaque;
+
+    if (!running || !t->resend_screen) {
+        return;
+    }
+    t->resend_screen = false;
+    if (!terminal_attached(t)) {
+        return;
+    }
+    if (!terminal_send_screen(t, true)) {
+        return;
+    }
+    if (!t->replay->len) {
+        /* Nothing to show but the banner: let the guest redraw. */
+        t->device_end_pending = true;
+    }
+    terminal_send_pending_read(t);
+    terminal_try_unsolicited_status(t);
+}
+
 static void terminal_init(EmulatedCcw3270Device *dev, Error **errp)
 {
     Terminal3270 *t = TERMINAL_3270(dev);
@@ -745,8 +858,10 @@ static void terminal_init(EmulatedCcw3270Device *dev, Error **errp)
     terminal_sch(t)->status_clear_cb = terminal_status_cleared;
     qemu_chr_fe_set_handlers(&t->chr, terminal_can_read,
                              terminal_read, chr_event, NULL, t, NULL, true);
-    migration_add_notifier(&t->migration_notifier,
-                           terminal_migration_notify);
+    /* A pending read migrates with the subchannel (see post_load). */
+    terminal_sch(t)->ccw_async_migratable = true;
+    t->vmstate_change = qemu_add_vm_change_state_handler(
+        terminal_vm_state_change, t);
 }
 
 static uint16_t decode_buffer_address(const uint8_t *address)
@@ -867,7 +982,11 @@ static bool terminal_send_record(Terminal3270 *t,
     size_t out = 0;
     int ret;
 
-    if (!t->connected || !t->ready) {
+    if (!terminal_attached(t)) {
+        if (t->persistent) {
+            /* Kept in the replay for the next client. */
+            return true;
+        }
         terminal_sch(t)->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return false;
     }
@@ -885,6 +1004,10 @@ static bool terminal_send_record(Terminal3270 *t,
     wire[out++] = IAC_EOR;
     ret = qemu_chr_fe_write_all(&t->chr, wire, out);
     if (ret != out) {
+        if (t->persistent) {
+            /* The client went away; the next one gets the screen. */
+            return true;
+        }
         terminal_sch(t)->sense_data[0] = SENSE_DATA_CHECK;
         return false;
     }
@@ -908,8 +1031,21 @@ static void terminal_remember_record(Terminal3270 *t,
 
     if (buf[0] == TN3270_CMD_EWRITE || buf[0] == TN3270_CMD_EWRITEA) {
         g_byte_array_set_size(t->replay, 0);
+        t->replay_lost = false;
     }
-    assert(terminal_replay_has_room(t, buf, len));
+    if (t->replay_lost) {
+        return;
+    }
+    if (!terminal_replay_has_room(t, buf, len)) {
+        /*
+         * The screen is built from more output than the replay keeps.
+         * That is no reason to fail the guest's write: forget the screen
+         * until the next erase, and give a later client the banner.
+         */
+        g_byte_array_set_size(t->replay, 0);
+        t->replay_lost = true;
+        return;
+    }
     stl_be_p(encoded_len, len);
     g_byte_array_append(t->replay, encoded_len, sizeof(encoded_len));
     g_byte_array_append(t->replay, buf, len);
@@ -971,7 +1107,7 @@ static int write_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     SubchDev *sch = terminal_sch(t);
     int ret;
 
-    if (!t->connected || !t->ready) {
+    if (!terminal_available(t)) {
         terminal_sch(t)->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return -EIO;
     }
@@ -996,10 +1132,6 @@ static int write_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     case TC_EAU:
         t->pos = 0;
         g_byte_array_set_size(t->write_record, 0);
-        if (!terminal_replay_has_room(t, &remote, 1)) {
-            sch->sense_data[0] = SENSE_DATA_CHECK;
-            return -EIO;
-        }
         if (!terminal_send_record(t, &remote, 1)) {
             return -EIO;
         }
@@ -1074,12 +1206,6 @@ static int write_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
         }
     }
 
-    if (!terminal_replay_has_room(t, t->write_record->data,
-                                  t->write_record->len)) {
-        g_byte_array_set_size(t->write_record, 0);
-        sch->sense_data[0] = SENSE_DATA_CHECK;
-        return -EIO;
-    }
     if (!terminal_send_record(t, t->write_record->data,
                               t->write_record->len)) {
         g_byte_array_set_size(t->write_record, 0);
@@ -1221,7 +1347,7 @@ static int read_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     uint8_t command;
     int ret;
 
-    if (!t->connected || !t->ready) {
+    if (!terminal_available(t)) {
         terminal_sch(t)->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return -EIO;
     }
@@ -1250,7 +1376,9 @@ static int read_payload_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
     } else {
         command = TN3270_CMD_READMOD;
     }
-    if (!terminal_send_record(t, &command, 1)) {
+    /* Without a client, the read waits for one (persistent terminal). */
+    t->read_unsent = !terminal_attached(t);
+    if (!t->read_unsent && !terminal_send_record(t, &command, 1)) {
         return -EIO;
     }
 
@@ -1300,8 +1428,7 @@ static int terminal_control_3270(EmulatedCcw3270Device *dev, CCW1 *ccw)
      * a client connects.
      */
     if (ccw->cmd_code != TC_SENSE && ccw->cmd_code != TC_SENSEID &&
-        ccw->cmd_code != TC_RCD &&
-        (!t->connected || !t->ready)) {
+        ccw->cmd_code != TC_RCD && !terminal_available(t)) {
         sch->sense_data[0] = SENSE_INTERVENTION_REQUIRED;
         return -EIO;
     }
@@ -1372,6 +1499,7 @@ static void terminal_reset_hold(Object *obj, ResetType type)
     terminal_clear_records(t);
     g_byte_array_set_size(t->write_record, 0);
     g_byte_array_set_size(t->replay, 0);
+    t->replay_lost = false;
     t->record_len = 0;
     t->subneg_len = 0;
     t->parse_state = TN3270_PARSE_DATA;
@@ -1380,26 +1508,13 @@ static void terminal_reset_hold(Object *obj, ResetType type)
     t->aid = 0;
 }
 
-static int terminal_migration_notify(NotifierWithReturn *notifier,
-                                     MigrationEvent *event, Error **errp)
+static int terminal_pre_load(void *opaque)
 {
-    Terminal3270 *t = container_of(notifier, Terminal3270,
-                                   migration_notifier);
+    Terminal3270 *t = opaque;
 
-    if (event->type == MIG_EVENT_SETUP && t->connected) {
-        /* TCP is external state: preserve the controller, then reconnect. */
-        if (t->read_pending) {
-            terminal_cancel_pending(t);
-            terminal_set_unit_check(t, SENSE_DATA_CHECK);
-            css_virtual_ccw_complete(terminal_sch(t), -EIO);
-        }
-        t->migration_disconnect = true;
-        t->reconnect_restore = true;
-        qemu_chr_fe_disconnect(&t->chr);
-        t->connected = false;
-        t->ready = false;
-        terminal_timer_cancel(t);
-    }
+    /* A stream without the "ccw" subsection has no pending read. */
+    t->read_pending = false;
+    t->replay_lost = false;
     return 0;
 }
 
@@ -1496,7 +1611,12 @@ static int terminal_post_load(void *opaque, int version_id)
         replay_offset += len;
     }
 
-    if (t->connected) {
+    /*
+     * Loading a state in a running QEMU (loadvm, a snapshot): a persistent
+     * terminal keeps its client and gives it the loaded screen when the VM
+     * runs; otherwise the client is disconnected and reconnects.
+     */
+    if (t->connected && !(t->persistent && t->ready)) {
         t->migration_disconnect = true;
         qemu_chr_fe_disconnect(&t->chr);
     }
@@ -1525,10 +1645,19 @@ static int terminal_post_load(void *opaque, int version_id)
     g_byte_array_append(t->replay, t->migration_replay,
                         t->migration_replay_len);
 
+    /*
+     * The pending read (with its subchannel, see ccw_async_migratable)
+     * goes to the client that sees the loaded screen, and completes when
+     * that client answers.
+     */
+    t->read_unsent = t->read_pending;
+    t->record_len = 0;
+    if (t->connected && t->persistent && t->ready) {
+        t->resend_screen = true;
+        return 0;
+    }
     t->connected = false;
     t->ready = false;
-    t->read_pending = false;
-    t->record_len = 0;
     t->subneg_len = 0;
     t->parse_state = TN3270_PARSE_DATA;
     t->local_binary = false;
@@ -1606,18 +1735,55 @@ static void terminal_unrealize(DeviceState *dev)
 
     terminal_sch(t)->enable_cb = NULL;
     terminal_sch(t)->status_clear_cb = NULL;
-    migration_remove_notifier(&t->migration_notifier);
+    g_clear_pointer(&t->vmstate_change, qemu_del_vm_change_state_handler);
     qemu_chr_fe_deinit(&t->chr, false);
 }
 
 static const Property terminal_properties[] = {
     DEFINE_PROP_CHR("chardev", Terminal3270, chr),
+    /*
+     * on: the display stays available to the guest while no TN3270 client
+     * is attached, and a client that attaches gets the current screen.
+     * off: like a display that is switched off, I/O fails with intervention
+     * required, and an attaching client gets the banner and device end.
+     */
+    DEFINE_PROP_BOOL("persistent", Terminal3270, persistent, true),
+};
+
+static bool terminal_ccw_needed(void *opaque)
+{
+    return true;
+}
+
+/*
+ * The subchannel (status, sense, the channel program and, through
+ * ccw_async_migratable, a pending read with its data stream) and the
+ * terminal state that goes with it.  Older streams lack it.
+ */
+static const VMStateDescription terminal3270_vmstate_ccw = {
+    .name = TYPE_TERMINAL_3270 "/ccw",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = terminal_ccw_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_CCW_DEVICE(cdev.parent_obj, Terminal3270),
+        VMSTATE_BOOL(read_pending, Terminal3270),
+        VMSTATE_UINT8(pending_ccw.cmd_code, Terminal3270),
+        VMSTATE_UINT8(pending_ccw.flags, Terminal3270),
+        VMSTATE_UINT16(pending_ccw.count, Terminal3270),
+        VMSTATE_UINT32(pending_ccw.cda, Terminal3270),
+        VMSTATE_BOOL(attention_pending, Terminal3270),
+        VMSTATE_BOOL(device_end_pending, Terminal3270),
+        VMSTATE_BOOL(replay_lost, Terminal3270),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static const VMStateDescription terminal3270_vmstate = {
     .name = TYPE_TERMINAL_3270,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = terminal_pre_load,
     .pre_save = terminal_pre_save,
     .post_load = terminal_post_load,
     .fields = (const VMStateField[]) {
@@ -1647,6 +1813,10 @@ static const VMStateDescription terminal3270_vmstate = {
         VMSTATE_VBUFFER_ALLOC_UINT32(migration_replay, Terminal3270, 1, NULL,
                                      migration_replay_len),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &terminal3270_vmstate_ccw,
+        NULL
     },
 };
 

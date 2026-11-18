@@ -73,16 +73,35 @@ The supported terminal types are ``IBM-DYNAMIC``, ``IBM-3179-2``,
 ``IBM-3180-2``, ``IBM-3277-2``, and IBM 3278/3279 models 2 through 5, with or
 without the ``-E`` extended-attribute suffix.
 
-Migration disconnects the external TCP peer; it is not possible to migrate a
-live TCP stream transparently. Controller state, queued complete records, a
-partial chained record, and a bounded display replay log are migrated. After
-the terminal reconnects at the destination, QEMU renegotiates TN3270 and
-replays the display state. If it reconnects with a different model, QEMU drops
-geometry-dependent queued and replay state. The replay log contains
-guest-issued display commands; keyboard edits which have not yet been sent by
-the terminal client are external state and cannot be preserved. The log is
-limited to 4 MiB; a display command which would exceed that limit completes
-with data check without being sent.
+Terminal clients come and go
+----------------------------
+
+By default (``persistent=on``) the display stays available to the guest while
+no TN3270 client is attached, like the display of a console controller that is
+only switched off: writes complete, a read waits for a client, and the guest
+sees no status when a client attaches or leaves. QEMU keeps the screen as the
+guest wrote it (the replay of the data stream since the last Erase/Write, at
+most 4 MiB) together with unread input. A client that attaches gets the
+current screen and, if the guest is waiting in a read, the read; a client that
+leaves takes only its unsent keyboard input with it. Before the guest has
+written anything, and after the replay limit was exceeded until the next
+Erase/Write, an attaching client gets the connection banner and the guest a
+Device End, so that it redraws. A client of a different model also gets the
+banner and Device End.
+
+With ``persistent=off`` the display behaves like a terminal that is switched
+off while no client is attached: I/O ends with Unit Check (intervention
+required), a pending read ends with data check when its client leaves, and an
+attaching client gets the banner while the guest gets Device End.
+
+Migration and snapshots carry the subchannel (including a read in progress),
+the controller state, queued complete records, a partial chained record and
+the display replay. The TN3270 connection itself is not migrated: a client of
+the destination gets the replayed screen and the pending read. Loading a
+snapshot in a running QEMU keeps a persistent terminal's client attached and
+gives it the loaded screen. If a client reconnects with a different model,
+QEMU drops the geometry-dependent replay. Keyboard edits which the client has
+not sent yet cannot be preserved.
 
 SCLP integrated 3270 console
 ----------------------------

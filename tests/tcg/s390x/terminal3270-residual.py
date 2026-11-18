@@ -25,7 +25,7 @@ def main():
             "-chardev",
             (f"socket,id=tn,path={terminal_path},server=on,"
              "wait=off,tn3270=on"),
-            "-device", "x-terminal3270,chardev=tn,devno=fe.0.0301",
+            "-device", "x-terminal3270,chardev=tn,devno=fe.0.0301,persistent=off",
             "-kernel", guest,
         ], timeout=10).returncode
 

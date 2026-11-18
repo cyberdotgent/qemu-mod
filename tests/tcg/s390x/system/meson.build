@@ -294,6 +294,11 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../terminal3270-clear.py')],
   },
+  # A persistent terminal keeps the screen and a read for the next client.
+  'terminal3270-detach.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../terminal3270-detach.py')],
+  },
   'tape-write.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../tape-write.py')],
