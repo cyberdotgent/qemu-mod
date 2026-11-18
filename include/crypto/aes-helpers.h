@@ -7,6 +7,20 @@
 #ifndef QEMU_AES_HELPERS_H
 #define QEMU_AES_HELPERS_H
 
+/*
+ * OpenSSL's libcrypto has an AES_cbc_encrypt() with a different signature.
+ * Like crypto/aes.h, rename ours, so that a library calling OpenSSL's
+ * (e.g. Ceph's libceph-common, loaded with librbd) can never bind to
+ * QEMU's when the linker exports it from the executable.
+ */
+#define AES_xor QEMU_AES_xor
+#define AES_cbc_encrypt QEMU_AES_cbc_encrypt
+#define AES_cbc_decrypt QEMU_AES_cbc_decrypt
+#define AES_ctr_encrypt QEMU_AES_ctr_encrypt
+#define AES_xts_prep_next_tweak QEMU_AES_xts_prep_next_tweak
+#define AES_xts_encrypt QEMU_AES_xts_encrypt
+#define AES_xts_decrypt QEMU_AES_xts_decrypt
+
 /**
  * AES_xor:
  * @src1: first source buffer of AES_BLOCK_SIZE bytes
