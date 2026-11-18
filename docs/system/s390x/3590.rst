@@ -102,6 +102,9 @@ state fails when the destination drive has no medium although a loaded tape
 migrated, when a read-only medium differs in AWS data length from the
 migrated one, or when the migrated position is not a block boundary of the
 mounted medium (a record or tape-mark header whose backward link matches).  A
-writable medium may have grown after the destination opened it, so only the
-position check applies.  A drive whose tray was open on the source stays
-open; closing it remounts the medium at load point.
+writable medium may still be written by the source while the destination
+starts, so the destination does not parse it at startup and checks only the
+position, when the VM starts running there; if that check fails, the drive
+is presented unloaded (tray open) and an error is logged.  A drive whose tray
+was open on the source stays open; closing it remounts the medium at load
+point.

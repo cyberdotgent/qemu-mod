@@ -331,6 +331,45 @@ static void test_migration_other_medium(void)
     unlink(other);
 }
 
+/*
+ * A writable medium may still grow while the destination starts: an
+ * incomplete record at its tail must not keep the destination from
+ * starting, the migrated position is what counts.
+ */
+static void test_migration_writable_growing(void)
+{
+    static const uint8_t partial[] = { 0x00, 0x10, 0x00, 0x00, 0xa0 };
+    g_autofree char *path = create_aws_image();
+    g_autofree char *state = NULL;
+    g_autofree char *status = NULL;
+    QTestState *src, *dst;
+    int fd = g_file_open_tmp("qemu-3590-state-XXXXXX", &state, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    src = qtest_initf("-nodefaults -S -dev3590 file=%s,devno=580,"
+                      "readonly=off,id=tape0", path);
+    g_free(status);
+    status = migrate_to_file(src, state);
+    g_assert_cmpstr(status, ==, "completed");
+    qtest_quit(src);
+
+    fd = open(path, O_WRONLY | O_APPEND);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, partial, sizeof(partial)), ==, sizeof(partial));
+    close(fd);
+
+    dst = qtest_initf("-nodefaults -S -dev3590 file=%s,devno=580,"
+                      "readonly=off,id=tape0 -incoming defer", path);
+    g_free(status);
+    status = migrate_from_file(dst, state);
+    g_assert_cmpstr(status, ==, "completed");
+    g_assert_false(tape_tray_open(dst));
+    qtest_quit(dst);
+    unlink(state);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -347,5 +386,7 @@ int main(int argc, char **argv)
                    test_migration_no_medium);
     qtest_add_func("/3590-ccw/migration-other-medium",
                    test_migration_other_medium);
+    qtest_add_func("/3590-ccw/migration-writable-growing",
+                   test_migration_writable_growing);
     return g_test_run();
 }

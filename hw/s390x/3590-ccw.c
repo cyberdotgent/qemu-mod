@@ -19,6 +19,7 @@
 #include "system/block-backend.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 #define TAPE3590_CHPID_TYPE       0x1b
@@ -106,6 +107,9 @@ struct Tape3590CcwDevice {
     uint8_t partition_id[11];
     /* Medium length parsed on the migration destination, or -1 */
     int64_t local_length;
+    /* A migrated position on a writable medium awaits validation */
+    bool restore_pending;
+    VMChangeStateEntry *vmstate_change;
 };
 
 static const TapeIdentity *tape3590_find_identity(const char *name)
@@ -595,6 +599,9 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
     }
 }
 
+static void tape3590_vm_state_change(void *opaque, bool running,
+                                     RunState state);
+
 static void tape3590_realize(DeviceState *dev, Error **errp)
 {
     Tape3590CcwDevice *tape = TAPE_3590_CCW(dev);
@@ -634,13 +641,24 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
         return;
     }
     tape->tray_open = !blk_is_inserted(tape->blk);
-    if (!tape->tray_open) {
+    if (!tape->tray_open && runstate_check(RUN_STATE_INMIGRATE) &&
+        blk_is_writable(tape->blk)) {
+        /*
+         * The source may still be writing this medium, so its tail can be
+         * an incomplete record.  The incoming state supplies the position
+         * and length, which post_load checks against the medium.
+         */
+        tape->medium.blk = tape->blk;
+        tape->medium.length = -1;
+    } else if (!tape->tray_open) {
         aws_tape_init(&tape->medium, tape->blk, errp);
         if (*errp) {
             return;
         }
     }
     blk_set_dev_ops(tape->blk, &tape3590_block_ops, tape);
+    tape->vmstate_change = qemu_add_vm_change_state_handler(
+        tape3590_vm_state_change, tape);
     tape->record = g_malloc(AWS_TAPE_MAX_RECORD);
     sch = css_create_sch_at(cdev->devno, TAPE3590_AUTO_DEVNO, errp);
     if (!sch) {
@@ -675,12 +693,19 @@ fail_sch:
     cdev->sch = NULL;
     g_free(sch);
 fail_record:
+    qemu_del_vm_change_state_handler(tape->vmstate_change);
+    tape->vmstate_change = NULL;
     g_clear_pointer(&tape->record, g_free);
 }
 
 static void tape3590_unrealize(DeviceState *dev)
 {
     Tape3590CcwDevice *tape = TAPE_3590_CCW(dev);
+
+    if (tape->vmstate_change) {
+        qemu_del_vm_change_state_handler(tape->vmstate_change);
+        tape->vmstate_change = NULL;
+    }
     g_clear_pointer(&tape->record, g_free);
 }
 
@@ -724,7 +749,7 @@ static int tape3590_post_load(void *opaque, int version_id)
      * The medium is supplied by the management layer.  A read-only volume
      * must be the same image as on the source; a writable one may have
      * grown after the destination opened it, so only the position check
-     * applies.
+     * applies, once the VM runs.
      */
     if (!blk_is_writable(tape->blk) &&
         tape->local_length != tape->medium.length) {
@@ -733,11 +758,43 @@ static int tape3590_post_load(void *opaque, int version_id)
                      sch->devno, tape->local_length, tape->medium.length);
         return -EINVAL;
     }
+    if (blk_is_writable(tape->blk)) {
+        /*
+         * The destination's view of a medium the source wrote to is only
+         * current once the block layer reactivates it for the running VM.
+         */
+        tape->restore_pending = true;
+        return 0;
+    }
     if (!aws_tape_restore(&tape->medium, tape->blk, &local_err)) {
         error_reportf_err(local_err, "3590-ccw %04x: ", sch->devno);
         return -EINVAL;
     }
     return 0;
+}
+
+static void tape3590_vm_state_change(void *opaque, bool running,
+                                     RunState state)
+{
+    Tape3590CcwDevice *tape = opaque;
+    Error *local_err = NULL;
+
+    if (!running || !tape->restore_pending) {
+        return;
+    }
+    tape->restore_pending = false;
+    if (!blk_is_inserted(tape->blk) ||
+        !aws_tape_restore(&tape->medium, tape->blk, &local_err)) {
+        /*
+         * Present the drive unloaded rather than reading or writing at a
+         * position that does not exist on this medium.
+         */
+        error_reportf_err(local_err, "3590-ccw %04x: migrated position "
+                          "unusable, medium unloaded: ",
+                          CCW_DEVICE(tape)->sch->devno);
+        tape->tray_open = true;
+        aws_tape_rewind(&tape->medium);
+    }
 }
 
 /*
