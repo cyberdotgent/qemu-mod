@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 
+#include "block/accounting.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/css-bridge.h"
 #include "hw/s390x/fba-ccw.h"
@@ -87,6 +88,15 @@ struct FBACcwDevice {
     uint16_t consumed_blocks;
     bool io_is_read;
     bool completion_overrun;
+
+    /* A block was written since the last successful flush. */
+    bool dirty;
+    /* The current channel program wrote a block. */
+    bool program_wrote;
+    /* Completion of the final CCW, presented once the flush completes. */
+    int flush_completion;
+    uint8_t flush_sense;
+    BlockAcctCookie flush_acct;
 };
 
 static void fba_set_length_status(FBACcwDevice *fba, const CCW1 *ccw,
@@ -161,15 +171,81 @@ static void fba_free_request(FBACcwDevice *fba)
     fba->consumed_blocks = 0;
 }
 
+/* Present the final result of an asynchronously completed CCW. */
+static void fba_complete(FBACcwDevice *fba, int completion, uint8_t sense)
+{
+    SubchDev *sch = CCW_DEVICE(fba)->sch;
+
+    if (sense) {
+        completion = fba_unit_check(fba, sense);
+    }
+    css_virtual_ccw_complete(sch, completion);
+}
+
+static void fba_flush_complete(void *opaque, int ret)
+{
+    FBACcwDevice *fba = opaque;
+    int completion = fba->flush_completion;
+    uint8_t sense = fba->flush_sense;
+
+    fba->aiocb = NULL;
+    if (ret < 0) {
+        block_acct_failed(blk_get_stats(fba->blk), &fba->flush_acct);
+        /* The data did not reach stable storage: report it as a write. */
+        if (!completion && !sense) {
+            sense = FBA_SENSE_EQUIPMENT_CHECK;
+        }
+    } else {
+        block_acct_done(blk_get_stats(fba->blk), &fba->flush_acct);
+        fba->dirty = false;
+    }
+    fba_complete(fba, completion, sense);
+}
+
+/*
+ * A real DASD control unit acknowledges a write once the data is in its
+ * battery-backed nonvolatile storage (NVS): when a channel program ends,
+ * everything it wrote survives a power loss, and z/OS and z/VSE rely on
+ * that.  The backend may cache writes (host page cache, cache=writeback),
+ * so flush it before the final status of every channel program that wrote
+ * a block, including programs ending in unit check: error recovery
+ * redrives a program from the failing CCW, assuming that the writes before
+ * it are complete.
+ *
+ * Channel programs which wrote nothing do not flush.  In particular, after
+ * a failed flush the next Sense must not fail as well; the unhardened data
+ * is flushed again by the next writing program, a reset, or unplug.
+ *
+ * Start the flush if the channel program ends with this CCW and return
+ * true; fba_flush_complete() then presents @completion and @sense.
+ */
+static bool fba_start_flush(FBACcwDevice *fba, const CCW1 *ccw,
+                            int completion, uint8_t sense)
+{
+    SubchDev *sch = CCW_DEVICE(fba)->sch;
+    bool ends = completion || sense || css_ccw_ends_program(sch, ccw, 0);
+
+    if (!fba->program_wrote || !ends) {
+        return false;
+    }
+    fba->flush_completion = completion;
+    fba->flush_sense = sense;
+    block_acct_start(blk_get_stats(fba->blk), &fba->flush_acct, 0,
+                     BLOCK_ACCT_FLUSH);
+    fba->aiocb = blk_aio_flush(fba->blk, fba_flush_complete, fba);
+    return true;
+}
+
 static void fba_aio_complete(void *opaque, int ret)
 {
     FBACcwDevice *fba = opaque;
     SubchDev *sch = CCW_DEVICE(fba)->sch;
     int completion = 0;
+    uint8_t sense = 0;
 
     fba->aiocb = NULL;
     if (ret < 0) {
-        completion = fba_unit_check(fba, FBA_SENSE_EQUIPMENT_CHECK);
+        sense = FBA_SENSE_EQUIPMENT_CHECK;
     } else if (fba->io_is_read &&
                fba_write_guest(fba, fba->io_buffer, fba->guest_length)) {
         completion = -EFAULT;
@@ -178,11 +254,14 @@ static void fba_aio_complete(void *opaque, int ret)
         fba->byte_offset += fba->io_is_read ? fba->guest_length
                                             : fba->io_length;
         if (fba->completion_overrun) {
-            completion = fba_unit_check(fba, FBA_SENSE_OVERRUN);
+            sense = FBA_SENSE_OVERRUN;
         }
     }
     fba_free_request(fba);
-    css_virtual_ccw_complete(sch, completion);
+    /* css sets last_cmd to the CCW before it waits for the completion. */
+    if (!fba_start_flush(fba, &sch->last_cmd, completion, sense)) {
+        fba_complete(fba, completion, sense);
+    }
 }
 
 static int fba_start_io(FBACcwDevice *fba, CCW1 *ccw, bool read)
@@ -242,6 +321,8 @@ static int fba_start_io(FBACcwDevice *fba, CCW1 *ccw, bool read)
             fba_free_request(fba);
             return ret;
         }
+        fba->dirty = true;
+        fba->program_wrote = true;
         fba->aiocb = blk_aio_pwritev(fba->blk, fba->byte_offset,
                                      &fba->qiov, 0, fba_aio_complete, fba);
     } else {
@@ -251,7 +332,7 @@ static int fba_start_io(FBACcwDevice *fba, CCW1 *ccw, bool read)
     return CSS_CCW_PENDING;
 }
 
-static int fba_ccw_cb(SubchDev *sch, CCW1 ccw)
+static int fba_ccw_cmd(SubchDev *sch, CCW1 ccw)
 {
     FBACcwDevice *fba = sch->driver_data;
     uint8_t buf[32] = { 0 };
@@ -463,6 +544,49 @@ static int fba_ccw_cb(SubchDev *sch, CCW1 ccw)
     }
 }
 
+/* Harden the writes of a program that ended in error or was cut short. */
+static void fba_flush_dirty(FBACcwDevice *fba)
+{
+    BlockAcctStats *stats = blk_get_stats(fba->blk);
+    BlockAcctCookie cookie;
+
+    if (!fba->dirty) {
+        return;
+    }
+    block_acct_start(stats, &cookie, 0, BLOCK_ACCT_FLUSH);
+    if (blk_flush(fba->blk) == 0) {
+        block_acct_done(stats, &cookie);
+        fba->dirty = false;
+    } else {
+        block_acct_failed(stats, &cookie);
+    }
+}
+
+static int fba_ccw_cb(SubchDev *sch, CCW1 ccw)
+{
+    FBACcwDevice *fba = sch->driver_data;
+    int ret;
+
+    if (!sch->last_cmd_valid) {
+        fba->program_wrote = false;
+    }
+    ret = fba_ccw_cmd(sch, ccw);
+    if (!fba->program_wrote || !css_ccw_ends_program(sch, &ccw, ret)) {
+        return ret;
+    }
+    if (ret == 0) {
+        /* A successful last CCW: present its status after the flush. */
+        fba_start_flush(fba, &ccw, 0, 0);
+        return CSS_CCW_PENDING;
+    }
+    /*
+     * The program ends in error and the status is already set up.  This
+     * is a rare path; flush synchronously rather than defer the status.
+     */
+    fba_flush_dirty(fba);
+    return ret;
+}
+
 static void fba_cancel(SubchDev *sch)
 {
     FBACcwDevice *fba = sch->driver_data;
@@ -480,6 +604,7 @@ static void fba_reset_hold(Object *obj, ResetType type)
     if (fba->aiocb) {
         blk_aio_cancel(fba->aiocb);
     }
+    fba_flush_dirty(fba);
     fba->extent_defined = false;
     fba->ipl_positioned = false;
     fba->reserved = false;
@@ -590,6 +715,7 @@ static void fba_unrealize(DeviceState *dev)
     if (fba->aiocb) {
         blk_aio_cancel(fba->aiocb);
     }
+    fba_flush_dirty(fba);
 }
 
 static const Property fba_properties[] = {

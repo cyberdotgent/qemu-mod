@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 
 #include "hw/s390x/ckd-image.h"
+#include "block/accounting.h"
 #include "qemu/bswap.h"
 #include "qemu/cutils.h"
 #include "qemu/memalign.h"
@@ -233,6 +234,9 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp)
 
 void ckd_image_close(CkdImage *image)
 {
+    if (image->blk) {
+        ckd_image_flush(image);
+    }
     g_clear_pointer(&image->track, qemu_vfree);
     image->blk = NULL;
 }
@@ -303,6 +307,8 @@ int ckd_image_store_track(CkdImage *image, uint16_t cylinder, uint16_t head,
 
     track_number = (uint64_t)cylinder * image->heads + head;
     offset = CKD_IMAGE_HEADER_SIZE + track_number * image->track_size;
+    image->dirty = true;
+    image->write_count++;
     ret = blk_pwrite(image->blk, offset, image->track_size, image->track, 0);
     if (ret < 0) {
         image->track_loaded = false;
@@ -327,7 +333,28 @@ const CkdImageRecord *ckd_image_find_record(const CkdImage *image,
     return NULL;
 }
 
+/*
+ * Make the tracks written since the last flush durable.  Nothing is done
+ * when no track was written, so read-only channel programs cost nothing.
+ * After a failed flush the image stays dirty and the next flush retries.
+ */
 int ckd_image_flush(CkdImage *image)
 {
-    return blk_flush(image->blk);
+    BlockAcctStats *stats;
+    BlockAcctCookie cookie;
+    int ret;
+
+    if (!image->dirty) {
+        return 0;
+    }
+    stats = blk_get_stats(image->blk);
+    block_acct_start(stats, &cookie, 0, BLOCK_ACCT_FLUSH);
+    ret = blk_flush(image->blk);
+    if (ret == 0) {
+        block_acct_done(stats, &cookie);
+        image->dirty = false;
+    } else {
+        block_acct_failed(stats, &cookie);
+    }
+    return ret;
 }

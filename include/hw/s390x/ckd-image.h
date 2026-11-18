@@ -32,6 +32,10 @@ typedef struct CkdImage {
     uint32_t heads;
     uint32_t track_size;
     uint8_t serial[12];
+    /* A track was written since the last successful flush. */
+    bool dirty;
+    /* Number of track writes, to tell whether a channel program wrote. */
+    uint64_t write_count;
 
     uint8_t *track;
     uint16_t loaded_cylinder;

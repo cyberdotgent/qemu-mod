@@ -163,6 +163,8 @@ struct EckdCcwDevice {
      * and then the following records.  Valid for the next command only.
      */
     bool update_done;
+    /* image.write_count when the current channel program started. */
+    uint64_t program_write_count;
     uint8_t update_done_record;
 
     uint8_t read_command;
@@ -1306,7 +1308,7 @@ static int eckd_sense(EckdCcwDevice *eckd, const CCW1 *ccw)
     return eckd_copy_response(eckd, ccw, sense, sizeof(sense));
 }
 
-static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
+static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
 {
     EckdCcwDevice *eckd = sch->driver_data;
     uint8_t buf[256] = { 0 };
@@ -1800,6 +1802,40 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     }
 }
 
+/*
+ * A real DASD control unit acknowledges a write once the data is in its
+ * battery-backed nonvolatile storage (NVS): when a channel program ends,
+ * everything it wrote survives a power loss, and z/OS and z/VSE rely on
+ * that (journals, catalogs, VSAM, JES2 checkpoints).  The image writes go
+ * through the host page cache or a write-back cache of the block layer, so
+ * flush the backend before the final status of every channel program that
+ * wrote a track.  This includes programs ending in unit check: error
+ * recovery redrives a program from the failing CCW, assuming that the
+ * writes before it are complete.  ECKD I/O is synchronous, so the flush is
+ * too.
+ *
+ * Channel programs which wrote nothing do not flush.  In particular, after
+ * a failed flush the next Sense must not fail as well; the unhardened data
+ * is flushed again by the next writing program, a reset, or unplug.
+ */
+static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
+{
+    EckdCcwDevice *eckd = sch->driver_data;
+    int ret;
+
+    if (!sch->last_cmd_valid) {
+        eckd->program_write_count = eckd->image.write_count;
+    }
+    ret = eckd_ccw_cmd(sch, ccw);
+    if (eckd->image.write_count != eckd->program_write_count &&
+        css_ccw_ends_program(sch, &ccw, ret) &&
+        ckd_image_flush(&eckd->image) < 0 && ret == 0) {
+        /* The data did not reach stable storage: report it as a write. */
+        return eckd_unit_check(eckd, SENSE_EQUIPMENT_CHECK, 0);
+    }
+    return ret;
+}
+
 static void eckd_reset_hold(Object *obj, ResetType type)
 {
     EckdCcwDevice *eckd = ECKD_CCW(obj);
@@ -1817,6 +1853,8 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->update_active = false;
     eckd->update_done = false;
     eckd->read_active = false;
+    /* Writes of a program cut short by the reset are still hardened. */
+    ckd_image_flush(&eckd->image);
     if (ec->parent_phases.hold) {
         ec->parent_phases.hold(obj, type);
     }

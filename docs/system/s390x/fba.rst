@@ -36,6 +36,20 @@ Read and Reset Buffered Log, Reserve, and Sense ID.  Reserve state is local to
 one QEMU device and is migrated, but reservations are not coordinated between
 separate QEMU processes sharing storage.
 
+Write durability
+----------------
+
+Like a real DASD control unit, which acknowledges a write once the data is in
+its battery-backed nonvolatile storage, the device flushes its block backend
+before it presents the final status of a channel program that wrote a block.
+The guest can therefore rely on the data surviving a host crash once the
+channel program has ended, also with ``cache=writeback`` or ``cache=none``.
+If the flush fails, the channel program ends with unit check and equipment
+check; the data is flushed again by the next channel program that writes.
+Channel programs which only read do not flush. The flushes appear in the
+``flush_operations`` and ``failed_flush_operations`` counters of
+``query-blockstats``.
+
 IPL
 ---
 

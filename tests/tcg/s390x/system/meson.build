@@ -248,6 +248,11 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../eckd-blank.py')],
   },
+  # Runs under TCG unless DASD_TEST_ACCEL says otherwise.
+  'dasd-flush.c': {
+    'cflags': [ccw_cflags],
+    'wrapper': [python, files('../dasd-flush.py')],
+  },
   'native-ipl.c': {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../native-ipl.py')],

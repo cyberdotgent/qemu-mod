@@ -174,6 +174,28 @@ struct SubchDev {
 /* A virtual device owns the current CCW and will complete it asynchronously. */
 #define CSS_CCW_PENDING (-EINPROGRESS)
 
+/*
+ * Whether the channel program ends once @ccw completes with @ret, the value
+ * a ccw_cb returned (or passes to css_virtual_ccw_complete()).  This
+ * mirrors the chaining rule of the virtual channel subsystem: an error ends
+ * the program, and a successful CCW ends it unless it is command or data
+ * chained and no channel status other than PCI terminated the chaining.
+ * A device which must finish work before the final status (for example a
+ * DASD hardening its writes) uses this to recognise the last CCW.
+ */
+static inline bool css_ccw_ends_program(const SubchDev *sch, const CCW1 *ccw,
+                                        int ret)
+{
+    if (ret == CSS_CCW_PENDING) {
+        return false;
+    }
+    if (ret) {
+        return true;
+    }
+    return !(ccw->flags & (CCW_FLAG_CC | CCW_FLAG_DC)) ||
+           (sch->curr_status.scsw.cstat & ~SCSW_CSTAT_PCI);
+}
+
 static inline void sch_gen_unit_exception(SubchDev *sch)
 {
     sch->curr_status.scsw.ctrl &= ~(SCSW_ACTL_DEVICE_ACTIVE |

@@ -76,6 +76,20 @@ first write to the track stores the complete track in the slot. A slot which
 is neither all zero nor a valid track is reported to the guest as an invalid
 track.
 
+Write durability
+----------------
+
+Like a real DASD control unit, which acknowledges a write once the data is in
+its battery-backed nonvolatile storage, the device flushes its block backend
+before it presents the final status of a channel program that wrote a track.
+The guest can therefore rely on the data surviving a host crash once the
+channel program has ended, also with ``cache=writeback`` or ``cache=none``.
+If the flush fails, the channel program ends with unit check and equipment
+check; the data is flushed again by the next channel program that writes.
+Channel programs which only read do not flush. The flushes appear in the
+``flush_operations`` and ``failed_flush_operations`` counters of
+``query-blockstats``.
+
 Image creation
 --------------
 
