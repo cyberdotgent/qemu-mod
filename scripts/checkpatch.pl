@@ -1885,8 +1885,6 @@ sub process {
 # Provenance is still recorded: AI-assisted commits keep their Co-Authored-By
 # trailer, which is the actual record.  Upstream scripts/checkpatch.pl retains
 # the check, so nothing here weakens the gate on contributions to QEMU proper.
-# See docs/devel/code-provenance.rst, whose policy governs what may be
-# *submitted* upstream, not what may live in a private tree.
 #
 # Keep this comment where the check used to be: if upstream ever touches that
 # code, the merge conflict lands here and explains itself.

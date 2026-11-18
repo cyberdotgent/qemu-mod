@@ -376,8 +376,7 @@ Patch emails must include a ``Signed-off-by:`` line
 
 Your patches **must** include a Signed-off-by: line. This is a hard
 requirement because it's how you say "I'm legally okay to contribute
-this and happy for it to go into QEMU". For full guidance, read the
-:ref:`code-provenance` documentation.
+this and happy for it to go into QEMU".
 
 
 .. _include_a_meaningful_cover_letter:
