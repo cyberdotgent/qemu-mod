@@ -725,6 +725,7 @@ static int check_se_sparse_const_header(VMDKSESparseConstHeader *header,
 {
     header->magic = le64_to_cpu(header->magic);
     header->version = le64_to_cpu(header->version);
+    header->capacity = le64_to_cpu(header->capacity);
     header->grain_size = le64_to_cpu(header->grain_size);
     header->grain_table_size = le64_to_cpu(header->grain_table_size);
     header->flags = le64_to_cpu(header->flags);
