@@ -21,6 +21,7 @@
 #include "hw/s390x/adapter.h"
 #include "hw/s390x/css.h"
 #include "migration/qemu-file-types.h"
+#include "system/runstate.h"
 #include "trace.h"
 #include "qom/object.h"
 
@@ -33,6 +34,8 @@ struct KVMS390FLICState{
 
     uint32_t fd;
     bool clear_io_supported;
+    /* the state was saved: pfault is off, enable it when the VM runs again */
+    bool pfault_off_by_save;
 };
 
 static KVMS390FLICState *s390_get_kvm_flic(S390FLICState *fs)
@@ -413,6 +416,60 @@ static void kvm_s390_release_adapter_routes(S390FLICState *fs,
  * increase until buffer is sufficient or maximum size is
  * reached
  */
+/*
+ * Getting the pending interrupts test-and-clears the adapter interrupts
+ * pending in the GISA (get_all_floating_irqs() in KVM): they are meant to
+ * be re-created on the migration destination.  A VM that continues here
+ * (a snapshot, savevm, a failed or cancelled migration) would lose them,
+ * and with them, for example, a virtio-ccw notification: virtio-ccw only
+ * interrupts again once the guest has handled the summary indicator, so
+ * the device's queues stall for good.  Make them pending again; an adapter
+ * interrupt more than needed only makes the guest scan its indicators.
+ */
+static void flic_reinject_adapter_irqs(KVMS390FLICState *flic,
+                                       struct kvm_s390_irq *irqs, int count)
+{
+    uint8_t iscs = 0;
+    int i, isc;
+
+    for (i = 0; i < count; i++) {
+        if (irqs[i].type > KVM_S390_INT_IO_MAX ||
+            !(irqs[i].type & KVM_S390_INT_IO_AI_MASK)) {
+            continue;
+        }
+        iscs |= 0x80 >> ((irqs[i].u.io.io_int_word & 0x38000000) >> 27);
+    }
+    for (isc = 0; isc <= MAX_ISC; isc++) {
+        struct kvm_s390_irq irq = {
+            .type = KVM_S390_INT_IO(1, 0, 0, 0),
+            .u.io.io_int_word = ((uint32_t)isc << 27) | 0x80000000,
+        };
+
+        if (!(iscs & (0x80 >> isc))) {
+            continue;
+        }
+        if (flic_enqueue_irqs(&irq, sizeof(irq), flic)) {
+            error_report("flic: couldn't re-inject the adapter interrupt "
+                         "for isc %d", isc);
+        }
+    }
+}
+
+/*
+ * Saving the state disables pfault (see kvm_flic_save()).  A VM that
+ * continues on this host afterwards gets it back.
+ */
+static void kvm_flic_vm_state_change(void *opaque, bool running,
+                                     RunState state)
+{
+    KVMS390FLICState *flic = opaque;
+
+    if (running && flic->pfault_off_by_save) {
+        flic->pfault_off_by_save = false;
+        flic_enable_pfault(flic);
+    }
+}
+
 static int kvm_flic_save(QEMUFile *f, void *opaque, size_t size,
                          const VMStateField *field, JSONWriter *vmdesc)
 {
@@ -423,6 +480,7 @@ static int kvm_flic_save(QEMUFile *f, void *opaque, size_t size,
     int r = 0;
 
     flic_disable_wait_pfault((struct KVMS390FLICState *) opaque);
+    flic->pfault_off_by_save = true;
 
     buf = g_try_malloc0(len);
     if (!buf) {
@@ -447,6 +505,7 @@ static int kvm_flic_save(QEMUFile *f, void *opaque, size_t size,
         qemu_put_be64(f, count);
         qemu_put_buffer(f, (uint8_t *) buf,
                         count * sizeof(struct kvm_s390_irq));
+        flic_reinject_adapter_irqs(flic, buf, count);
     }
     g_free(buf);
 
@@ -636,6 +695,7 @@ static void kvm_s390_flic_realize(DeviceState *dev, Error **errp)
     test_attr.group = KVM_DEV_FLIC_CLEAR_IO_IRQ;
     flic_state->clear_io_supported = !ioctl(flic_state->fd,
                                             KVM_HAS_DEVICE_ATTR, &test_attr);
+    qemu_add_vm_change_state_handler(kvm_flic_vm_state_change, flic_state);
 }
 
 static void kvm_s390_flic_reset(DeviceState *dev)
