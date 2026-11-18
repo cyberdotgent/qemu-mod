@@ -40,6 +40,62 @@ static char *create_malformed_aws_image(void)
     return path;
 }
 
+static char *create_other_aws_image(void)
+{
+    /* One four-byte record and a tape mark */
+    static const uint8_t image[] = {
+        0x04, 0x00, 0x00, 0x00, 0xa0, 0x00, 'Q', 'E', 'M', 'U',
+        0x00, 0x00, 0x04, 0x00, 0x40, 0x00,
+    };
+    char *path = NULL;
+    int fd = g_file_open_tmp("qemu-3590-other-XXXXXX.aws", &path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, image, sizeof(image)), ==, sizeof(image));
+    close(fd);
+    return path;
+}
+
+static char *wait_migration(QTestState *qts)
+{
+    for (;;) {
+        QDict *rsp = qtest_qmp(qts, "{'execute': 'query-migrate'}");
+        QDict *ret = qdict_get_qdict(rsp, "return");
+        const char *status = ret && qdict_haskey(ret, "status") ?
+                             qdict_get_str(ret, "status") : "none";
+
+        if (!strcmp(status, "completed") || !strcmp(status, "failed")) {
+            char *result = g_strdup(status);
+
+            qobject_unref(rsp);
+            return result;
+        }
+        qobject_unref(rsp);
+        g_usleep(10 * 1000);
+    }
+}
+
+/* Migrate @from into a file and return the final source status. */
+static char *migrate_to_file(QTestState *from, const char *path)
+{
+    g_autofree char *uri = g_strdup_printf("file:%s", path);
+
+    qtest_qmp_assert_success(from,
+        "{'execute': 'migrate', 'arguments': {'uri': %s}}", uri);
+    return wait_migration(from);
+}
+
+/* Load the migration file into @to and return the final status. */
+static char *migrate_from_file(QTestState *to, const char *path)
+{
+    g_autofree char *uri = g_strdup_printf("file:%s", path);
+
+    qtest_qmp_assert_success(to,
+        "{'execute': 'migrate-incoming', 'arguments': "
+        " {'uri': %s, 'exit-on-error': false}}", uri);
+    return wait_migration(to);
+}
+
 static char *qom_get_string(QTestState *qts, const char *path,
                             const char *property)
 {
@@ -187,6 +243,94 @@ static void test_identity_whitelist(void)
     qtest_quit(qts);
 }
 
+/*
+ * Migrate a drive with a medium loaded (tray open with @open_tray) into a
+ * destination with drive arguments @dst_args and return the status of
+ * the destination.
+ */
+static char *tape_migrate(const char *src_image, bool open_tray,
+                          const char *dst_args, bool *dst_tray_open)
+{
+    g_autofree char *state = NULL;
+    g_autofree char *status = NULL;
+    QTestState *src, *dst;
+    char *result;
+    int fd = g_file_open_tmp("qemu-3590-state-XXXXXX", &state, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    src = qtest_initf("-nodefaults -S -dev3590 file=%s,devno=580,id=tape0",
+                      src_image);
+    if (open_tray) {
+        qtest_qmp_assert_success(src,
+            "{'execute': 'blockdev-open-tray', 'arguments': {'id': 'tape0'}}");
+    }
+    status = migrate_to_file(src, state);
+    g_assert_cmpstr(status, ==, "completed");
+    qtest_quit(src);
+
+    dst = qtest_initf("-nodefaults -S %s -incoming defer", dst_args);
+    result = migrate_from_file(dst, state);
+    if (dst_tray_open && !strcmp(result, "completed")) {
+        *dst_tray_open = tape_tray_open(dst);
+    }
+    qtest_quit(dst);
+    unlink(state);
+    return result;
+}
+
+static void test_migration(void)
+{
+    g_autofree char *path = create_aws_image();
+    g_autofree char *args = g_strdup_printf(
+        "-dev3590 file=%s,devno=580,id=tape0", path);
+    g_autofree char *status = NULL;
+    bool open = true;
+
+    status = tape_migrate(path, false, args, &open);
+    g_assert_cmpstr(status, ==, "completed");
+    g_assert_false(open);
+    unlink(path);
+}
+
+static void test_migration_tray_open(void)
+{
+    g_autofree char *path = create_aws_image();
+    g_autofree char *args = g_strdup_printf(
+        "-dev3590 file=%s,devno=580,id=tape0", path);
+    g_autofree char *status = NULL;
+    bool open = false;
+
+    status = tape_migrate(path, true, args, &open);
+    g_assert_cmpstr(status, ==, "completed");
+    g_assert_true(open);
+    unlink(path);
+}
+
+static void test_migration_no_medium(void)
+{
+    g_autofree char *path = create_aws_image();
+    g_autofree char *status = NULL;
+
+    status = tape_migrate(path, false, "-dev3590 devno=580,id=tape0", NULL);
+    g_assert_cmpstr(status, ==, "failed");
+    unlink(path);
+}
+
+static void test_migration_other_medium(void)
+{
+    g_autofree char *path = create_aws_image();
+    g_autofree char *other = create_other_aws_image();
+    g_autofree char *args = g_strdup_printf(
+        "-dev3590 file=%s,devno=580,id=tape0", other);
+    g_autofree char *status = NULL;
+
+    status = tape_migrate(path, false, args, NULL);
+    g_assert_cmpstr(status, ==, "failed");
+    unlink(path);
+    unlink(other);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -196,5 +340,12 @@ int main(int argc, char **argv)
                    test_runtime_media_change);
     qtest_add_func("/3590-ccw/identity-whitelist",
                    test_identity_whitelist);
+    qtest_add_func("/3590-ccw/migration", test_migration);
+    qtest_add_func("/3590-ccw/migration-tray-open",
+                   test_migration_tray_open);
+    qtest_add_func("/3590-ccw/migration-no-medium",
+                   test_migration_no_medium);
+    qtest_add_func("/3590-ccw/migration-other-medium",
+                   test_migration_other_medium);
     return g_test_run();
 }

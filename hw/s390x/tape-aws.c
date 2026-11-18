@@ -114,6 +114,46 @@ void aws_tape_init(AwsTape *tape, BlockBackend *blk, Error **errp)
     aws_tape_rewind(tape);
 }
 
+bool aws_tape_restore(AwsTape *tape, BlockBackend *blk, Error **errp)
+{
+    int64_t backend_length = blk_getlength(blk);
+    AwsHeader header;
+    AwsTapeResult result;
+
+    if (backend_length < 0) {
+        error_setg_errno(errp, -backend_length,
+                         "cannot determine AWS image size");
+        return false;
+    }
+    tape->blk = blk;
+    if (tape->length < 0 || tape->length > backend_length ||
+        tape->offset < 0 || tape->offset > tape->length) {
+        error_setg(errp, "AWS position 0x%" PRIx64 " of 0x%" PRIx64
+                   " does not fit the %" PRId64 "-byte medium",
+                   tape->offset, tape->length, backend_length);
+        return false;
+    }
+    if (tape->offset == tape->length) {
+        return true;
+    }
+
+    /*
+     * The position must be a block boundary of this medium: a header
+     * starting a record or holding a tape mark, linked back to the block
+     * the source passed last.
+     */
+    result = aws_read_header(tape, tape->offset, &header);
+    if (result != AWS_TAPE_OK ||
+        !(header.flags1 & (AWS_FLAG_NEW_RECORD | AWS_FLAG_TAPE_MARK)) ||
+        header.previous_length != tape->previous_length) {
+        error_setg(errp, "AWS position 0x%" PRIx64
+                   " is not a block boundary of the mounted medium",
+                   tape->offset);
+        return false;
+    }
+    return true;
+}
+
 void aws_tape_rewind(AwsTape *tape)
 {
     tape->offset = 0;

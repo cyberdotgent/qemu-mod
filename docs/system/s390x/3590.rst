@@ -86,6 +86,22 @@ records are interpreted by the channel subsystem directly from the mounted
 tape; QEMU does not scan for a private header or reconstruct the AWS image in
 guest storage.
 
-Migration is currently disabled for this device.  A future migration format
-must identify and validate the externally supplied tape medium at the
-destination before restoring its logical position and buffered record.
+Migration
+---------
+
+The drive migrates with the medium position and drive state: the byte offset
+of the next AWS header, the AWS data length, the logical block ID, the length
+of the chunk before the position, the tray state, write-immediate mode, the
+assigned partition and the volume fence.  Sense data, status and the channel
+program are part of the subchannel state.  Channel programs run
+synchronously, so no partially transferred record is in flight.
+
+The medium itself is not migrated: the destination must mount the same AWS
+image, from shared storage or copied by the management layer.  Loading the
+state fails when the destination drive has no medium although a loaded tape
+migrated, when a read-only medium differs in AWS data length from the
+migrated one, or when the migrated position is not a block boundary of the
+mounted medium (a record or tape-mark header whose backward link matches).  A
+writable medium may have grown after the destination opened it, so only the
+position check applies.  A drive whose tray was open on the source stays
+open; closing it remounts the medium at load point.

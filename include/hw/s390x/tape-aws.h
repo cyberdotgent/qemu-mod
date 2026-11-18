@@ -36,6 +36,13 @@ typedef struct AwsTape {
 } AwsTape;
 
 void aws_tape_init(AwsTape *tape, BlockBackend *blk, Error **errp);
+/*
+ * Take over a medium position restored by migration: @tape holds the
+ * migrated offset, length, block ID and previous chunk length, @blk the
+ * medium mounted on the destination.  Fails unless the position is a
+ * block boundary of that medium.
+ */
+bool aws_tape_restore(AwsTape *tape, BlockBackend *blk, Error **errp);
 void aws_tape_rewind(AwsTape *tape);
 AwsTapeResult aws_tape_read(AwsTape *tape, uint8_t *buf, size_t capacity,
                             size_t *length);

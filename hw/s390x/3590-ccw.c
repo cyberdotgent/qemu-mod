@@ -14,6 +14,7 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "system/block-backend.h"
 #include "system/block-backend-global-state.h"
@@ -103,6 +104,8 @@ struct Tape3590CcwDevice {
     bool tray_open;
     bool write_immediate;
     uint8_t partition_id[11];
+    /* Medium length parsed on the migration destination, or -1 */
+    int64_t local_length;
 };
 
 static const TapeIdentity *tape3590_find_identity(const char *name)
@@ -681,9 +684,89 @@ static void tape3590_unrealize(DeviceState *dev)
     g_clear_pointer(&tape->record, g_free);
 }
 
+static int tape3590_pre_load(void *opaque)
+{
+    Tape3590CcwDevice *tape = opaque;
+
+    tape->local_length = tape->tray_open ? -1 : tape->medium.length;
+    return 0;
+}
+
+static int tape3590_post_load(void *opaque, int version_id)
+{
+    Tape3590CcwDevice *tape = opaque;
+    SubchDev *sch = CCW_DEVICE(tape)->sch;
+    Error *local_err = NULL;
+
+    if (sch->id.cu_type != tape->identity->cu_type ||
+        sch->id.dev_type != tape->identity->dev_type ||
+        sch->id.dev_model != tape->identity->dev_model) {
+        error_report("3590-ccw %04x: migrated identity %04x/%04x-%02x "
+                     "differs from ident=%s", sch->devno, sch->id.cu_type,
+                     sch->id.dev_type, sch->id.dev_model,
+                     tape->identity->name);
+        return -EINVAL;
+    }
+
+    /* Channel programs run synchronously: no buffered record survives. */
+    tape->record_length = tape->record_offset = 0;
+    if (tape->tray_open) {
+        /* Unloaded: a remount repositions the medium at load point. */
+        aws_tape_rewind(&tape->medium);
+        return 0;
+    }
+    if (!blk_is_inserted(tape->blk)) {
+        error_report("3590-ccw %04x: a loaded tape migrated, but the drive "
+                     "has no medium", sch->devno);
+        return -EINVAL;
+    }
+    /*
+     * The medium is supplied by the management layer.  A read-only volume
+     * must be the same image as on the source; a writable one may have
+     * grown after the destination opened it, so only the position check
+     * applies.
+     */
+    if (!blk_is_writable(tape->blk) &&
+        tape->local_length != tape->medium.length) {
+        error_report("3590-ccw %04x: mounted read-only medium has %" PRId64
+                     " bytes of AWS data, the migrated one %" PRId64,
+                     sch->devno, tape->local_length, tape->medium.length);
+        return -EINVAL;
+    }
+    if (!aws_tape_restore(&tape->medium, tape->blk, &local_err)) {
+        error_reportf_err(local_err, "3590-ccw %04x: ", sch->devno);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/*
+ * The device state is the medium position (byte offset of the next AWS
+ * header, AWS data length, logical block ID, length of the chunk before the
+ * position) and the drive state (tray, write-immediate mode, assigned
+ * partition).  Sense data, status and the channel program live in the
+ * subchannel state.  The medium itself is not part of the state: the
+ * destination must mount the same AWS image (shared storage or a copy
+ * made by the management layer).
+ */
 static const VMStateDescription vmstate_tape3590 = {
     .name = "3590-ccw",
-    .unmigratable = 1,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_load = tape3590_pre_load,
+    .post_load = tape3590_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_CCW_DEVICE(parent_obj, Tape3590CcwDevice),
+        VMSTATE_BOOL(tray_open, Tape3590CcwDevice),
+        VMSTATE_BOOL(write_immediate, Tape3590CcwDevice),
+        VMSTATE_UINT8_ARRAY(partition_id, Tape3590CcwDevice, 11),
+        VMSTATE_INT64(medium.offset, Tape3590CcwDevice),
+        VMSTATE_INT64(medium.length, Tape3590CcwDevice),
+        VMSTATE_UINT32(medium.block_id, Tape3590CcwDevice),
+        VMSTATE_UINT16(medium.previous_length, Tape3590CcwDevice),
+        VMSTATE_BOOL(medium.fenced, Tape3590CcwDevice),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static const Property tape3590_properties[] = {
