@@ -19,6 +19,8 @@
 #include "qapi/qapi-commands-machine.h"
 #include "qobject/qdict.h"
 #include "qemu/error-report.h"
+#include "qemu/thread.h"
+#include "hw/core/boards.h"
 #include "system/memory_mapping.h"
 #include "system/address-spaces.h"
 #include "system/kvm.h"
@@ -361,23 +363,299 @@ static void qemu_s390_skeys_class_init(ObjectClass *oc, const void *data)
     dc->user_creatable = false;
 }
 
-static void s390_storage_keys_save(QEMUFile *f, void *opaque)
+/*
+ * Migration and snapshots of the storage keys.
+ *
+ * Under KVM, every key is a page table walk and an ISKE or SSKE in the
+ * kernel, once the guest uses storage keys (z/OS, z/VSE and z/VM do; Linux
+ * does not, KVM then reports that keys are not in use and nothing is sent).
+ * Reading the keys of 2 GiB took 1.9 s, setting them on the destination as
+ * long: setting a key is a quiescing SSKE, and it faults in the pages the
+ * incoming RAM left unpopulated (the zero pages of the source), which is not
+ * faster with more threads.  As one non-iterable section, that was all
+ * downtime.
+ *
+ * So the keys are sent twice.  A first pass during precopy (iterable
+ * section, chunks of S390_SKEYS_ITERATE_PAGES) lets the destination set
+ * them while the VM still runs on the source.  The final pass with the VM
+ * stopped sends all keys again; the destination reads its keys (ISKE, in
+ * parallel) and only sets those that differ: keys the guest changed since
+ * the first pass, and R/C bits that changed on the destination meanwhile
+ * (pages written by the RAM migration; also, the C bit of pages that the
+ * first pass faulted in was seen lost again by the final pass, so what was
+ * set cannot be trusted without reading it back).  The keys are never
+ * tracked between the passes: the final pass alone is complete, as before.
+ *
+ * The records are unchanged (S390_SKEYS_SAVE_FLAG_SKEYS ranges, terminated
+ * by EOS in every section), so a destination with the former single-section
+ * loader loads each section in turn, and this loader loads the stream of
+ * the former single section.
+ */
+#define S390_SKEYS_MAX_THREADS 8
+#define S390_SKEYS_THREAD_MIN_PAGES (16 * KiB)  /* 64 MiB of guest memory  */
+#define S390_SKEYS_ITERATE_PAGES (1 * MiB)      /* 4 GiB per iteration    */
+#define S390_SKEYS_FINAL_PAGES (128 * KiB)      /* 512 MiB per record     */
+#define S390_SKEYS_SET_GAP 16
+
+typedef struct S390SKeysJob {
+    S390SKeysState *ss;
+    bool set;
+    uint64_t gfn;
+    uint64_t count;
+    uint8_t *keys;
+    int ret;
+} S390SKeysJob;
+
+static void *s390_skeys_job_run(void *opaque)
+{
+    S390SKeysJob *job = opaque;
+    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(job->ss);
+    uint64_t done = 0;
+
+    while (done < job->count && !job->ret) {
+        const uint64_t n = MIN(job->count - done, S390_SKEYS_BUFFER_SIZE);
+
+        if (job->set) {
+            job->ret = skeyclass->set_skeys(job->ss, job->gfn + done, n,
+                                            job->keys + done);
+        } else {
+            job->ret = skeyclass->get_skeys(job->ss, job->gfn + done, n,
+                                            job->keys + done);
+        }
+        done += n;
+    }
+    return NULL;
+}
+
+static int s390_skeys_num_threads(uint64_t count)
+{
+    uint64_t threads = DIV_ROUND_UP(count, S390_SKEYS_THREAD_MIN_PAGES);
+    long host_cpus = 1;
+
+#ifdef _SC_NPROCESSORS_ONLN
+    host_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (host_cpus < 1) {
+        host_cpus = 1;
+    }
+    return MAX(MIN(MIN(threads, S390_SKEYS_MAX_THREADS), host_cpus), 1);
+}
+
+/* Get or set the keys of count pages from gfn on; the first error. */
+static int s390_skeys_get_set_parallel(S390SKeysState *ss, bool set,
+                                       uint64_t gfn, uint64_t count,
+                                       uint8_t *keys)
+{
+    const int nthreads = s390_skeys_num_threads(count);
+    const uint64_t per_thread = DIV_ROUND_UP(count, nthreads);
+    S390SKeysJob jobs[S390_SKEYS_MAX_THREADS] = {};
+    QemuThread threads[S390_SKEYS_MAX_THREADS];
+    uint64_t start = 0;
+    int i, ret = 0;
+
+    for (i = 0; i < nthreads; i++) {
+        jobs[i] = (S390SKeysJob) {
+            .ss = ss,
+            .set = set,
+            .gfn = gfn + start,
+            .count = MIN(per_thread, count - start),
+            .keys = keys + start,
+        };
+        start += jobs[i].count;
+        if (i > 0) {
+            qemu_thread_create(&threads[i], "s390-skeys", s390_skeys_job_run,
+                               &jobs[i], QEMU_THREAD_JOINABLE);
+        }
+    }
+    s390_skeys_job_run(&jobs[0]);
+    for (i = 0; i < nthreads; i++) {
+        if (i > 0) {
+            qemu_thread_join(&threads[i]);
+        }
+        if (jobs[i].ret && !ret) {
+            ret = jobs[i].ret;
+        }
+    }
+    return ret;
+}
+
+/*
+ * Set the keys of count pages from gfn on, but only where they differ from
+ * the keys the pages have (see above).  The first key is always set: under
+ * KVM, setting a key enables storage keys for the VM, as before.  Equal
+ * keys between two differing ones closer than S390_SKEYS_SET_GAP are set
+ * as well, to save ioctls.
+ */
+static int s390_skeys_set_changed(S390SKeysState *ss, uint64_t gfn,
+                                  uint64_t count, uint8_t *keys)
+{
+    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
+    g_autofree uint8_t *cur = g_try_malloc0(count);
+    uint64_t i, first, last, set = 0;
+
+    if (!cur ||
+        (skeyclass->skeys_are_enabled(ss) &&
+         s390_skeys_get_set_parallel(ss, false, gfn, count, cur))) {
+        return s390_skeys_get_set_parallel(ss, true, gfn, count, keys);
+    }
+    /* (while keys are not enabled, all are 0 once they are) */
+    cur[0] = ~keys[0];
+
+    i = 0;
+    while (i < count) {
+        S390SKeysJob job;
+
+        if (cur[i] == keys[i]) {
+            i++;
+            continue;
+        }
+        first = last = i;
+        for (i++; i < count && i - last <= S390_SKEYS_SET_GAP; i++) {
+            if (cur[i] != keys[i]) {
+                last = i;
+            }
+        }
+        job = (S390SKeysJob) {
+            .ss = ss,
+            .set = true,
+            .gfn = gfn + first,
+            .count = last + 1 - first,
+            .keys = keys + first,
+        };
+        s390_skeys_job_run(&job);
+        if (job.ret) {
+            return job.ret;
+        }
+        set += job.count;
+        i = last + 1;
+    }
+    trace_s390_skeys_load(count, gfn, set);
+    return 0;
+}
+
+/* Send the keys of count pages from gfn on as one record; false: error. */
+static bool s390_skeys_put_range(QEMUFile *f, S390SKeysState *ss,
+                                 uint64_t gfn, uint64_t count)
+{
+    g_autofree uint8_t *buf = g_try_malloc(count);
+    int error;
+
+    if (!buf) {
+        error_report("storage key save could not allocate memory");
+        return false;
+    }
+    error = s390_skeys_get_set_parallel(ss, false, gfn, count, buf);
+    if (error) {
+        /*
+         * Create a valid stream with all 0x00 and indicate
+         * S390_SKEYS_SAVE_FLAG_ERROR to the destination.
+         */
+        error_report("S390_GET_KEYS error %d", error);
+        memset(buf, 0, count);
+    }
+    qemu_put_be64(f, (gfn * TARGET_PAGE_SIZE) | S390_SKEYS_SAVE_FLAG_SKEYS);
+    qemu_put_be64(f, count);
+    qemu_put_buffer(f, buf, count);
+    return !error;
+}
+
+/* The first pass of the source: the next range to send. */
+static struct {
+    GuestPhysBlockList blocks;
+    bool blocks_valid;
+    GuestPhysBlock *block;  /* NULL: done (or not needed) */
+    uint64_t offset;        /* pages of the block already sent */
+    uint64_t pending;       /* pages still to be sent */
+} skeys_precopy;
+
+static void s390_storage_keys_save_cleanup(void *opaque)
+{
+    if (skeys_precopy.blocks_valid) {
+        guest_phys_blocks_free(&skeys_precopy.blocks);
+    }
+    memset(&skeys_precopy, 0, sizeof(skeys_precopy));
+}
+
+static int s390_storage_keys_save_setup(QEMUFile *f, void *opaque,
+                                        Error **errp)
+{
+    S390SKeysState *ss = S390_SKEYS(opaque);
+    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
+    GuestPhysBlock *block;
+
+    s390_storage_keys_save_cleanup(opaque);
+    if (skeyclass->skeys_are_enabled(ss)) {
+        guest_phys_blocks_init(&skeys_precopy.blocks);
+        guest_phys_blocks_append(&skeys_precopy.blocks);
+        skeys_precopy.blocks_valid = true;
+        QTAILQ_FOREACH(block, &skeys_precopy.blocks.head, next) {
+            skeys_precopy.pending +=
+                (block->target_end - block->target_start) / TARGET_PAGE_SIZE;
+        }
+        skeys_precopy.block = QTAILQ_FIRST(&skeys_precopy.blocks.head);
+    }
+    qemu_put_be64(f, S390_SKEYS_SAVE_FLAG_EOS);
+    return 0;
+}
+
+static bool s390_storage_keys_is_active_iterate(void *opaque)
+{
+    return skeys_precopy.block != NULL;
+}
+
+static void s390_storage_keys_query_pending(void *opaque,
+                                            MigPendingData *pending,
+                                            bool exact, bool final)
+{
+    pending->precopy_bytes += skeys_precopy.pending;
+}
+
+/* One chunk of the first pass; an error only ends it. */
+static int s390_storage_keys_save_iterate(QEMUFile *f, void *opaque)
+{
+    S390SKeysState *ss = S390_SKEYS(opaque);
+    GuestPhysBlock *block = skeys_precopy.block;
+
+    if (block) {
+        const uint64_t gfn = block->target_start / TARGET_PAGE_SIZE +
+                             skeys_precopy.offset;
+        const uint64_t pages = (block->target_end - block->target_start) /
+                               TARGET_PAGE_SIZE - skeys_precopy.offset;
+        const uint64_t count = MIN(pages, S390_SKEYS_ITERATE_PAGES);
+
+        if (s390_skeys_put_range(f, ss, gfn, count)) {
+            skeys_precopy.offset += count;
+            skeys_precopy.pending -= count;
+            if (count == pages) {
+                skeys_precopy.block = QTAILQ_NEXT(block, next);
+                skeys_precopy.offset = 0;
+            }
+        } else {
+            /* the final pass sends (and checks) all keys anyway */
+            skeys_precopy.block = NULL;
+        }
+    }
+    qemu_put_be64(f, S390_SKEYS_SAVE_FLAG_EOS);
+    if (!skeys_precopy.block) {
+        skeys_precopy.pending = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* All keys, with the VM stopped. */
+static int s390_storage_keys_save_complete(QEMUFile *f, void *opaque)
 {
     S390SKeysState *ss = S390_SKEYS(opaque);
     S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
     GuestPhysBlockList guest_phys_blocks;
     GuestPhysBlock *block;
-    uint64_t pages, gfn;
-    int error = 0;
-    uint8_t *buf;
+    uint64_t gfn, pages;
+    bool ok = true;
 
+    skeys_precopy.block = NULL;
+    skeys_precopy.pending = 0;
     if (!skeyclass->skeys_are_enabled(ss)) {
-        goto end_stream;
-    }
-
-    buf = g_try_malloc(S390_SKEYS_BUFFER_SIZE);
-    if (!buf) {
-        error_report("storage key save could not allocate memory");
         goto end_stream;
     }
 
@@ -391,48 +669,32 @@ static void s390_storage_keys_save(QEMUFile *f, void *opaque)
 
         gfn = block->target_start / TARGET_PAGE_SIZE;
         pages = (block->target_end - block->target_start) / TARGET_PAGE_SIZE;
-        qemu_put_be64(f, block->target_start | S390_SKEYS_SAVE_FLAG_SKEYS);
-        qemu_put_be64(f, pages);
+        /* in records, the destination sets one while the next is read */
+        while (ok && pages) {
+            const uint64_t count = MIN(pages, S390_SKEYS_FINAL_PAGES);
 
-        while (pages) {
-            const uint64_t cur_pages = MIN(pages, S390_SKEYS_BUFFER_SIZE);
-
-            if (!error) {
-                error = skeyclass->get_skeys(ss, gfn, cur_pages, buf);
-                if (error) {
-                    /*
-                     * Create a valid stream with all 0x00 and indicate
-                     * S390_SKEYS_SAVE_FLAG_ERROR to the destination.
-                     */
-                    error_report("S390_GET_KEYS error %d", error);
-                    memset(buf, 0, S390_SKEYS_BUFFER_SIZE);
-                }
-            }
-
-            qemu_put_buffer(f, buf, cur_pages);
-            gfn += cur_pages;
-            pages -= cur_pages;
+            ok = s390_skeys_put_range(f, ss, gfn, count);
+            gfn += count;
+            pages -= count;
         }
-
-        if (error) {
+        if (!ok) {
             break;
         }
     }
 
     guest_phys_blocks_free(&guest_phys_blocks);
-    g_free(buf);
 end_stream:
-    if (error) {
-        qemu_put_be64(f, S390_SKEYS_SAVE_FLAG_ERROR);
-    } else {
-        qemu_put_be64(f, S390_SKEYS_SAVE_FLAG_EOS);
-    }
+    qemu_put_be64(f, ok ? S390_SKEYS_SAVE_FLAG_EOS
+                        : S390_SKEYS_SAVE_FLAG_ERROR);
+    return 0;
 }
 
 static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
 {
     S390SKeysState *ss = S390_SKEYS(opaque);
     S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
+    const uint64_t max_pages =
+        MACHINE(qdev_get_machine())->maxram_size / TARGET_PAGE_SIZE;
     int ret = 0;
 
     /*
@@ -454,30 +716,32 @@ static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
         switch (flags) {
         case S390_SKEYS_SAVE_FLAG_SKEYS: {
             const uint64_t total_count = qemu_get_be64(f);
-            uint64_t handled_count = 0, cur_count;
-            uint64_t cur_gfn = addr / TARGET_PAGE_SIZE;
-            uint8_t *buf = g_try_malloc(S390_SKEYS_BUFFER_SIZE);
+            const uint64_t gfn = addr / TARGET_PAGE_SIZE;
+            g_autofree uint8_t *buf = NULL;
 
+            /* at most the keys of the guest memory, one byte per page */
+            if (gfn > max_pages || total_count > max_pages - gfn) {
+                error_report("Storage key data for too many pages: %" PRIu64,
+                             total_count);
+                ret = -EINVAL;
+                break;
+            }
+            buf = g_try_malloc(total_count);
             if (!buf) {
                 error_report("storage key load could not allocate memory");
                 ret = -ENOMEM;
                 break;
             }
-
-            while (handled_count < total_count) {
-                cur_count = MIN(total_count - handled_count,
-                                S390_SKEYS_BUFFER_SIZE);
-                qemu_get_buffer(f, buf, cur_count);
-
-                ret = skeyclass->set_skeys(ss, cur_gfn, cur_count, buf);
-                if (ret < 0) {
-                    error_report("S390_SET_KEYS error %d", ret);
-                    break;
-                }
-                handled_count += cur_count;
-                cur_gfn += cur_count;
+            if (qemu_get_buffer(f, buf, total_count) != total_count) {
+                ret = qemu_file_get_error(f) ?: -EIO;
+                error_report("Storage key data is incomplete");
+                break;
             }
-            g_free(buf);
+
+            ret = s390_skeys_set_changed(ss, gfn, total_count, buf);
+            if (ret < 0) {
+                error_report("S390_SET_KEYS error %d", ret);
+            }
             break;
         }
         case S390_SKEYS_SAVE_FLAG_ERROR: {
@@ -498,7 +762,12 @@ static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
 }
 
 static SaveVMHandlers savevm_s390_storage_keys = {
-    .save_state = s390_storage_keys_save,
+    .save_setup = s390_storage_keys_save_setup,
+    .save_cleanup = s390_storage_keys_save_cleanup,
+    .save_complete = s390_storage_keys_save_complete,
+    .is_active_iterate = s390_storage_keys_is_active_iterate,
+    .save_query_pending = s390_storage_keys_query_pending,
+    .save_live_iterate = s390_storage_keys_save_iterate,
     .load_state = s390_storage_keys_load,
 };
 

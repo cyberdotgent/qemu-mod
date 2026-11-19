@@ -57,6 +57,7 @@ s390_pci_invalid(const char *cmd, uint32_t fh) "%s invalid space fh 0x%x"
 # s390-skeys.c
 s390_skeys_get_nonzero(int rc) "SKEY: Call to get_skeys unexpectedly returned %d"
 s390_skeys_set_nonzero(int rc) "SKEY: Call to set_skeys unexpectedly returned %d"
+s390_skeys_load(uint64_t count, uint64_t gfn, uint64_t set) "SKEY: loaded the keys of 0x%" PRIx64 " pages from gfn 0x%" PRIx64 ", set 0x%" PRIx64
 
 # event-facility.c
 sclp_write_event(uint8_t type, uint16_t len, uint16_t rc) "type=0x%02x len=%u rc=0x%04x"
