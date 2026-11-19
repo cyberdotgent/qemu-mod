@@ -1347,9 +1347,14 @@ static void s390_ipl_notify(S390IPLState *ipl, SubchDev *native_sch)
     S390IPLNotice notice = {};
     int i;
 
-    /* An incoming migration or a snapshot load continues a running system. */
+    /*
+     * An incoming migration or a snapshot load continues a running system,
+     * also the resets before -loadvm or -loadstate (PVE resume and rollback
+     * with RAM) have loaded the machine state.
+     */
     if (runstate_check(RUN_STATE_INMIGRATE) ||
-        runstate_check(RUN_STATE_RESTORE_VM)) {
+        runstate_check(RUN_STATE_RESTORE_VM) ||
+        qemu_vmstate_load_pending()) {
         return;
     }
     if (ipl->iplb_valid && ipl->iplb.pbt == S390_IPL_TYPE_CCW) {

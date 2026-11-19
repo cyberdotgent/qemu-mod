@@ -20,6 +20,7 @@
 #include "qemu/module.h"
 #include "qemu/readline.h"
 #include "chardev/char-fe.h"
+#include "system/runstate.h"
 
 #include "hw/s390x/sclp.h"
 #include "migration/vmstate.h"
@@ -56,6 +57,9 @@ struct SCLPConsoleLM {
     CharFrontend chr;
     CharFrontend hardcopy;      /* log of the messages and IPLs (optional) */
     Notifier ipl_notifier;
+    VMChangeStateEntry *vmstate_entry;
+    bool ipl_pending;           /* IPL marker waiting for the guest to run */
+    S390IPLNotice ipl_notice;   /* ... for this IPL                       */
     GQueue commands;            /* queued operator commands (strings)     */
     bool echo;                  /* immediate echo of input if true        */
     bool last_was_cr;           /* swallow the LF of a CR LF pair         */
@@ -95,10 +99,9 @@ static int hardcopy_be_change(void *opaque)
     return 0;
 }
 
-static void hardcopy_ipl(Notifier *notifier, void *data)
+static void hardcopy_write_ipl_marker(SCLPConsoleLM *scon,
+                                      const S390IPLNotice *notice)
 {
-    SCLPConsoleLM *scon = container_of(notifier, SCLPConsoleLM, ipl_notifier);
-    S390IPLNotice *notice = data;
     g_autoptr(GDateTime) now = g_date_time_new_now_local();
     g_autofree char *time = g_date_time_format(now, "%Y-%m-%d %H:%M:%S");
     g_autofree char *line = NULL;
@@ -110,6 +113,38 @@ static void hardcopy_ipl(Notifier *notifier, void *data)
                            *notice->loadparm ? " LOADPARM " : "",
                            notice->loadparm, time);
     hardcopy_write(scon, (uint8_t *)line, strlen(line));
+}
+
+/*
+ * The IPL marker is written when the IPL program runs: at once for a re-IPL
+ * of a running guest, at the start of the VM for the IPL prepared by the
+ * reset of a new machine. A VM that is never started (a paused start for a
+ * backup) gets no marker; a loaded machine state (snapshot, migration)
+ * replaces the prepared IPL and drops it (console_post_load()).
+ */
+static void hardcopy_ipl(Notifier *notifier, void *data)
+{
+    SCLPConsoleLM *scon = container_of(notifier, SCLPConsoleLM, ipl_notifier);
+    S390IPLNotice *notice = data;
+
+    if (runstate_is_running()) {
+        scon->ipl_pending = false;
+        hardcopy_write_ipl_marker(scon, notice);
+        return;
+    }
+    scon->ipl_notice = *notice;
+    scon->ipl_pending = true;
+}
+
+static void hardcopy_vm_state_change(void *opaque, bool running,
+                                     RunState state)
+{
+    SCLPConsoleLM *scon = opaque;
+
+    if (running && scon->ipl_pending) {
+        scon->ipl_pending = false;
+        hardcopy_write_ipl_marker(scon, &scon->ipl_notice);
+    }
 }
 
 /* Hand the next queued operator command to the guest, if there is one. */
@@ -540,6 +575,9 @@ static int console_post_load(void *opaque, int version_id)
 {
     SCLPConsoleLM *scon = opaque;
 
+    /* the loaded state replaces the IPL a reset prepared before */
+    scon->ipl_pending = false;
+
     /* tell the guest again, the signal may not have been presented yet */
     if (scon->event.event_pending) {
         sclp_service_interrupt(0);
@@ -585,6 +623,8 @@ static int console_init(SCLPEvent *event)
     g_queue_init(&scon->commands);
     scon->ipl_notifier.notify = hardcopy_ipl;
     s390_ipl_add_notifier(&scon->ipl_notifier);
+    scon->vmstate_entry =
+        qemu_add_vm_change_state_handler(hardcopy_vm_state_change, scon);
     if (qemu_chr_fe_backend_connected(&scon->hardcopy)) {
         qemu_chr_fe_set_handlers(&scon->hardcopy, NULL, NULL, NULL,
                                  hardcopy_be_change, scon, NULL, true);
