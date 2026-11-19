@@ -29,6 +29,7 @@
 #include "hw/s390x/css.h"
 #include "hw/s390x/storage-keys.h"
 #include "hw/s390x/ebcdic.h"
+#include "hw/s390x/sclp.h"
 #include "hw/scsi/scsi.h"
 #include "hw/virtio/virtio-net.h"
 #include "hw/virtio/virtio-pci.h"
@@ -1332,6 +1333,45 @@ failed:
     env->psw.addr = 0;
 }
 
+static NotifierList s390_ipl_notifiers =
+    NOTIFIER_LIST_INITIALIZER(s390_ipl_notifiers);
+
+void s390_ipl_add_notifier(Notifier *notifier)
+{
+    notifier_list_add(&s390_ipl_notifiers, notifier);
+}
+
+/* Tell the listeners which device and load parameter this IPL uses. */
+static void s390_ipl_notify(S390IPLState *ipl, SubchDev *native_sch)
+{
+    S390IPLNotice notice = {};
+    int i;
+
+    /* An incoming migration or a snapshot load continues a running system. */
+    if (runstate_check(RUN_STATE_INMIGRATE) ||
+        runstate_check(RUN_STATE_RESTORE_VM)) {
+        return;
+    }
+    if (ipl->iplb_valid && ipl->iplb.pbt == S390_IPL_TYPE_CCW) {
+        snprintf(notice.device, sizeof(notice.device), "0.%x.%04x",
+                 ipl->iplb.ccw.ssid, be16_to_cpu(ipl->iplb.ccw.devno));
+    } else if (native_sch) {
+        snprintf(notice.device, sizeof(notice.device), "0.%x.%04x",
+                 native_sch->ssid, native_sch->devno);
+    }
+    if (ipl->iplb_valid) {
+        for (i = 0; i < LOADPARM_LEN; i++) {
+            char c = ebcdic2ascii[ipl->iplb.loadparm[i]];
+
+            notice.loadparm[i] = qemu_isprint(c) ? c : ' ';
+        }
+        for (i = LOADPARM_LEN; i > 0 && notice.loadparm[i - 1] == ' '; i--) {
+            notice.loadparm[i - 1] = '\0';
+        }
+    }
+    notifier_list_notify(&s390_ipl_notifiers, &notice);
+}
+
 void s390_ipl_prepare_cpu(S390CPU *cpu)
 {
     S390IPLState *ipl = get_ipl_device();
@@ -1344,6 +1384,8 @@ void s390_ipl_prepare_cpu(S390CPU *cpu)
             ipl->iplb_valid = s390_build_iplb(ms->ipl_device, &ipl->iplb,
                                               NULL);
         }
+        s390_ipl_notify(ipl, ms->ipl_device ?
+                        CCW_DEVICE(ms->ipl_device)->sch : NULL);
         s390_ipl_native_ccw(cpu);
         return;
     }
@@ -1374,6 +1416,7 @@ void s390_ipl_prepare_cpu(S390CPU *cpu)
     }
     s390_ipl_set_boot_menu(ipl);
     s390_ipl_prepare_qipl(cpu);
+    s390_ipl_notify(ipl, NULL);
 }
 
 static void s390_ipl_reset(DeviceState *dev)

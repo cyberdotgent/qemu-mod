@@ -17,6 +17,7 @@
 #include "hw/core/sysbus.h"
 #include "target/s390x/cpu-qom.h"
 #include "qom/object.h"
+#include "qemu/notify.h"
 
 #define SCLP_CMD_CODE_MASK                      0xffff00ff
 
@@ -245,6 +246,18 @@ static inline int sccb_data_len(SCCB *sccb)
 }
 
 void sclp_service_interrupt(uint32_t sccb);
+
+/*
+ * An IPL is starting: the IPL device ("0.<ssid>.<devno>", empty if it is not a
+ * CCW device, e.g. a kernel image) and the load parameter (ASCII, trailing
+ * blanks removed, empty if there is none).  Not sent when a snapshot is
+ * loaded or a migration comes in: these continue a running system.
+ */
+typedef struct S390IPLNotice {
+    char device[16];
+    char loadparm[9];
+} S390IPLNotice;
+void s390_ipl_add_notifier(Notifier *notifier);
 void raise_irq_cpu_hotplug(void);
 int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code);
 int sclp_service_call_protected(S390CPU *cpu, uint64_t sccb, uint32_t code);

@@ -32,6 +32,9 @@
 #define SIZE_BUFFER 4096
 #define NEWLINE     "\n"
 
+/* operator commands entered while the guest has not read the previous one */
+#define MAX_QUEUED_COMMANDS 16
+
 typedef struct OprtnsCommand {
     EventBufferHeader header;
     MDMSU message_unit;
@@ -51,6 +54,9 @@ typedef struct OprtnsCommand {
 struct SCLPConsoleLM {
     SCLPEvent event;
     CharFrontend chr;
+    CharFrontend hardcopy;      /* log of the messages and IPLs (optional) */
+    Notifier ipl_notifier;
+    GQueue commands;            /* queued operator commands (strings)     */
     bool echo;                  /* immediate echo of input if true        */
     bool last_was_cr;           /* swallow the LF of a CR LF pair         */
     uint32_t codepage;          /* EBCDIC code page of the guest           */
@@ -65,6 +71,55 @@ typedef struct SCLPConsoleLM SCLPConsoleLM;
 #define TYPE_SCLPLM_CONSOLE "sclplmconsole"
 DECLARE_INSTANCE_CHECKER(SCLPConsoleLM, SCLPLM_CONSOLE,
                          TYPE_SCLPLM_CONSOLE)
+
+/*
+ * The hardcopy: like the printer log of a hardware console, every message
+ * of the guest as one line, and a marker line for every IPL.  It keeps
+ * everything since the VM was started, whether or not a client is connected
+ * to the console.  UTF-8, LF line ends.
+ */
+static void hardcopy_write(SCLPConsoleLM *scon, const uint8_t *buf, int len)
+{
+    if (qemu_chr_fe_backend_connected(&scon->hardcopy)) {
+        qemu_chr_fe_write_all(&scon->hardcopy, buf, len);
+    }
+}
+
+static void hardcopy_ipl(Notifier *notifier, void *data)
+{
+    SCLPConsoleLM *scon = container_of(notifier, SCLPConsoleLM, ipl_notifier);
+    S390IPLNotice *notice = data;
+    g_autoptr(GDateTime) now = g_date_time_new_now_local();
+    g_autofree char *time = g_date_time_format(now, "%Y-%m-%d %H:%M:%S");
+    g_autofree char *line = NULL;
+
+    /* U+2500 BOX DRAWINGS LIGHT HORIZONTAL, like a perforation line */
+    line = g_strdup_printf("\u2500\u2500\u2500\u2500 IPL%s%s%s%s at %s "
+                           "\u2500\u2500\u2500\u2500\n",
+                           *notice->device ? " " : "", notice->device,
+                           *notice->loadparm ? " LOADPARM " : "",
+                           notice->loadparm, time);
+    hardcopy_write(scon, (uint8_t *)line, strlen(line));
+}
+
+/* Hand the next queued operator command to the guest, if there is one. */
+static bool start_queued_command(SCLPConsoleLM *scon)
+{
+    g_autofree char *cmd = g_queue_pop_head(&scon->commands);
+
+    if (!cmd) {
+        return false;
+    }
+    scon->length = MIN(strlen(cmd), MAX_COMMAND_LEN);
+    memcpy(scon->buf, cmd, scon->length);
+    scon->event.event_pending = true;
+    return true;
+}
+
+static void clear_queued_commands(SCLPConsoleLM *scon)
+{
+    g_queue_clear_full(&scon->commands, g_free);
+}
 
 /*
 *  Character layer call-back functions
@@ -83,6 +138,14 @@ static int chr_can_read(void *opaque)
 {
     SCLPConsoleLM *scon = opaque;
 
+    /*
+     * The line editor keeps accepting input while the guest has not read
+     * the previous command yet: commands entered meanwhile are queued, so
+     * the operator still sees what they type.
+     */
+    if (scon->rs) {
+        return 1;
+    }
     if (scon->event.event_pending) {
         return 0;
     }
@@ -144,6 +207,17 @@ static void lm_readline_command(void *opaque, const char *str,
 {
     SCLPConsoleLM *scon = opaque;
 
+    if (scon->event.event_pending) {
+        if (g_queue_get_length(&scon->commands) >= MAX_QUEUED_COMMANDS) {
+            echo_output(scon, "(command not sent: the system has not read "
+                        "the previous commands)" NEWLINE,
+                        strlen("(command not sent: the system has not read "
+                               "the previous commands)" NEWLINE));
+            return;
+        }
+        g_queue_push_tail(&scon->commands, g_strdup(str));
+        return;
+    }
     scon->length = MIN(strlen(str), MAX_COMMAND_LEN);
     memcpy(scon->buf, str, scon->length);
     scon->event.event_pending = true;
@@ -241,8 +315,12 @@ static int get_console_data(SCLPEvent *event, uint8_t *buf, size_t *size,
     ebcdic_put_cp(cons->codepage, buf, (char *)&cons->buf, len);
     *size = len;
     cons->length = 0;
-    /* data provided and no more data pending */
+    /*
+     * Data provided; a queued command is pending next (the completion of
+     * this read tells the guest), otherwise no more data is pending.
+     */
     event->event_pending = false;
+    start_queued_command(cons);
     qemu_notify_event();
     return 0;
 }
@@ -370,6 +448,12 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
         buffer[0] = '\n';
     }
     buffer[start + len] = '\n';
+    if (qemu_chr_fe_backend_connected(&scon->hardcopy)) {
+        g_autofree uint8_t *utf8 = g_malloc((len + 1) * 2);
+        int n = latin1_to_utf8(utf8, buffer + start, len + 1);
+
+        hardcopy_write(scon, utf8, n);
+    }
     rc = write_console_data(event, buffer, start + len + 1);
     if (rc < 0) {
         return rc;
@@ -442,10 +526,22 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
 
 /* functions for live migration */
 
+static int console_post_load(void *opaque, int version_id)
+{
+    SCLPConsoleLM *scon = opaque;
+
+    /* tell the guest again, the signal may not have been presented yet */
+    if (scon->event.event_pending) {
+        sclp_service_interrupt(0);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_sclplmconsole = {
     .name = "sclplmconsole",
     .version_id = 0,
     .minimum_version_id = 0,
+    .post_load = console_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(event.event_pending, SCLPConsoleLM),
         VMSTATE_UINT32(write_errors, SCLPConsoleLM),
@@ -476,6 +572,10 @@ static int console_init(SCLPEvent *event)
     }
     console_available = true;
 
+    g_queue_init(&scon->commands);
+    scon->ipl_notifier.notify = hardcopy_ipl;
+    s390_ipl_add_notifier(&scon->ipl_notifier);
+
     if (scon->echo) {
         scon->rs = readline_init(lm_readline_printf, lm_readline_flush, scon,
                                  lm_readline_completion);
@@ -497,6 +597,7 @@ static void console_reset(DeviceState *dev)
     scon->last_was_cr = false;
     scon->utf8.pending = 0;
     scon->write_errors = 0;
+    clear_queued_commands(scon);
     if (scon->rs) {
         readline_restart(scon->rs);
     }
@@ -504,6 +605,11 @@ static void console_reset(DeviceState *dev)
 
 static const Property console_properties[] = {
     DEFINE_PROP_CHR("chardev", SCLPConsoleLM, chr),
+    /*
+     * Optional: a character device (normally a file) that gets the
+     * hardcopy, every message as a line and a marker line for every IPL.
+     */
+    DEFINE_PROP_CHR("hardcopy", SCLPConsoleLM, hardcopy),
     DEFINE_PROP_UINT32("write_errors", SCLPConsoleLM, write_errors, 0),
     DEFINE_PROP_BOOL("echo", SCLPConsoleLM, echo, true),
     /*
