@@ -85,6 +85,16 @@ static void hardcopy_write(SCLPConsoleLM *scon, const uint8_t *buf, int len)
     }
 }
 
+/*
+ * The hardcopy may be switched to another character device (QMP
+ * chardev-change), e.g. to rotate its log file: nothing to do, the next
+ * message goes to the new one.
+ */
+static int hardcopy_be_change(void *opaque)
+{
+    return 0;
+}
+
 static void hardcopy_ipl(Notifier *notifier, void *data)
 {
     SCLPConsoleLM *scon = container_of(notifier, SCLPConsoleLM, ipl_notifier);
@@ -575,6 +585,10 @@ static int console_init(SCLPEvent *event)
     g_queue_init(&scon->commands);
     scon->ipl_notifier.notify = hardcopy_ipl;
     s390_ipl_add_notifier(&scon->ipl_notifier);
+    if (qemu_chr_fe_backend_connected(&scon->hardcopy)) {
+        qemu_chr_fe_set_handlers(&scon->hardcopy, NULL, NULL, NULL,
+                                 hardcopy_be_change, scon, NULL, true);
+    }
 
     if (scon->echo) {
         scon->rs = readline_init(lm_readline_printf, lm_readline_flush, scon,
