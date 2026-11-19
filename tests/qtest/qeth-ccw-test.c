@@ -174,6 +174,47 @@ static void test_snapshot(void)
     unlink(disk);
 }
 
+/*
+ * The adapter is a NIC of the network core: announce-self (and the
+ * announcement after migration) sends the RARP for its MAC address.  An
+ * adapter without registered VLANs or layer-3 addresses adds nothing.
+ */
+static void test_announce(void)
+{
+    const uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x70 };
+    uint8_t frame[128];
+    uint32_t len;
+    QTestState *qts;
+    QDict *rsp;
+    int sv[2];
+
+    g_assert_cmpint(socketpair(PF_UNIX, SOCK_STREAM, 0, sv), ==, 0);
+    qts = qtest_initf("-nodefaults -netdev socket,id=net0,fd=%d "
+                      "-device qeth-ccw,id=qeth0,netdev=net0,devno=fe.0.0600,"
+                      "mac=52:54:00:12:34:70", sv[1]);
+    rsp = qtest_qmp(qts, "{ 'execute': 'announce-self', 'arguments': {"
+                    " 'initial': 10, 'max': 50, 'rounds': 1, 'step': 10 } }");
+    g_assert(!qdict_haskey(rsp, "error"));
+    qobject_unref(rsp);
+
+    g_assert_cmpint(recv(sv[0], &len, sizeof(len), MSG_WAITALL), ==,
+                    sizeof(len));
+    len = ntohl(len);
+    g_assert_cmpint(len, ==, 60);
+    g_assert_cmpint(recv(sv[0], frame, len, MSG_WAITALL), ==, len);
+    g_assert_cmpint(frame[12] << 8 | frame[13], ==, 0x8035);   /* RARP */
+    g_assert(!memcmp(frame + 6, mac, sizeof(mac)));
+    g_assert(!memcmp(frame + 32, mac, sizeof(mac)));
+
+    /* Nothing else follows */
+    g_usleep(300 * 1000);
+    g_assert_cmpint(recv(sv[0], frame, sizeof(frame), MSG_DONTWAIT), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+
+    qtest_quit(qts);
+    close(sv[0]);
+}
+
 static void test_configuration(void)
 {
     g_autofree char *dev_id = NULL;
@@ -294,5 +335,6 @@ int main(int argc, char **argv)
     qtest_add_func("/qeth-ccw/migration", test_migration);
     qtest_add_func("/qeth-ccw/migration-mismatch", test_migration_mismatch);
     qtest_add_func("/qeth-ccw/snapshot", test_snapshot);
+    qtest_add_func("/qeth-ccw/announce", test_announce);
     return g_test_run();
 }

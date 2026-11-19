@@ -33,6 +33,7 @@
 #include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -208,10 +209,17 @@
 #define QETH_ARP_RETRY_MS        1000
 #define QETH_ND_ENTRIES          64
 
+/* Layer-2 VLANs registered with SETVLAN, one bit per VLAN ID */
+#define QETH_VLAN_IDS            4096
+#define QETH_VLAN_BYTES          (QETH_VLAN_IDS / 8)
+
 #define ETH_HDR                  14
 #define ETHERTYPE_IPV4           0x0800
 #define ETHERTYPE_ARP            0x0806
 #define ETHERTYPE_IPV6           0x86dd
+#define ETHERTYPE_VLAN           0x8100
+#define ETHERTYPE_RARP           0x8035
+#define RARP_REQUEST             3
 #define ARP_PACKET               28
 #define ARP_REQUEST              1
 #define ARP_REPLY                2
@@ -329,6 +337,9 @@ struct QethCcwDevice {
     QethNdEntry nd[QETH_ND_ENTRIES];
     int64_t nd_last_request;
     uint8_t nd_last_ip[16];
+
+    /* Layer-2 VLANs registered per connection (for announcements) */
+    uint8_t vlans[QETH_MAX_DATA][QETH_VLAN_BYTES];
 
     /* Queued control responses, serialized for migration */
     uint8_t *migration_responses;
@@ -668,6 +679,7 @@ static void qeth_forget_addrs(QethCcwDevice *s, int conn)
             i++;
         }
     }
+    memset(s->vlans[conn], 0, QETH_VLAN_BYTES);
 }
 
 static void qeth_conn_release(QethCcwDevice *s, QethConn *c)
@@ -1510,12 +1522,22 @@ static void qeth_process_ipa(QethCcwDevice *s, SubchDev *sch,
         data[7] = 0xfe;
         data_size = 8;
         break;
+    case IPA_CMD_SETVLAN:
+    case IPA_CMD_DELVLAN:
+        if (avail >= 2) {
+            uint16_t vid = lduw_be_p(data) & (QETH_VLAN_IDS - 1);
+
+            if (cmd == IPA_CMD_SETVLAN) {
+                s->vlans[ci][vid / 8] |= 1 << (vid % 8);
+            } else {
+                s->vlans[ci][vid / 8] &= ~(1 << (vid % 8));
+            }
+        }
+        break;
     case IPA_CMD_SETVMAC:
     case IPA_CMD_DELVMAC:
     case IPA_CMD_SETGMAC:
     case IPA_CMD_DELGMAC:
-    case IPA_CMD_SETVLAN:
-    case IPA_CMD_DELVLAN:
         break;
     default:
         qeth_unhandled(sch, "ipa command", cmd);
@@ -2515,11 +2537,75 @@ static void qeth_vm_state_change(void *opaque, bool running, RunState state)
     }
 }
 
+/* A RARP request for the adapter's MAC address, tagged with @vid */
+static void qeth_send_rarp_vlan(QethCcwDevice *s, uint16_t vid)
+{
+    uint8_t f[4 + ETH_HDR + ARP_PACKET + 18] = { 0 };   /* 64 bytes */
+    uint8_t *arp = f + 4 + ETH_HDR;
+
+    memset(f, 0xff, ETH_ALEN);
+    memcpy(f + 6, s->conf.macaddr.a, ETH_ALEN);
+    stw_be_p(f + 12, ETHERTYPE_VLAN);
+    stw_be_p(f + 14, vid);
+    stw_be_p(f + 16, ETHERTYPE_RARP);
+    stw_be_p(arp, 1);                       /* Ethernet */
+    stw_be_p(arp + 2, ETHERTYPE_IPV4);
+    arp[4] = ETH_ALEN;
+    arp[5] = 4;
+    stw_be_p(arp + 6, RARP_REQUEST);
+    memcpy(arp + 8, s->conf.macaddr.a, ETH_ALEN);
+    memcpy(arp + 18, s->conf.macaddr.a, ETH_ALEN);
+    qemu_send_packet(qemu_get_queue(s->nic), f, sizeof(f));
+}
+
+/*
+ * Self-announcement after migration (and for announce-self), on top of
+ * the untagged RARP that the network core sends for every NIC.  A guest
+ * on a virtio NIC announces its own addresses (VIRTIO_NET_F_GUEST_ANNOUNCE);
+ * a qeth guest has no such notification, so the adapter announces what
+ * the guest registered with it:
+ *  - layer 2: a RARP tagged with each VLAN the guest registered (SETVLAN),
+ *    so VLAN-aware bridges and switches move the MAC in those VLANs too;
+ *  - layer 3: the adapter owns the link layer, the guest cannot send ARP
+ *    or neighbour discovery itself: a gratuitous ARP for every registered
+ *    IPv4 address (except VIPAs) and an unsolicited neighbour advertisement
+ *    for every registered IPv6 address, as on SETIP.
+ */
+static void qeth_announce(NetClientState *nc)
+{
+    QethCcwDevice *s = qemu_get_nic_opaque(nc);
+    unsigned int i, ci, vid;
+
+    for (ci = 0; ci < qeth_nr_conns(s); ci++) {
+        if (!s->conn[ci].in_use || s->conn[ci].layer3) {
+            continue;
+        }
+        for (vid = 1; vid < QETH_VLAN_IDS; vid++) {
+            if (s->vlans[ci][vid / 8] & (1 << (vid % 8))) {
+                trace_qeth_announce("vlan", vid);
+                qeth_send_rarp_vlan(s, vid);
+            }
+        }
+    }
+    for (i = 0; i < s->nr_ip4; i++) {
+        if (!(s->ip4[i].flags & IPA_SETIP_VIPA)) {
+            trace_qeth_announce("ip4", i);
+            qeth_send_arp(s, ARP_REQUEST, s->ip4[i].addr, NULL,
+                          s->ip4[i].addr);
+        }
+    }
+    for (i = 0; i < s->nr_ip6; i++) {
+        trace_qeth_announce("ip6", i);
+        qeth_send_na(s, s->ip6[i].addr, NULL, NULL);
+    }
+}
+
 static NetClientInfo qeth_net_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
     .can_receive = qeth_can_receive,
     .receive = qeth_receive,
+    .announce = qeth_announce,
 };
 
 static void qeth_setup_peer(QethCcwDevice *s, SubchDev *sch)
@@ -2946,6 +3032,26 @@ static int qeth_post_load(void *opaque, int version_id)
  * Frames held back for ARP or ND resolution are not migrated; the guest
  * retransmits them.
  */
+static bool qeth_vlans_needed(void *opaque)
+{
+    QethCcwDevice *s = opaque;
+
+    return !buffer_is_zero(s->vlans, sizeof(s->vlans));
+}
+
+/* Registered layer-2 VLANs; only sent when the guest registered any */
+static const VMStateDescription vmstate_qeth_vlans = {
+    .name = TYPE_QETH_CCW "/vlans",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = qeth_vlans_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_2DARRAY(vlans, QethCcwDevice, QETH_MAX_DATA,
+                              QETH_VLAN_BYTES),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_qeth = {
     .name = TYPE_QETH_CCW,
     .version_id = 1,
@@ -2990,6 +3096,10 @@ static const VMStateDescription vmstate_qeth = {
         VMSTATE_VBUFFER_ALLOC_UINT32(migration_responses, QethCcwDevice, 1,
                                      NULL, migration_responses_len),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_qeth_vlans,
+        NULL
     }
 };
 
