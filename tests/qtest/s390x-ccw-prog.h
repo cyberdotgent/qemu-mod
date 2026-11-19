@@ -102,17 +102,10 @@ static inline void ccw_prog_set_ccw(QTestState *qts, unsigned int index,
     qtest_memwrite(qts, CCW_PROG_CCWS + index * 8, ccw, sizeof(ccw));
 }
 
-/*
- * Run the channel program at CCW_PROG_CCWS and wait for its final status.
- * Returns the condition code of START SUBCHANNEL.
- */
-static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
-                               CcwProgIrb *irb)
+/* Start the channel program at CCW_PROG_CCWS. */
+static inline void ccw_prog_go(QTestState *qts, uint16_t orb_ctrl0)
 {
     uint8_t orb[12] = { 0 };
-    uint8_t scsw[12];
-    uint32_t ipm;
-    int i;
 
     stw_be_p(orb + 4, orb_ctrl0);
     orb[6] = 0xff;                  /* logical-path mask */
@@ -121,6 +114,18 @@ static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
     qtest_memset(qts, CCW_PROG_IRB, 0, 96);
     qtest_writeb(qts, CCW_PROG_DONE, 0);
     qtest_writeb(qts, CCW_PROG_GO, 1);
+}
+
+/*
+ * Wait for the final status of the channel program started by
+ * ccw_prog_go().  Returns the condition code of START SUBCHANNEL.
+ */
+static inline int ccw_prog_wait(QTestState *qts, CcwProgIrb *irb)
+{
+    uint8_t scsw[12];
+    uint32_t ipm;
+    int i;
+
     for (i = 0; i < 200000 && !qtest_readb(qts, CCW_PROG_DONE); i++) {
         g_usleep(50);
     }
@@ -134,6 +139,14 @@ static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
     irb->sense0 = qtest_readb(qts, CCW_PROG_IRB + 32);
     ipm = qtest_readl(qts, CCW_PROG_SSCH_CC);
     return (ipm >> 28) & 3;
+}
+
+/* Run the channel program at CCW_PROG_CCWS and wait for its status. */
+static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
+                               CcwProgIrb *irb)
+{
+    ccw_prog_go(qts, orb_ctrl0);
+    return ccw_prog_wait(qts, irb);
 }
 
 /* Start QEMU with the guest program and the given devices under TCG. */

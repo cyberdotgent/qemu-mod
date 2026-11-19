@@ -1324,6 +1324,11 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
             (sch->last_cmd.flags & (CCW_FLAG_CC | CCW_FLAG_DC)) &&
             !(schib->scsw.cstat & ~SCSW_CSTAT_PCI)) {
             sch->channel_prog += 8;
+            /* Status Modifier skips a CCW, as in css_interpret_ccw(). */
+            if (schib->scsw.dstat & SCSW_DSTAT_STAT_MOD) {
+                sch->channel_prog += 8;
+                schib->scsw.dstat &= ~SCSW_DSTAT_STAT_MOD;
+            }
             ret = -EAGAIN;
         }
         suspend_allowed = !!(sch->orb.ctrl0 & ORB_CTRL0_MASK_SPND);

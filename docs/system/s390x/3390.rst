@@ -90,6 +90,29 @@ Channel programs which only read do not flush. The flushes appear in the
 ``flush_operations`` and ``failed_flush_operations`` counters of
 ``query-blockstats``.
 
+I/O, track cache and migration
+------------------------------
+
+Track reads, writes and the flush are asynchronous: a CCW that needs the
+block backend runs in a coroutine and its channel program continues when the
+I/O has completed, so a slow backend (network storage) does not stall the
+vCPUs, and several volumes transfer in parallel. CCWs that work on the
+current track (searches, reads of a track that is already in memory, Define
+Extent, Locate Record) complete immediately.
+
+The device keeps the current track in memory. The copy is dropped when the
+device is reset and whenever the block backend is drained (block graph
+changes, snapshots, ``stop``/``cont``, migration), so a reverted or replaced
+image is read again. Writes by another process to an image in use are only
+seen after such an event.
+
+The device state (subchannel, Define Extent and Locate Record context,
+orientation, reserve and path group) is migrated and saved with ``savevm``.
+The drain before the state is saved lets the channel program in progress run
+to its end; a channel program that is still waiting to start is migrated and
+starts on the destination. The cached track is not migrated: the destination
+reads it from the shared or mirrored image.
+
 Image creation
 --------------
 

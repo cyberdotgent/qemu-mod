@@ -24,6 +24,7 @@ eckd_search_key(uint16_t devno, uint8_t cmd, uint16_t cyl, uint16_t head, uint8_
 eckd_search_id(uint16_t devno, uint16_t wanted_cyl, uint16_t wanted_head, uint8_t wanted_record, uint16_t found_cyl, uint16_t found_head, uint8_t found_record, bool match) "ECKD-SEARCH-ID: devno=0x%04x wanted=%04x/%04x/%02x found=%04x/%04x/%02x match=%d"
 eckd_write_chain(uint16_t devno, bool continuation, uint32_t expected, uint32_t used, uint16_t count, uint8_t flags) "ECKD-WRITE-CHAIN: devno=0x%04x continuation=%d expected=%u used=%u count=%u flags=0x%02x"
 eckd_write_ckd(uint16_t devno, uint16_t cyl, uint16_t head, uint8_t record, uint8_t key_length, uint16_t data_length, uint32_t supplied, uint32_t track_used) "ECKD-WRITE-CKD: devno=0x%04x CCHHR=%04x/%04x/%02x key=%u data=%u supplied=%u track-used=%u"
+eckd_async(uint16_t devno, const char *what, int ret) "ECKD-ASYNC: devno=0x%04x %s ret=%d"
 eckd_unit_check(uint16_t devno, uint8_t sense0, uint8_t sense1, uint16_t cyl, uint16_t head, uint8_t record, unsigned int record_count) "ECKD-UNIT-CHECK: devno=0x%04x sense=%02x/%02x CCHHR=%04x/%04x/%02x records=%u"
 
 # virtio-ccw.c

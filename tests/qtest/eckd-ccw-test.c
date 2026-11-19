@@ -449,6 +449,65 @@ static void test_migration_orientation(void)
     unlink(image);
 }
 
+/*
+ * Migration while a channel program runs: 14 seeks to tracks that are not
+ * cached, on a throttled backend so that each takes a while.  The drain
+ * before the device state is saved lets the program finish on the source;
+ * the destination presents the final status and keeps the orientation.
+ */
+static void test_migration_during_io(void)
+{
+    const uint8_t r0_count[8] = { 0, 0, 0, 14, 0, 0, 0, 8 };
+    uint8_t r0[16];
+    g_autofree char *path = create_ckd64_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    g_autofree char *sock = g_strdup_printf("%s/qemu-eckd-mig2-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *uri = g_strdup_printf("unix:%s", sock);
+    g_autofree char *devices = g_strdup_printf(
+        "-object throttle-group,id=tg0,x-iops-total=10 "
+        "-blockdev '{\"driver\": \"throttle\", \"node-name\": \"ckd0\", "
+        "\"throttle-group\": \"tg0\", \"file\": {\"driver\": \"raw\", "
+        "\"file\": {\"driver\": \"file\", \"filename\": \"%s\"}}}' "
+        "-device eckd-ccw,drive=ckd0,devno=fe.0.0200", path);
+    QTestState *src, *dst;
+    CcwProgIrb irb;
+
+    src = ccw_prog_start(image, "3G", devices);
+    for (int head = 1; head <= 14; head++) {
+        uint8_t seek[6] = { 0, 0, 0, 0, 0, head };
+
+        qtest_memwrite(src, CCW_PROG_DATA + head * 8, seek, sizeof(seek));
+        ccw_prog_set_ccw(src, head - 1, 0x07, head < 14 ? CCW_FLAG_CC : 0,
+                         sizeof(seek), CCW_PROG_DATA + head * 8);
+    }
+    dst = qtest_initf("-nodefaults -accel tcg -m 3G -kernel %s %s "
+                      "-incoming %s", image, devices, uri);
+    ccw_prog_go(src, CCW_ORB_FMT | CCW_ORB_C64);
+    qtest_qmp_assert_success(src, "{'execute': 'migrate', "
+                             "'arguments': {'uri': %s}}", uri);
+    wait_migration_completed(src);
+    qtest_qmp_eventwait(dst, "RESUME");
+    g_assert_cmpint(ccw_prog_wait(dst, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 14 * 8);
+
+    /* Read R0 of the track the program ended on. */
+    ccw_prog_set_ccw(dst, 0, 0x16, CCW_FLAG_SLI, sizeof(r0),
+                     CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(dst, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(dst, CCW_PROG_DATA + 0x100, r0, sizeof(r0));
+    g_assert_cmpmem(r0, 8, r0_count, 8);
+
+    qtest_quit(src);
+    qtest_quit(dst);
+    unlink(sock);
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -469,6 +528,8 @@ int main(int argc, char **argv)
                        test_track_cache_invalidation);
         qtest_add_func("/eckd-ccw/io/migration-orientation",
                        test_migration_orientation);
+        qtest_add_func("/eckd-ccw/io/migration-during-io",
+                       test_migration_during_io);
     }
     return g_test_run();
 }

@@ -15,8 +15,11 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
+#include "qemu/coroutine.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "system/block-backend.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 #define ECKD_AUTO_DEVNO 0x0300
@@ -174,6 +177,30 @@ struct EckdCcwDevice {
     uint32_t read_used;
     bool read_advance;
     bool read_active;
+
+    /*
+     * Asynchronous CCW execution, see eckd_ccw_cb().  The previous CCW of
+     * the channel program as it was when the current CCW started: css
+     * replaces sch->last_cmd with the current CCW once it is pending.
+     */
+    CCW1 prev_cmd;
+    bool prev_cmd_valid;
+    CCW1 co_ccw;
+    int co_ret;
+    /* The CCW coroutine has not returned yet. */
+    bool co_running;
+    /* It yielded, so its result is presented by eckd_complete_bh(). */
+    bool co_yielded;
+    /* A CCW is executing or its completion has not been presented. */
+    bool co_active;
+    /* Drop the result of the executing CCW (clear, halt, reset). */
+    bool co_discard;
+    /* The block backend is drained: no new channel program may start. */
+    bool quiesced;
+    /* A channel program waits for the drained section (or a CCW) to end. */
+    bool start_deferred;
+    CCW1 deferred_ccw;
+    VMChangeStateEntry *vmstate_change;
 };
 
 static bool eckd_has_explicit_topology(EckdCcwDevice *eckd)
@@ -893,9 +920,8 @@ static int eckd_prefix(EckdCcwDevice *eckd, const CCW1 *ccw,
 static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
                             uint8_t command, bool advance)
 {
-    SubchDev *sch = CCW_DEVICE(eckd)->sch;
-    bool continuation = eckd->read_active && sch->last_cmd_valid &&
-                        (sch->last_cmd.flags & CCW_FLAG_DC);
+    bool continuation = eckd->read_active && eckd->prev_cmd_valid &&
+                        (eckd->prev_cmd.flags & CCW_FLAG_DC);
     const CkdImageRecord *record;
     const uint8_t *data;
     uint32_t transferred;
@@ -985,9 +1011,8 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
 static int eckd_write_existing(EckdCcwDevice *eckd, const CCW1 *ccw,
                                uint8_t command)
 {
-    SubchDev *sch = CCW_DEVICE(eckd)->sch;
-    bool continuation = eckd->update_active && sch->last_cmd_valid &&
-                        (sch->last_cmd.flags & CCW_FLAG_DC);
+    bool continuation = eckd->update_active && eckd->prev_cmd_valid &&
+                        (eckd->prev_cmd.flags & CCW_FLAG_DC);
     const CkdImageRecord *record;
     uint32_t offset;
     uint32_t expected;
@@ -1153,8 +1178,8 @@ static int eckd_write_r0(EckdCcwDevice *eckd, const CCW1 *ccw)
 static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
 {
     SubchDev *sch = CCW_DEVICE(eckd)->sch;
-    bool continuation = eckd->write_active && sch->last_cmd_valid &&
-                        (sch->last_cmd.flags & CCW_FLAG_DC);
+    bool continuation = eckd->write_active && eckd->prev_cmd_valid &&
+                        (eckd->prev_cmd.flags & CCW_FLAG_DC);
     uint8_t *data = eckd->write_record;
     uint16_t cylinder;
     uint16_t head;
@@ -1318,7 +1343,7 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
     int ret;
 
     eckd->update_done = false;
-    if (!sch->last_cmd_valid) {
+    if (!eckd->prev_cmd_valid) {
         /*
          * Define Extent, Locate Record and format-write domains belong to
          * one channel program.  Retaining the final formatting extent into
@@ -1812,19 +1837,19 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
  * flush the backend before the final status of every channel program that
  * wrote a track.  This includes programs ending in unit check: error
  * recovery redrives a program from the failing CCW, assuming that the
- * writes before it are complete.  ECKD I/O is synchronous, so the flush is
- * too.
+ * writes before it are complete.  The flush is part of the last CCW: its
+ * status is presented when the flush has completed.
  *
  * Channel programs which wrote nothing do not flush.  In particular, after
  * a failed flush the next Sense must not fail as well; the unhardened data
  * is flushed again by the next writing program, a reset, or unplug.
  */
-static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
+static int coroutine_fn eckd_ccw_exec(EckdCcwDevice *eckd, CCW1 ccw)
 {
-    EckdCcwDevice *eckd = sch->driver_data;
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
     int ret;
 
-    if (!sch->last_cmd_valid) {
+    if (!eckd->prev_cmd_valid) {
         eckd->program_write_count = eckd->image.write_count;
     }
     /*
@@ -1843,11 +1868,155 @@ static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
     return ret;
 }
 
+/*
+ * ECKD I/O is asynchronous.  Each CCW runs in a coroutine; the image
+ * accesses (ckd_image_load_track(), ckd_image_store_track() and the flush)
+ * use the co_wrapper_mixed block layer calls, which yield inside a
+ * coroutine instead of waiting on the vCPU thread with the BQL held.
+ *
+ * Most CCWs need no I/O (Define Extent, Locate Record, searches and reads
+ * on the cached track, sense commands): the coroutine then returns before
+ * qemu_coroutine_enter() does, and the CCW completes synchronously as
+ * before.  A CCW that yields is reported to css as CSS_CCW_PENDING; when
+ * it finishes, eckd_complete_bh() presents its result and css continues
+ * the channel program, which may start the next CCW from there.
+ *
+ * Drained sections of the block backend (stop/cont, migration, block
+ * graph changes, snapshots) let the channel program in progress run to
+ * its end: request queuing is disabled for the backend, and
+ * eckd_drained_poll() keeps the drain waiting while a CCW is active.  A
+ * channel program that would start during the drained section waits for
+ * its end (eckd_run_deferred()).  So no CCW is executing when the device
+ * state is saved, and migration needs no in-flight state.
+ */
+static void eckd_complete_bh(void *opaque);
+
+static void coroutine_fn eckd_ccw_co(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    eckd->co_ret = eckd_ccw_exec(eckd, eckd->co_ccw);
+    eckd->co_running = false;
+    if (eckd->co_yielded) {
+        /* Present the result outside of coroutine context. */
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), eckd_complete_bh,
+                                eckd);
+    }
+}
+
+static int eckd_start_ccw(EckdCcwDevice *eckd, CCW1 ccw)
+{
+    Coroutine *co;
+
+    eckd->co_ccw = ccw;
+    eckd->co_yielded = false;
+    eckd->co_discard = false;
+    eckd->co_running = true;
+    eckd->co_active = true;
+    co = qemu_coroutine_create(eckd_ccw_co, eckd);
+    qemu_coroutine_enter(co);
+    if (eckd->co_running) {
+        eckd->co_yielded = true;
+        trace_eckd_async(CCW_DEVICE(eckd)->sch->devno, "pending", 0);
+        return CSS_CCW_PENDING;
+    }
+    eckd->co_active = false;
+    return eckd->co_ret;
+}
+
+static bool eckd_may_start(EckdCcwDevice *eckd)
+{
+    return !eckd->co_active && !eckd->quiesced && runstate_is_running();
+}
+
+/*
+ * Start a channel program that had to wait, see eckd_ccw_cb().  Not while
+ * the VM is stopped: the state may be saved before it runs again, and a
+ * waiting program is migrated (vmstate_eckd_deferred), a running one not.
+ */
+static void eckd_run_deferred(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+    int ret;
+
+    if (!eckd->start_deferred || !eckd_may_start(eckd)) {
+        return;
+    }
+    eckd->start_deferred = false;
+    trace_eckd_async(sch->devno, "start deferred", 0);
+    ret = eckd_start_ccw(eckd, eckd->deferred_ccw);
+    if (ret != CSS_CCW_PENDING) {
+        css_virtual_ccw_complete(sch, ret);
+    }
+}
+
+static void eckd_complete_bh(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+    SubchDev *sch = CCW_DEVICE(eckd)->sch;
+
+    eckd->co_active = false;
+    trace_eckd_async(sch->devno, eckd->co_discard ? "discarded" : "complete",
+                     eckd->co_ret);
+    if (!eckd->co_discard) {
+        /* css ignores this if a clear or halt ended the program. */
+        css_virtual_ccw_complete(sch, eckd->co_ret);
+    }
+    eckd_run_deferred(eckd);
+}
+
+static int eckd_ccw_cb(SubchDev *sch, CCW1 ccw)
+{
+    EckdCcwDevice *eckd = sch->driver_data;
+
+    eckd->prev_cmd = sch->last_cmd;
+    eckd->prev_cmd_valid = sch->last_cmd_valid;
+    /*
+     * A new channel program waits while the backend is drained, or while a
+     * CCW of a program that was cleared is still executing.  Inside a
+     * program, the next CCW always starts: the drain waits for the end of
+     * the program.  (The IPL starts its channel program before the VM
+     * runs and waits for it, so do not wait for the VM to run here.)
+     */
+    if (eckd->co_active || (!sch->last_cmd_valid && eckd->quiesced)) {
+        eckd->deferred_ccw = ccw;
+        eckd->start_deferred = true;
+        trace_eckd_async(sch->devno, "deferred", eckd->co_active);
+        return CSS_CCW_PENDING;
+    }
+    return eckd_start_ccw(eckd, ccw);
+}
+
+/* Clear, halt or reset of the subchannel while a CCW is pending. */
+static void eckd_cancel(SubchDev *sch)
+{
+    EckdCcwDevice *eckd = sch->driver_data;
+
+    eckd->start_deferred = false;
+    if (eckd->co_active) {
+        eckd->co_discard = true;
+    }
+}
+
+/* Wait until no CCW is executing, dropping its result. */
+static void eckd_quiesce(EckdCcwDevice *eckd)
+{
+    eckd->start_deferred = false;
+    if (eckd->co_active) {
+        eckd->co_discard = true;
+        blk_drain(eckd->blk);
+    }
+    assert(!eckd->co_active);
+}
+
 static void eckd_reset_hold(Object *obj, ResetType type)
 {
     EckdCcwDevice *eckd = ECKD_CCW(obj);
     EckdCcwDeviceClass *ec = ECKD_CCW_GET_CLASS(eckd);
 
+    /* A CCW still executing must not change the state reset below. */
+    eckd_quiesce(eckd);
     eckd->extent_defined = false;
     eckd->file_mask = 0;
     eckd->positioned = false;
@@ -1883,14 +2052,38 @@ static void eckd_drained_begin(void *opaque)
 {
     EckdCcwDevice *eckd = opaque;
 
+    eckd->quiesced = true;
     ckd_image_invalidate(&eckd->image);
+}
+
+/* The drain waits for the channel program in progress, see above. */
+static bool eckd_drained_poll(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    return eckd->co_active;
 }
 
 static void eckd_drained_end(void *opaque)
 {
     EckdCcwDevice *eckd = opaque;
 
+    eckd->quiesced = false;
     ckd_image_invalidate(&eckd->image);
+    if (eckd->start_deferred) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), eckd_run_deferred,
+                                eckd);
+    }
+}
+
+static void eckd_vm_state_change(void *opaque, bool running, RunState state)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    if (running && eckd->start_deferred) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), eckd_run_deferred,
+                                eckd);
+    }
 }
 
 static void eckd_resize_cb(void *opaque)
@@ -1902,6 +2095,7 @@ static void eckd_resize_cb(void *opaque)
 
 static const BlockDevOps eckd_block_ops = {
     .drained_begin = eckd_drained_begin,
+    .drained_poll = eckd_drained_poll,
     .drained_end = eckd_drained_end,
     .resize_cb = eckd_resize_cb,
 };
@@ -1954,6 +2148,7 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     eckd->format_track = g_malloc0(ECKD_TRACK_SIZE);
     eckd->write_record = g_malloc(ECKD_MAX_RECORD_SIZE);
     blk_set_dev_ops(eckd->blk, &eckd_block_ops, eckd);
+    blk_set_disable_request_queuing(eckd->blk, true);
 
     sch = css_create_sch_at(cdev->devno, ECKD_AUTO_DEVNO, errp);
     if (!sch) {
@@ -1985,11 +2180,16 @@ static void eckd_realize(DeviceState *dev, Error **errp)
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = eckd_ccw_cb;
     sch->ccw_cb_first = true;
+    sch->cancel_cb = eckd_cancel;
+    sch->disable_cb = eckd_cancel;
+    sch->ccw_async_migratable = true;
     sch->irb_cb = build_irb_virtual;
 
     if (!cdk->realize(cdev, &local_err)) {
         goto fail_sch;
     }
+    eckd->vmstate_change = qemu_add_vm_change_state_handler(
+        eckd_vm_state_change, eckd);
     return;
 
 fail_sch:
@@ -2008,6 +2208,9 @@ static void eckd_unrealize(DeviceState *dev)
 {
     EckdCcwDevice *eckd = ECKD_CCW(dev);
 
+    eckd_quiesce(eckd);
+    g_clear_pointer(&eckd->vmstate_change,
+                    qemu_del_vm_change_state_handler);
     blk_set_dev_ops(eckd->blk, NULL, NULL);
     ckd_image_close(&eckd->image);
     g_clear_pointer(&eckd->write_record, g_free);
@@ -2034,8 +2237,9 @@ static const Property eckd_properties[] = {
 };
 
 /*
- * Migration state.  eckd-ccw I/O is synchronous: when the device state is
- * saved, no CCW is executing.  A channel program may still be suspended,
+ * Migration state.  The drain before the device state is saved lets the
+ * channel program in progress finish (see eckd_ccw_cb()), so no CCW is
+ * executing then.  A channel program may still be suspended,
  * so the multi-CCW contexts (Define Extent, Locate Record, format-write,
  * write, update and read domains) are part of the state; the large
  * format-write and record buffers go into subsections that are sent only
@@ -2044,6 +2248,17 @@ static const Property eckd_properties[] = {
  * The cached track itself is not migrated: the destination reads it again
  * from the (shared or mirrored) image before the next CCW uses it.
  */
+static int eckd_pre_save(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    /* The drain before saving finishes every CCW that started. */
+    if (eckd->co_active) {
+        return -EBUSY;
+    }
+    return 0;
+}
+
 static int eckd_post_load(void *opaque, int version_id)
 {
     EckdCcwDevice *eckd = opaque;
@@ -2105,10 +2320,44 @@ static const VMStateDescription vmstate_eckd_write = {
     },
 };
 
+static bool eckd_deferred_needed(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    return eckd->start_deferred;
+}
+
+/*
+ * A channel program that waits for a drained section to end when the VM
+ * stops: its first CCW is pending at css level (the subchannel migrates
+ * its data stream, see ccw_async_migratable) and starts on the
+ * destination when the VM runs (eckd_vm_state_change()).
+ */
+static const VMStateDescription vmstate_eckd_deferred = {
+    .name = TYPE_ECKD_CCW "/deferred",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = eckd_deferred_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(start_deferred, EckdCcwDevice),
+        VMSTATE_UINT8(deferred_ccw.cmd_code, EckdCcwDevice),
+        VMSTATE_UINT8(deferred_ccw.flags, EckdCcwDevice),
+        VMSTATE_UINT16(deferred_ccw.count, EckdCcwDevice),
+        VMSTATE_UINT32(deferred_ccw.cda, EckdCcwDevice),
+        VMSTATE_UINT8(prev_cmd.cmd_code, EckdCcwDevice),
+        VMSTATE_UINT8(prev_cmd.flags, EckdCcwDevice),
+        VMSTATE_UINT16(prev_cmd.count, EckdCcwDevice),
+        VMSTATE_UINT32(prev_cmd.cda, EckdCcwDevice),
+        VMSTATE_BOOL(prev_cmd_valid, EckdCcwDevice),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_eckd_ccw = {
     .name = TYPE_ECKD_CCW,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = eckd_pre_save,
     .post_load = eckd_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CCW_DEVICE(parent_obj, EckdCcwDevice),
@@ -2169,6 +2418,7 @@ static const VMStateDescription vmstate_eckd_ccw = {
     .subsections = (const VMStateDescription * const []) {
         &vmstate_eckd_format,
         &vmstate_eckd_write,
+        &vmstate_eckd_deferred,
         NULL
     },
 };
