@@ -2743,6 +2743,92 @@ bool kvm_s390_apply_cpu_model(const S390CPUModel *model, Error **errp)
     return true;
 }
 
+/*
+ * SCLP "event pending" service signals.
+ *
+ * KVM presents an event-pending indication (bit 31 of the service-signal
+ * parameter) as an interruption of its own: an indication that comes with
+ * the completion of an SCCB is delivered first and separately (parameter 1,
+ * then the SCCB address), and an indication without SCCB is followed by a
+ * second service signal with parameter 0, which looks like the completion of
+ * an SCCB the guest never started.  Linux ignores that; z/VSE takes it for an
+ * unsolicited service signal, recovers the SCLP interface (write event mask,
+ * read SCP info) and stops reading operator commands from the line-mode
+ * console.  So present the event-pending indication like the CPU would,
+ * directly, as one service signal with parameter 1, on a CPU enabled for it;
+ * the completions of SCCBs stay with KVM.  Not for protected guests, whose
+ * lowcore QEMU cannot write.
+ */
+static bool sclp_event_signal_pending;
+static QEMUTimer *sclp_event_timer;
+
+static void kvm_s390_try_sclp_event_signal(CPUState *cs, run_on_cpu_data arg)
+{
+    S390CPU *cpu = S390_CPU(cs);
+    CPUS390XState *env = &cpu->env;
+    uint64_t mask, addr;
+    LowCore *lowcore;
+
+    if (!sclp_event_signal_pending) {
+        return;
+    }
+    cpu_synchronize_state(cs);
+    if (s390_cpu_get_state(cpu) != S390_CPU_STATE_OPERATING ||
+        !(env->psw.mask & PSW_MASK_EXT) ||
+        !(env->cregs[0] & CR0_SERVICE_SC)) {
+        /* try again soon, the guest will enable for it */
+        timer_mod(sclp_event_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+        return;
+    }
+    sclp_event_signal_pending = false;
+
+    lowcore = cpu_map_lowcore(env);
+    lowcore->ext_int_code = cpu_to_be16(EXT_SERVICE);
+    lowcore->ext_params = cpu_to_be32(1);
+    lowcore->cpu_addr = 0;
+    s390_lowcore_load_psw(env, lowcore,
+                          offsetof(LowCore, external_new_psw), 0x058,
+                          &mask, &addr);
+    s390_lowcore_store_psw(env, lowcore,
+                           offsetof(LowCore, external_old_psw), 0x018,
+                           s390_cpu_get_psw_mask(env), env->psw.addr);
+    cpu_unmap_lowcore(env, lowcore);
+    s390_cpu_set_psw(env, mask, addr);
+}
+
+static void kvm_s390_kick_sclp_event_signal(void *opaque)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        async_run_on_cpu(cs, kvm_s390_try_sclp_event_signal, RUN_ON_CPU_NULL);
+    }
+}
+
+/*
+ * Present an SCLP event-pending indication; after the completion of an
+ * SCCB a little later, so that the completion comes first.  False if KVM
+ * has to present it.
+ */
+bool kvm_s390_sclp_event_signal(bool after_completion)
+{
+    if (s390_is_pv()) {
+        return false;
+    }
+    if (!sclp_event_timer) {
+        sclp_event_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        kvm_s390_kick_sclp_event_signal, NULL);
+    }
+    sclp_event_signal_pending = true;
+    if (after_completion) {
+        timer_mod(sclp_event_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+    } else {
+        kvm_s390_kick_sclp_event_signal(NULL);
+    }
+    return true;
+}
+
 void kvm_s390_restart_interrupt(S390CPU *cpu)
 {
     struct kvm_s390_irq irq = {

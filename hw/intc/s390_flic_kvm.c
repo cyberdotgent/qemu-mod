@@ -23,6 +23,9 @@
 #include "migration/qemu-file-types.h"
 #include "system/runstate.h"
 #include "trace.h"
+
+/* bit 31 of the service-signal parameter: an SCLP event is pending */
+#define SCLP_PARM_EVENT_PENDING 1
 #include "qom/object.h"
 
 #define FLIC_SAVE_INITIAL_SIZE qemu_real_host_page_size()
@@ -145,11 +148,20 @@ static void kvm_s390_inject_flic(S390FLICState *fs, struct kvm_s390_irq *irq)
 
 static void kvm_s390_inject_service(S390FLICState *fs, uint32_t parm)
 {
-        struct kvm_s390_irq irq = {
+    struct kvm_s390_irq irq = {
         .type = KVM_S390_INT_SERVICE,
         .u.ext.ext_params = parm,
     };
 
+    /* KVM splits event-pending indications, see kvm_s390_sclp_event_signal */
+    if ((parm & SCLP_PARM_EVENT_PENDING) &&
+        kvm_s390_sclp_event_signal(parm & ~SCLP_PARM_EVENT_PENDING)) {
+        parm &= ~SCLP_PARM_EVENT_PENDING;
+        if (!parm) {
+            return;
+        }
+        irq.u.ext.ext_params = parm;
+    }
     kvm_s390_inject_flic(fs, &irq);
 }
 
