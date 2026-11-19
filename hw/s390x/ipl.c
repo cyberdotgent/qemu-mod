@@ -19,6 +19,7 @@
 #include "system/physmem.h"
 #include "system/reset.h"
 #include "system/runstate.h"
+#include "system/system.h"
 #include "elf.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
@@ -1272,9 +1273,12 @@ static void s390_ipl_native_ccw(S390CPU *cpu)
     /*
      * An incoming migration replaces whatever the IPL would do (like a
      * snapshot load, see s390_machine_reset()), and its block devices are
-     * inactive until then: do not start the IPL channel program.
+     * inactive until then: do not start the IPL channel program.  The same
+     * holds for the resets before a -loadvm or -loadstate (PVE resume and
+     * rollback with RAM) has loaded the machine state; an IPL there would
+     * only report bogus failures.
      */
-    if (runstate_check(RUN_STATE_INMIGRATE)) {
+    if (runstate_check(RUN_STATE_INMIGRATE) || qemu_vmstate_load_pending()) {
         goto failed;
     }
 

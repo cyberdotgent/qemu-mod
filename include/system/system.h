@@ -25,6 +25,7 @@ void qemu_remove_machine_init_done_notifier(Notifier *notify);
 void configure_rtc(QemuOpts *opts);
 
 void qemu_init_subsystems(void);
+bool qemu_vmstate_load_pending(void);
 
 extern int autostart;
 

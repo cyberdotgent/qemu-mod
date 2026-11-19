@@ -177,6 +177,7 @@ static bool have_custom_ram_size;
 static const char *ram_memdev_id;
 static QDict *machine_opts_dict;
 static const char *loadstate;
+static bool vmstate_load_done;
 static QTAILQ_HEAD(, ObjectOption) object_opts = QTAILQ_HEAD_INITIALIZER(object_opts);
 static QTAILQ_HEAD(, DeviceOption) device_opts = QTAILQ_HEAD_INITIALIZER(device_opts);
 static int display_remote;
@@ -3728,6 +3729,16 @@ static bool qemu_machine_creation_done(Error **errp)
     return true;
 }
 
+/*
+ * True from startup until the machine state from -loadvm or -loadstate has
+ * been loaded: resets before that (machine creation, the reset before the
+ * load) need not start the guest, the load replaces their result.
+ */
+bool qemu_vmstate_load_pending(void)
+{
+    return (loadvm || loadstate) && !vmstate_load_done;
+}
+
 void qmp_x_exit_preconfig(Error **errp)
 {
     if (phase_check(PHASE_MACHINE_INITIALIZED)) {
@@ -3752,6 +3763,7 @@ void qmp_x_exit_preconfig(Error **errp)
             autostart = 0;
         }
     }
+    vmstate_load_done = true;
     if (replay_mode != REPLAY_MODE_NONE) {
         replay_vmstate_init();
     }
