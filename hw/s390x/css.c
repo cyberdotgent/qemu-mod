@@ -3039,3 +3039,27 @@ int css_sch_build_schib(SubchDev *sch, CssDevId *dev_id)
 
     return 0;
 }
+
+bool css_parse_ccw_id(const char *name, const char *str, unsigned int digits,
+                      uint16_t *val, Error **errp)
+{
+    const char *p = str;
+    size_t len;
+    unsigned long v;
+
+    if (!str || !*str) {
+        return true;
+    }
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    len = strlen(p);
+    if (!len || len > digits || strspn(p, "0123456789abcdefABCDEF") != len) {
+        error_setg(errp, "%s=%s: expected 1 to %u hexadecimal digits",
+                   name, str, digits);
+        return false;
+    }
+    v = strtoul(p, NULL, 16);
+    *val = v;
+    return true;
+}

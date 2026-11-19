@@ -508,6 +508,114 @@ static void test_migration_during_io(void)
     unlink(image);
 }
 
+/* Start the ccw_prog guest with one eckd-ccw device and @extra options. */
+static QTestState *eckd_prog_start_opts(const char *image, const char *path,
+                                        const char *extra)
+{
+    g_autofree char *devices = g_strdup_printf(
+        "-drive if=none,id=ckd0,file=%s,format=raw "
+        "-device eckd-ccw,drive=ckd0,devno=fe.0.0200%s", path, extra);
+
+    return ccw_prog_start(image, "128M", devices);
+}
+
+/* Sense ID and RDC identity bytes: CU type/model, device type/model. */
+static void eckd_check_identity(QTestState *qts, uint16_t cu_type,
+                                uint8_t cu_model, uint16_t dev_type,
+                                uint8_t dev_model)
+{
+    uint8_t buf[64];
+    CcwProgIrb irb;
+
+    ccw_prog_set_ccw(qts, 0, 0xe4, CCW_FLAG_SLI, 24, CCW_PROG_DATA);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA, buf, 7);
+    g_assert_cmphex(buf[0], ==, 0xff);
+    g_assert_cmphex(lduw_be_p(buf + 1), ==, cu_type);
+    g_assert_cmphex(buf[3], ==, cu_model);
+    g_assert_cmphex(lduw_be_p(buf + 4), ==, dev_type);
+    g_assert_cmphex(buf[6], ==, dev_model);
+
+    ccw_prog_set_ccw(qts, 0, 0x64, CCW_FLAG_SLI, 64, CCW_PROG_DATA);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA, buf, sizeof(buf));
+    g_assert_cmphex(lduw_be_p(buf), ==, cu_type);
+    g_assert_cmphex(buf[2], ==, cu_model);
+    g_assert_cmphex(lduw_be_p(buf + 3), ==, dev_type);
+    g_assert_cmphex(buf[5], ==, dev_model);
+    /* The geometry stays the image's: one 3390 cylinder of 15 tracks. */
+    g_assert_cmpuint(lduw_be_p(buf + 12), ==, 1);
+    g_assert_cmpuint(lduw_be_p(buf + 14), ==, 15);
+}
+
+static void test_identity(void)
+{
+    g_autofree char *path = create_ckd64_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+
+    /* Default: from the image (2107-E8, 3390 model by cylinders). */
+    qts = eckd_prog_start_opts(image, path, "");
+    eckd_check_identity(qts, 0x2107, 0xe8, 0x3390, 0x02);
+    qtest_quit(qts);
+
+    /* A 3380 identity on the 3390 image, model from the cylinder count. */
+    qts = eckd_prog_start_opts(image, path, ",cutype=3990,devtype=3380");
+    eckd_check_identity(qts, 0x3990, 0xe9, 0x3380, 0x02);
+    qtest_quit(qts);
+
+    /* Everything explicit, with and without the 0x prefix. */
+    qts = eckd_prog_start_opts(image, path,
+                               ",cutype=0x2105,cumodel=e8,devtype=3390,"
+                               "devmodel=0A");
+    eckd_check_identity(qts, 0x2105, 0xe8, 0x3390, 0x0a);
+    qtest_quit(qts);
+
+    unlink(path);
+    unlink(image);
+}
+
+static void assert_device_fails(const char *path, const char *extra,
+                                const char *message)
+{
+    const char *binary = qtest_qemu_binary(NULL);
+    g_autofree char *drive = g_strdup_printf(
+        "if=none,id=ckd0,file=%s,format=raw", path);
+    g_autofree char *device = g_strdup_printf(
+        "eckd-ccw,drive=ckd0,devno=fe.0.0200%s", extra);
+    const char *argv[] = {
+        binary, "-nodefaults", "-display", "none", "-accel", "qtest",
+        "-drive", drive, "-device", device, NULL,
+    };
+    g_autofree char *stderr_data = NULL;
+    int status;
+
+    g_assert_true(g_spawn_sync(NULL, (char **)argv, NULL,
+                               G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL, NULL,
+                               &stderr_data, &status, NULL));
+    g_assert_true(WIFEXITED(status));
+    g_assert_cmpint(WEXITSTATUS(status), !=, 0);
+    if (!strstr(stderr_data, message)) {
+        g_test_message("stderr: %s", stderr_data);
+        g_assert_not_reached();
+    }
+}
+
+static void test_identity_invalid(void)
+{
+    g_autofree char *path = create_ckd64_image();
+
+    assert_device_fails(path, ",devtype=9345", "devtype=9345 needs devmodel=");
+    assert_device_fails(path, ",cutype=3880", "cutype=3880 needs cumodel=");
+    assert_device_fails(path, ",devtype=33900",
+                        "expected 1 to 4 hexadecimal digits");
+    assert_device_fails(path, ",devmodel=x1",
+                        "expected 1 to 2 hexadecimal digits");
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -522,7 +630,9 @@ int main(int argc, char **argv)
                    test_header_defined_size_limit);
     qtest_add_func("/eckd-ccw/legacy-exact-length", test_legacy_exact_length);
     qtest_add_func("/eckd-ccw/multi-file-rejected", test_multi_file_rejected);
+    qtest_add_func("/eckd-ccw/identity-invalid", test_identity_invalid);
     if (qtest_has_accel("tcg")) {
+        qtest_add_func("/eckd-ccw/io/identity", test_identity);
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
         qtest_add_func("/eckd-ccw/io/track-cache-invalidation",
                        test_track_cache_invalidation);

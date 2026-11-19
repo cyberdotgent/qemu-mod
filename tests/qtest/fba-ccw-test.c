@@ -192,6 +192,54 @@ static void test_io_2g_boundary(void)
     unlink(image);
 }
 
+static QTestState *fba_prog_start_opts(const char *image, const char *path,
+                                       const char *extra)
+{
+    g_autofree char *devices = g_strdup_printf(
+        "-drive if=none,id=fba0,file=%s,format=raw "
+        "-device fba-ccw,drive=fba0,devno=fe.0.0200%s", path, extra);
+
+    return ccw_prog_start(image, "128M", devices);
+}
+
+static void fba_check_sense_id(QTestState *qts, uint16_t cu_type,
+                               uint8_t cu_model, uint16_t dev_type,
+                               uint8_t dev_model)
+{
+    uint8_t buf[7];
+    CcwProgIrb irb;
+
+    ccw_prog_set_ccw(qts, 0, 0xe4, CCW_FLAG_SLI, sizeof(buf), CCW_PROG_DATA);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA, buf, sizeof(buf));
+    g_assert_cmphex(buf[0], ==, 0xff);
+    g_assert_cmphex(lduw_be_p(buf + 1), ==, cu_type);
+    g_assert_cmphex(buf[3], ==, cu_model);
+    g_assert_cmphex(lduw_be_p(buf + 4), ==, dev_type);
+    g_assert_cmphex(buf[6], ==, dev_model);
+}
+
+static void test_identity(void)
+{
+    g_autofree char *path = create_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+
+    qts = fba_prog_start_opts(image, path, "");
+    fba_check_sense_id(qts, 0x6310, 0x01, 0x9336, 0x10);
+    qtest_quit(qts);
+
+    qts = fba_prog_start_opts(image, path,
+                              ",cutype=3880,cumodel=01,devtype=3370,"
+                              "devmodel=0x02");
+    fba_check_sense_id(qts, 0x3880, 0x01, 0x3370, 0x02);
+    qtest_quit(qts);
+
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -200,6 +248,7 @@ int main(int argc, char **argv)
     qtest_add_func("/fba-ccw/auto-devnos", test_auto_devnos);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/fba-ccw/io/2g-boundary", test_io_2g_boundary);
+        qtest_add_func("/fba-ccw/io/identity", test_identity);
     }
     return g_test_run();
 }

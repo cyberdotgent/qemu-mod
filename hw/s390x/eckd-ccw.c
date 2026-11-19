@@ -116,6 +116,21 @@ struct EckdCcwDevice {
     uint16_t fla;
     uint16_t chpid;
 
+    /*
+     * Identity presented in Sense ID, RDC, RCD and RSSD (cutype=, cumodel=,
+     * devtype=, devmodel=; hexadecimal strings).  Unset values come from
+     * the image: 2107-E8 control unit, 3390 device with the model of its
+     * cylinder count.  The geometry always stays the image's (3390 tracks).
+     */
+    char *cutype_prop;
+    char *cumodel_prop;
+    char *devtype_prop;
+    char *devmodel_prop;
+    uint16_t cu_type;
+    uint8_t cu_model;
+    uint16_t dev_type;
+    uint8_t dev_model;
+
     bool extent_defined;
     uint16_t extent_begin_cylinder;
     uint16_t extent_begin_head;
@@ -238,6 +253,72 @@ static uint8_t eckd_model(uint32_t cylinders)
         return 0x0a;
     }
     return 0x0c;
+}
+
+/* Sense ID model of a 3380 with @cylinders cylinders (A/D/J, E, K). */
+static uint8_t eckd_model_3380(uint32_t cylinders)
+{
+    if (cylinders <= 885) {
+        return 0x02;
+    }
+    if (cylinders <= 1770) {
+        return 0x0a;
+    }
+    return 0x1e;
+}
+
+/*
+ * Resolve the identity properties.  A model may be left out only where it
+ * follows from the type: the 2105/2107 control units (E8), the 3990-6
+ * (E9), and 3390 or 3380 devices (from the cylinder count).
+ */
+static bool eckd_resolve_identity(EckdCcwDevice *eckd, Error **errp)
+{
+    uint16_t cu_type = ECKD_CU_TYPE, dev_type = ECKD_DEV_TYPE;
+    uint16_t cu_model = UINT16_MAX, dev_model = UINT16_MAX;
+
+    if (!css_parse_ccw_id("cutype", eckd->cutype_prop, 4, &cu_type, errp) ||
+        !css_parse_ccw_id("cumodel", eckd->cumodel_prop, 2, &cu_model,
+                          errp) ||
+        !css_parse_ccw_id("devtype", eckd->devtype_prop, 4, &dev_type,
+                          errp) ||
+        !css_parse_ccw_id("devmodel", eckd->devmodel_prop, 2, &dev_model,
+                          errp)) {
+        return false;
+    }
+    if (cu_model == UINT16_MAX) {
+        switch (cu_type) {
+        case 0x2105:
+        case 0x2107:
+            cu_model = ECKD_CU_MODEL;
+            break;
+        case 0x3990:
+            cu_model = 0xe9;
+            break;
+        default:
+            error_setg(errp, "eckd-ccw: cutype=%04x needs cumodel=", cu_type);
+            return false;
+        }
+    }
+    if (dev_model == UINT16_MAX) {
+        switch (dev_type) {
+        case 0x3390:
+            dev_model = eckd_model(eckd->image.cylinders);
+            break;
+        case 0x3380:
+            dev_model = eckd_model_3380(eckd->image.cylinders);
+            break;
+        default:
+            error_setg(errp, "eckd-ccw: devtype=%04x needs devmodel=",
+                       dev_type);
+            return false;
+        }
+    }
+    eckd->cu_type = cu_type;
+    eckd->cu_model = cu_model;
+    eckd->dev_type = dev_type;
+    eckd->dev_model = dev_model;
+    return true;
 }
 
 static uint8_t eckd_type_code(uint32_t cylinders)
@@ -580,10 +661,10 @@ static void eckd_build_sense_id(EckdCcwDevice *eckd, uint8_t *buf)
 
     memset(buf, 0, 24);
     buf[0] = 0xff;
-    stw_be_p(buf + 1, ECKD_CU_TYPE);
-    buf[3] = ECKD_CU_MODEL;
-    stw_be_p(buf + 4, ECKD_DEV_TYPE);
-    buf[6] = eckd_model(eckd->image.cylinders);
+    stw_be_p(buf + 1, eckd->cu_type);
+    buf[3] = eckd->cu_model;
+    stw_be_p(buf + 4, eckd->dev_type);
+    buf[6] = eckd->dev_model;
     for (i = 0; i < ARRAY_SIZE(ciws); i++) {
         stl_be_p(buf + 8 + i * 4, ciws[i]);
     }
@@ -594,10 +675,10 @@ static void eckd_build_rdc(EckdCcwDevice *eckd, uint8_t *buf)
     uint8_t code = eckd_type_code(eckd->image.cylinders);
 
     memset(buf, 0, 64);
-    stw_be_p(buf, ECKD_CU_TYPE);
-    buf[2] = ECKD_CU_MODEL;
-    stw_be_p(buf + 3, ECKD_DEV_TYPE);
-    buf[5] = eckd_model(eckd->image.cylinders);
+    stw_be_p(buf, eckd->cu_type);
+    buf[2] = eckd->cu_model;
+    stw_be_p(buf + 3, eckd->dev_type);
+    buf[5] = eckd->dev_model;
     stl_be_p(buf + 6, 0x528010b7);
     buf[10] = 0x20;
     buf[11] = code;
@@ -650,8 +731,8 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
         snprintf(text, sizeof(text), "002107900IBM75%012X",
                  (unsigned int)lss);
     } else {
-        snprintf(text, sizeof(text), "  33900%02XHRCZZ",
-                 eckd_model(eckd->image.cylinders));
+        snprintf(text, sizeof(text), "  %04X0%02XHRCZZ",
+                 eckd->dev_type, eckd->dev_model);
         memcpy(text + 14, eckd->image.serial, 12);
     }
     eckd_ned_text(buf + 4, text, 26);
@@ -663,8 +744,8 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
         snprintf(text, sizeof(text), "002107986IBM75%012X",
                  (unsigned int)lss);
     } else {
-        snprintf(text, sizeof(text), "  33900%02XHRCZZ000000000003",
-                 eckd_model(eckd->image.cylinders));
+        snprintf(text, sizeof(text), "  %04X0%02XHRCZZ000000000003",
+                 eckd->dev_type, eckd->dev_model);
     }
     eckd_ned_text(buf + 36, text, 26);
 
@@ -673,7 +754,8 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
         snprintf(text, sizeof(text), "002107986IBM75%012X",
                  (unsigned int)lss);
     } else {
-        snprintf(text, sizeof(text), "  21070E8HRCZZ000000000002");
+        snprintf(text, sizeof(text), "  %04X0%02XHRCZZ000000000002",
+                 eckd->cu_type, eckd->cu_model);
     }
     eckd_ned_text(buf + 68, text, 26);
     if (!explicit_topology) {
@@ -685,7 +767,8 @@ static void eckd_build_rcd(EckdCcwDevice *eckd, uint8_t *buf)
         snprintf(text, sizeof(text), "002107900IBM75%012X",
                  (unsigned int)lss);
     } else {
-        snprintf(text, sizeof(text), "  2107   HRCZZ000000000001");
+        snprintf(text, sizeof(text), "  %04X   HRCZZ000000000001",
+                 eckd->cu_type);
     }
     eckd_ned_text(buf + 100, text, 26);
 
@@ -790,7 +873,7 @@ static int eckd_perform_subsystem_function(EckdCcwDevice *eckd,
         memset(data, 0, 96);
         stl_be_p(data, 0x00000100);
         snprintf(node_id, sizeof(node_id), "00%04X   HRCZZ000000000001",
-                 ECKD_CU_TYPE);
+                 eckd->cu_type);
         ebcdic_put(data + 4, node_id, 26);
         stl_be_p(data + 40, 0x41010000);
         stl_be_p(data + 44, 0x41010001);
@@ -2145,6 +2228,10 @@ static void eckd_realize(DeviceState *dev, Error **errp)
         !ckd_image_open(&eckd->image, eckd->blk, errp)) {
         return;
     }
+    if (!eckd_resolve_identity(eckd, errp)) {
+        ckd_image_close(&eckd->image);
+        return;
+    }
     eckd->format_track = g_malloc0(ECKD_TRACK_SIZE);
     eckd->write_record = g_malloc(ECKD_MAX_RECORD_SIZE);
     blk_set_dev_ops(eckd->blk, &eckd_block_ops, eckd);
@@ -2162,10 +2249,10 @@ static void eckd_realize(DeviceState *dev, Error **errp)
         goto fail_sch;
     }
     sch->id.reserved = 0xff;
-    sch->id.cu_type = ECKD_CU_TYPE;
-    sch->id.cu_model = ECKD_CU_MODEL;
-    sch->id.dev_type = ECKD_DEV_TYPE;
-    sch->id.dev_model = eckd_model(eckd->image.cylinders);
+    sch->id.cu_type = eckd->cu_type;
+    sch->id.cu_model = eckd->cu_model;
+    sch->id.dev_type = eckd->dev_type;
+    sch->id.dev_model = eckd->dev_model;
     css_sch_build_virtual_schib(sch, chpid, ECKD_CHPID_TYPE);
     if (explicit_topology) {
         sch->topology.valid = true;
@@ -2234,6 +2321,10 @@ static const Property eckd_properties[] = {
                        UINT16_MAX),
     DEFINE_PROP_UINT16("fla", EckdCcwDevice, fla, UINT16_MAX),
     DEFINE_PROP_UINT16("chpid", EckdCcwDevice, chpid, UINT16_MAX),
+    DEFINE_PROP_STRING("cutype", EckdCcwDevice, cutype_prop),
+    DEFINE_PROP_STRING("cumodel", EckdCcwDevice, cumodel_prop),
+    DEFINE_PROP_STRING("devtype", EckdCcwDevice, devtype_prop),
+    DEFINE_PROP_STRING("devmodel", EckdCcwDevice, devmodel_prop),
 };
 
 /*

@@ -68,6 +68,20 @@ struct FBACcwDevice {
     uint64_t requested_blocks;
     uint32_t blocks;
 
+    /*
+     * Identity presented in Sense ID (cutype=, cumodel=, devtype=,
+     * devmodel=; hexadecimal strings, default 6310-01 / 9336-10).  RDC keeps
+     * describing the 512-byte block device.
+     */
+    char *cutype_prop;
+    char *cumodel_prop;
+    char *devtype_prop;
+    char *devmodel_prop;
+    uint16_t cu_type;
+    uint8_t cu_model;
+    uint16_t dev_type;
+    uint8_t dev_model;
+
     bool extent_defined;
     uint8_t file_mask;
     uint32_t extent_block;
@@ -530,10 +544,10 @@ static int fba_ccw_cmd(SubchDev *sch, CCW1 ccw)
 
     case FBA_CMD_SENSE_ID:
         buf[0] = 0xff;
-        stw_be_p(buf + 1, FBA_CU_TYPE);
-        buf[3] = FBA_CU_MODEL;
-        stw_be_p(buf + 4, FBA_DEV_TYPE);
-        buf[6] = FBA_DEV_MODEL;
+        stw_be_p(buf + 1, fba->cu_type);
+        buf[3] = fba->cu_model;
+        stw_be_p(buf + 4, fba->dev_type);
+        buf[6] = fba->dev_model;
         return fba_copy_response(fba, &ccw, buf, 7);
 
     case FBA_CMD_READ_RESET_LOG:
@@ -622,6 +636,45 @@ static int fba_pre_save(void *opaque)
     return 0;
 }
 
+/*
+ * Resolve the identity properties.  A model may be left out only with the
+ * default type (6310 control unit, 9336 device).
+ */
+static bool fba_resolve_identity(FBACcwDevice *fba, Error **errp)
+{
+    uint16_t cu_type = FBA_CU_TYPE, dev_type = FBA_DEV_TYPE;
+    uint16_t cu_model = UINT16_MAX, dev_model = UINT16_MAX;
+
+    if (!css_parse_ccw_id("cutype", fba->cutype_prop, 4, &cu_type, errp) ||
+        !css_parse_ccw_id("cumodel", fba->cumodel_prop, 2, &cu_model,
+                          errp) ||
+        !css_parse_ccw_id("devtype", fba->devtype_prop, 4, &dev_type, errp) ||
+        !css_parse_ccw_id("devmodel", fba->devmodel_prop, 2, &dev_model,
+                          errp)) {
+        return false;
+    }
+    if (cu_model == UINT16_MAX) {
+        if (cu_type != FBA_CU_TYPE) {
+            error_setg(errp, "fba-ccw: cutype=%04x needs cumodel=", cu_type);
+            return false;
+        }
+        cu_model = FBA_CU_MODEL;
+    }
+    if (dev_model == UINT16_MAX) {
+        if (dev_type != FBA_DEV_TYPE) {
+            error_setg(errp, "fba-ccw: devtype=%04x needs devmodel=",
+                       dev_type);
+            return false;
+        }
+        dev_model = FBA_DEV_MODEL;
+    }
+    fba->cu_type = cu_type;
+    fba->cu_model = cu_model;
+    fba->dev_type = dev_type;
+    fba->dev_model = dev_model;
+    return true;
+}
+
 static void fba_realize(DeviceState *dev, Error **errp)
 {
     FBACcwDevice *fba = FBA_CCW(dev);
@@ -636,6 +689,9 @@ static void fba_realize(DeviceState *dev, Error **errp)
 
     if (!fba->blk) {
         error_setg(errp, "fba-ccw requires a block backend via drive=");
+        return;
+    }
+    if (!fba_resolve_identity(fba, errp)) {
         return;
     }
     length = blk_getlength(fba->blk);
@@ -684,10 +740,10 @@ static void fba_realize(DeviceState *dev, Error **errp)
     }
 
     sch->id.reserved = 0xff;
-    sch->id.cu_type = FBA_CU_TYPE;
-    sch->id.cu_model = FBA_CU_MODEL;
-    sch->id.dev_type = FBA_DEV_TYPE;
-    sch->id.dev_model = FBA_DEV_MODEL;
+    sch->id.cu_type = fba->cu_type;
+    sch->id.cu_model = fba->cu_model;
+    sch->id.dev_type = fba->dev_type;
+    sch->id.dev_model = fba->dev_model;
     css_sch_build_virtual_schib(sch, chpid, FBA_CHPID_TYPE);
     sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = fba_ccw_cb;
@@ -722,6 +778,10 @@ static const Property fba_properties[] = {
     DEFINE_PROP_DRIVE("drive", FBACcwDevice, blk),
     DEFINE_PROP_UINT64("blocks", FBACcwDevice, requested_blocks, 0),
     DEFINE_PROP_CCW_LOADPARM("loadparm", CcwDevice, loadparm),
+    DEFINE_PROP_STRING("cutype", FBACcwDevice, cutype_prop),
+    DEFINE_PROP_STRING("cumodel", FBACcwDevice, cumodel_prop),
+    DEFINE_PROP_STRING("devtype", FBACcwDevice, devtype_prop),
+    DEFINE_PROP_STRING("devmodel", FBACcwDevice, devmodel_prop),
 };
 
 static const VMStateDescription vmstate_fba_ccw = {
