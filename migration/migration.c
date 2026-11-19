@@ -347,7 +347,9 @@ void migration_object_init(void)
 
     /* Initialize cpu throttle timers */
     cpu_throttle_init();
+#ifdef CONFIG_PVE_BACKUP
     pbs_state_mig_init();
+#endif
 }
 
 typedef struct {

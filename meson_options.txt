@@ -196,6 +196,8 @@ option('libpmem', type : 'feature', value : 'auto',
        description: 'libpmem support')
 option('libssh', type : 'feature', value : 'auto',
        description: 'ssh block device support')
+option('libsystemd', type : 'feature', value : 'auto',
+       description: 'systemd journal for stderr when daemonized')
 option('libudev', type : 'feature', value : 'auto',
        description: 'Use libudev to enumerate host devices')
 option('libusb', type : 'feature', value : 'auto',
@@ -331,6 +333,8 @@ option('fdt', type: 'combo', value: 'auto',
 
 option('selinux', type: 'feature', value: 'auto',
        description: 'SELinux support in qemu-nbd')
+option('pve_backup', type: 'feature', value: 'auto',
+       description: 'Proxmox VE backup (VMA/PBS, libproxmox-backup-qemu)')
 option('replication', type: 'feature', value: 'auto',
        description: 'replication support')
 option('colo_proxy', type: 'feature', value: 'auto',

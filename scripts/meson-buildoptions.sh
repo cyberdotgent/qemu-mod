@@ -148,6 +148,7 @@ meson_options_help() {
   printf "%s\n" '  libnfs          libnfs block device driver'
   printf "%s\n" '  libpmem         libpmem support'
   printf "%s\n" '  libssh          ssh block device support'
+  printf "%s\n" '  libsystemd      systemd journal for stderr when daemonized'
   printf "%s\n" '  libudev         Use libudev to enumerate host devices'
   printf "%s\n" '  libusb          libusb support for USB passthrough'
   printf "%s\n" '  libvduse        build VDUSE Library'
@@ -175,6 +176,7 @@ meson_options_help() {
   printf "%s\n" '  pixman          pixman support'
   printf "%s\n" '  plugins         TCG plugins via shared library loading'
   printf "%s\n" '  png             PNG support with libpng'
+  printf "%s\n" '  pve-backup      Proxmox VE backup (VMA/PBS, libproxmox-backup-qemu)'
   printf "%s\n" '  pvg             macOS paravirtualized graphics support'
   printf "%s\n" '  qatzip          QATzip compression support'
   printf "%s\n" '  qcow1           qcow1 image format support'
@@ -393,6 +395,8 @@ _meson_option_parse() {
     --disable-libpmem) printf "%s" -Dlibpmem=disabled ;;
     --enable-libssh) printf "%s" -Dlibssh=enabled ;;
     --disable-libssh) printf "%s" -Dlibssh=disabled ;;
+    --enable-libsystemd) printf "%s" -Dlibsystemd=enabled ;;
+    --disable-libsystemd) printf "%s" -Dlibsystemd=disabled ;;
     --enable-libudev) printf "%s" -Dlibudev=enabled ;;
     --disable-libudev) printf "%s" -Dlibudev=disabled ;;
     --enable-libusb) printf "%s" -Dlibusb=enabled ;;
@@ -455,6 +459,8 @@ _meson_option_parse() {
     --enable-png) printf "%s" -Dpng=enabled ;;
     --disable-png) printf "%s" -Dpng=disabled ;;
     --prefix=*) quote_sh "-Dprefix=$2" ;;
+    --enable-pve-backup) printf "%s" -Dpve_backup=enabled ;;
+    --disable-pve-backup) printf "%s" -Dpve_backup=disabled ;;
     --enable-pvg) printf "%s" -Dpvg=enabled ;;
     --disable-pvg) printf "%s" -Dpvg=disabled ;;
     --enable-qatzip) printf "%s" -Dqatzip=enabled ;;

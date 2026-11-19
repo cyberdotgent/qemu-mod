@@ -29,8 +29,10 @@
 #include <pwd.h>
 #include <grp.h>
 #include <libgen.h>
+#ifdef CONFIG_LIBSYSTEMD
 #include <systemd/sd-journal.h>
 #include <syslog.h>
+#endif
 
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -308,11 +310,18 @@ void os_setup_post(void)
 
         dup2(fd, 0);
         dup2(fd, 1);
+#ifdef CONFIG_LIBSYSTEMD
         /* In case -D is given do not redirect stderr to journal */
         if (!qemu_log_enabled()) {
             int journal_fd = sd_journal_stream_fd("QEMU", LOG_ERR, 0);
             dup2(journal_fd, 2);
         }
+#else
+        /* In case -D is given do not redirect stderr to /dev/null */
+        if (!qemu_log_enabled()) {
+            dup2(fd, 2);
+        }
+#endif
 
         close(fd);
 

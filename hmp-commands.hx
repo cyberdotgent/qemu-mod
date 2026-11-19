@@ -117,6 +117,7 @@ SRST
   Copy data from a backing file into a block device.
 ERST
 
+#if defined(CONFIG_PVE_BACKUP)
    {
         .name       = "backup",
         .args_type  = "backupfile:s,speed:o?,devlist:s?",
@@ -145,6 +146,7 @@ SRST
   Cancel the current VM backup.
 
 ERST
+#endif
 
     {
         .name       = "block_job_set_speed",

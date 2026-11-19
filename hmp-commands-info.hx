@@ -466,6 +466,7 @@ SRST
 ERST
 
 
+#if defined(CONFIG_PVE_BACKUP)
     {
         .name       = "backup",
         .args_type  = "",
@@ -478,6 +479,7 @@ SRST
   ``info backup``
     Show backup status.
 ERST
+#endif
 
 #if defined(CONFIG_SLIRP)
     {

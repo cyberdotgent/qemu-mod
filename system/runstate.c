@@ -66,7 +66,9 @@
 #include "ui/console.h"
 
 #include "trace.h"
+#ifdef CONFIG_PVE_BACKUP
 #include "pve-backup.h"
+#endif
 
 static NotifierList exit_notifiers =
     NOTIFIER_LIST_INITIALIZER(exit_notifiers);
@@ -1173,7 +1175,9 @@ void qemu_cleanup(int status)
      * The backup access is set up by a QMP command, but is neither owned by a monitor nor
      * associated to a BlockBackend. Need to tear it down manually here.
      */
+#ifdef CONFIG_PVE_BACKUP
     backup_access_teardown(false);
+#endif
     job_cancel_sync_all();
     bdrv_close_all();
 

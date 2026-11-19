@@ -952,6 +952,7 @@ void hmp_change_medium(MonitorHMP *hmp, const char *device, const char *target,
                                !!read_only, read_only_mode, errp);
 }
 
+#ifdef CONFIG_PVE_BACKUP
 void coroutine_fn hmp_backup_cancel(MonitorHMP *hmp, const QDict *qdict)
 {
     Error *error = NULL;
@@ -991,3 +992,4 @@ void coroutine_fn hmp_backup(MonitorHMP *hmp, const QDict *qdict)
 
     hmp_handle_error(hmp, error);
 }
+#endif

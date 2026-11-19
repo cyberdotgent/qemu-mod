@@ -2148,8 +2148,11 @@ endif
 has_gettid = cc.has_function('gettid')
 
 libuuid = cc.find_library('uuid', required: true)
-libsystemd = cc.find_library('systemd', required: true)
-libproxmox_backup_qemu = cc.find_library('proxmox_backup_qemu', required: true)
+libsystemd = cc.find_library('systemd', has_headers: ['systemd/sd-journal.h'],
+                             required: get_option('libsystemd'))
+libproxmox_backup_qemu = cc.find_library('proxmox_backup_qemu',
+                                         has_headers: ['proxmox-backup-qemu.h'],
+                                         required: get_option('pve_backup'))
 
 # libselinux
 selinux = dependency('libselinux',
@@ -2463,6 +2466,8 @@ config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))
 config_host_data.set('CONFIG_GCOV', get_option('b_coverage'))
 config_host_data.set('CONFIG_LIBUDEV', libudev.found())
+config_host_data.set('CONFIG_LIBSYSTEMD', libsystemd.found())
+config_host_data.set('CONFIG_PVE_BACKUP', libproxmox_backup_qemu.found())
 config_host_data.set('CONFIG_LINUX', host_os == 'linux')
 config_host_data.set('CONFIG_POSIX', host_os != 'windows')
 config_host_data.set('CONFIG_WIN32', host_os == 'windows')
@@ -4636,9 +4641,11 @@ if have_tools
   vma = executable('vma', files('vma.c', 'vma-reader.c') + genh,
                    dependencies: [authz, block, crypto, io, qemuutil, qom], install: true)
 
-  pbs_restore = executable('pbs-restore', files('pbs-restore.c') + genh,
-                  dependencies: [authz, block, crypto, io, qemuutil, qom,
-                    libproxmox_backup_qemu], install: true)
+  if libproxmox_backup_qemu.found()
+    pbs_restore = executable('pbs-restore', files('pbs-restore.c') + genh,
+                    dependencies: [authz, block, crypto, io, qemuutil, qom,
+                      libproxmox_backup_qemu], install: true)
+  endif
 
   subdir('storage-daemon')
 
@@ -5141,11 +5148,13 @@ summary_info += {'Query Processing Library support': qpl}
 summary_info += {'UADK Library support': uadk}
 summary_info += {'qatzip support':    qatzip}
 summary_info += {'NUMA host support': numa}
-summary_info += {'PBS bdrv support':  config_host.has_key('CONFIG_PBS_BDRV')}
+summary_info += {'capstone':          capstone}
 summary_info += {'libpmem support':   libpmem}
 summary_info += {'libdaxctl support': libdaxctl}
 summary_info += {'libcbor support':   libcbor}
 summary_info += {'libudev':           libudev}
+summary_info += {'systemd journal':   libsystemd}
+summary_info += {'PVE backup (PBS)':  libproxmox_backup_qemu}
 # Dummy dependency, keep .found()
 summary_info += {'FUSE lseek':        fuse_lseek.found()}
 summary_info += {'selinux':           selinux}

@@ -175,6 +175,7 @@ void hmp_sync_profile(MonitorHMP *hmp, const QDict *qdict)
     }
 }
 
+#ifdef CONFIG_PVE_BACKUP
 void hmp_info_backup(MonitorHMP *hmp, const QDict *qdict)
 {
     BackupStatus *info;
@@ -245,6 +246,7 @@ void hmp_info_backup(MonitorHMP *hmp, const QDict *qdict)
 
     qapi_free_BackupStatus(info);
 }
+#endif
 
 void hmp_exit_preconfig(MonitorHMP *hmp, const QDict *qdict)
 {

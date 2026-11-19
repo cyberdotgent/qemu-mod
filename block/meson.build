@@ -45,12 +45,11 @@ block_ss.add(files(
 ), zstd, zlib)
 
 block_ss.add(files('../vma-writer.c'), libuuid)
-block_ss.add(files(
+block_ss.add(when: libproxmox_backup_qemu, if_true: files(
   '../proxmox-backup-client.c',
   '../pve-backup.c',
-), libproxmox_backup_qemu)
-
-block_ss.add(files('pbs.c'), libproxmox_backup_qemu)
+  'pbs.c',
+))
 
 
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))

@@ -1013,7 +1013,8 @@
   'data': {'*status': 'str', '*errmsg': 'str', '*total': 'int', '*dirty': 'int',
            '*transferred': 'int', '*zero-bytes': 'int', '*reused': 'int',
            '*start-time': 'int', '*end-time': 'int',
-           '*backup-file': 'str', '*uuid': 'str', 'finishing': 'bool' } }
+           '*backup-file': 'str', '*uuid': 'str', 'finishing': 'bool' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BackupFormat:
@@ -1026,7 +1027,8 @@
 #
 ##
 { 'enum': 'BackupFormat',
-  'data': [ 'vma', 'pbs' ] }
+  'data': [ 'vma', 'pbs' ],
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @backup:
@@ -1103,7 +1105,8 @@
                                     '*speed': 'int',
                                     '*max-workers': 'int',
                                     '*fleecing': 'bool' },
-  'returns': 'UuidInfo', 'coroutine': true }
+  'returns': 'UuidInfo', 'coroutine': true,
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @query-backup:
@@ -1113,7 +1116,8 @@
 # Returns: @BackupStatus
 #
 ##
-{ 'command': 'query-backup', 'returns': 'BackupStatus' }
+{ 'command': 'query-backup', 'returns': 'BackupStatus',
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @backup-cancel:
@@ -1124,7 +1128,8 @@
 #     running.
 #
 ##
-{ 'command': 'backup-cancel', 'coroutine': true }
+{ 'command': 'backup-cancel', 'coroutine': true,
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @ProxmoxSupportStatus:
@@ -1169,7 +1174,8 @@
             'pbs-library-version': 'str',
             'backup-access-api': 'bool',
             'backup-fleecing': 'bool',
-            'backup-max-workers': 'bool' } }
+            'backup-max-workers': 'bool' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @query-proxmox-support:
@@ -1179,7 +1185,8 @@
 # Returns: @ProxmoxSupportStatus
 #
 ##
-{ 'command': 'query-proxmox-support', 'returns': 'ProxmoxSupportStatus' }
+{ 'command': 'query-proxmox-support', 'returns': 'ProxmoxSupportStatus',
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @PBSBitmapAction:
@@ -1208,7 +1215,8 @@
 ##
 { 'enum': 'PBSBitmapAction',
   'data': ['not-used', 'not-used-removed', 'new', 'used', 'invalid',
-           'missing-recreated'] }
+           'missing-recreated'],
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @PBSBitmapInfo:
@@ -1228,7 +1236,8 @@
 ##
 { 'struct': 'PBSBitmapInfo',
   'data': { 'drive': 'str', 'action': 'PBSBitmapAction', 'size': 'int',
-            'dirty': 'int' } }
+            'dirty': 'int' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @query-pbs-bitmap-info:
@@ -1240,7 +1249,8 @@
 # Returns: @PBSBitmapInfo
 #
 ##
-{ 'command': 'query-pbs-bitmap-info', 'returns': ['PBSBitmapInfo'] }
+{ 'command': 'query-pbs-bitmap-info', 'returns': ['PBSBitmapInfo'],
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BackupAccessInfo:
@@ -1266,7 +1276,8 @@
 { 'struct': 'BackupAccessInfo',
   'data': { 'node-name': 'str', 'device': 'str', 'size': 'size',
             '*bitmap-node-name': 'str', '*bitmap-name': 'str',
-            '*bitmap-action': 'PBSBitmapAction' } }
+            '*bitmap-action': 'PBSBitmapAction' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BackupAccessSourceDevice:
@@ -1280,7 +1291,8 @@
 #
 ##
 { 'struct': 'BackupAccessSourceDevice',
-  'data': { 'device': 'str', '*bitmap-mode': 'BackupAccessSetupBitmapMode' } }
+  'data': { 'device': 'str', '*bitmap-mode': 'BackupAccessSetupBitmapMode' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BackupAccessSetupBitmapMode:
@@ -1295,7 +1307,8 @@
 #     doesn't exist.
 ##
 { 'enum': 'BackupAccessSetupBitmapMode',
-  'data': ['none', 'new', 'use' ] }
+  'data': ['none', 'new', 'use' ],
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @backup-access-setup:
@@ -1317,7 +1330,8 @@
 ##
 { 'command': 'backup-access-setup',
   'data': { 'target-id': 'str', 'devices': [ 'BackupAccessSourceDevice' ] },
-  'returns': [ 'BackupAccessInfo' ], 'coroutine': true }
+  'returns': [ 'BackupAccessInfo' ], 'coroutine': true,
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @backup-access-teardown:
@@ -1332,7 +1346,8 @@
 ##
 { 'command': 'backup-access-teardown',
   'data': { 'target-id': 'str', 'success': 'bool' },
-  'coroutine': true }
+  'coroutine': true,
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BlockDeviceTimedStats:
@@ -3708,7 +3723,7 @@
             'parallels', 'preallocate', 'qcow', 'qcow2', 'qed', 'quorum',
             'raw', 'rbd',
             { 'name': 'replication', 'if': 'CONFIG_REPLICATION' },
-            'pbs',
+            { 'name': 'pbs', 'if': 'CONFIG_PVE_BACKUP' },
             'ssh', 'throttle', 'vdi', 'vhdx',
             { 'name': 'virtio-blk-vfio-pci', 'if': 'CONFIG_BLKIO' },
             { 'name': 'virtio-blk-vhost-user', 'if': 'CONFIG_BLKIO' },
@@ -3850,7 +3865,8 @@
 { 'struct': 'BlockdevOptionsPbs',
   'data': { 'repository': 'str', 'snapshot': 'str', 'archive': 'str',
             '*keyfile': 'str', '*password': 'str', '*fingerprint': 'str',
-            '*key_password': 'str', '*namespace': 'str' } }
+            '*key_password': 'str', '*namespace': 'str' },
+  'if': 'CONFIG_PVE_BACKUP' }
 
 ##
 # @BlockdevOptionsNVMe:
@@ -5233,7 +5249,8 @@
       'nfs':        'BlockdevOptionsNfs',
       'null-aio':   'BlockdevOptionsNull',
       'null-co':    'BlockdevOptionsNull',
-      'pbs':        'BlockdevOptionsPbs',
+      'pbs':        { 'type': 'BlockdevOptionsPbs',
+                      'if': 'CONFIG_PVE_BACKUP' },
       'nvme':       'BlockdevOptionsNVMe',
       'nvme-io_uring': { 'type': 'BlockdevOptionsNvmeIoUring',
                          'if': 'CONFIG_BLKIO' },
