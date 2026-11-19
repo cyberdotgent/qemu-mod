@@ -410,15 +410,6 @@ static inline int ccw_dstream_read_buf(CcwDataStream *cds, void *buff, int len)
     return cds->op_handler(cds, buff, len, CDS_OP_R);
 }
 
-/*
- * Parse a CCW device identity property (control unit or device type and
- * model, as in Sense ID): 1 to @digits hexadecimal digits, optionally with
- * a "0x" prefix, e.g. "3380" or "1e".  An unset or empty @str leaves @val
- * unchanged and returns true.
- */
-bool css_parse_ccw_id(const char *name, const char *str, unsigned int digits,
-                      uint16_t *val, Error **errp);
-
 #define ccw_dstream_read(cds, v) ccw_dstream_read_buf((cds), &(v), sizeof(v))
 #define ccw_dstream_write(cds, v) ccw_dstream_write_buf((cds), &(v), sizeof(v))
 

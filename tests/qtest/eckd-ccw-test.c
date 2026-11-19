@@ -562,14 +562,15 @@ static void test_identity(void)
     qtest_quit(qts);
 
     /* A 3380 identity on the 3390 image, model from the cylinder count. */
-    qts = eckd_prog_start_opts(image, path, ",cutype=3990,devtype=3380");
+    qts = eckd_prog_start_opts(image, path,
+                               ",control-unit-type=0x3990,device-type=0x3380");
     eckd_check_identity(qts, 0x3990, 0xe9, 0x3380, 0x02);
     qtest_quit(qts);
 
-    /* Everything explicit, with and without the 0x prefix. */
+    /* Everything explicit, decimal as qemu-server passes it. */
     qts = eckd_prog_start_opts(image, path,
-                               ",cutype=0x2105,cumodel=e8,devtype=3390,"
-                               "devmodel=0A");
+                               ",control-unit-type=8453,control-unit-model=232,"
+                               "device-type=13200,device-model=10");
     eckd_check_identity(qts, 0x2105, 0xe8, 0x3390, 0x0a);
     qtest_quit(qts);
 
@@ -607,12 +608,11 @@ static void test_identity_invalid(void)
 {
     g_autofree char *path = create_ckd64_image();
 
-    assert_device_fails(path, ",devtype=9345", "devtype=9345 needs devmodel=");
-    assert_device_fails(path, ",cutype=3880", "cutype=3880 needs cumodel=");
-    assert_device_fails(path, ",devtype=33900",
-                        "expected 1 to 4 hexadecimal digits");
-    assert_device_fails(path, ",devmodel=x1",
-                        "expected 1 to 2 hexadecimal digits");
+    assert_device_fails(path, ",device-type=0x9345",
+                        "device-type 9345 needs device-model");
+    assert_device_fails(path, ",control-unit-type=0x3880",
+                        "control-unit-type 3880 needs control-unit-model");
+    assert_device_fails(path, ",device-model=0x100", "device-model");
     unlink(path);
 }
 

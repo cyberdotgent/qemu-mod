@@ -69,14 +69,10 @@ struct FBACcwDevice {
     uint32_t blocks;
 
     /*
-     * Identity presented in Sense ID (cutype=, cumodel=, devtype=,
-     * devmodel=; hexadecimal strings, default 6310-01 / 9336-10).  RDC keeps
-     * describing the 512-byte block device.
+     * Identity presented in Sense ID (properties control-unit-type/-model,
+     * device-type/-model; default 6310-01 / 9336-10, a model of 0 is the
+     * default type's).  RDC keeps describing the 512-byte block device.
      */
-    char *cutype_prop;
-    char *cumodel_prop;
-    char *devtype_prop;
-    char *devmodel_prop;
     uint16_t cu_type;
     uint8_t cu_model;
     uint16_t dev_type;
@@ -642,36 +638,22 @@ static int fba_pre_save(void *opaque)
  */
 static bool fba_resolve_identity(FBACcwDevice *fba, Error **errp)
 {
-    uint16_t cu_type = FBA_CU_TYPE, dev_type = FBA_DEV_TYPE;
-    uint16_t cu_model = UINT16_MAX, dev_model = UINT16_MAX;
-
-    if (!css_parse_ccw_id("cutype", fba->cutype_prop, 4, &cu_type, errp) ||
-        !css_parse_ccw_id("cumodel", fba->cumodel_prop, 2, &cu_model,
-                          errp) ||
-        !css_parse_ccw_id("devtype", fba->devtype_prop, 4, &dev_type, errp) ||
-        !css_parse_ccw_id("devmodel", fba->devmodel_prop, 2, &dev_model,
-                          errp)) {
-        return false;
-    }
-    if (cu_model == UINT16_MAX) {
-        if (cu_type != FBA_CU_TYPE) {
-            error_setg(errp, "fba-ccw: cutype=%04x needs cumodel=", cu_type);
+    if (!fba->cu_model) {
+        if (fba->cu_type != FBA_CU_TYPE) {
+            error_setg(errp, "fba-ccw: control-unit-type %04x needs "
+                       "control-unit-model", fba->cu_type);
             return false;
         }
-        cu_model = FBA_CU_MODEL;
+        fba->cu_model = FBA_CU_MODEL;
     }
-    if (dev_model == UINT16_MAX) {
-        if (dev_type != FBA_DEV_TYPE) {
-            error_setg(errp, "fba-ccw: devtype=%04x needs devmodel=",
-                       dev_type);
+    if (!fba->dev_model) {
+        if (fba->dev_type != FBA_DEV_TYPE) {
+            error_setg(errp, "fba-ccw: device-type %04x needs device-model",
+                       fba->dev_type);
             return false;
         }
-        dev_model = FBA_DEV_MODEL;
+        fba->dev_model = FBA_DEV_MODEL;
     }
-    fba->cu_type = cu_type;
-    fba->cu_model = cu_model;
-    fba->dev_type = dev_type;
-    fba->dev_model = dev_model;
     return true;
 }
 
@@ -778,10 +760,11 @@ static const Property fba_properties[] = {
     DEFINE_PROP_DRIVE("drive", FBACcwDevice, blk),
     DEFINE_PROP_UINT64("blocks", FBACcwDevice, requested_blocks, 0),
     DEFINE_PROP_CCW_LOADPARM("loadparm", CcwDevice, loadparm),
-    DEFINE_PROP_STRING("cutype", FBACcwDevice, cutype_prop),
-    DEFINE_PROP_STRING("cumodel", FBACcwDevice, cumodel_prop),
-    DEFINE_PROP_STRING("devtype", FBACcwDevice, devtype_prop),
-    DEFINE_PROP_STRING("devmodel", FBACcwDevice, devmodel_prop),
+    DEFINE_PROP_UINT16("control-unit-type", FBACcwDevice, cu_type,
+                       FBA_CU_TYPE),
+    DEFINE_PROP_UINT8("control-unit-model", FBACcwDevice, cu_model, 0),
+    DEFINE_PROP_UINT16("device-type", FBACcwDevice, dev_type, FBA_DEV_TYPE),
+    DEFINE_PROP_UINT8("device-model", FBACcwDevice, dev_model, 0),
 };
 
 static const VMStateDescription vmstate_fba_ccw = {

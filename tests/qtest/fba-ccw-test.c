@@ -231,8 +231,9 @@ static void test_identity(void)
     qtest_quit(qts);
 
     qts = fba_prog_start_opts(image, path,
-                              ",cutype=3880,cumodel=01,devtype=3370,"
-                              "devmodel=0x02");
+                              ",control-unit-type=0x3880,"
+                              "control-unit-model=1,device-type=0x3370,"
+                              "device-model=0x02");
     fba_check_sense_id(qts, 0x3880, 0x01, 0x3370, 0x02);
     qtest_quit(qts);
 

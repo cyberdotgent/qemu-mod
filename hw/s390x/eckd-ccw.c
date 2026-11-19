@@ -117,15 +117,12 @@ struct EckdCcwDevice {
     uint16_t chpid;
 
     /*
-     * Identity presented in Sense ID, RDC, RCD and RSSD (cutype=, cumodel=,
-     * devtype=, devmodel=; hexadecimal strings).  Unset values come from
-     * the image: 2107-E8 control unit, 3390 device with the model of its
-     * cylinder count.  The geometry always stays the image's (3390 tracks).
+     * Identity presented in Sense ID, RDC, RCD and RSSD (properties
+     * control-unit-type/-model, device-type/-model).  Default: 2107-E8
+     * control unit, 3390 device; a model of 0 is derived from the type
+     * (and for the device from the cylinder count).  The geometry always
+     * stays the image's (3390 tracks).
      */
-    char *cutype_prop;
-    char *cumodel_prop;
-    char *devtype_prop;
-    char *devmodel_prop;
     uint16_t cu_type;
     uint8_t cu_model;
     uint16_t dev_type;
@@ -274,50 +271,35 @@ static uint8_t eckd_model_3380(uint32_t cylinders)
  */
 static bool eckd_resolve_identity(EckdCcwDevice *eckd, Error **errp)
 {
-    uint16_t cu_type = ECKD_CU_TYPE, dev_type = ECKD_DEV_TYPE;
-    uint16_t cu_model = UINT16_MAX, dev_model = UINT16_MAX;
-
-    if (!css_parse_ccw_id("cutype", eckd->cutype_prop, 4, &cu_type, errp) ||
-        !css_parse_ccw_id("cumodel", eckd->cumodel_prop, 2, &cu_model,
-                          errp) ||
-        !css_parse_ccw_id("devtype", eckd->devtype_prop, 4, &dev_type,
-                          errp) ||
-        !css_parse_ccw_id("devmodel", eckd->devmodel_prop, 2, &dev_model,
-                          errp)) {
-        return false;
-    }
-    if (cu_model == UINT16_MAX) {
-        switch (cu_type) {
+    if (!eckd->cu_model) {
+        switch (eckd->cu_type) {
         case 0x2105:
         case 0x2107:
-            cu_model = ECKD_CU_MODEL;
+            eckd->cu_model = ECKD_CU_MODEL;
             break;
         case 0x3990:
-            cu_model = 0xe9;
+            eckd->cu_model = 0xe9;
             break;
         default:
-            error_setg(errp, "eckd-ccw: cutype=%04x needs cumodel=", cu_type);
+            error_setg(errp, "eckd-ccw: control-unit-type %04x needs "
+                       "control-unit-model", eckd->cu_type);
             return false;
         }
     }
-    if (dev_model == UINT16_MAX) {
-        switch (dev_type) {
+    if (!eckd->dev_model) {
+        switch (eckd->dev_type) {
         case 0x3390:
-            dev_model = eckd_model(eckd->image.cylinders);
+            eckd->dev_model = eckd_model(eckd->image.cylinders);
             break;
         case 0x3380:
-            dev_model = eckd_model_3380(eckd->image.cylinders);
+            eckd->dev_model = eckd_model_3380(eckd->image.cylinders);
             break;
         default:
-            error_setg(errp, "eckd-ccw: devtype=%04x needs devmodel=",
-                       dev_type);
+            error_setg(errp, "eckd-ccw: device-type %04x needs device-model",
+                       eckd->dev_type);
             return false;
         }
     }
-    eckd->cu_type = cu_type;
-    eckd->cu_model = cu_model;
-    eckd->dev_type = dev_type;
-    eckd->dev_model = dev_model;
     return true;
 }
 
@@ -2321,10 +2303,11 @@ static const Property eckd_properties[] = {
                        UINT16_MAX),
     DEFINE_PROP_UINT16("fla", EckdCcwDevice, fla, UINT16_MAX),
     DEFINE_PROP_UINT16("chpid", EckdCcwDevice, chpid, UINT16_MAX),
-    DEFINE_PROP_STRING("cutype", EckdCcwDevice, cutype_prop),
-    DEFINE_PROP_STRING("cumodel", EckdCcwDevice, cumodel_prop),
-    DEFINE_PROP_STRING("devtype", EckdCcwDevice, devtype_prop),
-    DEFINE_PROP_STRING("devmodel", EckdCcwDevice, devmodel_prop),
+    DEFINE_PROP_UINT16("control-unit-type", EckdCcwDevice, cu_type,
+                       ECKD_CU_TYPE),
+    DEFINE_PROP_UINT8("control-unit-model", EckdCcwDevice, cu_model, 0),
+    DEFINE_PROP_UINT16("device-type", EckdCcwDevice, dev_type, ECKD_DEV_TYPE),
+    DEFINE_PROP_UINT8("device-model", EckdCcwDevice, dev_model, 0),
 };
 
 /*
