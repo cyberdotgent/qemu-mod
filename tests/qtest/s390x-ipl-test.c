@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qemu/bswap.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
 #include "qobject/qbool.h"
@@ -314,6 +315,106 @@ static void test_ipl_properties(void)
     qtest_quit(qts);
 }
 
+/* The PSW address of CPU 0, from "info registers". */
+static uint64_t cpu0_psw_addr(QTestState *qts)
+{
+    g_autofree char *regs = qtest_hmp(qts, "info registers");
+    const char *addr = strstr(regs, " addr ");
+
+    g_assert_nonnull(addr);
+    return g_ascii_strtoull(addr + 6, NULL, 16);
+}
+
+static void wait_psw_addr(QTestState *qts, uint64_t expected)
+{
+    for (int i = 0; i < 500 && cpu0_psw_addr(qts) != expected; i++) {
+        g_usleep(10000);
+    }
+    g_assert_cmphex(cpu0_psw_addr(qts), ==, expected);
+}
+
+/*
+ * IPL record of the channel-program IPL tests: the PSW (ESA/390 format,
+ * 31-bit, starting at 0x18), a Read CCW at 8 that reads the code to 0x18,
+ * and the code itself, "j .", which the IPL then executes.
+ */
+static const uint8_t ipl_psw_ccw[16] = {
+    0x00, 0x08, 0x00, 0x00, 0x80, 0x00, 0x00, 0x18,
+    0x00, 0x00, 0x00, 0x18, 0x20, 0x00, 0x00, 0x04,
+};
+static const uint8_t ipl_loop[4] = { 0xa7, 0xf4, 0x00, 0x00 };
+
+/*
+ * fba-ccw reads asynchronously: the IPL must wait for the end of its
+ * channel program.  After Read IPL, the Read continues in block 0 at the
+ * byte after the 24 bytes Read IPL transferred.
+ */
+static void test_ipl_fba_program(void)
+{
+    uint8_t block[512] = { 0 };
+    g_autofree char *path = NULL;
+    int fd = g_file_open_tmp("qemu-ipl-fba-XXXXXX.raw", &path, NULL);
+    QTestState *qts;
+
+    g_assert_cmpint(fd, >=, 0);
+    memcpy(block, ipl_psw_ccw, sizeof(ipl_psw_ccw));
+    block[8] = 0x42;                    /* Read */
+    memcpy(block + 0x18, ipl_loop, sizeof(ipl_loop));
+    g_assert_cmpint(write(fd, block, sizeof(block)), ==, sizeof(block));
+    g_assert_cmpint(ftruncate(fd, 1024 * 1024), ==, 0);
+    close(fd);
+
+    qts = qtest_initf("-nodefaults -accel tcg "
+                      "-drive if=none,id=fba,file=%s,format=raw "
+                      "-device fba-ccw,drive=fba,devno=fe.0.0200 -ipl 200",
+                      path);
+    wait_psw_addr(qts, 0x18);
+    qtest_quit(qts);
+    unlink(path);
+}
+
+/*
+ * eckd-ccw: Read IPL reads R1 of track 0, the Read Data at 8 the next
+ * record (R2), which holds the code.
+ */
+static void test_ipl_eckd_program(void)
+{
+    uint8_t header[512] = { 0 };
+    uint8_t track[5 + 16 + 8 + 24 + 8 + 4 + 8] = { 0 };
+    uint8_t *r1 = track + 5 + 16, *r2 = r1 + 8 + 24;
+    g_autofree char *path = NULL;
+    int fd = g_file_open_tmp("qemu-ipl-eckd-XXXXXX.ckd", &path, NULL);
+    QTestState *qts;
+
+    g_assert_cmpint(fd, >=, 0);
+    memcpy(header, "CKD_P064", 8);
+    stl_le_p(header + 8, 15);
+    stl_le_p(header + 12, 56832);
+    header[16] = 0x90;
+    stw_le_p(header + 18, 1);
+    stw_be_p(track + 5 + 6, 8);         /* R0 */
+    r1[4] = 1;
+    stw_be_p(r1 + 6, 24);
+    memcpy(r1 + 8, ipl_psw_ccw, sizeof(ipl_psw_ccw));
+    r1[8 + 8] = 0x06;                   /* Read Data */
+    r2[4] = 2;
+    stw_be_p(r2 + 6, 4);
+    memcpy(r2 + 8, ipl_loop, sizeof(ipl_loop));
+    memset(r2 + 8 + 4, 0xff, 8);
+    g_assert_cmpint(write(fd, header, sizeof(header)), ==, sizeof(header));
+    g_assert_cmpint(write(fd, track, sizeof(track)), ==, sizeof(track));
+    g_assert_cmpint(ftruncate(fd, 512 + 15 * 56832), ==, 0);
+    close(fd);
+
+    qts = qtest_initf("-nodefaults -accel tcg "
+                      "-drive if=none,id=ckd,file=%s,format=raw "
+                      "-device eckd-ccw,drive=ckd,devno=fe.0.0300 -ipl 300",
+                      path);
+    wait_psw_addr(qts, 0x18);
+    qtest_quit(qts);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -326,5 +427,9 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     qtest_add_func("/s390x/ipl/properties", test_ipl_properties);
+    if (qtest_has_accel("tcg")) {
+        qtest_add_func("/s390x/ipl/fba-program", test_ipl_fba_program);
+        qtest_add_func("/s390x/ipl/eckd-program", test_ipl_eckd_program);
+    }
     return g_test_run();
 }

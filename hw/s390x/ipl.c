@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/aio-wait.h"
 #include "qemu/datadir.h"
 #include "qapi/error.h"
 #include "system/physmem.h"
@@ -1268,6 +1269,14 @@ static void s390_ipl_native_ccw(S390CPU *cpu)
         error_report("IPL device has no subchannel");
         goto failed;
     }
+    /*
+     * An incoming migration replaces whatever the IPL would do (like a
+     * snapshot load, see s390_machine_reset()), and its block devices are
+     * inactive until then: do not start the IPL channel program.
+     */
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        goto failed;
+    }
 
     physical_memory_write(0, read_ipl, sizeof(read_ipl));
     sch->curr_status.pmcw.flags |= PMCW_FLAGS_MASK_ENA;
@@ -1276,6 +1285,11 @@ static void s390_ipl_native_ccw(S390CPU *cpu)
         error_report("IPL device %04x is not operational", sch->devno);
         goto failed;
     }
+    /*
+     * fba-ccw and eckd-ccw complete CCWs that need I/O asynchronously
+     * (CSS_CCW_PENDING): wait for the end of the IPL channel program.
+     */
+    AIO_WAIT_WHILE(NULL, sch->ccw_async_pending);
     css_do_tsch_get_irb(sch, &irb, &irb_len);
     css_do_tsch_update_subch(sch);
     if (irb.scsw.cstat ||
