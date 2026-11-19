@@ -1,7 +1,7 @@
 /*
- * Report the machine identity a guest sees on the mtm-3907 personality.
+ * Report the machine identity a guest sees on the czam machine.
  *
- * The companion mtm-3907.py launches this guest under KVM and compares the
+ * The companion czam.py launches this guest under KVM and compares the
  * printed values with the host's /proc/sysinfo and memory block size.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later

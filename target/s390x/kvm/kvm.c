@@ -1899,7 +1899,7 @@ static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
         uint8_t raw[sizeof(SysIB_222)];
     } u;
 
-    if (s390_is_pv() || !s390_mtm_lpar_identity(&number, name)) {
+    if (s390_is_pv() || !s390_mainframe_lpar_identity(&number, name)) {
         return;
     }
     if (s390_cpu_virt_mem_read(cpu, addr, ar, &u, sizeof(u))) {
@@ -1938,7 +1938,7 @@ static void insert_stsi_2_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
 }
 
 /*
- * mtm-3907 z/OS compatibility handshake.  This is an OS control-block
+ * czam z/OS compatibility handshake.  This is an OS control-block
  * adjustment, not an architectural STSI side effect.  Some execution
  * environments perform it at STNSM 0x950,0xff; using the existing STSI exit
  * avoids instruction stepping and matches the alternate STSI handshake.
@@ -1950,8 +1950,7 @@ static void kvm_zos_compat_stsi(S390CPU *cpu)
     uint8_t word[4], version[2], value;
     uint32_t cvt, ecvt, svt;
 
-    if (!object_dynamic_cast(qdev_get_machine(),
-                             MACHINE_TYPE_NAME("mtm-3907")) ||
+    if (!s390_mainframe_zos_compat() ||
         cpu_memory_rw_debug(cs, 16, word, sizeof(word), false)) {
         return;
     }

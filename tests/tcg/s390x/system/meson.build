@@ -174,7 +174,7 @@ tests += {
   },
   'stsi-zos-compat.c': {
     'cflags': [cflags],
-    'qemu_args': ['-machine', 'mtm-3907', '-accel', 'kvm', '-cpu', 'host',
+    'qemu_args': ['-machine', 'czam', '-accel', 'kvm', '-cpu', 'host',
                   '-m', '8192M', '-serial', 'null'] + qemu_args,
   },
   'stsi-zos-compat-disabled.c': {
@@ -236,10 +236,10 @@ tests += {
                   '-device', 'sclp3270console,chardev=sysg,persistent=off',
                   '-kernel'],
   },
-  # mtm-3907 maps -serial #0 to the line-mode console (KVM, 3907 hosts).
-  'sclp-line-console-mtm.c': {
+  # czam maps -serial #0 to the line-mode console (KVM, 3907 hosts).
+  'sclp-line-console-czam.c': {
     'cflags': [ccw_cflags],
-    'qemu_args': ['-machine', 'mtm-3907', '-accel', 'kvm', '-cpu', 'host',
+    'qemu_args': ['-machine', 'czam', '-accel', 'kvm', '-cpu', 'host',
                   '-monitor', 'none', '-display', 'none', '-nodefaults',
                   '-action', 'panic=exit-failure',
                   '-serial', 'stdio', '-kernel'],
@@ -274,9 +274,9 @@ tests += {
     'cflags': [ccw_cflags],
     'wrapper': [python, files('../native-ipl.py')],
   },
-  'mtm-3907.c': {
+  'czam.c': {
     'cflags': [ccw_cflags],
-    'wrapper': [python, files('../mtm-3907.py')],
+    'wrapper': [python, files('../czam.py')],
   },
   'eckd-topology.c': {
     'cflags': [ccw_cflags],

@@ -170,7 +170,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
 
     read_info->mha_pow = s390_get_mha_pow();
     read_info->hmfai = cpu_to_be32(s390_get_hmfai());
-    increment = s390_mtm_storage_increment();
+    increment = s390_mainframe_storage_increment();
     if (increment) {
         /* Host-mirrored LPAR personality: report the host's increment. */
         uint64_t increment_mb = increment >> 20;
@@ -201,7 +201,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
 
     s390_ipl_convert_loadparm((char *)S390_CCW_MACHINE(machine)->loadparm,
                                 read_info->loadparm);
-    s390_mtm_patch_read_info((uint8_t *)read_info);
+    s390_mainframe_patch_read_info((uint8_t *)read_info);
 
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_READ_COMPLETION);
 }

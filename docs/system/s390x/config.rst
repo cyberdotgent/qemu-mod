@@ -25,7 +25,7 @@ A complete example::
     guest = "example"
 
   [machine]
-    type = "mtm-3907"
+    type = "czam"
     ipl = "0A80"
     loadparm = "0A82CS"
 

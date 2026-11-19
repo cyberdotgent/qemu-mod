@@ -789,7 +789,7 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
     memset(general_chars, 0, sizeof(general_chars));
     memset(chsc_chars, 0, sizeof(chsc_chars));
 
-    if (s390_mtm_chsc_characteristics(general_chars, chsc_chars)) {
+    if (s390_mainframe_chsc_characteristics(general_chars, chsc_chars)) {
         goto out_chars;
     }
     general_chars[0] = cpu_to_be32(0x03080000);
@@ -891,7 +891,7 @@ static void ioinst_handle_chsc_sda(ChscReq *req, ChscResp *res)
     }
 
     oc = param0 & CHSC_SDA_0_OC;
-    if (s390_mtm_lpar_identity(&lpar_number, lpar_name)) {
+    if (s390_mainframe_lpar_identity(&lpar_number, lpar_name)) {
         /*
          * LPAR personality: multiple-CSS, multiple-subchannel-set and
          * extended-measurement (operation code 1) enablement are not
@@ -951,7 +951,7 @@ static void ioinst_handle_chsc_sdcal(ChscReq *req, ChscResp *res)
     uint16_t lpar_number;
     uint8_t lpar_name[8];
 
-    if (s390_mtm_lpar_identity(&lpar_number, lpar_name)) {
+    if (s390_mainframe_lpar_identity(&lpar_number, lpar_name)) {
         /*
          * LPAR personality: one channel-subsystem image (CSSID 0) holding
          * this partition's MIF image.  The response echoes the attribute

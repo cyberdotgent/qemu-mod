@@ -1229,7 +1229,12 @@ static void ccw_machine_11_2_class_options(MachineClass *mc)
 DEFINE_CCW_MACHINE_AS_LATEST(11, 2);
 
 /*
- * Host-mirrored LPAR personalities ("mtm-XXXX").
+ * Mainframe machine types: host-mirrored LPAR personalities.
+ *
+ * TYPE_S390_MAINFRAME_MACHINE is the abstract base of the machine types
+ * that present a guest as a logical partition of a real IBM machine rather
+ * than as a generic virtual s390x machine (today "czam"; a sibling for
+ * ESA/390-mode partitions of older machines can derive from the same base).
  *
  * These machines present a KVM guest as a logical partition of the IBM
  * machine type it physically runs on, instead of as a generic virtual
@@ -1242,12 +1247,12 @@ DEFINE_CCW_MACHINE_AS_LATEST(11, 2);
  * by Linux.  The host's machine type must match the personality.
  */
 
-#define MTM_SYSINFO_PATH "/proc/sysinfo"
-#define MTM_BLOCK_SIZE_PATH "/sys/devices/system/memory/block_size_bytes"
-#define MTM_DEFAULT_LPAR_NAME "QEMUKVM"
-#define MTM_DEFAULT_LPAR_NUMBER 1
+#define MAINFRAME_SYSINFO_PATH "/proc/sysinfo"
+#define MAINFRAME_BLOCK_SIZE_PATH "/sys/devices/system/memory/block_size_bytes"
+#define MAINFRAME_DEFAULT_LPAR_NAME "QEMUKVM"
+#define MAINFRAME_DEFAULT_LPAR_NUMBER 1
 
-static S390CcwMachineState *mtm_machine(void)
+static S390CcwMachineState *mainframe_machine(void)
 {
     Object *obj = qdev_get_machine();
     S390CcwMachineState *ms;
@@ -1256,12 +1261,12 @@ static S390CcwMachineState *mtm_machine(void)
         return NULL;
     }
     ms = S390_CCW_MACHINE(obj);
-    return S390_CCW_MACHINE_GET_CLASS(ms)->mtm ? ms : NULL;
+    return S390_CCW_MACHINE_GET_CLASS(ms)->mirror_type ? ms : NULL;
 }
 
-bool s390_mtm_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8])
+bool s390_mainframe_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8])
 {
-    S390CcwMachineState *ms = mtm_machine();
+    S390CcwMachineState *ms = mainframe_machine();
 
     if (!ms) {
         return false;
@@ -1272,27 +1277,27 @@ bool s390_mtm_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8])
     return true;
 }
 
-uint64_t s390_mtm_storage_increment(void)
+uint64_t s390_mainframe_storage_increment(void)
 {
-    S390CcwMachineState *ms = mtm_machine();
+    S390CcwMachineState *ms = mainframe_machine();
 
     return ms ? ms->storage_increment : 0;
 }
 
 /*
  * Guest-visible SCLP Read SCP Info and CHSC values of a z14 ZR1 logical
- * partition.  Under mtm-3907 these replace the generic virtual-machine
+ * partition.  Under czam these replace the generic virtual-machine
  * values, so the guest sees the configuration and channel-subsystem
  * characteristics of a real LPAR.
  */
-static void mtm_set_bits(uint32_t *words, const uint8_t *bits, size_t n)
+static void mainframe_set_bits(uint32_t *words, const uint8_t *bits, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         words[bits[i] / 32] |= cpu_to_be32(0x80000000U >> (bits[i] % 32));
     }
 }
 
-bool s390_mtm_chsc_characteristics(uint32_t *general_chars,
+bool s390_mainframe_chsc_characteristics(uint32_t *general_chars,
                                    uint32_t *chsc_chars)
 {
     /*
@@ -1310,17 +1315,17 @@ bool s390_mtm_chsc_characteristics(uint32_t *general_chars,
         0, 1, 2, 3, 4, 6, 7, 8, 10, 11, 64, 89, 102, 108, 109, 112, 126,
     };
 
-    if (!mtm_machine()) {
+    if (!mainframe_machine()) {
         return false;
     }
-    mtm_set_bits(general_chars, general, ARRAY_SIZE(general));
-    mtm_set_bits(chsc_chars, chsc, ARRAY_SIZE(chsc));
+    mainframe_set_bits(general_chars, general, ARRAY_SIZE(general));
+    mainframe_set_bits(chsc_chars, chsc, ARRAY_SIZE(chsc));
     return true;
 }
 
-void s390_mtm_patch_read_info(uint8_t *ri)
+void s390_mainframe_patch_read_info(uint8_t *ri)
 {
-    S390CcwMachineState *ms = mtm_machine();
+    S390CcwMachineState *ms = mainframe_machine();
     /*
      * Byte 84 bit 0x04 is set on real LPAR hardware; its meaning is not
      * documented.
@@ -1345,7 +1350,7 @@ void s390_mtm_patch_read_info(uint8_t *ri)
 }
 
 /* Return the trimmed value of a "Key: value" line of /proc/sysinfo. */
-static char *mtm_sysinfo_value(const char *sysinfo, const char *key)
+static char *mainframe_sysinfo_value(const char *sysinfo, const char *key)
 {
     g_auto(GStrv) lines = g_strsplit(sysinfo, "\n", -1);
     size_t keylen = strlen(key);
@@ -1358,9 +1363,10 @@ static char *mtm_sysinfo_value(const char *sysinfo, const char *key)
     return NULL;
 }
 
-static void mtm_check_host(S390CcwMachineState *ms, uint16_t mtm,
-                           Error **errp)
+static void mainframe_check_host(S390CcwMachineState *ms, Error **errp)
 {
+    MachineClass *mc = MACHINE_GET_CLASS(ms);
+    uint16_t mirror_type = S390_CCW_MACHINE_GET_CLASS(ms)->mirror_type;
     MachineState *machine = MACHINE(ms);
     g_autofree char *sysinfo = NULL;
     g_autofree char *type = NULL;
@@ -1370,30 +1376,31 @@ static void mtm_check_host(S390CcwMachineState *ms, uint16_t mtm,
     uint64_t increment;
 
     if (!kvm_enabled()) {
-        error_setg(errp, "machine mtm-%04x requires KVM", mtm);
+        error_setg(errp, "machine %s requires KVM", mc->name);
         return;
     }
-    if (!g_file_get_contents(MTM_SYSINFO_PATH, &sysinfo, NULL, &gerr)) {
-        error_setg(errp, "cannot read %s: %s", MTM_SYSINFO_PATH,
+    if (!g_file_get_contents(MAINFRAME_SYSINFO_PATH, &sysinfo, NULL, &gerr)) {
+        error_setg(errp, "cannot read %s: %s", MAINFRAME_SYSINFO_PATH,
                    gerr->message);
         return;
     }
-    type = mtm_sysinfo_value(sysinfo, "Type");
-    snprintf(expected, sizeof(expected), "%04x", mtm);
+    type = mainframe_sysinfo_value(sysinfo, "Type");
+    snprintf(expected, sizeof(expected), "%04x", mirror_type);
     if (!type || strcmp(type, expected)) {
-        error_setg(errp, "machine mtm-%s mirrors its host, but the host "
-                   "machine type is %s", expected, type ? type : "unknown");
+        error_setg(errp, "machine %s mirrors a %s host, but the host "
+                   "machine type is %s", mc->name, expected,
+                   type ? type : "unknown");
         return;
     }
 
     {
-        g_autofree char *cap = mtm_sysinfo_value(sysinfo, "Capability");
+        g_autofree char *cap = mainframe_sysinfo_value(sysinfo, "Capability");
 
         ms->host_capability = cap ? g_ascii_strtoull(cap, NULL, 10) : 0;
     }
 
-    if (!g_file_get_contents(MTM_BLOCK_SIZE_PATH, &block, NULL, &gerr)) {
-        error_setg(errp, "cannot read %s: %s", MTM_BLOCK_SIZE_PATH,
+    if (!g_file_get_contents(MAINFRAME_BLOCK_SIZE_PATH, &block, NULL, &gerr)) {
+        error_setg(errp, "cannot read %s: %s", MAINFRAME_BLOCK_SIZE_PATH,
                    gerr->message);
         return;
     }
@@ -1411,31 +1418,32 @@ static void mtm_check_host(S390CcwMachineState *ms, uint16_t mtm,
     ms->storage_increment = increment;
 }
 
-static void mtm_3907_init(MachineState *machine)
+/* czam v1: a z14 ZR1 (3907) LPAR, mirrored from the KVM host. */
+static void czam_v1_init(MachineState *machine)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(machine);
     S390CPU *cpu;
 
-    mtm_check_host(ms, 0x3907, &error_fatal);
+    mainframe_check_host(ms, &error_fatal);
     ccw_machine_11_2_instance_options(machine);
     ccw_init(machine);
 
     cpu = S390_CPU(first_cpu);
     if (cpu && cpu->model && cpu->model->def &&
         cpu->model->def->type != 0x3907) {
-        error_report("machine mtm-3907 requires a 3907 CPU model "
+        error_report("machine %s requires a 3907 CPU model "
                      "(e.g. -cpu host or z14ZR1), not %s",
-                     cpu->model->def->name);
+                     MACHINE_GET_CLASS(machine)->name, cpu->model->def->name);
         exit(1);
     }
 }
 
-static char *mtm_get_lpar_name(Object *obj, Error **errp)
+static char *mainframe_get_lpar_name(Object *obj, Error **errp)
 {
     return g_strdup(S390_CCW_MACHINE(obj)->lpar_name);
 }
 
-static void mtm_set_lpar_name(Object *obj, const char *value, Error **errp)
+static void mainframe_set_lpar_name(Object *obj, const char *value, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
     size_t len = strlen(value);
@@ -1451,7 +1459,7 @@ static void mtm_set_lpar_name(Object *obj, const char *value, Error **errp)
     ms->lpar_name = g_strdup(value);
 }
 
-static void mtm_get_lpar_number(Object *obj, Visitor *v, const char *name,
+static void mainframe_get_lpar_number(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
     uint16_t value = S390_CCW_MACHINE(obj)->lpar_number;
@@ -1459,7 +1467,7 @@ static void mtm_get_lpar_number(Object *obj, Visitor *v, const char *name,
     visit_type_uint16(v, name, &value, errp);
 }
 
-static void mtm_set_lpar_number(Object *obj, Visitor *v, const char *name,
+static void mainframe_set_lpar_number(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
     uint16_t value;
@@ -1474,61 +1482,87 @@ static void mtm_set_lpar_number(Object *obj, Visitor *v, const char *name,
     S390_CCW_MACHINE(obj)->lpar_number = value;
 }
 
-static void mtm_instance_init(Object *obj)
+static void mainframe_instance_init(Object *obj)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
 
-    ms->lpar_name = g_strdup(MTM_DEFAULT_LPAR_NAME);
-    ms->lpar_number = MTM_DEFAULT_LPAR_NUMBER;
+    ms->lpar_name = g_strdup(MAINFRAME_DEFAULT_LPAR_NAME);
+    ms->lpar_number = MAINFRAME_DEFAULT_LPAR_NUMBER;
 }
 
-static void mtm_instance_finalize(Object *obj)
+static void mainframe_instance_finalize(Object *obj)
 {
     g_free(S390_CCW_MACHINE(obj)->lpar_name);
 }
 
-static void mtm_3907_class_init(ObjectClass *oc, const void *data)
+bool s390_mainframe_zos_compat(void)
+{
+    S390CcwMachineState *ms = mainframe_machine();
+
+    return ms && S390_CCW_MACHINE_GET_CLASS(ms)->zos_compat;
+}
+
+static void mainframe_class_init(ObjectClass *oc, const void *data)
+{
+    object_class_property_add_str(oc, "lpar-name", mainframe_get_lpar_name,
+                                  mainframe_set_lpar_name);
+    object_class_property_set_description(oc, "lpar-name",
+        "Partition name reported in SYSIB 2.2.2 (default QEMUKVM)");
+    object_class_property_add(oc, "lpar-number", "uint16", &uint16_type_info,
+                              mainframe_get_lpar_number,
+                              mainframe_set_lpar_number, NULL, NULL);
+    object_class_property_set_description(oc, "lpar-number",
+        "Partition number reported in SYSIB 2.2.2 (default 1)");
+}
+
+/*
+ * czam ("CZAM hardware mode", z/Architecture-only machines) is versioned
+ * like QEMU's versioned machine types: czam-vN never changes once
+ * released, and the "czam" alias names the newest version.
+ *
+ * czam versions are bumped only by explicit maintainer decision.  Do not
+ * add a version for minor changes; fixes that keep the guest-visible
+ * machine identical go into the existing version.
+ *
+ * Version 1 (formerly named "mtm-3907") is a z14 ZR1 (3907) LPAR
+ * personality with the QEMU 11.2 machine compat properties.
+ */
+static void czam_v1_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     S390CcwMachineClass *s390mc = S390_CCW_MACHINE_CLASS(mc);
 
     compat_props_add(mc->compat_props, hw_compat_s390x, hw_compat_s390x_len);
     ccw_machine_11_2_class_options(mc);
-    mc->desc = "IBM z14 ZR1 (3907) LPAR personality, mirrored from the "
-               "KVM host";
-    mc->init = mtm_3907_init;
+    mc->desc = "CZAM hardware mode";
+    mc->init = czam_v1_init;
     mc->default_cpu_type = S390_CPU_TYPE_NAME("host");
     /* Operator messages on the first serial (e.g. stdio with -nographic). */
     s390mc->line_mode_console_first = true;
     /* One storage increment of a typical z14 LPAR (1 GiB memory blocks). */
     mc->default_ram_size = 1 * GiB;
-    s390mc->mtm = 0x3907;
-
-    object_class_property_add_str(oc, "lpar-name", mtm_get_lpar_name,
-                                  mtm_set_lpar_name);
-    object_class_property_set_description(oc, "lpar-name",
-        "Partition name reported in SYSIB 2.2.2 (default QEMUKVM)");
-    object_class_property_add(oc, "lpar-number", "uint16", &uint16_type_info,
-                              mtm_get_lpar_number, mtm_set_lpar_number,
-                              NULL, NULL);
-    object_class_property_set_description(oc, "lpar-number",
-        "Partition number reported in SYSIB 2.2.2 (default 1)");
+    s390mc->mirror_type = 0x3907;
+    s390mc->zos_compat = true;
+    mc->alias = "czam";
 }
 
-static const TypeInfo mtm_3907_info = {
-    .name = MACHINE_TYPE_NAME("mtm-3907"),
-    .parent = TYPE_S390_CCW_MACHINE,
-    .instance_init = mtm_instance_init,
-    .instance_finalize = mtm_instance_finalize,
-    .class_init = mtm_3907_class_init,
-    .secure = true,
+static const TypeInfo mainframe_types[] = {
+    {
+        .name = TYPE_S390_MAINFRAME_MACHINE,
+        .parent = TYPE_S390_CCW_MACHINE,
+        .abstract = true,
+        .instance_init = mainframe_instance_init,
+        .instance_finalize = mainframe_instance_finalize,
+        .class_init = mainframe_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("czam-v1"),
+        .parent = TYPE_S390_MAINFRAME_MACHINE,
+        .class_init = czam_v1_class_init,
+        .secure = true,
+    },
 };
 
-static void mtm_register(void)
-{
-    type_register_static(&mtm_3907_info);
-}
-type_init(mtm_register)
+DEFINE_TYPES(mainframe_types)
 
 static void ccw_machine_11_1_instance_options(MachineState *machine)
 {

@@ -16,10 +16,28 @@ distributions built for the z13.
 Device support
 ==============
 
+Mainframe machine types
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``czam`` ("CZAM hardware mode") presents a KVM guest as a logical
+partition of the IBM machine it runs on rather than as a generic virtual
+s390x machine.  It is versioned: ``czam-v1`` never changes once released,
+and ``czam`` is an alias of the newest version.  Versions are bumped only
+by explicit maintainer decision.
+
+``czam-v1`` is a z14 ZR1 (3907) LPAR personality: the host must be a
+3907, the CPU model a 3907 model (``-cpu host`` or ``z14ZR1``), KVM is
+required.  Partition name and number in SYSIB 2.2.2 come from the machine
+properties ``lpar-name`` (default ``QEMUKVM``) and ``lpar-number``
+(default 1).
+
+``czam-v1`` replaces the former ``mtm-3907`` machine (same machine, new
+name; the old name is no longer accepted).
+
 z/OS compatibility handshake under KVM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``mtm-3907`` machine automatically enables a z/OS control-block
+The ``czam`` machine automatically enables a z/OS control-block
 adjustment at KVM STSI exits.  This reproduces
 the result of the compatibility handshake which some emulators perform
 at ``STNSM 0x950,0xff``; it is not an architectural instruction side effect.
@@ -36,7 +54,7 @@ initialization to publish the pointers after earlier STSI calls.
 
 For example::
 
-  qemu-system-s390x -machine mtm-3907 -accel kvm -cpu host ...
+  qemu-system-s390x -machine czam -accel kvm -cpu host ...
 
 This hook does not intercept STNSM itself.  It requires an STSI exit after
 the guest initializes the byte and before the guest consumes it; validate

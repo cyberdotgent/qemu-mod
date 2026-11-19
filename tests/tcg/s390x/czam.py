@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Check the mtm-3907 host-mirrored LPAR personality under KVM.
+"""Check the czam (v1) host-mirrored LPAR personality under KVM.
 
 The guest prints what it sees through STIDP, STSI and SCLP Read SCP Info.
 This wrapper compares that with the host's /proc/sysinfo and memory block
@@ -46,14 +46,14 @@ def main():
 
     result = subprocess.run([
         qemu,
-        "-machine", "mtm-3907",
+        "-machine", "czam",
         "-accel", "kvm",
         "-cpu", "host",
         "-m", f"{MEMORY_MB}M",
         "-smp", "2,maxcpus=4",
         "-nodefaults",
         "-display", "none",
-        # mtm-3907: serial #0 is the line-mode console, #1 the ASCII
+        # czam: serial #0 is the line-mode console, #1 the ASCII
         # console that the test guest prints to.
         "-serial", "null",
         "-serial", "stdio",
