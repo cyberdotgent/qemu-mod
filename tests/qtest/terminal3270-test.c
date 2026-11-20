@@ -8,6 +8,7 @@
 #include "qemu/sockets.h"
 #include "hw/s390x/ebcdic.h"
 #include "libqtest.h"
+#include "s390x-ccw-prog.h"
 
 #define TERMINAL_PATH "/machine/peripheral/dev3270-0"
 #define TN_IAC 0xff
@@ -572,6 +573,97 @@ static void test_terminal_models(void)
     qtest_quit(qts);
 }
 
+/*
+ * Linux sets a 3270 online with MSCH (enable), then a NOP for path
+ * verification.  A client that attached while the subchannel was disabled
+ * leaves an unsolicited device end that becomes pending on the enable, so
+ * the START SUBCHANNEL gets condition code 1 and Linux clears the
+ * subchannel.  The clear status must be "status pending" alone: with the
+ * alert bit of the discarded device end still set, Linux takes the clear
+ * completion for an unsolicited interruption and hangs.
+ */
+static void test_client_before_enable(void)
+{
+    static const uint8_t code[] = {
+        0x58, 0x10, 0x0c, 0x00,     /* 200 l     %r1,SID         */
+        0x95, 0x00, 0x0c, 0x10,     /* 204 cli   GO,0            */
+        0xa7, 0x84, 0xff, 0xfe,     /* 208 je    204             */
+        0xb2, 0x34, 0x0b, 0x00,     /* 20c stsch SCHIB           */
+        0x96, 0x80, 0x0b, 0x05,     /* 210 oi    SCHIB+5,0x80    */
+        0xb2, 0x32, 0x0b, 0x00,     /* 214 msch  SCHIB           */
+        0xb2, 0x33, 0x09, 0x00,     /* 218 ssch  ORB             */
+        0xb2, 0x22, 0x00, 0x20,     /* 21c ipm   %r2             */
+        0x50, 0x20, 0x0c, 0x04,     /* 220 st    %r2,SSCH_CC     */
+        0xb2, 0x30, 0x00, 0x00,     /* 224 csch                  */
+        0xb2, 0x22, 0x00, 0x20,     /* 228 ipm   %r2             */
+        0x50, 0x20, 0x0c, 0x0c,     /* 22c st    %r2,CSCH_CC     */
+        0xb2, 0x35, 0x0a, 0x00,     /* 230 tsch  IRB             */
+        0xa7, 0x74, 0xff, 0xfe,     /* 234 jnz   230             */
+        0xb2, 0x33, 0x09, 0x00,     /* 238 ssch  ORB             */
+        0xb2, 0x22, 0x00, 0x20,     /* 23c ipm   %r2             */
+        0x50, 0x20, 0x0c, 0x08,     /* 240 st    %r2,SSCH2_CC    */
+        0xb2, 0x35, 0x0a, 0x80,     /* 244 tsch  IRB2            */
+        0xa7, 0x74, 0xff, 0xfe,     /* 248 jnz   244             */
+        0x92, 0x01, 0x0c, 0x11,     /* 24c mvi   DONE,1          */
+        0xa7, 0xf4, 0x00, 0x00,     /* 250 j     250             */
+    };
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    g_autofree char *devices = NULL;
+    uint8_t orb[12] = { 0 };
+    uint8_t scsw[12];
+    QTestState *qts;
+    int port = get_free_port();
+    int fd;
+    int i;
+
+    /* The ccw_prog guest program, with the sequence above instead. */
+    {
+        int img = open(image, O_WRONLY);
+
+        g_assert_cmpint(img, >=, 0);
+        g_assert_cmpint(pwrite(img, code, sizeof(code), CCW_PROG_CODE), ==,
+                        sizeof(code));
+        close(img);
+    }
+    devices = g_strdup_printf("-dev3270 port=%d,devno=fe.0.0300", port);
+    qts = ccw_prog_start(image, "64M", devices);
+
+    /* The client attaches while the guest has not enabled the subchannel. */
+    fd = connect_terminal(port);
+    negotiate_terminal(qts, fd);
+    g_byte_array_unref(socket_read_record(fd));
+
+    ccw_prog_set_ccw(qts, 0, 0x03, CCW_FLAG_SLI, 0, 0);
+    stw_be_p(orb + 4, CCW_ORB_FMT);
+    orb[6] = 0xff;
+    stl_be_p(orb + 8, CCW_PROG_CCWS);
+    qtest_memwrite(qts, CCW_PROG_ORB, orb, sizeof(orb));
+    qtest_writeb(qts, CCW_PROG_GO, 1);
+    for (i = 0; i < 200000 && !qtest_readb(qts, CCW_PROG_DONE); i++) {
+        g_usleep(50);
+    }
+    g_assert_cmpint(qtest_readb(qts, CCW_PROG_DONE), ==, 1);
+
+    /* The device end became pending on the enable. */
+    g_assert_cmpint(qtest_readl(qts, CCW_PROG_SSCH_CC) >> 28 & 3, ==, 1);
+    g_assert_cmpint(qtest_readl(qts, 0xc0c) >> 28 & 3, ==, 0);
+
+    /* Clear function, status pending alone: no alert, no device status. */
+    qtest_memread(qts, CCW_PROG_IRB, scsw, sizeof(scsw));
+    g_assert_cmphex(lduw_be_p(scsw + 2) & 0x7000, ==, 0x1000);
+    g_assert_cmphex(lduw_be_p(scsw + 2) & 0x001f, ==, 0x0001);
+    g_assert_cmphex(scsw[8], ==, 0);
+
+    /* Path verification goes on: the NOP ends normally. */
+    g_assert_cmpint(qtest_readl(qts, 0xc08) >> 28 & 3, ==, 0);
+    qtest_memread(qts, 0xa80, scsw, sizeof(scsw));
+    g_assert_cmphex(scsw[8], ==, CCW_DSTAT_CE_DE);
+
+    close(fd);
+    qtest_quit(qts);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -593,6 +685,8 @@ int main(int argc, char **argv)
     qtest_add_func("/terminal3270/protocol-edge-cases",
                    test_negotiation_retry_refusal_and_record_replacement);
     qtest_add_func("/terminal3270/models", test_terminal_models);
+    qtest_add_func("/terminal3270/client-before-enable",
+                   test_client_before_enable);
 
     return g_test_run();
 }

@@ -795,7 +795,14 @@ static void sch_handle_clear_func(SubchDev *sch)
     sch->channel_prog = 0x0;
     sch->last_cmd_valid = false;
     sch->last_ccw_was_tic = false;
-    schib->scsw.ctrl &= ~SCSW_ACTL_CLEAR_PEND;
+    /*
+     * The clear function discards any status the subchannel had pending
+     * (an unsolicited device end, say) and completes with status pending
+     * alone.  A stale alert bit would make the clear status look like an
+     * unsolicited interruption: Linux does not accumulate it, never sees the
+     * clear completion of its own CSCH and waits forever.
+     */
+    schib->scsw.ctrl &= ~(SCSW_ACTL_CLEAR_PEND | SCSW_CTRL_MASK_STCTL);
     schib->scsw.ctrl |= SCSW_STCTL_STATUS_PEND;
 
     schib->scsw.dstat = 0;
