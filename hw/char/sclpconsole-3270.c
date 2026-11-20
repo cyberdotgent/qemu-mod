@@ -14,6 +14,7 @@
 #include "hw/s390x/event-facility.h"
 #include "hw/s390x/sclp.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 #include "qom/object.h"
 
 #define TYPE_SCLP_3270_CONSOLE "sclp3270console"
@@ -58,6 +59,13 @@ struct SCLPConsole3270 {
     bool read_unsent;           /* read command not yet sent to a client */
     bool replay_lost;           /* screen no longer reproducible */
     GByteArray *replay;         /* records since the last erase */
+
+    /* migration of the replay (subsection "replay") */
+    uint8_t *migration_replay;
+    uint32_t migration_replay_len;
+    /* a state was loaded: give an attached client the screen */
+    bool resend_screen;
+    VMChangeStateEntry *vmstate_change;
 };
 
 static bool sclp_3270_can_handle_event(uint8_t type)
@@ -396,6 +404,20 @@ static void sclp_3270_chr_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+static void sclp_3270_vm_state_change(void *opaque, bool running,
+                                      RunState state)
+{
+    SCLPConsole3270 *console = opaque;
+
+    if (!running || !console->resend_screen) {
+        return;
+    }
+    console->resend_screen = false;
+    if (console->client_attached) {
+        sclp_3270_resume(console);
+    }
+}
+
 static int sclp_3270_init(SCLPEvent *event)
 {
     static bool console_available;
@@ -406,6 +428,8 @@ static int sclp_3270_init(SCLPEvent *event)
         return -1;
     }
     console_available = true;
+    console->vmstate_change = qemu_add_vm_change_state_handler(
+        sclp_3270_vm_state_change, console);
 
     qemu_chr_fe_set_handlers(&console->chr, sclp_3270_chr_can_read,
                              sclp_3270_chr_read, sclp_3270_chr_event, NULL,
@@ -428,10 +452,130 @@ static void sclp_3270_reset(DeviceState *dev)
     console->replay_lost = false;
 }
 
+/*
+ * The screen kept for the next client (replay, replay_lost) and a read no
+ * client got yet (read_unsent) travel in a subsection, sent only when there
+ * is something to keep, so that streams without it stay loadable by older
+ * builds.  A loaded state is given to the client when the VM runs.
+ */
+static bool sclp_3270_replay_needed(void *opaque)
+{
+    SCLPConsole3270 *console = opaque;
+
+    return console->persistent &&
+           (console->replay->len || console->replay_lost ||
+            console->read_unsent);
+}
+
+static int sclp_3270_pre_save(void *opaque)
+{
+    SCLPConsole3270 *console = opaque;
+
+    g_free(console->migration_replay);
+    console->migration_replay_len = console->replay->len;
+    console->migration_replay = g_memdup2(console->replay->data,
+                                          console->replay->len);
+    return 0;
+}
+
+static void sclp_3270_post_save(void *opaque)
+{
+    SCLPConsole3270 *console = opaque;
+
+    g_clear_pointer(&console->migration_replay, g_free);
+    console->migration_replay_len = 0;
+}
+
+static int sclp_3270_pre_load(void *opaque)
+{
+    SCLPConsole3270 *console = opaque;
+
+    /* a stream without the subsection has no screen to restore */
+    g_byte_array_set_size(console->replay, 0);
+    console->replay_lost = false;
+    console->read_unsent = false;
+    return 0;
+}
+
+static int sclp_3270_replay_post_load(void *opaque, int version_id)
+{
+    SCLPConsole3270 *console = opaque;
+    uint32_t offset = 0;
+    int ret = 0;
+
+    if (console->migration_replay_len > SCLP_3270_MAX_REPLAY) {
+        ret = -EINVAL;
+        goto out;
+    }
+    while (offset < console->migration_replay_len) {
+        uint32_t len;
+
+        if (console->migration_replay_len - offset < sizeof(uint32_t)) {
+            ret = -EINVAL;
+            goto out;
+        }
+        len = ldl_be_p(console->migration_replay + offset);
+        offset += sizeof(uint32_t);
+        if (!len || len > console->migration_replay_len - offset) {
+            ret = -EINVAL;
+            goto out;
+        }
+        offset += len;
+    }
+    g_byte_array_append(console->replay, console->migration_replay,
+                        console->migration_replay_len);
+out:
+    g_clear_pointer(&console->migration_replay, g_free);
+    console->migration_replay_len = 0;
+    return ret;
+}
+
+static int sclp_3270_post_load(void *opaque, int version_id)
+{
+    SCLPConsole3270 *console = opaque;
+
+    if (console->persistent) {
+        /*
+         * A read the guest started and nobody answered: whichever client
+         * is attached here (a new process, or a client that saw another
+         * screen) has not seen it.
+         */
+        if (console->read_command && !console->record_len) {
+            console->read_unsent = true;
+        }
+        console->resend_screen = true;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_sclp_3270_replay = {
+    .name = TYPE_SCLP_3270_CONSOLE "/replay",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sclp_3270_replay_needed,
+    .post_load = sclp_3270_replay_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(replay_lost, SCLPConsole3270),
+        VMSTATE_BOOL(read_unsent, SCLPConsole3270),
+        VMSTATE_UINT32(migration_replay_len, SCLPConsole3270),
+        VMSTATE_VBUFFER_ALLOC_UINT32(migration_replay, SCLPConsole3270, 1,
+                                     NULL, migration_replay_len),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_sclp_3270 = {
     .name = TYPE_SCLP_3270_CONSOLE,
     .version_id = 0,
     .minimum_version_id = 0,
+    .pre_save = sclp_3270_pre_save,
+    .post_save = sclp_3270_post_save,
+    .pre_load = sclp_3270_pre_load,
+    .post_load = sclp_3270_post_load,
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_sclp_3270_replay,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(event.event_pending, SCLPConsole3270),
         VMSTATE_UINT8_ARRAY(record, SCLPConsole3270, SCLP_3270_MAX_RECORD),
