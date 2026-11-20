@@ -21,6 +21,7 @@
 #include "block/block-io.h"
 #include "block/block_int.h"
 #include "block/qdict.h"
+#include "block/thread-pool.h"
 #include "crypto/secret.h"
 #include "qemu/cutils.h"
 #include "system/replay.h"
@@ -119,6 +120,13 @@ typedef struct RBDDiffIterateReq {
     uint64_t bytes;
     bool exists;
 } RBDDiffIterateReq;
+
+typedef struct RBDDiffIterateCall {
+    rbd_image_t image;
+    uint64_t offs;
+    uint64_t len;
+    RBDDiffIterateReq *req;
+} RBDDiffIterateCall;
 
 static int qemu_rbd_connect(rados_t *cluster, rados_ioctx_t *io_ctx,
                             BlockdevOptionsRbd *opts, bool cache,
@@ -1532,6 +1540,14 @@ static int qemu_rbd_diff_iterate_cb(uint64_t offs, size_t len,
     return 0;
 }
 
+static int qemu_rbd_diff_iterate_worker(void *opaque)
+{
+    RBDDiffIterateCall *call = opaque;
+
+    return rbd_diff_iterate2(call->image, NULL, call->offs, call->len, true,
+                             true, qemu_rbd_diff_iterate_cb, call->req);
+}
+
 static int coroutine_fn qemu_rbd_co_block_status(BlockDriverState *bs,
                                                  unsigned int mode,
                                                  int64_t offset, int64_t bytes,
@@ -1541,6 +1557,7 @@ static int coroutine_fn qemu_rbd_co_block_status(BlockDriverState *bs,
     BDRVRBDState *s = bs->opaque;
     int status, r;
     RBDDiffIterateReq req = { .offs = offset };
+    RBDDiffIterateCall call;
     uint64_t features, flags;
     uint64_t head = 0;
 
@@ -1606,8 +1623,19 @@ static int coroutine_fn qemu_rbd_co_block_status(BlockDriverState *bs,
     bytes += head;
 #endif
 
-    r = rbd_diff_iterate2(s->image, NULL, req.offs, bytes, true, true,
-                          qemu_rbd_diff_iterate_cb, &req);
+    /*
+     * rbd_diff_iterate2() blocks until the requests in flight on the image
+     * have completed, which can take a long time while a backup reads from it.
+     * Call it in a worker thread, so that it does not block the AioContext,
+     * which is the main loop for a disk without an iothread.
+     */
+    call = (RBDDiffIterateCall) {
+        .image = s->image,
+        .offs = req.offs,
+        .len = bytes,
+        .req = &req,
+    };
+    r = thread_pool_submit_co(qemu_rbd_diff_iterate_worker, &call);
     if (r < 0 && r != QEMU_RBD_EXIT_DIFF_ITERATE2) {
         return status;
     }
