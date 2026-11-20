@@ -354,6 +354,39 @@ class S390StorageAttributes(object):
         return ""
 
 
+class S390StorageKeys(object):
+    # Stream format of hw/s390x/s390-skeys.c: records of
+    # (address | flags, count, count key bytes), ended by EOS or ERROR.
+    SKEYS_FLAG_EOS   = 0x01
+    SKEYS_FLAG_SKEYS = 0x02
+    SKEYS_FLAG_ERROR = 0x04
+
+    def __init__(self, file, version_id, device, section_key):
+        if version_id != 1:
+            raise Exception("Unknown s390-skeys version %d" % version_id)
+
+        self.file = file
+        self.section_key = section_key
+
+    def read(self):
+        while True:
+            addr_flags = self.file.read64()
+            flags = addr_flags & 0xfff
+
+            if flags & self.SKEYS_FLAG_ERROR:
+                raise Exception("Error in migration stream")
+            elif flags & self.SKEYS_FLAG_EOS:
+                return
+            elif flags & self.SKEYS_FLAG_SKEYS:
+                count = self.file.read64()
+                self.file.readvar(count)
+            else:
+                raise Exception("Unknown flags %x" % flags)
+
+    def getDict(self):
+        return ""
+
+
 class ConfigurationSection(object):
     def __init__(self, file, desc):
         self.file = file
@@ -682,6 +715,7 @@ class MigrationDump(object):
         self.section_classes = {
             ( 'ram', 0 ) : [ RamSection, None ],
             ( 's390-storage_attributes', 0 ) : [ S390StorageAttributes, None],
+            ( 's390-skeys', 0 ) : [ S390StorageKeys, None ],
             ( 'spapr/htab', 0) : ( HTABSection, None )
         }
         self.filename = filename
