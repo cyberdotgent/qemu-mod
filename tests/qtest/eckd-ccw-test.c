@@ -60,6 +60,36 @@ static char *create_ckd_image_full(const char *identifier,
     return path;
 }
 
+/*
+ * Write the home address, R0 and end of track of track 0 of @cylinder into
+ * its slot, with @home_cylinder as the cylinder in the home address (a later
+ * member of a multi-file volume starts with a cylinder other than 0).
+ */
+static void format_track(const char *path, unsigned int cylinder,
+                         uint16_t home_cylinder)
+{
+    uint8_t track[29] = { 0 };
+    int fd = open(path, O_WRONLY);
+    int64_t offset = CKD_HEADER_SIZE + cylinder * CKD_CYLINDER_SIZE;
+
+    g_assert_cmpint(fd, >=, 0);
+    stw_be_p(track + 1, home_cylinder);
+    stw_be_p(track + 5, home_cylinder);
+    stw_be_p(track + 11, 8);
+    memset(track + 21, 0xff, 8);
+    g_assert_cmpint(pwrite(fd, track, sizeof(track), offset), ==,
+                    sizeof(track));
+    close(fd);
+}
+
+/* Bytes block storage adds to a volume of @cylinders: rounded up to @unit */
+static int64_t padding(unsigned int cylinders, int64_t unit)
+{
+    int64_t size = CKD_HEADER_SIZE + cylinders * CKD_CYLINDER_SIZE;
+
+    return ROUND_UP(size, unit) - size;
+}
+
 /* New images carry the cylinder count in the header. */
 static char *create_ckd_image(const char *identifier, uint8_t file_sequence,
                               uint16_t high_cylinder)
@@ -132,11 +162,12 @@ static void test_legacy_single_file_header(void)
     unlink(path);
 }
 
-static void assert_open_fails(const char *path, const char *message)
+static void assert_open_fails_opts(const char *path, const char *opts,
+                                   const char *message)
 {
     const char *binary = qtest_qemu_binary(NULL);
-    g_autofree char *drive = g_strdup_printf("file=%s,format=raw,devno=200",
-                                             path);
+    g_autofree char *drive = g_strdup_printf("file=%s,format=raw,devno=200%s",
+                                             path, opts);
     const char *argv[] = {
         binary, "-nodefaults", "-display", "none", "-accel", "qtest",
         "-dev3390", drive, NULL,
@@ -155,13 +186,23 @@ static void assert_open_fails(const char *path, const char *message)
     }
 }
 
-static void assert_open_succeeds(const char *path)
+static void assert_open_fails(const char *path, const char *message)
+{
+    assert_open_fails_opts(path, "", message);
+}
+
+static void assert_open_succeeds_opts(const char *path, const char *opts)
 {
     QTestState *qts = qtest_initf(
-        "-nodefaults -dev3390 file=%s,format=raw,devno=200,id=dasd0 -S",
-        path);
+        "-nodefaults -dev3390 file=%s,format=raw,devno=200,id=dasd0%s -S",
+        path, opts);
 
     qtest_quit(qts);
+}
+
+static void assert_open_succeeds(const char *path)
+{
+    assert_open_succeeds_opts(path, "");
 }
 
 /*
@@ -234,6 +275,11 @@ static void test_multi_file_rejected(void)
     g_autofree char *first = create_ckd_image_full("CKD_P064", 1, 1, 2, 0);
     g_autofree char *middle = create_ckd_image_full("CKD_P064", 2, 3, 2, 0);
     g_autofree char *last = create_ckd_image_full("CKD_P064", 2, 0, 2, 0);
+
+    /* Hercules formats every track: the first member's cylinder 1 ... */
+    format_track(first, 1, 1);
+    /* ... and a later member starts with its first cylinder (here 2) */
+    format_track(middle, 0, 2);
 
     assert_open_fails(first, "multi-file CKD images are unsupported");
     assert_open_fails(middle, "multi-file CKD images are unsupported");
@@ -616,6 +662,67 @@ static void test_identity_invalid(void)
     unlink(path);
 }
 
+/*
+ * zPDT-style images carry the exact cylinder count with a nonzero file
+ * sequence byte (seen: 3 and 4).  On block storage that rounds sizes up
+ * (ZFS volume block size, LVM extent) the rest is padding.
+ */
+static void test_header_size_any_file_sequence(void)
+{
+    const int64_t slacks[] = { 0, padding(2, 16 * 1024),
+                               padding(2, 4 * 1024 * 1024), 12345,
+                               CKD_CYLINDER_SIZE + 512 };
+    g_autofree char *short_image =
+        create_ckd_image_full("CKD_P370", 4, 3, 2, 0);
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(slacks); i++) {
+        g_autofree char *path =
+            create_ckd_image_full("CKD_P370", 4, 2, 2, slacks[i]);
+
+        assert_open_succeeds(path);
+        unlink(path);
+    }
+    assert_open_fails(short_image, "CKD image is too short for 3 cylinders");
+    unlink(short_image);
+}
+
+/*
+ * The cylinders property must match a count in the header, and gives the
+ * count of an image whose header has none (high_cylinder 0).
+ */
+static void test_cylinders_property(void)
+{
+    g_autofree char *hercules = create_ckd_image_full(
+        "CKD_P064", 0, 0, 2, padding(2, 4 * 1024 * 1024));
+    g_autofree char *exact = create_ckd_image_full("CKD_P064", 0, 0, 2, 0);
+    g_autofree char *declared = create_ckd_image_full(
+        "CKD_P064", 0, 2, 2, padding(2, 16 * 1024));
+    g_autofree char *zpdt = create_ckd_image_full(
+        "CKD_P370", 4, 2, 2, padding(2, 16 * 1024));
+
+    assert_open_succeeds_opts(hercules, ",cylinders=2");
+    assert_open_succeeds_opts(exact, ",cylinders=2");
+    assert_open_succeeds_opts(declared, ",cylinders=2");
+    assert_open_succeeds_opts(zpdt, ",cylinders=2");
+    assert_open_fails(hercules, "does not contain whole cylinders");
+    assert_open_fails_opts(exact, ",cylinders=3",
+                           "CKD image is too short for 3 cylinders");
+    assert_open_fails_opts(declared, ",cylinders=3",
+                           "cylinders=3 does not match the CKD image header "
+                           "(2 cylinders)");
+    assert_open_fails_opts(zpdt, ",cylinders=1",
+                           "cylinders=1 does not match");
+    /* a formatted cylinder follows: the volume is larger than claimed */
+    format_track(hercules, 1, 1);
+    assert_open_fails_opts(hercules, ",cylinders=1",
+                           "CKD image holds more than 1 cylinders");
+    unlink(hercules);
+    unlink(exact);
+    unlink(declared);
+    unlink(zpdt);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -630,6 +737,9 @@ int main(int argc, char **argv)
                    test_header_defined_size_limit);
     qtest_add_func("/eckd-ccw/legacy-exact-length", test_legacy_exact_length);
     qtest_add_func("/eckd-ccw/multi-file-rejected", test_multi_file_rejected);
+    qtest_add_func("/eckd-ccw/header-size-any-file-sequence",
+                   test_header_size_any_file_sequence);
+    qtest_add_func("/eckd-ccw/cylinders-property", test_cylinders_property);
     qtest_add_func("/eckd-ccw/identity-invalid", test_identity_invalid);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/eckd-ccw/io/identity", test_identity);

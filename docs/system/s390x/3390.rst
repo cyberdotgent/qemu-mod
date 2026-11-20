@@ -36,22 +36,37 @@ per track, so a volume of *n* cylinders needs 512 + *n* × 852,480 bytes. The
 number of cylinders comes from the header's 16-bit little-endian
 ``high_cylinder`` field at offset 18:
 
-* If ``high_cylinder`` is nonzero and the file sequence byte at offset 17 is
-  zero, ``high_cylinder`` is the number of cylinders (one-origin, 1 to
-  65,520). The backend may be longer than the volume needs; the trailing
-  bytes are ignored and never written. This allows block storage which rounds
-  volume sizes up, such as LVM logical volumes, ZFS volumes, or Ceph RBD
-  images. A backend shorter than the volume is refused.
-* If ``high_cylinder`` is zero, the volume size is derived from the backend
-  length, which must be exactly 512 + *n* × 852,480 bytes.
+* If ``high_cylinder`` is nonzero, it is the number of cylinders (one-origin,
+  1 to 65,520), whatever the file sequence byte at offset 17 holds: Hercules
+  writes 0 there (or 1 in its old single-file form), zPDT-style images carry
+  other values.
+* If ``high_cylinder`` is zero and the file sequence byte is zero, the
+  device's ``cylinders`` property gives the number of cylinders; without it,
+  the volume size is derived from the backend length, which must then be
+  exactly 512 + *n* × 852,480 bytes.
 
-This is the single-file form Hercules accepts: Hercules writes
-``high_cylinder`` = 0 for a single-file volume, and also accepts a nonzero
-``high_cylinder`` equal to the cylinder count. In a member of a multi-file
-Hercules volume the file sequence byte is nonzero and ``high_cylinder`` is
-the zero-origin number of the member's last cylinder; such members are
-refused. Hercules itself requires the exact length, so trailing bytes must
+The backend may be longer than the volume needs: the bytes behind the last
+cylinder are padding, which is never read as tracks, never written and never
+shown to the guest. This allows block storage which rounds volume sizes up,
+such as ZFS volumes, LVM logical volumes, or Ceph RBD images. A backend
+shorter than the volume is refused. The header is never rewritten, so
+truncating such a backend to 512 + *n* × 852,480 bytes gives the original
+image back. Hercules itself requires the exact length, so the padding must
 be cut off before an image is used with Hercules.
+
+If the ``cylinders`` property is set and the header declares a different
+count, the device is refused.
+
+Hercules multi-file volumes are not supported. In a member of such a volume
+the file sequence byte is the member's number (1 to *n*) and
+``high_cylinder`` the zero-origin number of the member's last cylinder (zero
+in the last member). Members are recognised and refused: the last member by
+``high_cylinder`` = 0 with a nonzero sequence byte, later members by a first
+track of a cylinder other than 0, and the first member by the formatted
+track of the next cylinder right behind the cylinders its header declares.
+For the same reason, an image whose cylinder count comes from the
+``cylinders`` property is refused if a formatted track of the next cylinder
+follows the last one.
 
 Images should be created with ``high_cylinder`` set. Track slots which are
 entirely zero read as empty tracks, so a new volume needs only the header::

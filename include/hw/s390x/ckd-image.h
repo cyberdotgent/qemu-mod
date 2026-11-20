@@ -51,7 +51,8 @@ typedef struct CkdImage {
     CkdImageRecord records[CKD_IMAGE_MAX_RECORDS];
 } CkdImage;
 
-bool ckd_image_open(CkdImage *image, BlockBackend *blk, Error **errp);
+bool ckd_image_open(CkdImage *image, BlockBackend *blk, uint32_t cylinders,
+                    Error **errp);
 void ckd_image_close(CkdImage *image);
 int ckd_image_load_track(CkdImage *image, uint16_t cylinder, uint16_t head);
 int ckd_image_store_track(CkdImage *image, uint16_t cylinder, uint16_t head,

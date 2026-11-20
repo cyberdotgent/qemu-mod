@@ -653,6 +653,7 @@ static QemuOptsList qemu_dev3390_opts = {
         { .name = "path-cu-number", .type = QEMU_OPT_STRING },
         { .name = "fla", .type = QEMU_OPT_STRING },
         { .name = "chpid", .type = QEMU_OPT_STRING },
+        { .name = "cylinders", .type = QEMU_OPT_STRING },
         { .name = "id", .type = QEMU_OPT_STRING },
         { /* end of list */ }
     },
@@ -1992,9 +1993,10 @@ static bool dev3390_add_opts(QemuOpts *opts, Error **errp)
     QemuOpts *drive_opts = NULL;
     QemuOpts *device_opts = NULL;
     const char *file, *drive, *format, *devno, *id;
-    static const char * const topology_options[] = {
+    /* passed on to the device as they are */
+    static const char * const device_options[] = {
         "unit-address", "unit-address-limit", "subsystem-id", "interface-id",
-        "lcu-queue-number", "path-cu-number", "fla", "chpid",
+        "lcu-queue-number", "path-cu-number", "fla", "chpid", "cylinders",
     };
     unsigned int short_devno;
     int consumed;
@@ -2049,10 +2051,10 @@ static bool dev3390_add_opts(QemuOpts *opts, Error **errp)
             goto fail;
         }
     }
-    for (unsigned int i = 0; i < ARRAY_SIZE(topology_options); i++) {
-        const char *value = qemu_opt_get(opts, topology_options[i]);
+    for (unsigned int i = 0; i < ARRAY_SIZE(device_options); i++) {
+        const char *value = qemu_opt_get(opts, device_options[i]);
 
-        if (value && !qemu_opt_set(device_opts, topology_options[i], value,
+        if (value && !qemu_opt_set(device_opts, device_options[i], value,
                                    errp)) {
             goto fail;
         }

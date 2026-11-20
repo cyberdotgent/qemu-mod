@@ -127,6 +127,12 @@ struct EckdCcwDevice {
     uint8_t cu_model;
     uint16_t dev_type;
     uint8_t dev_model;
+    /*
+     * Expected cylinder count (property cylinders, 0 = not given): must
+     * match the image header where it declares one, else it is the volume
+     * size of an image whose length may include padding (ckd_image_open).
+     */
+    uint32_t cylinders;
 
     bool extent_defined;
     uint16_t extent_begin_cylinder;
@@ -2207,7 +2213,7 @@ static void eckd_realize(DeviceState *dev, Error **errp)
         perm |= BLK_PERM_WRITE;
     }
     if (blk_set_perm(eckd->blk, perm, BLK_PERM_ALL, errp) < 0 ||
-        !ckd_image_open(&eckd->image, eckd->blk, errp)) {
+        !ckd_image_open(&eckd->image, eckd->blk, eckd->cylinders, errp)) {
         return;
     }
     if (!eckd_resolve_identity(eckd, errp)) {
@@ -2308,6 +2314,7 @@ static const Property eckd_properties[] = {
     DEFINE_PROP_UINT8("control-unit-model", EckdCcwDevice, cu_model, 0),
     DEFINE_PROP_UINT16("device-type", EckdCcwDevice, dev_type, ECKD_DEV_TYPE),
     DEFINE_PROP_UINT8("device-model", EckdCcwDevice, dev_model, 0),
+    DEFINE_PROP_UINT32("cylinders", EckdCcwDevice, cylinders, 0),
 };
 
 /*
