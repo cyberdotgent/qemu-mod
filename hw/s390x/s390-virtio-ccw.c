@@ -1536,7 +1536,16 @@ static void czam_v1_class_init(ObjectClass *oc, const void *data)
     ccw_machine_11_2_class_options(mc);
     mc->desc = "CZAM hardware mode";
     mc->init = czam_v1_init;
+#ifdef CONFIG_KVM
     mc->default_cpu_type = S390_CPU_TYPE_NAME("host");
+#else
+    /*
+     * The "host" CPU type exists only in KVM-enabled builds.  Default to
+     * the matching model elsewhere so that selecting the machine fails
+     * with "requires KVM" instead of tripping over a missing CPU class.
+     */
+    mc->default_cpu_type = S390_CPU_TYPE_NAME("z14ZR1");
+#endif
     /* Operator messages on the first serial (e.g. stdio with -nographic). */
     s390mc->line_mode_console_first = true;
     /* One storage increment of a typical z14 LPAR (1 GiB memory blocks). */

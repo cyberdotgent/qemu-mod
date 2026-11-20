@@ -1902,7 +1902,9 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine),
             g_str_equal("xenpvh", machines[i].name) ||
             g_str_equal("vmapple", machines[i].name) ||
             g_str_equal("nitro", machines[i].name) ||
-            g_str_equal("nitro-enclave", machines[i].name)) {
+            g_str_equal("nitro-enclave", machines[i].name) ||
+            /* s390x czam mirrors a z14 ZR1 KVM host; never under qtest */
+            !strncmp("czam", machines[i].name, 4)) {
             continue;
         }
         if (!skip_old_versioned ||
