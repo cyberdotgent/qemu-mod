@@ -247,7 +247,28 @@ static void test_qmp_oob(void)
     q = qdict_get_qdict(resp, "QMP");
     g_assert(q);
     capabilities = qdict_get_qlist(q, "capabilities");
-    g_assert(capabilities && !qlist_empty(capabilities));
+    g_assert(capabilities);
+    if (qlist_empty(capabilities)) {
+        /*
+         * This fork disables the OOB capability (monitor/qmp.c, carried
+         * over from the Proxmox patch set).  Check that it is really
+         * off: enabling it must be refused, and so must exec-oob.
+         */
+        qobject_unref(resp);
+        resp = qtest_qmp(qts,
+                         "{ 'execute': 'qmp_capabilities', "
+                         "  'arguments': { 'enable': [ 'oob' ] } }");
+        g_assert(qdict_haskey(resp, "error"));
+        qobject_unref(resp);
+        resp = qtest_qmp(qts, "{ 'execute': 'qmp_capabilities' }");
+        g_assert(qdict_haskey(resp, "return"));
+        qobject_unref(resp);
+        resp = qtest_qmp(qts, "{ 'exec-oob': 'query-status' }");
+        g_assert(qdict_haskey(resp, "error"));
+        qobject_unref(resp);
+        qtest_quit(qts);
+        return;
+    }
     entry = qlist_first(capabilities);
     g_assert(entry);
     qstr = qobject_to(QString, entry->value);
