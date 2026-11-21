@@ -24,6 +24,7 @@
 #include "system/memory_mapping.h"
 #include "system/address-spaces.h"
 #include "system/kvm.h"
+#include "system/runstate.h"
 #include "migration/qemu-file-types.h"
 #include "migration/register.h"
 #include "monitor/hmp.h"
@@ -689,6 +690,78 @@ end_stream:
     return 0;
 }
 
+/*
+ * The destination: a stream from a source whose guest never used storage
+ * keys carries no keys at all.  On a fresh destination there is nothing to
+ * do, its keys are not in use either.  But a snapshot loaded into a VM whose
+ * guest used keys since (loadvm of a snapshot taken before the IPL of z/OS,
+ * z/VSE or z/VM, or of a Linux guest) kept the keys of that later state.
+ * Those are set back to the key of a page never keyed instead (ACC 0, no
+ * fetch protection, R and C over-indicated) once the whole stream is in.
+ */
+#define S390_SKEYS_UNUSED_KEY 0x06
+
+static struct {
+    bool setup;
+    bool in_use_before;     /* keys were in use when the load began */
+    bool section_seen;
+    bool keys_seen;
+} skeys_incoming;
+
+static int s390_storage_keys_load_setup(QEMUFile *f, void *opaque,
+                                        Error **errp)
+{
+    S390SKeysState *ss = S390_SKEYS(opaque);
+    S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
+
+    skeys_incoming.setup = true;
+    skeys_incoming.in_use_before = skeyclass->skeys_are_enabled(ss);
+    skeys_incoming.section_seen = false;
+    skeys_incoming.keys_seen = false;
+    return 0;
+}
+
+static void s390_storage_keys_reset_unused(S390SKeysState *ss)
+{
+    g_autofree uint8_t *buf = g_malloc(S390_SKEYS_FINAL_PAGES);
+    GuestPhysBlockList guest_phys_blocks;
+    GuestPhysBlock *block;
+    uint64_t gfn, pages;
+    int ret = 0;
+
+    memset(buf, S390_SKEYS_UNUSED_KEY, S390_SKEYS_FINAL_PAGES);
+    guest_phys_blocks_init(&guest_phys_blocks);
+    guest_phys_blocks_append(&guest_phys_blocks);
+    QTAILQ_FOREACH(block, &guest_phys_blocks.head, next) {
+        gfn = block->target_start / TARGET_PAGE_SIZE;
+        pages = (block->target_end - block->target_start) / TARGET_PAGE_SIZE;
+        while (!ret && pages) {
+            const uint64_t count = MIN(pages, S390_SKEYS_FINAL_PAGES);
+
+            ret = s390_skeys_set_changed(ss, gfn, count, buf);
+            gfn += count;
+            pages -= count;
+        }
+    }
+    guest_phys_blocks_free(&guest_phys_blocks);
+    if (ret) {
+        error_report("S390_SET_KEYS error %d", ret);
+    }
+}
+
+static int s390_storage_keys_load_cleanup(void *opaque)
+{
+    S390SKeysState *ss = S390_SKEYS(opaque);
+
+    if (skeys_incoming.setup && skeys_incoming.in_use_before &&
+        skeys_incoming.section_seen && !skeys_incoming.keys_seen &&
+        !runstate_is_running()) {
+        s390_storage_keys_reset_unused(ss);
+    }
+    memset(&skeys_incoming, 0, sizeof(skeys_incoming));
+    return 0;
+}
+
 static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
 {
     S390SKeysState *ss = S390_SKEYS(opaque);
@@ -704,6 +777,7 @@ static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
     if (skeyclass->enable_skeys) {
         skeyclass->enable_skeys(ss);
     }
+    skeys_incoming.section_seen = true;
 
     while (!ret) {
         ram_addr_t addr;
@@ -718,6 +792,8 @@ static int s390_storage_keys_load(QEMUFile *f, void *opaque, int version_id)
             const uint64_t total_count = qemu_get_be64(f);
             const uint64_t gfn = addr / TARGET_PAGE_SIZE;
             g_autofree uint8_t *buf = NULL;
+
+            skeys_incoming.keys_seen = true;
 
             /* at most the keys of the guest memory, one byte per page */
             if (gfn > max_pages || total_count > max_pages - gfn) {
@@ -768,7 +844,9 @@ static SaveVMHandlers savevm_s390_storage_keys = {
     .is_active_iterate = s390_storage_keys_is_active_iterate,
     .save_query_pending = s390_storage_keys_query_pending,
     .save_live_iterate = s390_storage_keys_save_iterate,
+    .load_setup = s390_storage_keys_load_setup,
     .load_state = s390_storage_keys_load,
+    .load_cleanup = s390_storage_keys_load_cleanup,
 };
 
 static void s390_skeys_realize(DeviceState *dev, Error **errp)
