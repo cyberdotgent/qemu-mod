@@ -15,6 +15,7 @@ s390x_ss.add(files(
   'sclp.c',
   'sclpcpi.c',
   'sclpcpu.c',
+  'sclpfile.c',
   'sclpquiesce.c',
   'tod.c',
   'cert-store.c',

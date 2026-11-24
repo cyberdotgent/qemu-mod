@@ -82,3 +82,7 @@ qeth_announce(const char *what, unsigned int value) "%s %u"
 
 # qdio.c
 qdio_establish(uint8_t iq, uint8_t oq, uint8_t iqdsz, uint8_t oqdsz, uint64_t qiba, int ret) "input queues %u output queues %u input desc size %u output desc size %u qib 0x%" PRIx64 " ret %d"
+
+# sclpfile.c
+sclp_file_request(unsigned cmd, const char *name, uint64_t offset, uint64_t length, uint64_t addr, uint64_t asce) "cmd=0x%x name='%s' offset=%" PRIu64 " length=%" PRIu64 " addr=0x%" PRIx64 " asce=0x%" PRIx64
+sclp_file_result(unsigned cmd, unsigned code, uint64_t length, uint64_t fsize) "cmd=0x%x code=0x%02x length=%" PRIu64 " fsize=%" PRIu64
