@@ -85,4 +85,6 @@ qdio_establish(uint8_t iq, uint8_t oq, uint8_t iqdsz, uint8_t oqdsz, uint64_t qi
 
 # sclpfile.c
 sclp_file_request(unsigned cmd, const char *name, uint64_t offset, uint64_t length, uint64_t addr, uint64_t asce) "cmd=0x%x name='%s' offset=%" PRIu64 " length=%" PRIu64 " addr=0x%" PRIx64 " asce=0x%" PRIx64
+sclp_file_load(unsigned type, unsigned f0, unsigned f1, unsigned f2, unsigned pcx, unsigned ldflg) "load by name: type=0x%02x flags=0x%02x 0x%02x 0x%02x pcx=0x%02x ldflg=0x%02x"
+sclp_file_ftp(unsigned pgsize, unsigned srcflg, unsigned spare, unsigned pcx, unsigned ldflg, uint64_t fsize, uint64_t failaddr) "file command: pgsize=0x%02x srcflg=0x%02x spare=0x%02x pcx=0x%02x ldflg=0x%02x fsize=%" PRIu64 " failaddr=0x%" PRIx64
 sclp_file_result(unsigned cmd, unsigned code, uint64_t length, uint64_t fsize) "cmd=0x%x code=0x%02x length=%" PRIu64 " fsize=%" PRIu64
