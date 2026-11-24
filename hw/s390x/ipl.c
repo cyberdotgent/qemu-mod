@@ -142,9 +142,68 @@ static bool s390_ipl_is_ins_file(const char *filename)
     return suffix && !g_ascii_strcasecmp(suffix, ".ins");
 }
 
+/*
+ * The components of an INS file may overlap: Linux installers place the
+ * parameter file and the initrd address inside the kernel image. Components
+ * are applied in the order of the file, a later one overwriting an earlier
+ * one, and what overlaps is loaded as one piece.
+ */
+typedef struct S390InsRegion {
+    uint64_t addr;
+    GByteArray *data;
+} S390InsRegion;
+
+static void s390_ins_region_free(gpointer opaque)
+{
+    S390InsRegion *region = opaque;
+
+    g_byte_array_unref(region->data);
+    g_free(region);
+}
+
+static void s390_ins_add(GPtrArray *regions, uint64_t addr,
+                         const char *buf, size_t len)
+{
+    S390InsRegion *new = g_new0(S390InsRegion, 1);
+    unsigned int i = 0;
+
+    new->addr = addr;
+    new->data = g_byte_array_sized_new(len);
+    g_byte_array_append(new->data, (const guint8 *)buf, len);
+
+    while (i < regions->len) {
+        S390InsRegion *old = g_ptr_array_index(regions, i);
+        uint64_t old_end = old->addr + old->data->len;
+        uint64_t new_end = new->addr + new->data->len;
+        uint64_t start, end;
+        GByteArray *merged;
+
+        if (old->addr >= new_end || old_end <= new->addr) {
+            i++;
+            continue;
+        }
+        start = MIN(old->addr, new->addr);
+        end = MAX(old_end, new_end);
+        merged = g_byte_array_sized_new(end - start);
+        g_byte_array_set_size(merged, end - start);
+        memcpy(merged->data + (old->addr - start), old->data->data,
+               old->data->len);
+        memcpy(merged->data + (new->addr - start), new->data->data,
+               new->data->len);
+        g_byte_array_unref(new->data);
+        new->data = merged;
+        new->addr = start;
+        g_ptr_array_remove_index(regions, i);
+        i = 0;
+    }
+    g_ptr_array_add(regions, new);
+}
+
 static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
                              Error **errp)
 {
+    g_autoptr(GPtrArray) regions =
+        g_ptr_array_new_with_free_func(s390_ins_region_free);
     g_autofree char *contents = NULL;
     g_autofree char *directory = g_path_get_dirname(filename);
     g_auto(GStrv) lines = NULL;
@@ -160,11 +219,12 @@ static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
         g_autofree char *line = g_strdup(lines[line_no]);
         g_auto(GStrv) fields = NULL;
         g_autofree char *component = NULL;
+        g_autofree char *data = NULL;
+        gsize size;
         const char *component_name = NULL;
         const char *address_string = NULL;
         char *p = g_strstrip(line);
         uint64_t addr;
-        int size;
 
         if (!*p || *p == '*') {
             continue;
@@ -199,14 +259,27 @@ static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
             return -1;
         }
         component = g_build_filename(directory, component_name, NULL);
-        size = load_image_targphys(component, addr,
-                                   MIN(ram_size, 0x80000000ULL) - addr, NULL);
-        if (size < 0) {
+        if (!g_file_get_contents(component, &data, &size, NULL)) {
             error_setg(errp, "%s:%u: could not load component '%s'",
                        filename, line_no + 1, component);
             return -1;
         }
+        if (size > MIN(ram_size, 0x80000000ULL) - addr) {
+            error_setg(errp, "%s:%u: component '%s' does not fit into "
+                       "list-load memory", filename, line_no + 1, component);
+            return -1;
+        }
+        if (size) {
+            s390_ins_add(regions, addr, data, size);
+        }
         loaded++;
+    }
+
+    for (unsigned int i = 0; i < regions->len; i++) {
+        S390InsRegion *region = g_ptr_array_index(regions, i);
+
+        rom_add_blob_fixed("ins", region->data->data, region->data->len,
+                           region->addr);
     }
 
     if (!loaded) {
