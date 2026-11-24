@@ -966,6 +966,30 @@ static size_t terminal_position_offset(Terminal3270 *t, const uint8_t *buf,
     uint16_t pos = 0;
     uint16_t cells = t->ewa ? t->rows * t->cols : 24 * 80;
 
+    /*
+     * Formatted buffer: the record lists the modified fields, each as an SBA
+     * order with the address of the field's first character followed by the
+     * field data.  The search for modified fields starts at the current
+     * buffer address, so a field is reported, with its SBA order, when its
+     * attribute byte is at or behind that address.
+     */
+    if (len > 3 && buf[3] == O3270_SBA) {
+        while (offset < len) {
+            if (buf[offset] == O3270_SBA && len - offset >= 3) {
+                uint16_t field = decode_buffer_address(&buf[offset + 1]) %
+                                 cells;
+
+                if ((field + cells - 1) % cells >= wanted) {
+                    return offset;
+                }
+            }
+            if (!advance_3270_position(buf, len, &offset, &pos, cells)) {
+                return 0;
+            }
+        }
+        return len;
+    }
+
     while (offset < len && pos < wanted) {
         if (!advance_3270_position(buf, len, &offset, &pos, cells)) {
             return 0;
