@@ -426,6 +426,9 @@ static void sclp_file_do_ftp(SCLPFileAccess *fa, SclpFileFtp *ftp)
     int root = -1, fd = -1;
     struct stat st;
 
+    trace_sclp_file_ftp(ftp->pgsize, ftp->srcflg, ftp->spare, ftp->h.pcx,
+                        ftp->h.ldflg, be64_to_cpu(ftp->fsize),
+                        be64_to_cpu(ftp->failaddr));
     trace_sclp_file_request(ftp->cmd, name, offset, length, buf.addr,
                             buf.asce);
 
@@ -538,6 +541,8 @@ static void sclp_file_do_load(SCLPFileAccess *fa, SclpFileLoad *load)
         name[i] = ebcdic2ascii[load->image_in[i]];
     }
     name[i] = '\0';
+    trace_sclp_file_load(load->type, load->flags[0], load->flags[1],
+                         load->flags[2], load->h.pcx, load->h.ldflg);
     trace_sclp_file_request(0x100 | load->type, name, 0, 0, buf.addr,
                             buf.asce);
 
