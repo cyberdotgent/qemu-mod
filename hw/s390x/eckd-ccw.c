@@ -57,6 +57,7 @@
 #define CMD_LOCATE 0x47
 #define CMD_SEARCH_KEY_HIGH 0x49
 #define CMD_LOCATE_EXT 0x4b
+#define CMD_SUSPEND_MPR 0x5b
 #define CMD_SEARCH_ID_HIGH 0x51
 #define CMD_SNSS 0x54
 #define CMD_SEARCH_KEY_EQ_HIGH 0x69
@@ -1446,6 +1447,18 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
         return 0;
     case 0x04:
         return eckd_sense(eckd, &ccw);
+    case CMD_SUSPEND_MPR:
+        /*
+         * Suspend Multipath Reconnection: the rest of the channel program
+         * stays on the path it was started on.  The device has a single
+         * path, so there is nothing to do.  The command must be the first
+         * of the channel program.
+         */
+        if (eckd->prev_cmd_valid) {
+            return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
+        }
+        sch->curr_status.scsw.count = ccw.count;
+        return 0;
     case CMD_SET_FILE_MASK:
         if (ccw.count < 1 || eckd_read_guest(eckd, buf, 1)) {
             return eckd_unit_check(eckd, SENSE_COMMAND_REJECT, 0);
