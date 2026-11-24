@@ -157,7 +157,8 @@ static int sclp_file_root(SCLPFileAccess *fa)
     return fd;
 }
 
-static int sclp_file_openat(int root, const char *name, int flags, mode_t mode)
+static int sclp_file_openat2(int dirfd, const char *name, int flags,
+                             mode_t mode)
 {
     struct open_how how = {
         .flags = flags | O_CLOEXEC,
@@ -165,13 +166,102 @@ static int sclp_file_openat(int root, const char *name, int flags, mode_t mode)
         .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
     };
 
+    return syscall(SYS_openat2, dirfd, name, &how, sizeof(how));
+}
+
+/*
+ * The one entry of @dirfd whose name matches @name without regard to case,
+ * NULL if there is none or more than one.
+ */
+static char *sclp_file_match_nocase(int dirfd, const char *name)
+{
+    int fd = sclp_file_openat2(dirfd, ".", O_RDONLY | O_DIRECTORY, 0);
+    DIR *dir = fd < 0 ? NULL : fdopendir(fd);
+    struct dirent *de;
+    char *match = NULL;
+
+    if (!dir) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return NULL;
+    }
+    while ((de = readdir(dir))) {
+        if (!g_ascii_strcasecmp(de->d_name, name)) {
+            if (match) {
+                g_clear_pointer(&match, g_free);
+                break;
+            }
+            match = g_strdup(de->d_name);
+        }
+    }
+    closedir(dir);
+    return match;
+}
+
+/*
+ * Systems name the files of their installation medium in upper case, while
+ * a medium copied to a host directory usually has them in lower case.  When
+ * a path does not exist as given, look its components up without regard to
+ * case, as the service element does for a medium.
+ */
+static int sclp_file_open_nocase(int root, const char *name, int flags)
+{
+    g_auto(GStrv) parts = g_strsplit(name, "/", -1);
+    int dirfd = dup(root);
+    int fd = -1;
+
+    for (unsigned int i = 0; dirfd >= 0 && parts[i]; i++) {
+        bool last = !parts[i + 1];
+        int how = last ? flags : O_RDONLY | O_DIRECTORY;
+        g_autofree char *match = NULL;
+
+        if (!*parts[i] || !strcmp(parts[i], ".")) {
+            if (!last) {
+                continue;
+            }
+            fd = sclp_file_openat2(dirfd, ".", how, 0);
+        } else {
+            fd = sclp_file_openat2(dirfd, parts[i], how, 0);
+            if (fd < 0 && errno == ENOENT) {
+                match = sclp_file_match_nocase(dirfd, parts[i]);
+                fd = match ? sclp_file_openat2(dirfd, match, how, 0) : -1;
+                if (!match) {
+                    errno = ENOENT;
+                }
+            }
+        }
+        if (fd < 0 || last) {
+            break;
+        }
+        close(dirfd);
+        dirfd = fd;
+        fd = -1;
+    }
+    if (dirfd >= 0) {
+        int err = errno;
+
+        close(dirfd);
+        errno = err;
+    }
+    return fd;
+}
+
+static int sclp_file_openat(int root, const char *name, int flags, mode_t mode)
+{
+    int fd;
+
     while (*name == '/') {
         name++;
     }
     if (!*name) {
         name = ".";
     }
-    return syscall(SYS_openat2, root, name, &how, sizeof(how));
+    fd = sclp_file_openat2(root, name, flags, mode);
+    if (fd < 0 && errno == ENOENT && !(flags & O_CREAT)) {
+        fd = sclp_file_open_nocase(root, name, flags);
+    }
+    return fd;
 }
 
 /* Guest side: the data buffer of a request */
