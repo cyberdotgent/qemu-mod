@@ -192,6 +192,63 @@ static void test_io_2g_boundary(void)
     unlink(image);
 }
 
+/*
+ * A read with the skip flag makes no storage reference, so its data address
+ * is not checked: the control program of a mainframe operating system reads
+ * blocks it does not want with an address outside the configuration.
+ */
+static void test_io_skip(void)
+{
+    g_autofree char *path = create_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    uint8_t pat[2][512], back[512];
+    CcwProgIrb irb;
+    g_autofree char *devices = g_strdup_printf(
+        "-drive if=none,id=fba0,file=%s,format=raw "
+        "-device fba-ccw,drive=fba0,devno=fe.0.0200", path);
+    QTestState *qts = ccw_prog_start(image, "128M", devices);
+
+    fill(pat[0], 512, 0x44);
+    fill(pat[1], 512, 0x55);
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x1000, pat, sizeof(pat));
+    fba_set_extent_locate(qts, 0x01, 2, 0);
+    ccw_prog_set_ccw(qts, 2, 0x41, 0, 1024, CCW_PROG_DATA + 0x1000);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+
+    /* Skip block 0 at an address that does not exist, read block 1. */
+    fba_set_extent_locate(qts, 0x06, 2, 0);
+    ccw_prog_set_ccw(qts, 2, 0x42, CCW_FLAG_DC | CCW_FLAG_SKIP, 512,
+                     0xfffff000);
+    ccw_prog_set_ccw(qts, 3, 0x42, 0, 512, CCW_PROG_DATA + 0x2000);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA + 0x2000, back, 512);
+    g_assert_cmpmem(back, 512, pat[1], 512);
+
+    /* The same with indirect addressing and an IDAW that is not there. */
+    fba_set_extent_locate(qts, 0x06, 2, 0);
+    ccw_prog_set_ccw(qts, 2, 0x42, CCW_FLAG_DC | CCW_FLAG_SKIP | CCW_FLAG_IDA,
+                     512, 0x7ffff000);
+    qtest_memset(qts, CCW_PROG_DATA + 0x2000, 0, 512);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA + 0x2000, back, 512);
+    g_assert_cmpmem(back, 512, pat[1], 512);
+
+    /* Without the skip flag the address is checked. */
+    fba_set_extent_locate(qts, 0x06, 2, 0);
+    ccw_prog_set_ccw(qts, 2, 0x42, CCW_FLAG_DC, 512, 0xfffff000);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, CCW_CSTAT_PROG_CHECK);
+
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
 static QTestState *fba_prog_start_opts(const char *image, const char *path,
                                        const char *extra)
 {
@@ -249,6 +306,7 @@ int main(int argc, char **argv)
     qtest_add_func("/fba-ccw/auto-devnos", test_auto_devnos);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/fba-ccw/io/2g-boundary", test_io_2g_boundary);
+        qtest_add_func("/fba-ccw/io/skip", test_io_skip);
         qtest_add_func("/fba-ccw/io/identity", test_identity);
     }
     return g_test_run();

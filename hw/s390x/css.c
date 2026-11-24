@@ -927,6 +927,10 @@ static int ccw_dstream_rw_noflags(CcwDataStream *cds, void *buff, int len,
     if (ret <= 0) {
         return ret;
     }
+    if (cds->do_skip) {
+        /* no storage reference: the data address is not looked at */
+        goto incr;
+    }
     if (!cds_ccw_addrs_ok(cds->cda, len, cds->flags & CDS_F_FMT)) {
         return -EINVAL; /* channel program check */
     }
@@ -1011,6 +1015,11 @@ static int ccw_dstream_rw_ida(CcwDataStream *cds, void *buff, int len,
     ret = cds_check_len(cds, len);
     if (ret <= 0) {
         return ret;
+    }
+    if (cds->do_skip) {
+        /* no storage reference: the IDAWs are not looked at */
+        cds->at_byte += len;
+        return 0;
     }
     if (!cds->at_idaw) {
         /* read first idaw */
