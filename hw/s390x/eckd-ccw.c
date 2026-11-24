@@ -204,6 +204,11 @@ struct EckdCcwDevice {
      */
     CCW1 prev_cmd;
     bool prev_cmd_valid;
+    /*
+     * The previous CCW transferred a record and moved on: 'record' names
+     * the record that follows it, not the one the device is oriented to.
+     */
+    bool read_advanced;
     CCW1 co_ccw;
     int co_ret;
     /* The CCW coroutine has not returned yet. */
@@ -1059,6 +1064,7 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
     eckd->read_active = false;
     if (advance) {
         eckd_advance_record(eckd, record);
+        eckd->read_advanced = true;
     } else if (eckd->locate_count) {
         eckd->locate_count--;
     }
@@ -1412,9 +1418,11 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
     uint8_t buf[256] = { 0 };
     uint32_t length;
     bool update_done = eckd->update_done;
+    bool read_advanced = eckd->read_advanced;
     int ret;
 
     eckd->update_done = false;
+    eckd->read_advanced = false;
     if (!eckd->prev_cmd_valid) {
         /*
          * Define Extent, Locate Record and format-write domains belong to
@@ -1684,7 +1692,14 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
          * locates R0, writes R1, locates R0 again, then verifies R1 with
          * Read CKD.
          */
-        eckd->record++;
+        /*
+         * After a Read Data or Read Key and Data the device has left the
+         * record it transferred, and the next count field is the one this
+         * command reads.
+         */
+        if (!read_advanced) {
+            eckd->record++;
+        }
         return eckd_read_record(eckd, &ccw, ccw.cmd_code, false);
     case CMD_READ_COUNT:
     case CMD_READ_COUNT_MT: {
