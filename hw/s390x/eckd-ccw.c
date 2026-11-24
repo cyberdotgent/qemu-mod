@@ -209,6 +209,11 @@ struct EckdCcwDevice {
      * the record that follows it, not the one the device is oriented to.
      */
     bool read_advanced;
+    /*
+     * The previous CCW was a Read CKD: 'record' names the record it
+     * transferred completely, and the device has left that record.
+     */
+    bool record_consumed;
     CCW1 co_ccw;
     int co_ret;
     /* The CCW coroutine has not returned yet. */
@@ -1065,8 +1070,11 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
     if (advance) {
         eckd_advance_record(eckd, record);
         eckd->read_advanced = true;
-    } else if (eckd->locate_count) {
-        eckd->locate_count--;
+    } else {
+        eckd->record_consumed = true;
+        if (eckd->locate_count) {
+            eckd->locate_count--;
+        }
     }
     eckd->search_count_advance = false;
     /*
@@ -1419,10 +1427,12 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
     uint32_t length;
     bool update_done = eckd->update_done;
     bool read_advanced = eckd->read_advanced;
+    bool record_consumed = eckd->record_consumed;
     int ret;
 
     eckd->update_done = false;
     eckd->read_advanced = false;
+    eckd->record_consumed = false;
     if (!eckd->prev_cmd_valid) {
         /*
          * Define Extent, Locate Record and format-write domains belong to
@@ -1718,7 +1728,7 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
          */
         record = eckd->record <= UINT8_MAX ?
                  ckd_image_find_record(&eckd->image, eckd->record) : NULL;
-        if (eckd->search_count_advance && record) {
+        if ((eckd->search_count_advance || record_consumed) && record) {
             eckd_advance_record(eckd, record);
             record = eckd->record <= UINT8_MAX ?
                      ckd_image_find_record(&eckd->image, eckd->record) : NULL;
