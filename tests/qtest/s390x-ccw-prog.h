@@ -32,6 +32,7 @@
 #define CCW_FLAG_DC  0x80
 #define CCW_FLAG_CC  0x40
 #define CCW_FLAG_SLI 0x20
+#define CCW_FLAG_SKIP 0x10
 #define CCW_FLAG_IDA 0x04
 
 #define CCW_ORB_FMT  0x0080
