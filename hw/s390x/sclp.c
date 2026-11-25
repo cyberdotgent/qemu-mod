@@ -470,6 +470,8 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
 
     sclp_c->execute(sclp, work_sccb, code);
 out_write:
+    trace_sclp_service_call(code, sccb, be16_to_cpu(header.length),
+                            be16_to_cpu(work_sccb->h.response_code));
     ret = address_space_write(as, sccb, attrs,
                               work_sccb, be16_to_cpu(header.length));
     if (ret != MEMTX_OK) {
