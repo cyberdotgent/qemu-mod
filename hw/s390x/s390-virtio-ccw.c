@@ -283,6 +283,11 @@ static void ccw_init(MachineState *machine)
     VirtualCssBus *css_bus;
     DeviceState *dev;
 
+    if (ms->esa390_cm && !kvm_enabled()) {
+        error_report("machine property esa390-cm=on requires KVM");
+        exit(1);
+    }
+
     ms->sclp = SCLP(object_new(TYPE_SCLP));
     object_property_add_child(OBJECT(machine), TYPE_SCLP, OBJECT(ms->sclp));
     qdev_realize_and_unref(DEVICE(ms->sclp), NULL, &error_fatal);
@@ -540,6 +545,22 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
 
     /* all CPUs are paused and synchronized at this point */
     s390_cmma_reset();
+
+    /*
+     * A configuration with the ESA/390-compatibility mode facility is
+     * put (back) into that mode by every reset that belongs to a load or
+     * clears the configuration; only a CPU reset or a system-reset-normal
+     * would leave the mode alone, and those do not come through here.
+     */
+    if (ms->esa390_cm && reset_type != S390_RESET_PV) {
+        if (kvm_s390_set_arch_mode(true)) {
+            error_report("could not put the configuration into the "
+                         "ESA/390-compatibility mode");
+        }
+        CPU_FOREACH(t) {
+            S390_CPU(t)->env.esa_mode = true;
+        }
+    }
 
     cpu = S390_CPU(cs);
 
@@ -805,6 +826,21 @@ static inline void machine_set_aes_key_wrap(Object *obj, bool value,
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
 
     ms->aes_key_wrap = value;
+}
+
+static inline bool machine_get_esa390_cm(Object *obj, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    return ms->esa390_cm;
+}
+
+static inline void machine_set_esa390_cm(Object *obj, bool value,
+                                         Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    ms->esa390_cm = value;
 }
 
 static inline bool machine_get_dea_key_wrap(Object *obj, Error **errp)
@@ -1119,6 +1155,14 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "ext-measurement-block",
             "provide the extended-I/O-measurement-block facility of the "
             "channel subsystem (format-1 measurement blocks)");
+
+    object_class_property_add_bool(oc, "esa390-cm",
+                                   machine_get_esa390_cm,
+                                   machine_set_esa390_cm);
+    object_class_property_set_description(oc, "esa390-cm",
+            "start the configuration in the ESA/390-compatibility mode; "
+            "the guest switches to z/Architecture with SIGP set-architecture "
+            "(KVM only)");
 
     object_class_property_add_bool(oc, "dea-key-wrap",
                                    machine_get_dea_key_wrap,

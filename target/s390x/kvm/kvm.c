@@ -365,6 +365,11 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
     cap_zpci_op = kvm_check_extension(s, KVM_CAP_S390_ZPCI_OP);
     cap_protected_dump = kvm_check_extension(s, KVM_CAP_S390_PROTECTED_DUMP);
 
+    /* must precede the CPU model and the creation of the first vCPU */
+    if (kvm_s390_esa390_init(ms, s) < 0) {
+        return -ENOTSUP;
+    }
+
     kvm_vm_enable_cap(s, KVM_CAP_S390_USER_SIGP, 0);
     kvm_vm_enable_cap(s, KVM_CAP_S390_VECTOR_REGISTERS, 0);
     kvm_vm_enable_cap(s, KVM_CAP_S390_USER_STSI, 0);
@@ -586,6 +591,15 @@ int kvm_arch_get_registers(CPUState *cs, Error **errp)
     CPUS390XState *env = cpu_env(cs);
     struct kvm_fpu fpu;
     int i, r;
+
+    /*
+     * The guest leaves the ESA/390-compatibility mode with SIGP
+     * set-architecture, which KVM executes itself. The PSW is always
+     * exchanged in the 16-byte format.
+     */
+    if (kvm_s390_esa390_cm_enabled()) {
+        env->esa_mode = kvm_s390_get_arch_mode() == 1;
+    }
 
     /* get the PSW */
     env->psw.addr = cs->kvm_run->psw_addr;

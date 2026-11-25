@@ -32,6 +32,7 @@ struct S390CcwMachineState {
     /*< public >*/
     bool aes_key_wrap;
     bool dea_key_wrap;
+    bool esa390_cm;
     bool pv;
     bool secure_boot;
     uint8_t loadparm[8];

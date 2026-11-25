@@ -27,6 +27,13 @@ void kvm_s390_vcpu_interrupt_pre_save(S390CPU *cpu);
 int kvm_s390_vcpu_interrupt_post_load(S390CPU *cpu);
 int kvm_s390_get_hpage(void);
 int kvm_s390_get_protected_dump(void);
+
+/* ESA/390-compatibility mode (esa390.c) */
+int kvm_s390_esa390_init(MachineState *ms, struct KVMState *s);
+bool kvm_s390_esa390_cm_enabled(void);
+int kvm_s390_set_arch_mode(bool esa);
+int kvm_s390_get_arch_mode(void);
+
 int kvm_s390_get_ri(void);
 int kvm_s390_get_zpci_op(void);
 int kvm_s390_get_clock(uint8_t *tod_high, uint64_t *tod_clock);

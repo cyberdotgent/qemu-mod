@@ -15,6 +15,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "cpu.h"
 #include "s390x-internal.h"
 #include "kvm/kvm_s390x.h"
@@ -32,6 +33,12 @@ static int cpu_post_load(void *opaque, int version_id)
      * than via cpu_synchronize_state, we need update kvm here.
      */
     if (kvm_enabled()) {
+        /* the architectural mode is a property of the whole configuration */
+        if (cpu->env.esa_mode && kvm_s390_set_arch_mode(true)) {
+            error_report("the ESA/390-compatibility mode of the incoming "
+                         "configuration is not available");
+            return -EINVAL;
+        }
         kvm_s390_set_cpu_state(cpu, s390_cpu_get_state(cpu));
         return kvm_s390_vcpu_interrupt_post_load(cpu);
     }

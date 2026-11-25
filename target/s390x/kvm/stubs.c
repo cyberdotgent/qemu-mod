@@ -148,6 +148,21 @@ int kvm_s390_get_hpage(void)
     g_assert_not_reached();
 }
 
+bool kvm_s390_esa390_cm_enabled(void)
+{
+    return false;
+}
+
+int kvm_s390_set_arch_mode(bool esa)
+{
+    return esa ? -ENOTSUP : 0;
+}
+
+int kvm_s390_get_arch_mode(void)
+{
+    return -ENOTSUP;
+}
+
 void kvm_s390_enable_css_support(S390CPU *cpu)
 {
     g_assert_not_reached();
