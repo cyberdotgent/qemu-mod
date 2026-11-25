@@ -1,3 +1,5 @@
+.. _s390x-bootdevices:
+
 Boot devices on s390x
 =====================
 
@@ -88,7 +90,11 @@ HMC list-directed loads
 On s390x, ``-kernel`` also accepts an HMC list-directed-load control file whose
 name ends in ``.INS`` (case-insensitive). Each non-comment line contains a
 component filename and its hexadecimal load address. Component filenames are
-resolved relative to the control file. For example::
+resolved relative to the control file; a component that does not exist as
+written is looked up without regard to case, since a medium copied to a host
+directory often has lower-case names. Components may overlap, as in the INS
+files of Linux installers, which place the parameter file inside the kernel
+image: they are applied in the order of the file. For example::
 
  * Install image
  NUCLEUS 0x00000000
@@ -101,9 +107,9 @@ operation and avoids a separate ``loader`` device for every component::
 
  qemu-system-s390x -m 2G -kernel media/BOOT.INS -loadparm CONS0009
 
-The INS control file only describes the initial memory image. Any later files
-that the installer retrieves from the HMC media still require an emulated
-device or another QEMU service that implements that media protocol.
+The INS control file only describes the initial memory image. Later files
+that the loaded system retrieves from the same location are served by the
+``sclpfileaccess`` device, see :doc:`sclpfile`.
 
 Booting with bootindex parameter
 --------------------------------
