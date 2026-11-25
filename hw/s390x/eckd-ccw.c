@@ -2378,6 +2378,16 @@ static int eckd_pre_save(void *opaque)
     return 0;
 }
 
+static int eckd_pre_load(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    /* State of subsections the stream may not have (loadvm of a snapshot) */
+    eckd->read_advanced = false;
+    eckd->record_consumed = false;
+    return 0;
+}
+
 static int eckd_post_load(void *opaque, int version_id)
 {
     EckdCcwDevice *eckd = opaque;
@@ -2472,11 +2482,38 @@ static const VMStateDescription vmstate_eckd_deferred = {
     },
 };
 
+static bool eckd_orientation_needed(void *opaque)
+{
+    EckdCcwDevice *eckd = opaque;
+
+    return eckd->read_advanced || eckd->record_consumed;
+}
+
+/*
+ * How the last read CCW left the device relative to record.  This
+ * outlives the channel program, like the rest of the orientation: a Read
+ * CKD or Read Count that starts the next program continues from there.
+ * Only sent when one of the flags is set, so the stream of a device whose
+ * last CCW was not such a read is unchanged.
+ */
+static const VMStateDescription vmstate_eckd_orientation = {
+    .name = TYPE_ECKD_CCW "/orientation",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = eckd_orientation_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(read_advanced, EckdCcwDevice),
+        VMSTATE_BOOL(record_consumed, EckdCcwDevice),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_eckd_ccw = {
     .name = TYPE_ECKD_CCW,
     .version_id = 1,
     .minimum_version_id = 1,
     .pre_save = eckd_pre_save,
+    .pre_load = eckd_pre_load,
     .post_load = eckd_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CCW_DEVICE(parent_obj, EckdCcwDevice),
@@ -2538,6 +2575,7 @@ static const VMStateDescription vmstate_eckd_ccw = {
         &vmstate_eckd_format,
         &vmstate_eckd_write,
         &vmstate_eckd_deferred,
+        &vmstate_eckd_orientation,
         NULL
     },
 };

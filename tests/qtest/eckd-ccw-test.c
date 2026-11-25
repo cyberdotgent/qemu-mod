@@ -495,6 +495,107 @@ static void test_migration_orientation(void)
     unlink(image);
 }
 
+#define ECKD_R2_LENGTH 32
+
+/* Add a 32-byte R2 behind the R1 that ckd_write_r1() wrote on 0/@head. */
+static void ckd_write_r2(const char *path, uint16_t head)
+{
+    uint8_t r2[8 + ECKD_R2_LENGTH + 8] = { 0 };
+    int fd = open(path, O_WRONLY);
+
+    g_assert_cmpint(fd, >=, 0);
+    stw_be_p(r2 + 2, head);
+    r2[4] = 2;
+    stw_be_p(r2 + 6, ECKD_R2_LENGTH);
+    memset(r2 + 8, 0x22, ECKD_R2_LENGTH);
+    memset(r2 + 8 + ECKD_R2_LENGTH, 0xff, 8);
+    g_assert_cmpint(pwrite(fd, r2, sizeof(r2),
+                           CKD_HEADER_SIZE + (int64_t)head * CKD_TRACK_SIZE +
+                           5 + 16 + 8 + ECKD_R1_LENGTH),
+                    ==, sizeof(r2));
+    close(fd);
+}
+
+/*
+ * A Read Count that follows a Read CKD steps to the next count field, also
+ * when the Read CKD ended the previous channel program.  That part of the
+ * orientation must survive a migration: Read CKD of R1 on the source, then
+ * Read Count on the destination returns the count field of R2, as it does
+ * on a machine that was not migrated.
+ */
+static void read_ckd_then_count(bool migrate)
+{
+    uint8_t pattern[ECKD_R1_LENGTH];
+    uint8_t ckd[8 + ECKD_R1_LENGTH], seek[6] = { 0, 0, 0, 0, 0, 1 };
+    uint8_t count[8];
+    const uint8_t count1[8] = { 0, 0, 0, 1, 1, 0, 0, ECKD_R1_LENGTH };
+    const uint8_t count2[8] = { 0, 0, 0, 1, 2, 0, 0, ECKD_R2_LENGTH };
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    g_autofree char *sock = g_strdup_printf("%s/qemu-eckd-mig-%d.sock",
+                                            g_get_tmp_dir(), getpid());
+    g_autofree char *uri = g_strdup_printf("unix:%s", sock);
+    g_autofree char *devices = NULL;
+    QTestState *src, *dst = NULL, *qts;
+    CcwProgIrb irb;
+
+    for (int i = 0; i < ECKD_R1_LENGTH; i++) {
+        pattern[i] = 0x40 + i;
+    }
+    path = create_ckd_image_r1(pattern);
+    ckd_write_r1(path, 1, pattern);
+    ckd_write_r2(path, 1);
+    devices = g_strdup_printf(
+        "-drive if=none,id=ckd0,file=%s,format=raw "
+        "-device eckd-ccw,drive=ckd0,devno=fe.0.0200", path);
+
+    /* Seek to track 0/1 and read R1 with Read CKD. */
+    src = ccw_prog_start(image, "3G", devices);
+    qtest_memwrite(src, CCW_PROG_DATA, seek, sizeof(seek));
+    ccw_prog_set_ccw(src, 0, 0x07, CCW_FLAG_CC, sizeof(seek), CCW_PROG_DATA);
+    ccw_prog_set_ccw(src, 1, 0x1e, CCW_FLAG_SLI, sizeof(ckd),
+                     CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(src, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(src, CCW_PROG_DATA + 0x100, ckd, sizeof(ckd));
+    g_assert_cmpmem(ckd, 8, count1, 8);
+
+    qts = src;
+    if (migrate) {
+        dst = qtest_initf("-nodefaults -accel %s -m 3G -kernel %s %s "
+                          "-incoming %s", ccw_prog_accel(), image, devices,
+                          uri);
+        qtest_qmp_assert_success(src, "{'execute': 'migrate', "
+                                 "'arguments': {'uri': %s}}", uri);
+        wait_migration_completed(src);
+        qtest_qmp_eventwait(dst, "RESUME");
+        qts = dst;
+    }
+
+    /* A new channel program: Read Count. */
+    ccw_prog_set_ccw(qts, 0, 0x12, CCW_FLAG_SLI, sizeof(count),
+                     CCW_PROG_DATA + 0x200);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA + 0x200, count, sizeof(count));
+    g_assert_cmpmem(count, 8, count2, 8);
+
+    qtest_quit(src);
+    if (dst) {
+        qtest_quit(dst);
+    }
+    unlink(sock);
+    unlink(path);
+    unlink(image);
+}
+
+static void test_migration_read_orientation(void)
+{
+    read_ckd_then_count(false);
+    read_ckd_then_count(true);
+}
+
 /*
  * Migration while a channel program runs: 14 seeks to tracks that are not
  * cached, on a throttled backend so that each takes a while.  The drain
@@ -748,6 +849,8 @@ int main(int argc, char **argv)
                        test_track_cache_invalidation);
         qtest_add_func("/eckd-ccw/io/migration-orientation",
                        test_migration_orientation);
+        qtest_add_func("/eckd-ccw/io/migration-read-orientation",
+                       test_migration_read_orientation);
         qtest_add_func("/eckd-ccw/io/migration-during-io",
                        test_migration_during_io);
     }
