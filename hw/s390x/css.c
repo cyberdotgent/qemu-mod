@@ -248,6 +248,29 @@ static const VMStateDescription vmstate_schdev_async = {
     }
 };
 
+static bool vmstate_schdev_chnmon_needed(void *opaque)
+{
+    SubchDev *s = opaque;
+
+    return s->chnmon_pending;
+}
+
+/*
+ * The measurement block is updated when a start function ends.  One that
+ * is still in progress (a CCW the device completes asynchronously) takes
+ * the pending update along.
+ */
+static const VMStateDescription vmstate_schdev_chnmon = {
+    .name = "s390_subch_dev/chnmon",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_schdev_chnmon_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(chnmon_pending, SubchDev),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static int subch_dev_post_load(void *opaque, int version_id);
 static int subch_dev_pre_save(void *opaque);
 
@@ -281,6 +304,7 @@ const VMStateDescription vmstate_subch_dev = {
     .subsections = (const VMStateDescription * const []) {
         &vmstate_schdev_orb,
         &vmstate_schdev_async,
+        &vmstate_schdev_chnmon,
         NULL
     }
 };
@@ -642,10 +666,116 @@ uint16_t css_build_subchannel_id(SubchDev *sch)
     return css_do_build_subchannel_id(sch->cssid, sch->ssid);
 }
 
+/*
+ * Measurement-block update (z/Architecture Principles of Operation,
+ * "Channel-Subsystem Monitoring").
+ *
+ * The subchannels have no channel-subsystem timing (their timing-facility
+ * bit is zero), so the SSCH+RSCH count is the only measurement data: the
+ * sample count and the time fields of a measurement block are never
+ * updated.  The count is stored when the start function completes at the
+ * device or is suspended, not when START SUBCHANNEL or RESUME SUBCHANNEL
+ * is accepted.
+ *
+ * The measurement-block key is not applied: channel-subsystem accesses are
+ * not subject to key-controlled protection here.  A measurement block that
+ * cannot be addressed is not stored; the measurement-block program check
+ * is not reported to the program.
+ */
+static void css_update_chnmon(SubchDev *sch)
+{
+    SCHIB *schib = &sch->curr_status;
+    bool format1 = schib->pmcw.chars & PMCW_CHARS_MASK_MBFC;
+    MemTxResult res = MEMTX_OK;
+    hwaddr addr;
+
+    if (format1) {
+        /* A 64-byte block of its own; the count is a word. */
+        uint32_t count;
+
+        addr = schib->mba;
+        count = address_space_ldl_be(&address_space_memory, addr,
+                                     MEMTXATTRS_UNSPECIFIED, &res);
+        if (res == MEMTX_OK) {
+            address_space_stl_be(&address_space_memory, addr, count + 1,
+                                 MEMTXATTRS_UNSPECIFIED, &res);
+        }
+    } else {
+        /* A 32-byte block of the measurement-block area; a halfword. */
+        uint16_t count;
+
+        addr = channel_subsys.chnmon_area + ((hwaddr)schib->pmcw.mbi << 5);
+        if (addr < channel_subsys.chnmon_area || addr > 0x7fffffffULL) {
+            res = MEMTX_DECODE_ERROR;
+        } else {
+            count = address_space_lduw_be(&address_space_memory, addr,
+                                          MEMTXATTRS_UNSPECIFIED, &res);
+        }
+        if (res == MEMTX_OK) {
+            address_space_stw_be(&address_space_memory, addr, count + 1,
+                                 MEMTXATTRS_UNSPECIFIED, &res);
+        }
+    }
+    trace_css_chnmon_update(sch->cssid, sch->ssid, sch->schid, format1, addr,
+                            res == MEMTX_OK ? "count stored" :
+                            "invalid address, not stored");
+}
+
+/*
+ * START SUBCHANNEL or RESUME SUBCHANNEL initiates a start function: the
+ * mode and the enablement of the subchannel at this point decide whether
+ * its measurement data will be stored.
+ */
+static void css_chnmon_start(SubchDev *sch)
+{
+    sch->chnmon_pending = channel_subsys.chnmon_active &&
+        (sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_MME_MBU);
+}
+
+/*
+ * The status of the subchannel changed: store the measurement data of a
+ * start function which has completed at the device, has been terminated by
+ * HALT SUBCHANNEL or has been suspended.
+ */
+static void css_chnmon_status(SubchDev *sch)
+{
+    SCHIB *schib = &sch->curr_status;
+    uint16_t ctrl = schib->scsw.ctrl;
+
+    if (!sch->chnmon_pending) {
+        return;
+    }
+    if (ctrl & SCSW_FCTL_CLEAR_FUNC) {
+        /* The clear function discards the operation. */
+        sch->chnmon_pending = false;
+        return;
+    }
+    /*
+     * Not yet suspended or ended: the end is secondary status, or the
+     * status of a halt function that terminated the start function.
+     */
+    if (!(ctrl & SCSW_ACTL_SUSP) &&
+        !((ctrl & SCSW_STCTL_STATUS_PEND) &&
+          (ctrl & (SCSW_STCTL_SECONDARY | SCSW_FCTL_HALT_FUNC)))) {
+        return;
+    }
+    sch->chnmon_pending = false;
+    if (schib->scsw.cstat & (SCSW_CSTAT_DATA_CHECK | SCSW_CSTAT_CHN_CTRL_CHK |
+                             SCSW_CSTAT_INTF_CTRL_CHK)) {
+        /* Subchannel logout: nothing is stored, the count included. */
+        return;
+    }
+    if (!channel_subsys.chnmon_active) {
+        return;
+    }
+    css_update_chnmon(sch);
+}
+
 void css_inject_io_interrupt(SubchDev *sch)
 {
     uint8_t isc = (sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_ISC) >> 11;
 
+    css_chnmon_status(sch);
     trace_css_io_interrupt(sch->cssid, sch->ssid, sch->schid,
                            sch->curr_status.pmcw.intparm, isc, "");
     s390_io_interrupt(css_build_subchannel_id(sch),
@@ -1773,6 +1903,7 @@ IOInstEnding css_do_xsch(SubchDev *sch)
         sch->cancel_cb(sch);
     }
     sch->ccw_async_pending = false;
+    sch->chnmon_pending = false;
     schib->scsw.ctrl &= ~(SCSW_FCTL_START_FUNC |
                  SCSW_ACTL_RESUME_PEND |
                  SCSW_ACTL_START_PEND |
@@ -1861,39 +1992,6 @@ IOInstEnding css_do_hsch(SubchDev *sch)
     return ccode;
 }
 
-static void css_update_chnmon(SubchDev *sch)
-{
-    if (!(sch->curr_status.pmcw.flags & PMCW_FLAGS_MASK_MME)) {
-        /* Not active. */
-        return;
-    }
-    /* The counter is conveniently located at the beginning of the struct. */
-    if (sch->curr_status.pmcw.chars & PMCW_CHARS_MASK_MBFC) {
-        /* Format 1, per-subchannel area. */
-        uint32_t count;
-
-        count = address_space_ldl_be(&address_space_memory,
-                                     sch->curr_status.mba,
-                                     MEMTXATTRS_UNSPECIFIED, NULL);
-        count++;
-        address_space_stl_be(&address_space_memory, sch->curr_status.mba, count,
-                             MEMTXATTRS_UNSPECIFIED, NULL);
-    } else {
-        /* Format 0, global area. */
-        uint32_t offset;
-        uint16_t count;
-
-        offset = sch->curr_status.pmcw.mbi << 5;
-        count = address_space_lduw_be(&address_space_memory,
-                                      channel_subsys.chnmon_area + offset,
-                                      MEMTXATTRS_UNSPECIFIED, NULL);
-        count++;
-        address_space_stw_be(&address_space_memory,
-                             channel_subsys.chnmon_area + offset, count,
-                             MEMTXATTRS_UNSPECIFIED, NULL);
-    }
-}
-
 IOInstEnding css_do_ssch(SubchDev *sch, ORB *orb)
 {
     SCHIB *schib = &sch->curr_status;
@@ -1914,10 +2012,7 @@ IOInstEnding css_do_ssch(SubchDev *sch, ORB *orb)
         return IOINST_CC_BUSY;
     }
 
-    /* If monitoring is active, update counter. */
-    if (channel_subsys.chnmon_active) {
-        css_update_chnmon(sch);
-    }
+    css_chnmon_start(sch);
     sch->orb = *orb;
     sch->channel_prog = orb->cpa;
 
@@ -1937,6 +2032,7 @@ IOInstEnding css_do_ssch(SubchDev *sch, ORB *orb)
     if (ccode != IOINST_CC_EXPECTED) {
         schib->scsw.ctrl = old_scsw_ctrl;
         schib->scsw.flags = old_scsw_flags;
+        sch->chnmon_pending = false;
     }
 
     return ccode;
@@ -2040,6 +2136,9 @@ int css_do_tsch_get_irb(SubchDev *sch, IRB *target_irb, int *irb_len)
     if (~(schib->pmcw.flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         return 3;
     }
+
+    /* Status a device presented without requesting an interruption */
+    css_chnmon_status(sch);
 
     stctl = schib->scsw.ctrl & SCSW_CTRL_MASK_STCTL;
 
@@ -2228,15 +2327,21 @@ int css_collect_chp_desc(int m, uint8_t cssid, uint8_t f_chpid, uint8_t l_chpid,
 
 void css_do_schm(uint8_t mbk, int update, int dct, uint64_t mbo)
 {
-    /* dct is currently ignored (not really meaningful for our devices) */
-    /* TODO: Don't ignore mbk. */
-    if (update && !channel_subsys.chnmon_active) {
-        /* Enable measuring. */
+    /*
+     * The device-connect-time-measurement mode (dct) has no effect: no
+     * subchannel has the timing facility, so no device-connect-time
+     * interval is ever stored in an extended-status word.  The
+     * measurement-block key (mbk) is not applied, see css_update_chnmon().
+     */
+    if (update) {
+        /*
+         * Make the mode active, or, if it is active already, replace the
+         * measurement-block origin for the start functions initiated from
+         * now on.
+         */
         channel_subsys.chnmon_area = mbo;
         channel_subsys.chnmon_active = true;
-    }
-    if (!update && channel_subsys.chnmon_active) {
-        /* Disable measuring. */
+    } else {
         channel_subsys.chnmon_area = 0;
         channel_subsys.chnmon_active = false;
     }
@@ -2245,6 +2350,7 @@ void css_do_schm(uint8_t mbk, int update, int dct, uint64_t mbo)
 IOInstEnding css_do_rsch(SubchDev *sch)
 {
     SCHIB *schib = &sch->curr_status;
+    IOInstEnding ccode;
 
     if (~(schib->pmcw.flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         return IOINST_CC_NOT_OPERATIONAL;
@@ -2260,13 +2366,13 @@ IOInstEnding css_do_rsch(SubchDev *sch)
         return IOINST_CC_BUSY;
     }
 
-    /* If monitoring is active, update counter. */
-    if (channel_subsys.chnmon_active) {
-        css_update_chnmon(sch);
-    }
-
+    css_chnmon_start(sch);
     schib->scsw.ctrl |= SCSW_ACTL_RESUME_PEND;
-    return do_subchannel_work(sch);
+    ccode = do_subchannel_work(sch);
+    if (ccode != IOINST_CC_EXPECTED) {
+        sch->chnmon_pending = false;
+    }
+    return ccode;
 }
 
 int css_do_rchp(uint8_t cssid, uint8_t chpid)
@@ -2727,6 +2833,7 @@ void css_reset_sch(SubchDev *sch)
         sch->cancel_cb(sch);
     }
     sch->ccw_async_pending = false;
+    sch->chnmon_pending = false;
 
     if ((schib->pmcw.flags & PMCW_FLAGS_MASK_ENA) != 0 && sch->disable_cb) {
         sch->disable_cb(sch);

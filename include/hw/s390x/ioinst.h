@@ -104,6 +104,10 @@ QEMU_BUILD_BUG_MSG(sizeof(PMCW) != 28, "size of PMCW is wrong");
 #define PMCW_FLAGS_MASK_ENA 0x0080
 #define PMCW_FLAGS_MASK_LM 0x0060
 #define PMCW_FLAGS_MASK_MME 0x0018
+/* measurement-block-update enable (bit 11 of word 1) */
+#define PMCW_FLAGS_MASK_MME_MBU 0x0010
+/* device-connect-time-measurement enable (bit 12 of word 1) */
+#define PMCW_FLAGS_MASK_MME_DCT 0x0008
 #define PMCW_FLAGS_MASK_MP 0x0004
 #define PMCW_FLAGS_MASK_TF 0x0002
 #define PMCW_FLAGS_MASK_DNV 0x0001

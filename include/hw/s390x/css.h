@@ -168,6 +168,11 @@ struct SubchDev {
     ESW esw;
     bool ccw_async_pending;
     /*
+     * A start function is in progress whose measurement data are to be
+     * stored in the measurement block when it completes or is suspended.
+     */
+    bool chnmon_pending;
+    /*
      * A CCW the device completes asynchronously (its ccw_cb returned
      * CSS_CCW_PENDING) blocks migration of the subchannel (pre_save fails
      * with -EBUSY) unless the device sets this flag.  A device opting in
