@@ -89,7 +89,8 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
     if (!esa390_cm_enable(s)) {
         error_report("The KVM of this host kernel does not support the "
                      "ESA/390-compatibility mode, which machine property "
-                     "esa390-cm=on needs");
+                     "esa390-cm=on (a default of machine czam-compat) "
+                     "needs");
         return -ENOTSUP;
     }
     cap_esa390_cm = true;
@@ -115,7 +116,8 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
             error_report("The KVM of this host kernel does not support "
                          "ESA/390 address translation in the "
                          "ESA/390-compatibility mode, which machine "
-                         "property esa390-dat=on needs");
+                         "property esa390-dat=on (a default of machine "
+                         "czam-compat) needs");
             return -ENOTSUP;
         }
         esa390_dat_area_size = ESA390_DAT_AREA_SIZE;

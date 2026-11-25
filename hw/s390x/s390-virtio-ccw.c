@@ -1708,6 +1708,40 @@ static void czam_v1_class_init(ObjectClass *oc, const void *data)
     mc->alias = "czam";
 }
 
+/*
+ * czam-compat (experimental): czam for operating systems from before the
+ * z/Architecture-only machines.  It is czam with other defaults of three
+ * machine properties, which stay settable:
+ *
+ *   esa390-cm=on              start in the ESA/390-compatibility mode
+ *   esa390-dat=on             ESA/390 address translation in that mode
+ *   ext-measurement-block=off no extended-I/O-measurement-block facility
+ *
+ * The first two need KVM support that is not in upstream Linux; the
+ * machine does not start without it (target/s390x/kvm/esa390.c).
+ *
+ * It is versioned like czam, with its own version sequence: czam-compat-v1
+ * is czam-v1 with these defaults, and "czam-compat" names the newest
+ * version.  czam itself is not changed by anything here.
+ */
+static void czam_compat_v1_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    czam_v1_class_init(oc, data);
+    mc->desc = "CZAM hardware mode with ESA/390 compatibility (experimental)";
+    mc->alias = "czam-compat";
+}
+
+static void czam_compat_v1_instance_init(Object *obj)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    ms->esa390_cm = true;
+    ms->esa390_dat = true;
+    ms->ext_measurement_block = false;
+}
+
 static const TypeInfo mainframe_types[] = {
     {
         .name = TYPE_S390_MAINFRAME_MACHINE,
@@ -1720,6 +1754,12 @@ static const TypeInfo mainframe_types[] = {
         .name = MACHINE_TYPE_NAME("czam-v1"),
         .parent = TYPE_S390_MAINFRAME_MACHINE,
         .class_init = czam_v1_class_init,
+        .secure = true,
+    }, {
+        .name = MACHINE_TYPE_NAME("czam-compat-v1"),
+        .parent = TYPE_S390_MAINFRAME_MACHINE,
+        .instance_init = czam_compat_v1_instance_init,
+        .class_init = czam_compat_v1_class_init,
         .secure = true,
     },
 };

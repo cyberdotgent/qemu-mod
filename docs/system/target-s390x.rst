@@ -34,6 +34,27 @@ properties ``lpar-name`` (default ``QEMUKVM``) and ``lpar-number``
 ``czam-v1`` replaces the former ``mtm-3907`` machine (same machine, new
 name; the old name is no longer accepted).
 
+``czam-compat`` (experimental) is ``czam`` for operating systems from
+before the z/Architecture-only machines.  It differs from ``czam`` only in
+the defaults of three machine properties, described in
+:ref:`s390x-esa390-compat` and :ref:`s390x-css-measurement`:
+``esa390-cm=on``, ``esa390-dat=on`` and ``ext-measurement-block=off``.
+Each can still be set on the command line, and the same properties are
+available on ``czam`` for testing one of them alone.  It is versioned like
+``czam``: ``czam-compat-v1`` is ``czam-v1`` with these defaults, and
+``czam-compat`` is an alias of the newest version.
+
+The first two defaults need support in the host kernel's KVM that is not
+part of upstream Linux.  On a host without it the machine does not start::
+
+  qemu-system-s390x: The KVM of this host kernel does not support the
+  ESA/390-compatibility mode, which machine property esa390-cm=on (a
+  default of machine czam-compat) needs
+
+The machine type is experimental: its defaults, and the kernel interface
+behind them, may still change, and a guest cannot be migrated or
+snapshotted before it has switched to z/Architecture.
+
 z/OS compatibility handshake under KVM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
