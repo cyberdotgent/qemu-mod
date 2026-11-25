@@ -58,6 +58,20 @@ static int cpu_pre_save(void *opaque)
     S390CPU *cpu = opaque;
 
     if (kvm_enabled()) {
+        /*
+         * While the configuration is in the ESA/390-compatibility mode the
+         * kernel holds state that cannot be read: the z/Architecture PSW
+         * and control-register halves it captured at the switch into the
+         * mode, and the shadow tables of esa390-dat.  Refuse to save rather
+         * than produce a state that resumes differently.  Once the guest
+         * has switched to z/Architecture the usual state is complete.
+         */
+        if (kvm_s390_esa390_cm_enabled() && cpu->env.esa_mode) {
+            error_report("The state of a guest in the ESA/390-compatibility "
+                         "mode cannot be saved or migrated; retry after it "
+                         "has switched to z/Architecture");
+            return -EBUSY;
+        }
         kvm_s390_vcpu_interrupt_pre_save(cpu);
     }
 
