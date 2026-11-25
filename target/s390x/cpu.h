@@ -77,6 +77,8 @@ typedef struct CPUArchState {
 
     PSW psw;
     PSW captured_z_psw;
+    /* bits 0-31 of the control registers, captured with the PSW */
+    uint32_t captured_z_cregs[16];
     bool esa_mode;
 
     S390CrashReason crash_reason;
@@ -787,6 +789,7 @@ void s390_cpu_topology_set_changed(bool changed);
 #define SIGP_CPU_RESET         0x0c
 #define SIGP_SET_PREFIX        0x0d
 #define SIGP_STORE_STATUS_ADDR 0x0e
+#define SIGP_STORE_EXT_STATUS_ADDR 0x11
 #define SIGP_SET_ARCH          0x12
 #define SIGP_COND_EMERGENCY    0x13
 #define SIGP_SENSE_RUNNING     0x15
@@ -934,6 +937,7 @@ void s390_init_sigp(void);
 
 /* helper.c */
 void s390_cpu_set_psw(CPUS390XState *env, uint64_t mask, uint64_t addr);
+void s390_cpu_capture_z_state(CPUS390XState *env);
 uint64_t s390_cpu_get_psw_mask(CPUS390XState *env);
 void cpu_s390x_load_fpc(CPUS390XState *env, uint32_t fpc);
 

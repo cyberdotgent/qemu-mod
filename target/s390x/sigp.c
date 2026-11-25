@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "qemu/error-report.h"
 #include "s390x-internal.h"
 #include "hw/core/boards.h"
 #include "system/hw_accel.h"
@@ -18,6 +19,8 @@
 #include "system/address-spaces.h"
 #include "exec/cputlb.h"
 #include "system/tcg.h"
+#include "system/kvm.h"
+#include "kvm/kvm_s390x.h"
 #include "trace.h"
 #include "qapi/qapi-types-machine.h"
 #include "target/s390x/kvm/pv.h"
@@ -145,6 +148,96 @@ typedef struct SigpSaveArea {
 } SigpSaveArea;
 QEMU_BUILD_BUG_ON(sizeof(SigpSaveArea) != 512);
 
+/*
+ * The save area of a CPU in the ESA/390 architectural mode.  The offsets
+ * are those of the assigned storage locations: store status uses the first
+ * 512 bytes of absolute storage, the orders "at address" a block with the
+ * same layout.  The parts of the block not listed stay unchanged.
+ */
+#define ESA_SAVE_AREA_SIZE      512
+#define ESA_SA_EXT_SAVE_ADDR    212     /* extended save area, 4 bytes */
+#define ESA_SA_CPU_TIMER        216     /* 8 bytes */
+#define ESA_SA_CLOCK_COMP       224     /* 8 bytes */
+#define ESA_SA_PSW              256     /* 8 bytes */
+#define ESA_SA_PREFIX           264     /* 4 bytes */
+#define ESA_SA_ARS              288     /* 16 * 4 bytes */
+#define ESA_SA_FPRS             352     /* registers 0, 2, 4, 6 */
+#define ESA_SA_GRS              384     /* 16 * 4 bytes */
+#define ESA_SA_CRS              448     /* 16 * 4 bytes */
+/* extended save area: a 4K block */
+#define ESA_XSA_FPRS            0       /* registers 0-15 */
+#define ESA_XSA_FPC             128     /* 4 bytes, then 12 bytes of zeros */
+#define ESA_XSA_STORED          144
+
+static int s390_store_status_esa(S390CPU *cpu, hwaddr addr, bool store_arch)
+{
+    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    AddressSpace *as = CPU(cpu)->as;
+    CPUS390XState *env = &cpu->env;
+    hwaddr len = ESA_SAVE_AREA_SIZE;
+    uint64_t psw;
+    uint8_t *sa;
+    int i;
+
+    sa = address_space_map(as, addr, &len, true, attrs);
+    if (!sa) {
+        return -EFAULT;
+    }
+    if (len != ESA_SAVE_AREA_SIZE) {
+        address_space_unmap(as, sa, len, true, 0);
+        return -EFAULT;
+    }
+
+    psw = ((s390_cpu_get_psw_mask(env) ^ PSW_MASK_SHORTPSW) &
+           PSW_MASK_SHORT_CTRL) | (env->psw.addr & PSW_MASK_SHORT_ADDR);
+    stq_be_p(sa + ESA_SA_CPU_TIMER, env->cputm);
+    stq_be_p(sa + ESA_SA_CLOCK_COMP, env->ckc);
+    stq_be_p(sa + ESA_SA_PSW, psw);
+    stl_be_p(sa + ESA_SA_PREFIX, env->psa);
+    for (i = 0; i < 16; i++) {
+        stl_be_p(sa + ESA_SA_ARS + 4 * i, env->aregs[i]);
+        stl_be_p(sa + ESA_SA_GRS + 4 * i, env->regs[i]);
+        stl_be_p(sa + ESA_SA_CRS + 4 * i, env->cregs[i]);
+    }
+    for (i = 0; i < 4; i++) {
+        stq_be_p(sa + ESA_SA_FPRS + 8 * i, *get_freg(env, 2 * i));
+    }
+    address_space_unmap(as, sa, len, true, len);
+
+    if (store_arch) {
+        /* the architectural-mode identification: ESA/390 */
+        address_space_stb(as, offsetof(LowCore, ar_access_id), 0, attrs, NULL);
+    }
+    return 0;
+}
+
+/* floating-point registers 0-15 and control register, by an order only */
+static int s390_store_ext_status_esa(S390CPU *cpu, hwaddr addr)
+{
+    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    AddressSpace *as = CPU(cpu)->as;
+    CPUS390XState *env = &cpu->env;
+    hwaddr len = ESA_XSA_STORED;
+    uint8_t *xsa;
+    int i;
+
+    xsa = address_space_map(as, addr, &len, true, attrs);
+    if (!xsa) {
+        return -EFAULT;
+    }
+    if (len != ESA_XSA_STORED) {
+        address_space_unmap(as, xsa, len, true, 0);
+        return -EFAULT;
+    }
+    for (i = 0; i < 16; i++) {
+        stq_be_p(xsa + ESA_XSA_FPRS + 8 * i, *get_freg(env, i));
+    }
+    stl_be_p(xsa + ESA_XSA_FPC, env->fpc);
+    memset(xsa + ESA_XSA_FPC + 4, 0, 12);
+    address_space_unmap(as, xsa, len, true, len);
+    return 0;
+}
+
 #define S390_STORE_STATUS_DEF_ADDR offsetof(LowCore, floating_pt_save_area)
 static int s390_store_status(S390CPU *cpu, hwaddr addr, bool store_arch)
 {
@@ -157,6 +250,11 @@ static int s390_store_status(S390CPU *cpu, hwaddr addr, bool store_arch)
     /* For PVMs storing will occur when this cpu enters SIE again */
     if (s390_is_pv()) {
         return 0;
+    }
+
+    if (cpu->env.esa_mode) {
+        /* the default address of the other format means: at location 0 */
+        return s390_store_status_esa(cpu, store_arch ? 0 : addr, store_arch);
     }
 
     sa = address_space_map(as, addr, &len, true, attrs);
@@ -242,6 +340,39 @@ static void sigp_store_status_at_address(CPUState *cs, run_on_cpu_data arg)
     cpu_synchronize_state(cs);
 
     if (s390_store_status(cpu, address, false)) {
+        set_sigp_status(si, SIGP_STAT_INVALID_PARAMETER);
+        return;
+    }
+    si->cc = SIGP_CC_ORDER_CODE_ACCEPTED;
+}
+
+/* SIGP store extended status at address: an order of the ESA/390 mode */
+static void sigp_store_ext_status_at_address(CPUState *cs,
+                                             run_on_cpu_data arg)
+{
+    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    S390CPU *cpu = S390_CPU(cs);
+    SigpInfo *si = arg.host_ptr;
+    uint32_t address = si->param & 0x7ffffe00u;
+    MemTxResult res;
+    uint32_t xsa;
+
+    /* cpu has to be stopped */
+    if (s390_cpu_get_state(cpu) != S390_CPU_STATE_STOPPED) {
+        set_sigp_status(si, SIGP_STAT_INCORRECT_STATE);
+        return;
+    }
+
+    cpu_synchronize_state(cs);
+
+    /* the program supplies the address of the extended save area */
+    xsa = address_space_ldl_be(cs->as, address + ESA_SA_EXT_SAVE_ADDR, attrs,
+                               &res) & 0x7ffff000u;
+    if (res != MEMTX_OK || !xsa ||
+        !address_space_access_valid(cs->as, xsa, 4096, true,
+                                    attrs) ||
+        s390_store_status(cpu, address, false) ||
+        s390_store_ext_status_esa(cpu, xsa)) {
         set_sigp_status(si, SIGP_STAT_INVALID_PARAMETER);
         return;
     }
@@ -395,11 +526,17 @@ static void sigp_set_prefix(CPUState *cs, run_on_cpu_data arg)
     S390CPU *cpu = S390_CPU(cs);
     SigpInfo *si = arg.host_ptr;
     uint32_t addr = si->param & 0x7fffe000u;
+    hwaddr len = sizeof(struct LowCore);
 
     cpu_synchronize_state(cs);
 
-    if (!address_space_access_valid(&address_space_memory, addr,
-                                    sizeof(struct LowCore), false,
+    /* the prefix area of the ESA/390 mode is one 4K block */
+    if (cpu->env.esa_mode) {
+        addr = si->param & 0x7ffff000u;
+        len = 4096;
+    }
+
+    if (!address_space_access_valid(&address_space_memory, addr, len, false,
                                     MEMTXATTRS_UNSPECIFIED)) {
         set_sigp_status(si, SIGP_STAT_INVALID_PARAMETER);
         return;
@@ -518,7 +655,21 @@ static int handle_sigp_single_dst(S390CPU *cpu, S390CPU *dst_cpu, uint8_t order,
     case SIGP_STORE_STATUS_ADDR:
         run_on_cpu(CPU(dst_cpu), sigp_store_status_at_address, RUN_ON_CPU_HOST_PTR(&si));
         break;
+    case SIGP_STORE_EXT_STATUS_ADDR:
+        /* the mode is that of the whole configuration */
+        if (!cpu->env.esa_mode) {
+            set_sigp_status(&si, SIGP_STAT_INVALID_ORDER);
+            break;
+        }
+        run_on_cpu(CPU(dst_cpu), sigp_store_ext_status_at_address,
+                   RUN_ON_CPU_HOST_PTR(&si));
+        break;
     case SIGP_STORE_ADTL_STATUS:
+        /* an order of the z/Architecture architectural mode */
+        if (cpu->env.esa_mode) {
+            set_sigp_status(&si, SIGP_STAT_INVALID_ORDER);
+            break;
+        }
         run_on_cpu(CPU(dst_cpu), sigp_store_adtl_status, RUN_ON_CPU_HOST_PTR(&si));
         break;
     case SIGP_SET_PREFIX:
@@ -546,11 +697,14 @@ static int handle_sigp_single_dst(S390CPU *cpu, S390CPU *dst_cpu, uint8_t order,
 static int sigp_set_architecture(S390CPU *cpu, uint32_t param,
                                  uint64_t *status_reg)
 {
+    /* under KVM the order exists for a configuration that has the mode */
+    const bool kvm_cm = kvm_enabled() && kvm_s390_esa390_cm_enabled();
     CPUState *cs;
     uint8_t mode = param & 0xff;
     bool esa_mode = cpu->env.esa_mode;
+    int ret;
 
-    if (!tcg_enabled()) {
+    if (!tcg_enabled() && !kvm_cm) {
         if (mode == 1) {
             return SIGP_CC_ORDER_CODE_ACCEPTED;
         }
@@ -575,6 +729,58 @@ static int sigp_set_architecture(S390CPU *cpu, uint32_t param,
         *status_reg = (*status_reg & 0xffffffff00000000ULL) |
                       SIGP_STAT_INVALID_PARAMETER;
         return SIGP_CC_STATUS_STORED;
+    }
+
+    if (kvm_cm) {
+        /*
+         * The kernel only changes the format in which it runs the CPUs.
+         * It can do so now: the other CPUs are stopped, this one is
+         * handling its interception.  What the order defines for the
+         * registers is done here.
+         */
+        CPU_FOREACH(cs) {
+            cpu_synchronize_state(cs);
+        }
+        ret = kvm_s390_set_arch_mode(mode == 0);
+        if (ret == -EBUSY) {
+            /* a vCPU is still on its way out of the kernel */
+            return SIGP_CC_BUSY;
+        } else if (ret) {
+            error_report_once("SIGP set-architecture: the kernel does not "
+                              "change the architectural mode: %s",
+                              strerror(-ret));
+            *status_reg = (*status_reg & 0xffffffff00000000ULL) |
+                          SIGP_STAT_INVALID_PARAMETER;
+            return SIGP_CC_STATUS_STORED;
+        }
+        CPU_FOREACH(cs) {
+            S390CPU *target = S390_CPU(cs);
+            CPUS390XState *env = &target->env;
+            int i;
+
+            if (mode == 0) {
+                s390_cpu_capture_z_state(env);
+                env->esa_mode = true;
+            } else {
+                env->esa_mode = false;
+                /*
+                 * The PSW is the same PSW in the longer format.  With code
+                 * 2 the CPUs other than this one get back what was
+                 * captured when they left z/Architecture.
+                 */
+                if (mode == 2 && target != cpu) {
+                    env->psw = env->captured_z_psw;
+                    for (i = 0; i < 16; i++) {
+                        env->cregs[i] = (env->cregs[i] & 0xffffffffULL) |
+                                        (uint64_t)env->captured_z_cregs[i] << 32;
+                    }
+                }
+                /* bit 51 of the prefix becomes zero */
+                env->psa &= 0x7fffe000;
+            }
+            kvm_s390_esa390_put_arch_regs(cs);
+        }
+        return SIGP_CC_ORDER_CODE_ACCEPTED;
     }
 
     CPU_FOREACH(cs) {

@@ -24,6 +24,20 @@
 #include "system/kvm.h"
 #include "system/tcg.h"
 
+static int cpu_pre_load(void *opaque)
+{
+    S390CPU *cpu = opaque;
+
+    /*
+     * The stream says so if the CPU is in the ESA/390 mode (subsection
+     * cpu/esa-mode); this machine may be in it from its start.
+     */
+    cpu->env.esa_mode = false;
+    memset(&cpu->env.captured_z_psw, 0, sizeof(cpu->env.captured_z_psw));
+    memset(cpu->env.captured_z_cregs, 0, sizeof(cpu->env.captured_z_cregs));
+    return 0;
+}
+
 static int cpu_post_load(void *opaque, int version_id)
 {
     S390CPU *cpu = opaque;
@@ -33,10 +47,16 @@ static int cpu_post_load(void *opaque, int version_id)
      * than via cpu_synchronize_state, we need update kvm here.
      */
     if (kvm_enabled()) {
-        /* the architectural mode is a property of the whole configuration */
-        if (cpu->env.esa_mode && kvm_s390_set_arch_mode(true)) {
-            error_report("the ESA/390-compatibility mode of the incoming "
-                         "configuration is not available");
+        /*
+         * The architectural mode is a property of the whole configuration:
+         * the first CPU changes it, for the others nothing is left to do.
+         * No vCPU is running.
+         */
+        if (kvm_s390_set_arch_mode(cpu->env.esa_mode)) {
+            error_report("the architectural mode of the incoming "
+                         "configuration (%s) cannot be set",
+                         cpu->env.esa_mode ? "ESA/390-compatibility mode" :
+                         "z/Architecture");
             return -EINVAL;
         }
         kvm_s390_set_cpu_state(cpu, s390_cpu_get_state(cpu));
@@ -59,17 +79,18 @@ static int cpu_pre_save(void *opaque)
 
     if (kvm_enabled()) {
         /*
-         * While the configuration is in the ESA/390-compatibility mode the
-         * kernel holds state that cannot be read: the z/Architecture PSW
-         * and control-register halves it captured at the switch into the
-         * mode, and the shadow tables of esa390-dat.  Refuse to save rather
-         * than produce a state that resumes differently.  Once the guest
-         * has switched to z/Architecture the usual state is complete.
+         * The state of a configuration in the ESA/390-compatibility mode
+         * is QEMU's (subsections cpu/esa-mode and cpu/esa-captured-cregs),
+         * with one exception: with esa390-dat the kernel holds shadow
+         * tables while the guest runs with address translation, and there
+         * is no interface to move them.  Refuse to save rather than
+         * produce a state that resumes differently.  Once the guest has
+         * switched to z/Architecture the usual state is complete.
          */
-        if (kvm_s390_esa390_cm_enabled() && cpu->env.esa_mode) {
+        if (kvm_s390_esa390_dat_reserve() && cpu->env.esa_mode) {
             error_report("The state of a guest in the ESA/390-compatibility "
-                         "mode cannot be saved or migrated; retry after it "
-                         "has switched to z/Architecture");
+                         "mode cannot be saved or migrated with esa390-dat; "
+                         "retry after it has switched to z/Architecture");
             return -EBUSY;
         }
         kvm_s390_vcpu_interrupt_pre_save(cpu);
@@ -312,8 +333,36 @@ static const VMStateDescription vmstate_esa_mode = {
     }
 };
 
+static bool esa_captured_cregs_needed(void *opaque)
+{
+    S390CPU *cpu = opaque;
+    int i;
+
+    if (!cpu->env.esa_mode) {
+        return false;
+    }
+    for (i = 0; i < 16; i++) {
+        if (cpu->env.captured_z_cregs[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const VMStateDescription vmstate_esa_captured_cregs = {
+    .name = "cpu/esa-captured-cregs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esa_captured_cregs_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(env.captured_z_cregs, S390CPU, 16),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_s390_cpu = {
     .name = "cpu",
+    .pre_load = cpu_pre_load,
     .post_load = cpu_post_load,
     .pre_save = cpu_pre_save,
     .version_id = 4,
@@ -350,6 +399,7 @@ const VMStateDescription vmstate_s390_cpu = {
         &vmstate_etoken,
         &vmstate_diag318,
         &vmstate_esa_mode,
+        &vmstate_esa_captured_cregs,
         NULL
     },
 };

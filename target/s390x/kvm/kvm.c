@@ -637,9 +637,9 @@ int kvm_arch_get_registers(CPUState *cs, Error **errp)
     int i, r;
 
     /*
-     * The guest leaves the ESA/390-compatibility mode with SIGP
-     * set-architecture, which KVM executes itself. The PSW is always
-     * exchanged in the 16-byte format.
+     * The kernel knows the architectural mode of the configuration (QEMU
+     * changes it for SIGP set-architecture and at resets). The PSW is
+     * always exchanged in the 16-byte format.
      */
     if (kvm_s390_esa390_cm_enabled()) {
         env->esa_mode = kvm_s390_get_arch_mode() == 1;

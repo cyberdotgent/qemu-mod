@@ -151,6 +151,27 @@ void s390_lowcore_load_psw(CPUS390XState *env, const LowCore *lowcore,
     }
 }
 
+/*
+ * A CPU goes from the z/Architecture architectural mode to the ESA/390
+ * (compatibility) mode, by SIGP set-architecture or by the CPU reset of a
+ * load: the PSW and bits 0-31 of the control registers are captured for a
+ * later SIGP set-architecture with code 2, the PSW keeps bits 0-32 and the
+ * rightmost 31 bits of the address, bits 0-31 of the control registers
+ * become zero.  (A PSW with the extended-addressing bit stays as invalid
+ * as the architecture makes it.)
+ */
+void s390_cpu_capture_z_state(CPUS390XState *env)
+{
+    int i;
+
+    env->captured_z_psw = env->psw;
+    env->psw.addr &= PSW_MASK_SHORT_ADDR;
+    for (i = 0; i < 16; i++) {
+        env->captured_z_cregs[i] = env->cregs[i] >> 32;
+        env->cregs[i] &= 0xffffffffULL;
+    }
+}
+
 void do_restart_interrupt(CPUS390XState *env)
 {
     uint64_t mask, addr;

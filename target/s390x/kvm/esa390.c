@@ -21,10 +21,13 @@
  *                                 not told about
  *   kvm_s390_set_arch_mode()      put the configuration into a mode
  *   kvm_s390_get_arch_mode()      the mode the configuration is in
+ *   kvm_s390_esa390_put_arch_regs() hand a CPU's registers that a mode
+ *                                 change alters to the kernel
  *
  * A change of the kernel interface, or moving work from the kernel into
  * QEMU, lands here; the callers (machine reset, register synchronisation,
- * incoming migration) only use these functions.
+ * incoming migration, SIGP set-architecture in target/s390x/sigp.c) only
+ * use these functions.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -182,4 +185,20 @@ int kvm_s390_get_arch_mode(void)
         return ret;
     }
     return mode == KVM_S390_ARCH_MODE_ESA390_CM;
+}
+
+/*
+ * SIGP set-architecture changes control registers and the prefix of all
+ * CPUs.  The usual synchronisation writes those only with the state of a
+ * reset; mark them for the next entry of the CPU, which is not running.
+ * The PSW follows with the runtime state.
+ */
+void kvm_s390_esa390_put_arch_regs(CPUState *cs)
+{
+    CPUS390XState *env = cpu_env(cs);
+
+    memcpy(cs->kvm_run->s.regs.crs, env->cregs,
+           sizeof(cs->kvm_run->s.regs.crs));
+    cs->kvm_run->s.regs.prefix = env->psa;
+    cs->kvm_run->kvm_dirty_regs |= KVM_SYNC_CRS | KVM_SYNC_PREFIX;
 }

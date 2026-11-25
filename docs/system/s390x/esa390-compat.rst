@@ -47,13 +47,19 @@ For example::
 
 Limitations:
 
-* A guest cannot be migrated or saved in a snapshot while it is in the mode;
-  the attempt fails with a message and the guest keeps running.  Once it has
-  switched to z/Architecture it migrates as usual.  Source and destination
-  need the same setting of both properties.
+* With ``esa390-dat=on`` a guest cannot be migrated or saved in a snapshot
+  while it is in the mode; the attempt fails with a message and the guest
+  keeps running.  Once it has switched to z/Architecture it migrates as
+  usual.  Source and destination need the same setting of both properties.
 * Protected virtualization is not available with the mode.
-* SIGP store status at address and set prefix, which QEMU handles itself,
-  use the z/Architecture formats also while the guest is in the mode.
+
+SIGP set-architecture is executed by QEMU: the kernel changes the format
+in which it runs the CPUs, QEMU the PSW, control registers and prefix as
+the order defines, including the state captured for code 2.  While the
+guest is in the mode the SIGP orders that QEMU handles use the ESA/390
+formats: store status and store status at address, a 4K prefix area for
+set prefix, store extended status at address (order 0x11) instead of store
+additional status at address (order 0x17).
 
 Nested guests in ESA/390 mode
 -----------------------------

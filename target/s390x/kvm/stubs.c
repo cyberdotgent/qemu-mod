@@ -158,6 +158,11 @@ uint64_t kvm_s390_esa390_dat_reserve(void)
     return 0;
 }
 
+void kvm_s390_esa390_put_arch_regs(CPUState *cs)
+{
+    g_assert_not_reached();
+}
+
 int kvm_s390_set_arch_mode(bool esa)
 {
     return esa ? -ENOTSUP : 0;

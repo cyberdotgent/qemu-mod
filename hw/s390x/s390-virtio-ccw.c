@@ -567,7 +567,16 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
                          "ESA/390-compatibility mode");
         }
         CPU_FOREACH(t) {
-            S390_CPU(t)->env.esa_mode = true;
+            CPUS390XState *env = &S390_CPU(t)->env;
+
+            /*
+             * What a CPU reset keeps when it is the reset of a load: an
+             * initial or clear reset, which most CPUs get below, wipes it.
+             */
+            if (!env->esa_mode) {
+                s390_cpu_capture_z_state(env);
+            }
+            env->esa_mode = true;
         }
     }
 
