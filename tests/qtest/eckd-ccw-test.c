@@ -487,6 +487,47 @@ static void test_write_ckd_record_number(void)
     unlink(image);
 }
 
+/*
+ * The SCSW describes the channel program of the current start function:
+ * its F bit (CCW format) comes from that ORB.  Error recovery builds its
+ * restart program in the format the SCSW reports, so a stale F bit from
+ * an earlier format-1 program makes it restart a format-0 program in
+ * format 1.  Read IPL in format 1, then in format 0: F must follow.
+ */
+static void test_scsw_ccw_format(void)
+{
+    uint8_t pattern[ECKD_R1_LENGTH];
+    uint8_t ccw0[8] = { 0x02, 0, 0, 0, CCW_FLAG_SLI, 0, 0, ECKD_R1_LENGTH };
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+    CcwProgIrb irb;
+
+    for (int i = 0; i < ECKD_R1_LENGTH; i++) {
+        pattern[i] = 0x50 + i;
+    }
+    path = create_ckd_image_r1(pattern);
+    qts = eckd_prog_start(image, path);
+
+    /* Format 1. */
+    eckd_read_ipl_check(qts, CCW_PROG_DATA, pattern);
+    g_assert_cmphex(qtest_readw(qts, CCW_PROG_IRB) & 0x0080, ==, 0x0080);
+
+    /* Format 0: same Read IPL, data address in bytes 1-3. */
+    ccw0[2] = CCW_PROG_DATA >> 8;
+    ccw0[3] = CCW_PROG_DATA & 0xff;
+    qtest_memset(qts, CCW_PROG_DATA, 0, ECKD_R1_LENGTH);
+    qtest_memwrite(qts, CCW_PROG_CCWS, ccw0, sizeof(ccw0));
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    g_assert_cmphex(qtest_readw(qts, CCW_PROG_IRB) & 0x0080, ==, 0);
+
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
 static void wait_migration_completed(QTestState *qts)
 {
     for (int i = 0; i < 6000; i++) {
@@ -919,6 +960,8 @@ int main(int argc, char **argv)
                        test_track_cache_invalidation);
         qtest_add_func("/eckd-ccw/io/write-ckd-record-number",
                        test_write_ckd_record_number);
+        qtest_add_func("/eckd-ccw/io/scsw-ccw-format",
+                       test_scsw_ccw_format);
         qtest_add_func("/eckd-ccw/io/migration-orientation",
                        test_migration_orientation);
         qtest_add_func("/eckd-ccw/io/migration-read-orientation",

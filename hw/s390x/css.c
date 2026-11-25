@@ -1494,7 +1494,6 @@ static bool sch_handle_start_func_virtual(SubchDev *sch,
         }
         schib->pmcw.lpum = path;
         sch->ccw_fmt_1 = !!(orb->ctrl0 & ORB_CTRL0_MASK_FMT);
-        schib->scsw.flags |= (sch->ccw_fmt_1) ? SCSW_FLAGS_MASK_FMT : 0;
         sch->ccw_no_data_cnt = 0;
         sch->ccw_tic_cnt = 0;
         sch->last_ccw_was_tic = false;
@@ -2030,9 +2029,17 @@ IOInstEnding css_do_ssch(SubchDev *sch, ORB *orb)
     old_scsw_ctrl = schib->scsw.ctrl;
     old_scsw_flags = schib->scsw.flags;
 
-    /* Trigger the start function. */
+    /*
+     * Trigger the start function.  The subchannel key and the S, F, P, I,
+     * A and U bits of the SCSW are set from the ORB of this start function
+     * (z/Architecture Principles of Operation, "Subchannel-Status Word"):
+     * they describe the channel program now running, not an earlier one.
+     * Error-recovery code reads the F bit to build a restart program in the
+     * format of the failing one.
+     */
     schib->scsw.ctrl |= (SCSW_FCTL_START_FUNC | SCSW_ACTL_START_PEND);
-    schib->scsw.flags &= ~SCSW_FLAGS_MASK_PNO;
+    schib->scsw.flags &= ~(SCSW_FLAGS_MASK_PNO | SCSW_FLAGS_FROM_ORB);
+    schib->scsw.flags |= orb->ctrl0 & SCSW_FLAGS_FROM_ORB;
 
     ccode = do_subchannel_work(sch);
 

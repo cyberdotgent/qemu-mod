@@ -40,6 +40,11 @@ QEMU_BUILD_BUG_MSG(sizeof(SCSW) != 12, "size of SCSW is wrong");
 #define SCSW_FLAGS_MASK_ZCC 0x0004
 #define SCSW_FLAGS_MASK_ECTL 0x0002
 #define SCSW_FLAGS_MASK_PNO 0x0001
+/* SCSW flags that a start function copies from the ORB (same bit positions). */
+#define SCSW_FLAGS_FROM_ORB (SCSW_FLAGS_MASK_KEY | SCSW_FLAGS_MASK_SCTL | \
+                             SCSW_FLAGS_MASK_FMT | SCSW_FLAGS_MASK_PFCH | \
+                             SCSW_FLAGS_MASK_ISIC | SCSW_FLAGS_MASK_ALCC | \
+                             SCSW_FLAGS_MASK_SSI)
 
 #define SCSW_CTRL_MASK_FCTL 0x7000
 #define SCSW_CTRL_MASK_ACTL 0x0fe0
