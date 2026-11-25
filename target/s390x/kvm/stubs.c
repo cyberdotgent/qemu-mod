@@ -153,11 +153,6 @@ bool kvm_s390_esa390_cm_enabled(void)
     return false;
 }
 
-uint64_t kvm_s390_esa390_dat_reserve(void)
-{
-    return 0;
-}
-
 void kvm_s390_esa390_put_arch_regs(CPUState *cs)
 {
     g_assert_not_reached();

@@ -33,7 +33,6 @@ struct kvm_guest_debug;
 int kvm_s390_esa390_init(MachineState *ms, struct KVMState *s);
 bool kvm_s390_esa390_cm_enabled(void);
 void kvm_s390_esa390_fac_list(uint8_t *fac_list);
-uint64_t kvm_s390_esa390_dat_reserve(void);
 int kvm_s390_set_arch_mode(bool esa);
 int kvm_s390_get_arch_mode(void);
 void kvm_s390_esa390_put_arch_regs(CPUState *cs);

@@ -19,8 +19,8 @@ and ``czam`` machine types start in that mode.  The machine type
    kernel's KVM that is not part of upstream Linux, and the interface to it
    is provisional (see the ``PROVISIONAL`` blocks in ``linux-headers/`` and
    ``target/s390x/kvm/esa390.c``).  QEMU speaks the interface of the kernel
-   series for Linux 7.3; ``esa390-dat`` additionally needs a lab patch of
-   that series and its ``kvm`` module parameter ``esa390_lab_dat=1``.
+   series for Linux 7.3; ``esa390-dat`` additionally needs the ESA/390 DAT
+   shadowing series on top of it.
    QEMU checks for the support when it starts and ends with an error
    message naming the property if the kernel does not have it, or if the
    accelerator is not KVM.  Whether the machine, or a hypervisor below the
@@ -43,11 +43,10 @@ mode active) in line with the mode.
 
 ``esa390-dat=on|off``
   Needs ``esa390-cm=on``.  Lets the guest turn on ESA/390 dynamic address
-  translation while it is in the mode, which the mode itself does not
-  provide and an older generation of initial program load code relies on.
-  The topmost megabyte of the guest's storage is set aside for the tables
-  the kernel keeps for this and is not reported to the guest as storage.
-  The machine needs at least 16 MiB.
+  translation (primary space) while it is in the mode, which the mode
+  itself does not provide and an older generation of initial program load
+  code relies on.  The kernel runs translated code on shadow tables in host
+  memory; the guest keeps all of its storage.
 
 For example::
 
@@ -55,10 +54,8 @@ For example::
 
 Limitations:
 
-* With ``esa390-dat=on`` a guest cannot be migrated or saved in a snapshot
-  while it is in the mode; the attempt fails with a message and the guest
-  keeps running.  Once it has switched to z/Architecture it migrates as
-  usual.  Source and destination need the same setting of both properties.
+* Source and destination of a migration need the same setting of both
+  properties.
 * Protected virtualization is not available with the mode.
 * KVM refuses guest debugging in the mode: single-stepping, hardware
   breakpoints and watchpoints of the gdbstub are refused (with a warning)

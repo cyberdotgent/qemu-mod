@@ -197,7 +197,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
      * memory device region, which is not exposed through SCLP but through
      * diag500.
      */
-    rnmax = (machine->ram_size - kvm_s390_esa390_dat_reserve()) / increment;
+    rnmax = machine->ram_size / increment;
     if (rnmax < 0x10000) {
         read_info->rnmax = cpu_to_be16(rnmax);
     } else {

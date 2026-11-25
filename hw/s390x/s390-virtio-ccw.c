@@ -1257,9 +1257,8 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
                                    machine_set_esa390_dat);
     object_class_property_set_description(oc, "esa390-dat",
             "with esa390-cm: let the guest use ESA/390 dynamic address "
-            "translation before it switches to z/Architecture; the topmost "
-            "megabyte of storage is hidden from the guest and holds shadow "
-            "tables (KVM only)");
+            "translation (primary space) in the ESA/390-compatibility mode; "
+            "needs ESA/390 DAT shadowing in the host kernel (KVM only)");
 
     object_class_property_add_enum(oc, "nested-esa390", "OnOffAuto",
                                    &OnOffAuto_type_info,

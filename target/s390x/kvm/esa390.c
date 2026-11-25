@@ -24,8 +24,6 @@
  *   kvm_s390_esa390_cm_enabled()  the VM was set up for the mode
  *   kvm_s390_esa390_fac_list()    the facility bits of the mode in the
  *                                 CPU model given to the kernel
- *   kvm_s390_esa390_dat_reserve() storage at the top that the guest is
- *                                 not told about
  *   kvm_s390_set_arch_mode()      put the configuration into a mode
  *   kvm_s390_get_arch_mode()      the mode the configuration is in
  *   kvm_s390_esa390_put_arch_regs() hand a CPU's registers that a mode
@@ -51,19 +49,9 @@
 #include "system/kvm.h"
 #include "system/kvm_int.h"
 #include "qemu/error-report.h"
-#include "qemu/units.h"
 #include "hw/core/boards.h"
 
-/*
- * ESA/390 address translation in the mode: the kernel keeps shadow tables
- * in an area of guest absolute storage that QEMU sets aside for it, the
- * topmost megabyte.
- */
-#define ESA390_DAT_AREA_SIZE (1 * MiB)
-#define ESA390_DAT_MIN_RAM (16 * MiB)
-
 static bool cap_esa390_cm;
-static uint64_t esa390_dat_area_size;
 /* the mode the configuration was last put into */
 static bool arch_mode_esa;
 /* a vCPU came back from KVM_RUN with an exit while in the mode */
@@ -76,7 +64,7 @@ static bool esa390_debug_warned;
  * capability has been enabled, a kernel that implements the mode also has
  * the attribute group and reports a valid mode.
  */
-static bool esa390_cm_enable(KVMState *s)
+static bool esa390_cm_enable(KVMState *s, uint64_t flags)
 {
     uint32_t mode = ~0U;
     struct kvm_device_attr attr = {
@@ -86,7 +74,7 @@ static bool esa390_cm_enable(KVMState *s)
     };
 
     if (kvm_check_extension(s, KVM_CAP_S390_ESA390_CM) <= 0 ||
-        kvm_vm_enable_cap(s, KVM_CAP_S390_ESA390_CM, 0)) {
+        kvm_vm_enable_cap(s, KVM_CAP_S390_ESA390_CM, 0, flags)) {
         return false;
     }
     if (kvm_vm_ioctl(s, KVM_HAS_DEVICE_ATTR, &attr) ||
@@ -106,10 +94,29 @@ static bool esa390_cm_enable(KVMState *s)
  */
 int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
 {
+    bool dat = object_property_get_bool(OBJECT(ms), "esa390-dat", NULL);
+
     if (!object_property_get_bool(OBJECT(ms), "esa390-cm", NULL)) {
         return 0;
     }
-    if (!esa390_cm_enable(s)) {
+    /*
+     * ESA/390 DAT shadowing: the kernel runs translated guest code on
+     * shadow tables of its own.  Nothing of them is visible to QEMU or to
+     * the guest, and nothing of them is migration state.
+     */
+    if (dat && esa390_cm_enable(s, KVM_S390_ESA390_CM_DAT)) {
+        cap_esa390_cm = true;
+        return 0;
+    }
+    if (dat && kvm_check_extension(s, KVM_CAP_S390_ESA390_CM) > 0) {
+        error_report("The KVM of this host kernel does not support ESA/390 "
+                     "DAT shadowing in the ESA/390-compatibility mode, which "
+                     "machine property esa390-dat=on (a default of machine "
+                     "czam-compat) needs: it takes a kernel with that "
+                     "support");
+        return -ENOTSUP;
+    }
+    if (!esa390_cm_enable(s, 0)) {
         error_report("The KVM of this host kernel does not offer the "
                      "ESA/390-compatibility mode, which machine property "
                      "esa390-cm=on (a default of machine czam-compat) "
@@ -117,36 +124,6 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
         return -ENOTSUP;
     }
     cap_esa390_cm = true;
-
-    if (object_property_get_bool(OBJECT(ms), "esa390-dat", NULL)) {
-        struct kvm_s390_esa390_dat_area area = {
-            .base = ms->ram_size - ESA390_DAT_AREA_SIZE,
-            .size = ESA390_DAT_AREA_SIZE,
-        };
-        struct kvm_device_attr attr = {
-            .group = KVM_S390_VM_ARCH_MODE,
-            .attr = KVM_S390_VM_ARCH_MODE_DAT_AREA,
-            .addr = (uint64_t)&area,
-        };
-
-        if (ms->ram_size < ESA390_DAT_MIN_RAM) {
-            error_report("machine property esa390-dat=on needs at least "
-                         "16 MiB of memory");
-            return -EINVAL;
-        }
-        if (kvm_vm_ioctl(s, KVM_HAS_DEVICE_ATTR, &attr) ||
-            kvm_vm_ioctl(s, KVM_SET_DEVICE_ATTR, &attr)) {
-            error_report("The KVM of this host kernel does not support "
-                         "ESA/390 address translation in the "
-                         "ESA/390-compatibility mode, which machine "
-                         "property esa390-dat=on (a default of machine "
-                         "czam-compat) needs: it takes a kernel with that "
-                         "support and the kvm module parameter "
-                         "esa390_lab_dat=1");
-            return -ENOTSUP;
-        }
-        esa390_dat_area_size = ESA390_DAT_AREA_SIZE;
-    }
     return 0;
 }
 
@@ -165,15 +142,6 @@ void kvm_s390_esa390_fac_list(uint8_t *fac_list)
     }
     fac_list[138 / 8] &= ~(0x80 >> (138 % 8));
     fac_list[168 / 8] |= 0x80 >> (168 % 8);
-}
-
-/*
- * Size of the storage at the top of the configuration that is set aside
- * (esa390-dat) and must not be reported to the guest as its own; 0 if none.
- */
-uint64_t kvm_s390_esa390_dat_reserve(void)
-{
-    return esa390_dat_area_size;
 }
 
 bool kvm_s390_esa390_cm_enabled(void)

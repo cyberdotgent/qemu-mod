@@ -78,21 +78,6 @@ static int cpu_pre_save(void *opaque)
     S390CPU *cpu = opaque;
 
     if (kvm_enabled()) {
-        /*
-         * The state of a configuration in the ESA/390-compatibility mode
-         * is QEMU's (subsections cpu/esa-mode and cpu/esa-captured-cregs),
-         * with one exception: with esa390-dat the kernel holds shadow
-         * tables while the guest runs with address translation, and there
-         * is no interface to move them.  Refuse to save rather than
-         * produce a state that resumes differently.  Once the guest has
-         * switched to z/Architecture the usual state is complete.
-         */
-        if (kvm_s390_esa390_dat_reserve() && cpu->env.esa_mode) {
-            error_report("The state of a guest in the ESA/390-compatibility "
-                         "mode cannot be saved or migrated with esa390-dat; "
-                         "retry after it has switched to z/Architecture");
-            return -EBUSY;
-        }
         kvm_s390_vcpu_interrupt_pre_save(cpu);
     }
 

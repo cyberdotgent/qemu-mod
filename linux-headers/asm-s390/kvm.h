@@ -396,9 +396,9 @@ struct kvm_s390_io_adapter_req {
  * series for Linux 7.3 (capability KVM_CAP_S390_ESA390_CM, see
  * linux/kvm.h).  Setting KVM_S390_VM_ARCH_MODE_CURRENT only changes the
  * format in which the kernel runs the vCPUs; it fails with EBUSY while a
- * vCPU is in an ioctl.  KVM_S390_VM_ARCH_MODE_DAT_AREA belongs to a lab
- * patch of that series.  The group number, the attributes and the
- * structure are not assigned upstream and change when they are.  Keep
+ * vCPU is in an ioctl.  KVM_S390_ESA390_CM_DAT (argument of the capability)
+ * is from a later series of the same work.  The group number, the
+ * attributes and the flag are not assigned upstream and change when they are.  Keep
  * this block when updating the headers with
  * scripts/update-linux-headers.sh.
  */
@@ -407,16 +407,12 @@ struct kvm_s390_io_adapter_req {
 /* kvm attributes for KVM_S390_VM_ARCH_MODE */
 /* the architectural mode of the configuration: a __u32, values below */
 #define KVM_S390_VM_ARCH_MODE_CURRENT	0
-/* struct kvm_s390_esa390_dat_area: hidden storage for shadow tables */
-#define KVM_S390_VM_ARCH_MODE_DAT_AREA	1
 /* values of the architectural mode */
 #define KVM_S390_ARCH_MODE_ZARCH	0
 #define KVM_S390_ARCH_MODE_ESA390_CM	1
 
-struct kvm_s390_esa390_dat_area {
-	__u64 base;
-	__u64 size;
-};
+/* flags for KVM_CAP_S390_ESA390_CM, args[0]: ESA/390 DAT shadowing */
+#define KVM_S390_ESA390_CM_DAT		(1ULL << 0)
 /* end of PROVISIONAL (qemu-mod) */
 
 /* kvm attributes for mem_ctrl */
