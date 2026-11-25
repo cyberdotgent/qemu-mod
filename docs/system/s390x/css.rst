@@ -49,6 +49,35 @@ configuration is unchanged.  For example::
 If the property is omitted, QEMU retains its legacy basic-mode response
 without a configuration token.
 
+.. _s390x-css-measurement:
+
+Channel-subsystem monitoring
+----------------------------
+
+The channel subsystem maintains measurement blocks for subchannels that the
+guest enables for it (SET CHANNEL MONITOR, measurement-block-update mode).
+The subchannels have no timing facility, so the only measurement data is the
+count of START SUBCHANNEL and RESUME SUBCHANNEL operations.  It is stored
+when the start function completes at the device or is suspended, as the
+architecture describes, and not for an operation that is cleared, cancelled
+or ends with a subchannel logout.
+
+Both block formats are available by default: format 0 (an entry in the
+measurement-block area) and format 1 (a block of its own per subchannel, the
+extended-I/O-measurement-block facility).  The machine property
+``ext-measurement-block=off`` withholds the facility: CHSC store
+channel-subsystem characteristics does not report it (general
+characteristic 48), MODIFY SUBCHANNEL rejects the measurement-block-format
+control, and only format-0 blocks are used.  QEMU does not provide the
+extended-measurement-word facility that real machines have together with
+the first one, and an operating system that takes one for the other stops
+during its initialisation; for such a system turn the property off::
+
+    -machine s390-ccw-virtio,ext-measurement-block=off
+
+The default is ``on`` for all machine types except ``czam-compat``.  The
+property adds no migration state; source and destination need the same
+setting.  Trace event: ``css_chnmon_update``.
 
 Examples
 --------
