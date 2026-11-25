@@ -32,6 +32,7 @@ tests = {
   'test-int128': [],
   # all code tested by test-ebcdic is inside hw/s390x/ebcdic.h
   'test-ebcdic': [],
+  'test-ckd-init': [],
   'rcutorture': [],
   'test-rcu-list': [],
   'test-rcu-simpleq': [],

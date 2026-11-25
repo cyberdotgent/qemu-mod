@@ -366,6 +366,17 @@ Command description:
   state after (the attempt at) repairing it. That is, a successful ``-r all``
   will yield the exit code 0, independently of the image state before.
 
+.. option:: ckdinit [--object OBJECTDEF] [--image-opts] [-q] [-f FMT] [-m MODEL | -c CYLINDERS] (-V VOLSER [--owner OWNER] [--vtoc CYL,HEAD,TRACKS] | --header-only) [--serial SERIAL] [--ckd] [--no-zero] [--force] FILENAME
+
+  Write an empty IBM 3390 CKD volume for the s390x ``eckd-ccw`` device into
+  the existing image *FILENAME* (any format, a block device included): the
+  device header and, unless ``--header-only`` is given, the IPL records, the
+  volume label with volume serial *VOLSER* and a VTOC, as a minimal ICKDSF
+  ``INIT`` leaves them. *MODEL* is one of ``3390-1``, ``3390-2``,
+  ``3390-3``, ``3390-9``, ``3390-27`` or ``3390-54``; *CYLINDERS* any
+  number from 1 to 65520. The image is zeroed first unless ``--no-zero``
+  is given. See :doc:`/system/s390x/3390` for the details.
+
 .. option:: commit [--object OBJECTDEF] [--image-opts] [-q] [-f FMT] [-t CACHE] [-b BASE] [-r RATE_LIMIT] [-d] [-p] FILENAME
 
   Commit the changes recorded in *FILENAME* in its base image or backing file.

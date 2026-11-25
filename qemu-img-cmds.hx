@@ -35,6 +35,12 @@ SRST
 .. option:: check [--object OBJECTDEF] [--image-opts] [-q] [-f FMT] [--output=OFMT] [-r [leaks | all]] [-T SRC_CACHE] [-U] FILENAME
 ERST
 
+DEF("ckdinit", img_ckdinit,
+    "ckdinit [--object objectdef] [--image-opts] [-q] [-f fmt] [-m model | -c cylinders] (-V volser [--owner owner] [--vtoc cyl,head,tracks] | --header-only) [--serial serial] [--ckd] [--no-zero] [--force] filename")
+SRST
+.. option:: ckdinit [--object OBJECTDEF] [--image-opts] [-q] [-f FMT] [-m MODEL | -c CYLINDERS] (-V VOLSER [--owner OWNER] [--vtoc CYL,HEAD,TRACKS] | --header-only) [--serial SERIAL] [--ckd] [--no-zero] [--force] FILENAME
+ERST
+
 DEF("commit", img_commit,
     "commit [--object objectdef] [--image-opts] [-q] [-f fmt] [-t cache] [-b base] [-r rate_limit] [-d] [-p] filename")
 SRST

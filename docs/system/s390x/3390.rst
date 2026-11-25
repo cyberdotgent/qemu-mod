@@ -116,7 +116,9 @@ entirely zero read as empty tracks, so a new volume needs only the header::
       dd of=dosres.ckd conv=notrunc
 
 The guest then initialises the volume, for example with ICKDSF or
-``dasdfmt``.
+``dasdfmt``. ``qemu-img ckdinit`` (see `Image creation`_) writes the
+header, and by default an initialised empty volume, without this
+arithmetic.
 
 Unformatted tracks
 ------------------
@@ -170,12 +172,50 @@ reads it from the shared or mirrored image.
 Image creation
 --------------
 
-``work/ckd-qcow2-init.py`` in the source checkout is a dasdinit-like
-development tool which creates a qcow2 container holding a preformatted
-CKD64 image. For example::
+``qemu-img ckdinit`` writes an empty 3390 volume into an existing image of
+any format and protocol: a qcow2 or raw file, a block device such as a ZFS
+volume or an LVM logical volume, or a network image given with
+``--image-opts``. The image must hold at least 512 + *n* × 852,480 bytes;
+anything behind the last cylinder stays padding. For example::
 
-  python3 work/ckd-qcow2-init.py dosres.qcow2 3390-3 DOSRES
-  python3 work/ckd-qcow2-init.py archive.qcow2 3390-54 ARCHIV
+  qemu-img create -f qcow2 dosres.qcow2 2846431232
+  qemu-img ckdinit -f qcow2 -m 3390-3 -V DOSRES dosres.qcow2
 
-Use ``--ckd`` for ``CKD_P370`` instead of the default ``CKD_P064``. Images
-can be exported for Hercules with ``qemu-img convert -O raw``.
+  qemu-img ckdinit -f raw -m 3390-9 -V SYSRS1 /dev/zvol/tank/vm-100-disk-1
+
+By default the volume is *initialised* the way a minimal ICKDSF ``INIT``
+leaves it, so that a stand-alone restore program or an operating system
+accepts it as a volume:
+
+* cylinder 0, head 0: record 0, the IPL bootstrap records ``IPL1`` and
+  ``IPL2`` of a volume without IPL program (an IPL from it ends in a
+  disabled wait with code X'0F') and the volume label ``VOL1`` (record 3)
+  with the volume serial (``-V``), the owner (``--owner``, blank by
+  default) and the address of the VTOC;
+* the VTOC, by default at cylinder 0, head 1 for the 14 remaining tracks of
+  cylinder 0 (ICKDSF's default for a 3390; ``--vtoc CYL,HEAD,TRACKS`` to
+  place it elsewhere, below relative track 65,535): 50 DSCBs per track, a
+  format-4 DSCB describing the volume and the VTOC, a format-5 DSCB
+  listing the free space and format-0 DSCBs for the rest. The VTOC is not
+  indexed. On volumes with more than 65,535 tracks (3390-9 and larger) the
+  format-4 DSCB also marks the free space for the system to rebuild
+  (DS4DOSBT), as these systems keep free space in other DSCBs there;
+* all other tracks empty (all-zero slots, see below).
+
+The volume serial has 1 to 6 characters A-Z, 0-9, the national characters
+@, # and $, or hyphens. Without ``-m`` or ``-c`` the number of cylinders
+comes from the image size, which must then be exact. ``--header-only``
+writes only the device header, for a volume the guest initialises itself
+(ICKDSF, ``dasdfmt``). ``--ckd`` writes a ``CKD_P370`` instead of a
+``CKD_P064`` header; ``--serial`` sets the 12-character device serial
+(random digits by default).
+
+Everything after the header, padding included, is zeroed first (write
+zeroes with unmap, which is cheap on qcow2, sparse files, thin pools and
+ZFS); ``--no-zero`` skips that for a target known to read as zeros. The
+header is written last. An image whose first track is already formatted
+is only overwritten with ``--force``. Extended address volumes (more than
+65,520 cylinders) are not supported, as the device does not support them.
+
+Images can be exported for Hercules with ``qemu-img convert -O raw`` (cut
+to the exact size).

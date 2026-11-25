@@ -43,6 +43,7 @@
 #include "qemu/module.h"
 #include "qemu/sockets.h"
 #include "qemu/units.h"
+#include "qemu/ckd-init.h"
 #include "qemu/memalign.h"
 #include "qom/object_interfaces.h"
 #include "system/block-backend.h"
@@ -88,6 +89,12 @@ enum {
     OPTION_SKIP_BROKEN = 277,
     OPTION_LIMITS = 278,
     OPTION_REMOVE_ALL = 279,
+    OPTION_CKD_OWNER = 280,
+    OPTION_CKD_VTOC = 281,
+    OPTION_CKD_SERIAL = 282,
+    OPTION_CKD_HEADER_ONLY = 283,
+    OPTION_CKD_P370 = 284,
+    OPTION_CKD_NO_ZERO = 285,
 };
 
 typedef enum OutputFormat {
@@ -6026,6 +6033,323 @@ out:
     return ret;
 }
 
+/*
+ * ckdinit: write an empty 3390 CKD volume (device header, and unless
+ * --header-only, IPL records, volume label and VTOC) into an existing image
+ * of any format and protocol, a block device included.
+ */
+static int img_ckdinit(const img_cmd_t *ccmd, int argc, char **argv)
+{
+    Error *err = NULL;
+    const char *filename, *fmt = NULL, *model = NULL;
+    const char *cylinders_arg = NULL, *volser = NULL, *owner = NULL;
+    const char *vtoc = NULL, *serial = NULL;
+    bool image_opts = false, quiet = false, zero = true, force = false;
+    CkdInitParams p = { .ckd64 = true };
+    BlockBackend *blk = NULL;
+    uint8_t *buf = NULL;
+    int64_t length, offset;
+    uint64_t needed;
+    uint32_t track;
+    int c, ret = 1;
+
+    for (;;) {
+        static const struct option long_options[] = {
+            {"help", no_argument, 0, 'h'},
+            {"format", required_argument, 0, 'f'},
+            {"image-opts", no_argument, 0, OPTION_IMAGE_OPTS},
+            {"object", required_argument, 0, OPTION_OBJECT},
+            {"quiet", no_argument, 0, 'q'},
+            {"model", required_argument, 0, 'm'},
+            {"cylinders", required_argument, 0, 'c'},
+            {"volser", required_argument, 0, 'V'},
+            {"owner", required_argument, 0, OPTION_CKD_OWNER},
+            {"vtoc", required_argument, 0, OPTION_CKD_VTOC},
+            {"serial", required_argument, 0, OPTION_CKD_SERIAL},
+            {"header-only", no_argument, 0, OPTION_CKD_HEADER_ONLY},
+            {"ckd", no_argument, 0, OPTION_CKD_P370},
+            {"no-zero", no_argument, 0, OPTION_CKD_NO_ZERO},
+            {"force", no_argument, 0, OPTION_FORCE},
+            {0, 0, 0, 0}
+        };
+        c = getopt_long(argc, argv, "hf:qm:c:V:", long_options, NULL);
+        if (c == -1) {
+            break;
+        }
+        switch (c) {
+        case 'h':
+            cmd_help(ccmd, "[-f FMT | --image-opts] [-q] [--object OBJDEF]\n"
+"        [-m MODEL | -c CYLINDERS] (-V VOLSER [--owner OWNER]\n"
+"        [--vtoc CYL,HEAD,TRACKS] | --header-only) [--serial SERIAL]\n"
+"        [--ckd] [--no-zero] [--force] FILE\n"
+,
+"  -f, --format FMT\n"
+"     specify FILE format explicitly (default: probing is used)\n"
+"  --image-opts\n"
+"     treat FILE as an option string (key=value,...), not a file name\n"
+"     (incompatible with -f|--format)\n"
+"  -q, --quiet\n"
+"     quiet mode (produce only error messages if any)\n"
+"  --object OBJDEF\n"
+"     defines QEMU user-creatable object\n"
+"  -m, --model MODEL\n"
+"     3390 model: 3390-1, 3390-2, 3390-3, 3390-9, 3390-27 or 3390-54\n"
+"  -c, --cylinders CYLINDERS\n"
+"     number of cylinders (1 to 65520); without -m and -c, the image\n"
+"     size must be exactly that of a volume (512 + n * 852480 bytes)\n"
+"  -V, --volser VOLSER\n"
+"     volume serial: 1 to 6 characters A-Z, 0-9, @, #, $, -\n"
+"  --owner OWNER\n"
+"     owner name in the volume label (up to 14 characters)\n"
+"  --vtoc CYL,HEAD,TRACKS\n"
+"     VTOC location and size (default 0,1,14: the rest of cylinder 0)\n"
+"  --header-only\n"
+"     only write the device header: the guest initialises the volume\n"
+"  --serial SERIAL\n"
+"     12-character device serial in the header (default: random digits)\n"
+"  --ckd\n"
+"     write a CKD_P370 header (default CKD_P064)\n"
+"  --no-zero\n"
+"     do not zero the image first (it must already read as zeros)\n"
+"  --force\n"
+"     overwrite an image whose first track is already formatted\n"
+"  FILE\n"
+"     name of the image file or block device, or option string\n"
+"     (key=value,..) with --image-opts, to initialise\n"
+);
+            return 0;
+        case 'f':
+            fmt = optarg;
+            break;
+        case OPTION_IMAGE_OPTS:
+            image_opts = true;
+            break;
+        case OPTION_OBJECT:
+            user_creatable_process_cmdline(optarg);
+            break;
+        case 'q':
+            quiet = true;
+            break;
+        case 'm':
+            model = optarg;
+            break;
+        case 'c':
+            cylinders_arg = optarg;
+            break;
+        case 'V':
+            volser = optarg;
+            break;
+        case OPTION_CKD_OWNER:
+            owner = optarg;
+            break;
+        case OPTION_CKD_VTOC:
+            vtoc = optarg;
+            break;
+        case OPTION_CKD_SERIAL:
+            serial = optarg;
+            break;
+        case OPTION_CKD_HEADER_ONLY:
+            p.header_only = true;
+            break;
+        case OPTION_CKD_P370:
+            p.ckd64 = false;
+            break;
+        case OPTION_CKD_NO_ZERO:
+            zero = false;
+            break;
+        case OPTION_FORCE:
+            force = true;
+            break;
+        default:
+            tryhelp(argv[0]);
+        }
+    }
+    if (optind != argc - 1) {
+        error_exit(argv[0], "Expecting one image file name");
+    }
+    filename = argv[optind];
+
+    if (model && cylinders_arg) {
+        error_report("Use either --model or --cylinders");
+        return 1;
+    }
+    if (model) {
+        p.cylinders = ckd_init_model_cylinders(model);
+        if (!p.cylinders) {
+            error_report("Unknown 3390 model '%s'", model);
+            return 1;
+        }
+    } else if (cylinders_arg) {
+        int64_t n = cvtnum_full("cylinders", cylinders_arg, false, 1,
+                                CKD_INIT_MAX_CYLINDERS);
+        if (n < 0) {
+            return 1;
+        }
+        p.cylinders = n;
+    }
+    if (p.header_only && (volser || owner || vtoc)) {
+        error_report("--header-only writes no volume label: "
+                     "--volser, --owner and --vtoc do not apply");
+        return 1;
+    }
+    if (volser && !ckd_init_parse_volser(volser, p.volser, &err)) {
+        error_report_err(err);
+        return 1;
+    }
+    if (owner) {
+        if (strlen(owner) > 14) {
+            error_report("The owner has at most 14 characters");
+            return 1;
+        }
+        pstrcpy(p.owner, sizeof(p.owner), owner);
+    }
+    if (vtoc) {
+        unsigned long v[3];
+        const char *s = vtoc;
+        int i;
+
+        for (i = 0; i < 3; i++) {
+            if (qemu_strtoul(s, &s, 0, &v[i]) < 0 || v[i] > UINT32_MAX ||
+                (i < 2 ? *s != ',' : *s != 0)) {
+                error_report("--vtoc expects CYLINDER,HEAD,TRACKS, "
+                             "not '%s'", vtoc);
+                return 1;
+            }
+            s++;
+        }
+        if (!v[2]) {
+            error_report("The VTOC needs at least one track");
+            return 1;
+        }
+        p.vtoc_cylinder = v[0];
+        p.vtoc_head = v[1];
+        p.vtoc_tracks = v[2];
+    }
+    if (serial) {
+        if (strlen(serial) > 12) {
+            error_report("The serial has at most 12 characters");
+            return 1;
+        }
+        /* blank padded, like the rest of the identity */
+        snprintf(p.serial, sizeof(p.serial), "%-12s", serial);
+    }
+
+    blk = img_open(image_opts, filename, fmt, BDRV_O_RDWR | BDRV_O_UNMAP,
+                   false, quiet, false);
+    if (!blk) {
+        return 1;
+    }
+    length = blk_getlength(blk);
+    if (length < 0) {
+        error_report("Cannot get the image size: %s", strerror(-length));
+        goto out;
+    }
+    if (!p.cylinders) {
+        uint64_t cyl_size = CKD_INIT_HEADS * CKD_INIT_TRACK_SIZE;
+
+        if (length <= CKD_INIT_HEADER_SIZE ||
+            (length - CKD_INIT_HEADER_SIZE) % cyl_size ||
+            (length - CKD_INIT_HEADER_SIZE) / cyl_size >
+                CKD_INIT_MAX_CYLINDERS) {
+            error_report("Give --model or --cylinders: the image size %"
+                         PRId64 " is not that of a 3390 volume "
+                         "(512 + n * 852480 bytes)", length);
+            goto out;
+        }
+        p.cylinders = (length - CKD_INIT_HEADER_SIZE) / cyl_size;
+    }
+    if (!ckd_init_check(&p, &err)) {
+        error_report_err(err);
+        goto out;
+    }
+    needed = ckd_init_image_size(p.cylinders);
+    if (length < needed) {
+        error_report("The image has %" PRId64 " bytes, a volume of %u "
+                     "cylinders needs %" PRIu64, length, p.cylinders, needed);
+        goto out;
+    }
+
+    buf = blk_blockalign(blk, CKD_INIT_TRACK_SIZE);
+
+    /* Refuse to overwrite a volume whose first track is formatted. */
+    if (!force) {
+        uint8_t head[CKD_INIT_HEADER_SIZE + 16];
+        size_t i;
+
+        if (blk_pread(blk, 0, sizeof(head), head, 0) < 0) {
+            error_report("Cannot read the image");
+            goto out;
+        }
+        if (!memcmp(head, "CKD_", 4)) {
+            for (i = CKD_INIT_HEADER_SIZE; i < sizeof(head); i++) {
+                if (head[i]) {
+                    error_report("The image holds a formatted CKD volume; "
+                                 "use --force to overwrite it");
+                    goto out;
+                }
+            }
+        }
+    }
+
+    if (zero) {
+        /* Everything after the header, padding included, reads as zeros. */
+        for (offset = CKD_INIT_HEADER_SIZE; offset < length;) {
+            int64_t n = MIN(length - offset, 1 * GiB);
+
+            ret = blk_pwrite_zeroes(blk, offset, n, BDRV_REQ_MAY_UNMAP);
+            if (ret < 0) {
+                error_report("Cannot zero the image: %s", strerror(-ret));
+                ret = 1;
+                goto out;
+            }
+            offset += n;
+        }
+        ret = 1;
+    }
+
+    for (track = 0; track < p.cylinders * CKD_INIT_HEADS; track++) {
+        if (!ckd_init_track_is_formatted(&p, track)) {
+            if (track > ckd_init_vtoc_last(&p) || p.header_only) {
+                break;
+            }
+            continue;
+        }
+        ckd_init_build_track(&p, track, buf);
+        if (blk_pwrite(blk, CKD_INIT_HEADER_SIZE +
+                       (int64_t)track * CKD_INIT_TRACK_SIZE,
+                       CKD_INIT_TRACK_SIZE, buf, 0) < 0) {
+            error_report("Cannot write track %u", track);
+            goto out;
+        }
+    }
+
+    /* The header last: an interrupted run leaves no valid volume. */
+    memset(buf, 0, CKD_INIT_HEADER_SIZE);
+    ckd_init_build_header(&p, buf);
+    if (blk_pwrite(blk, 0, CKD_INIT_HEADER_SIZE, buf, 0) < 0 ||
+        blk_flush(blk) < 0) {
+        error_report("Cannot write the device header");
+        goto out;
+    }
+
+    if (!quiet) {
+        if (p.header_only) {
+            printf("Wrote the header of a 3390 volume of %u cylinders "
+                   "(%" PRIu64 " bytes)\n", p.cylinders, needed);
+        } else {
+            printf("Initialised 3390 volume %s: %u cylinders (%" PRIu64
+                   " bytes), VTOC at cylinder %u head %u, %u tracks\n",
+                   p.volser, p.cylinders, needed, p.vtoc_cylinder,
+                   p.vtoc_head, p.vtoc_tracks);
+        }
+    }
+    ret = 0;
+out:
+    qemu_vfree(buf);
+    blk_unref(blk);
+    return ret;
+}
+
 static const img_cmd_t img_cmds[] = {
     { "amend", img_amend,
       "Update format-specific options of the image" },
@@ -6035,6 +6359,8 @@ static const img_cmd_t img_cmds[] = {
       "Perform modifications of the persistent bitmap in the image" },
     { "check", img_check,
       "Check basic image integrity" },
+    { "ckdinit", img_ckdinit,
+      "Initialise an empty 3390 CKD volume (label and VTOC)" },
     { "commit", img_commit,
       "Commit image to its backing file" },
     { "compare", img_compare,
