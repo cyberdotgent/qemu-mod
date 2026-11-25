@@ -1383,12 +1383,14 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
     trace_eckd_write_ckd(sch->devno, cylinder, head, data[4], data[5],
                          lduw_be_p(data + 6), eckd->write_used,
                          eckd->format_used);
-    if (data[4] != eckd->record + 1) {
-        return eckd_unit_check(eckd, SENSE_DATA_CHECK, 0);
-    }
     if (eckd->format_used + required + 8 > ECKD_TRACK_SIZE) {
         return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
     }
+    /*
+     * The record identifier is taken from the count area as given: the
+     * control unit formats by position and puts no rule on R (an
+     * end-of-file record is commonly XFF, data sets may skip numbers).
+     */
     memcpy(eckd->format_track + eckd->format_used, data, required);
     eckd->format_used += required;
     eckd->record = data[4];

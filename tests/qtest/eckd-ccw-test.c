@@ -417,6 +417,76 @@ static void test_track_cache_invalidation(void)
     unlink(image);
 }
 
+/*
+ * Write CKD takes the record identifier from the count area as given: a
+ * real control unit orients by position and does not require the record
+ * number to be the previous one plus one.  An end-of-file record is often
+ * numbered X'FF', and data sets may skip numbers.  Format-write R3 behind
+ * R1 (skipping 2), then an end-of-file R=X'FF', and check the track.
+ */
+static void test_write_ckd_record_number(void)
+{
+    uint8_t pattern[ECKD_R1_LENGTH], data3[32];
+    uint8_t extent[16] = { 0 }, locate[16] = { 0 };
+    uint8_t ckd3[8 + sizeof(data3)];
+    const uint8_t eof[8] = { 0, 0, 0, 0, 0xff, 0, 0, 0 };
+    uint8_t track[8 + sizeof(data3) + 8 + 8];
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+    CcwProgIrb irb;
+    int fd;
+
+    for (int i = 0; i < ECKD_R1_LENGTH; i++) {
+        pattern[i] = 0x30 + i;
+    }
+    memset(data3, 0x33, sizeof(data3));
+    path = create_ckd_image_r1(pattern);
+    qts = eckd_prog_start(image, path);
+
+    /* Define Extent: tracks 0/0 to 0/14, file mask 0 (writes permitted). */
+    stw_be_p(extent + 14, CKD_HEADS - 1);
+    /* Locate Record: Format Write, 2 records, orient on 0000 0000 01. */
+    locate[0] = 0x03;
+    locate[3] = 2;
+    locate[12] = 1;
+    /* R3: key length 0, data length 32. */
+    memset(ckd3, 0, 8);
+    ckd3[4] = 3;
+    stw_be_p(ckd3 + 6, sizeof(data3));
+    memcpy(ckd3 + 8, data3, sizeof(data3));
+
+    qtest_memwrite(qts, CCW_PROG_DATA, extent, sizeof(extent));
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x20, locate, sizeof(locate));
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x40, ckd3, sizeof(ckd3));
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x80, eof, sizeof(eof));
+    ccw_prog_set_ccw(qts, 0, 0x63, CCW_FLAG_CC, sizeof(extent),
+                     CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x47, CCW_FLAG_CC, sizeof(locate),
+                     CCW_PROG_DATA + 0x20);
+    ccw_prog_set_ccw(qts, 2, 0x1d, CCW_FLAG_CC, sizeof(ckd3),
+                     CCW_PROG_DATA + 0x40);
+    ccw_prog_set_ccw(qts, 3, 0x1d, 0, sizeof(eof), CCW_PROG_DATA + 0x80);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_quit(qts);
+
+    /* Track 0/0: HA, R0, R1 unchanged, then R3, the EOF record, the end. */
+    fd = open(path, O_RDONLY);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(pread(fd, track, sizeof(track),
+                          ECKD_R1_OFFSET + ECKD_R1_LENGTH), ==, sizeof(track));
+    close(fd);
+    g_assert_cmpmem(track, sizeof(ckd3), ckd3, sizeof(ckd3));
+    g_assert_cmpmem(track + sizeof(ckd3), 8, eof, 8);
+    for (int i = 0; i < 8; i++) {
+        g_assert_cmphex(track[sizeof(ckd3) + 8 + i], ==, 0xff);
+    }
+    unlink(path);
+    unlink(image);
+}
+
 static void wait_migration_completed(QTestState *qts)
 {
     for (int i = 0; i < 6000; i++) {
@@ -847,6 +917,8 @@ int main(int argc, char **argv)
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
         qtest_add_func("/eckd-ccw/io/track-cache-invalidation",
                        test_track_cache_invalidation);
+        qtest_add_func("/eckd-ccw/io/write-ckd-record-number",
+                       test_write_ckd_record_number);
         qtest_add_func("/eckd-ccw/io/migration-orientation",
                        test_migration_orientation);
         qtest_add_func("/eckd-ccw/io/migration-read-orientation",
