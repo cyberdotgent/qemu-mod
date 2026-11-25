@@ -164,8 +164,12 @@ static int sclp_file_root(SCLPFileAccess *fa)
 static int sclp_file_openat2(int dirfd, const char *name, int flags,
                              mode_t mode)
 {
+    /*
+     * Never wait in open: a FIFO or a device node in the directory must not
+     * block the worker. Regular files and directories are not affected.
+     */
     struct open_how how = {
-        .flags = flags | O_CLOEXEC,
+        .flags = flags | O_CLOEXEC | O_NONBLOCK,
         .mode = (flags & O_CREAT) ? mode : 0,
         .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
     };
@@ -558,6 +562,10 @@ static void sclp_file_do_ftp(SCLPFileAccess *fa, SclpFileFtp *ftp)
                               0644);
         if (fd < 0) {
             code = sclp_file_errno_code(errno);
+            break;
+        }
+        if (fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+            code = SCLP_FILE_NOT_PERMITTED;
             break;
         }
         code = sclp_file_put(fa, fd, &buf, length, &done);
