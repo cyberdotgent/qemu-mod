@@ -43,6 +43,7 @@ struct S390CcwMachineState {
     uint64_t memory_limit;
     uint64_t max_pagesize;
     BootCertificatesList *boot_certs;
+    bool ext_measurement_block;
     bool chsc_config_token_set;
     uint8_t chsc_config_token[64];
 
@@ -77,6 +78,14 @@ void s390_handle_ptf(S390CPU *cpu, uint8_t r1, uintptr_t ra);
  * bytes, or 0 to keep the default.
  */
 bool s390_mainframe_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8]);
+/*
+ * Whether the channel subsystem has the extended-I/O-measurement-block
+ * facility (machine property "ext-measurement-block"): general
+ * characteristic 48 of CHSC store channel-subsystem characteristics, the
+ * measurement-block-format control and the measurement-block address of
+ * the subchannels.
+ */
+bool s390_css_ext_measurement_block(void);
 uint64_t s390_mainframe_storage_increment(void);
 /* LPAR-personality overlays for SCLP Read SCP Info and CHSC (see .c) */
 void s390_mainframe_patch_read_info(uint8_t *read_info);

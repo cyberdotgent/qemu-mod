@@ -1007,6 +1007,27 @@ static void machine_set_boot_certs(Object *obj, Visitor *v, const char *name,
     ms->boot_certs = cert_list;
 }
 
+static bool machine_get_ext_measurement_block(Object *obj, Error **errp)
+{
+    return S390_CCW_MACHINE(obj)->ext_measurement_block;
+}
+
+static void machine_set_ext_measurement_block(Object *obj, bool value,
+                                              Error **errp)
+{
+    S390_CCW_MACHINE(obj)->ext_measurement_block = value;
+}
+
+bool s390_css_ext_measurement_block(void)
+{
+    Object *obj = qdev_get_machine();
+
+    if (!obj || !object_dynamic_cast(obj, TYPE_S390_CCW_MACHINE)) {
+        return true;
+    }
+    return S390_CCW_MACHINE(obj)->ext_measurement_block;
+}
+
 static inline bool machine_get_secure_boot(Object *obj, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
@@ -1092,6 +1113,13 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "aes-key-wrap",
             "enable/disable AES key wrapping using the CPACF wrapping key");
 
+    object_class_property_add_bool(oc, "ext-measurement-block",
+                                   machine_get_ext_measurement_block,
+                                   machine_set_ext_measurement_block);
+    object_class_property_set_description(oc, "ext-measurement-block",
+            "provide the extended-I/O-measurement-block facility of the "
+            "channel subsystem (format-1 measurement blocks)");
+
     object_class_property_add_bool(oc, "dea-key-wrap",
                                    machine_get_dea_key_wrap,
                                    machine_set_dea_key_wrap);
@@ -1141,6 +1169,7 @@ static inline void s390_machine_initfn(Object *obj)
 
     ms->aes_key_wrap = true;
     ms->dea_key_wrap = true;
+    ms->ext_measurement_block = true;
     ms->ipl_notifier.notify = s390_machine_ipl_notify;
     qemu_add_machine_init_done_notifier(&ms->ipl_notifier);
 }
@@ -1319,6 +1348,10 @@ bool s390_mainframe_chsc_characteristics(uint32_t *general_chars,
         return false;
     }
     mainframe_set_bits(general_chars, general, ARRAY_SIZE(general));
+    if (!s390_css_ext_measurement_block()) {
+        /* extended-I/O-measurement-block facility (48) */
+        general_chars[1] &= ~cpu_to_be32(0x00008000);
+    }
     mainframe_set_bits(chsc_chars, chsc, ARRAY_SIZE(chsc));
     return true;
 }

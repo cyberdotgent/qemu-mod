@@ -1864,7 +1864,14 @@ IOInstEnding css_do_msch(SubchDev *sch, const SCHIB *orig_schib)
     schib->pmcw.chars &= ~(PMCW_CHARS_MASK_MBFC | PMCW_CHARS_MASK_CSENSE);
     schib->pmcw.chars |= schib_copy.pmcw.chars &
             (PMCW_CHARS_MASK_MBFC | PMCW_CHARS_MASK_CSENSE);
-    schib->mba = schib_copy.mba;
+    /*
+     * Words 10 and 11 are the measurement-block address only with the
+     * extended-I/O-measurement-block facility; the address stays zero
+     * without it.
+     */
+    if (s390_css_ext_measurement_block()) {
+        schib->mba = schib_copy.mba;
+    }
 
     /* Has the channel been enabled or disabled? */
     if (sch->enable_cb && (oldflags & PMCW_FLAGS_MASK_ENA) == 0 &&

@@ -154,6 +154,11 @@ static const char *ioinst_schib_invalid_reason(SCHIB *schib)
     if (be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_XMWME) {
         return "extended measurement words not installed";
     }
+    /* Without extended measurement blocks bit 29 of word 6 must be 0. */
+    if ((be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_MBFC) &&
+        !s390_css_ext_measurement_block()) {
+        return "extended measurement blocks not installed";
+    }
     /* for MB format 1 bits 26-31 of word 11 must be 0 */
     /* MBA uses words 10 and 11, it means align on 2**6 */
     if ((be32_to_cpu(schib->pmcw.chars) & PMCW_CHARS_MASK_MBFC) &&
@@ -793,7 +798,9 @@ static void ioinst_handle_chsc_scsc(ChscReq *req, ChscResp *res)
         goto out_chars;
     }
     general_chars[0] = cpu_to_be32(0x03080000);
-    general_chars[1] = cpu_to_be32(0x00079000);
+    /* Bit 48: extended-I/O-measurement-block facility */
+    general_chars[1] = cpu_to_be32(s390_css_ext_measurement_block() ?
+                                   0x00079000 : 0x00071000);
     general_chars[3] = cpu_to_be32(0x00080000);
 
     /*
