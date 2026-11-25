@@ -85,6 +85,7 @@ Architectural features
 
 .. toctree::
    s390x/bootdevices
+   s390x/esa390-compat
    s390x/protvirt
    s390x/cpu-topology
    s390x/secure-ipl
