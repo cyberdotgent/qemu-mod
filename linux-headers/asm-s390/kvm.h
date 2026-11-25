@@ -392,10 +392,14 @@ struct kvm_s390_io_adapter_req {
 /*
  * PROVISIONAL (qemu-mod): not part of the upstream Linux uAPI.
  *
- * Attribute group of the ESA/390-compatibility mode of a prototype kernel
- * (capability KVM_CAP_S390_ESA390_CM, see linux/kvm.h).  The group number,
- * the attributes and the structure are not assigned upstream and change
- * when they are.  Keep this block when updating the headers with
+ * Attribute group of the ESA/390-compatibility mode, as in the kernel
+ * series for Linux 7.3 (capability KVM_CAP_S390_ESA390_CM, see
+ * linux/kvm.h).  Setting KVM_S390_VM_ARCH_MODE_CURRENT only changes the
+ * format in which the kernel runs the vCPUs; it fails with EBUSY while a
+ * vCPU is in an ioctl.  KVM_S390_VM_ARCH_MODE_DAT_AREA belongs to a lab
+ * patch of that series.  The group number, the attributes and the
+ * structure are not assigned upstream and change when they are.  Keep
+ * this block when updating the headers with
  * scripts/update-linux-headers.sh.
  */
 #define KVM_S390_VM_ARCH_MODE		6

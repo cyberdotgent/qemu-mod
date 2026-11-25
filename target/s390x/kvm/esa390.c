@@ -6,8 +6,12 @@
  * set-architecture.  KVM runs the vCPUs in the mode; QEMU selects it at
  * machine start and at the resets that belong to a load.
  *
- * The kernel interface for this is that of a prototype and not part of
- * upstream Linux (see the PROVISIONAL blocks in linux-headers/).  Everything
+ * The kernel interface for this is that of a kernel series for Linux 7.3
+ * and not part of upstream Linux (see the PROVISIONAL blocks in
+ * linux-headers/).  The kernel offers the capability only when its kvm
+ * module was loaded with esa390_cm=1, wants KVM_CAP_S390_USER_SIGP enabled
+ * first, and leaves everything SIGP set-architecture defines apart from
+ * the format of the state descriptions to user space.  Everything
  * QEMU knows about it is in this file, behind the functions declared in
  * kvm_s390x.h under "ESA/390-compatibility mode":
  *
@@ -87,10 +91,11 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
         return 0;
     }
     if (!esa390_cm_enable(s)) {
-        error_report("The KVM of this host kernel does not support the "
+        error_report("The KVM of this host kernel does not offer the "
                      "ESA/390-compatibility mode, which machine property "
                      "esa390-cm=on (a default of machine czam-compat) "
-                     "needs");
+                     "needs: it takes a kernel with that support and the "
+                     "kvm module parameter esa390_cm=1");
         return -ENOTSUP;
     }
     cap_esa390_cm = true;
@@ -117,7 +122,9 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
                          "ESA/390 address translation in the "
                          "ESA/390-compatibility mode, which machine "
                          "property esa390-dat=on (a default of machine "
-                         "czam-compat) needs");
+                         "czam-compat) needs: it takes a kernel with that "
+                         "support and the kvm module parameter "
+                         "esa390_lab_dat=1");
             return -ENOTSUP;
         }
         esa390_dat_area_size = ESA390_DAT_AREA_SIZE;

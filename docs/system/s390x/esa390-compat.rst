@@ -18,7 +18,10 @@ and ``czam`` machine types start in that mode.  The machine type
    These properties are experimental.  They need support in the host
    kernel's KVM that is not part of upstream Linux, and the interface to it
    is provisional (see the ``PROVISIONAL`` blocks in ``linux-headers/`` and
-   ``target/s390x/kvm/esa390.c``).  QEMU checks for the support when it
+   ``target/s390x/kvm/esa390.c``).  QEMU speaks the interface of the kernel
+   series for Linux 7.3; that kernel offers the mode only when its ``kvm``
+   module is loaded with ``esa390_cm=1``, and ``esa390-dat`` additionally
+   needs ``esa390_lab_dat=1``.  QEMU checks for the support when it
    starts and ends with an error message naming the property if the kernel
    does not have it, or if the accelerator is not KVM.  With the properties
    off, which is the default of every machine type but ``czam-compat``,

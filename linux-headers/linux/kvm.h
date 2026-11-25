@@ -991,16 +991,17 @@ struct kvm_enable_cap {
 /*
  * PROVISIONAL (qemu-mod): not part of the upstream Linux uAPI.
  *
- * The ESA/390-compatibility mode exists only in a prototype kernel, and
- * upstream has assigned no capability number to it.  The prototype uses
- * the value below, which upstream has given to a capability of another
- * architecture; s390 KVM does not report that one, and QEMU checks the
- * device attribute group as well before it trusts the answer (see
- * target/s390x/kvm/esa390.c, the only user).  Replace the value when
+ * The ESA/390-compatibility mode for first-level guests is not in upstream
+ * Linux, and upstream has assigned no capability number to it.  The kernel
+ * series for Linux 7.3 uses the value below, the first one that mainline
+ * (7.4-rc) leaves free; QEMU checks the device attribute group as well
+ * before it trusts the answer (see target/s390x/kvm/esa390.c, the only
+ * user).  The capability can only be enabled after KVM_CAP_S390_USER_SIGP
+ * and before the first vCPU exists.  Replace the value when
  * upstream assigns one, and keep this block when updating the headers
  * with scripts/update-linux-headers.sh.
  */
-#define KVM_CAP_S390_ESA390_CM 250
+#define KVM_CAP_S390_ESA390_CM 253
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

@@ -401,16 +401,20 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
     cap_zpci_op = kvm_check_extension(s, KVM_CAP_S390_ZPCI_OP);
     cap_protected_dump = kvm_check_extension(s, KVM_CAP_S390_PROTECTED_DUMP);
 
-    /* must precede the CPU model and the creation of the first vCPU */
-    if (kvm_s390_esa390_init(ms, s) < 0) {
-        return -ENOTSUP;
-    }
-
     if (kvm_s390_nested_esa390_init(ms, s) < 0) {
         return -ENOTSUP;
     }
 
     kvm_vm_enable_cap(s, KVM_CAP_S390_USER_SIGP, 0);
+
+    /*
+     * Must precede the CPU model and the creation of the first vCPU, and
+     * follow KVM_CAP_S390_USER_SIGP: the kernel leaves SIGP
+     * set-architecture and the store-status orders to QEMU.
+     */
+    if (kvm_s390_esa390_init(ms, s) < 0) {
+        return -ENOTSUP;
+    }
     kvm_vm_enable_cap(s, KVM_CAP_S390_VECTOR_REGISTERS, 0);
     kvm_vm_enable_cap(s, KVM_CAP_S390_USER_STSI, 0);
     kvm_vm_enable_cap(s, KVM_CAP_S390_CPU_TOPOLOGY, 0);
