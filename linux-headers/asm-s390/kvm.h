@@ -389,6 +389,32 @@ struct kvm_s390_io_adapter_req {
 #define KVM_S390_VM_MIGRATION		4
 #define KVM_S390_VM_CPU_TOPOLOGY	5
 
+/*
+ * PROVISIONAL (qemu-mod): not part of the upstream Linux uAPI.
+ *
+ * Attribute group of the ESA/390-compatibility mode of a prototype kernel
+ * (capability KVM_CAP_S390_ESA390_CM, see linux/kvm.h).  The group number,
+ * the attributes and the structure are not assigned upstream and change
+ * when they are.  Keep this block when updating the headers with
+ * scripts/update-linux-headers.sh.
+ */
+#define KVM_S390_VM_ARCH_MODE		6
+
+/* kvm attributes for KVM_S390_VM_ARCH_MODE */
+/* the architectural mode of the configuration: a __u32, values below */
+#define KVM_S390_VM_ARCH_MODE_CURRENT	0
+/* struct kvm_s390_esa390_dat_area: hidden storage for shadow tables */
+#define KVM_S390_VM_ARCH_MODE_DAT_AREA	1
+/* values of the architectural mode */
+#define KVM_S390_ARCH_MODE_ZARCH	0
+#define KVM_S390_ARCH_MODE_ESA390_CM	1
+
+struct kvm_s390_esa390_dat_area {
+	__u64 base;
+	__u64 size;
+};
+/* end of PROVISIONAL (qemu-mod) */
+
 /* kvm attributes for mem_ctrl */
 #define KVM_S390_VM_MEM_ENABLE_CMMA	0
 #define KVM_S390_VM_MEM_CLR_CMMA	1

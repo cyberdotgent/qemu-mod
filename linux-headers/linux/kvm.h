@@ -988,6 +988,20 @@ struct kvm_enable_cap {
 #define KVM_CAP_S390_HPAGE_2G 249
 #define KVM_CAP_PPC_COMPAT_CAPS 250
 
+/*
+ * PROVISIONAL (qemu-mod): not part of the upstream Linux uAPI.
+ *
+ * The ESA/390-compatibility mode exists only in a prototype kernel, and
+ * upstream has assigned no capability number to it.  The prototype uses
+ * the value below, which upstream has given to a capability of another
+ * architecture; s390 KVM does not report that one, and QEMU checks the
+ * device attribute group as well before it trusts the answer (see
+ * target/s390x/kvm/esa390.c, the only user).  Replace the value when
+ * upstream assigns one, and keep this block when updating the headers
+ * with scripts/update-linux-headers.sh.
+ */
+#define KVM_CAP_S390_ESA390_CM 250
+
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
 	__u32 pin;
