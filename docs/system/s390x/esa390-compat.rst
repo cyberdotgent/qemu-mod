@@ -52,6 +52,29 @@ Limitations:
 * SIGP store status at address and set prefix, which QEMU handles itself,
   use the z/Architecture formats also while the guest is in the mode.
 
+Nested guests in ESA/390 mode
+-----------------------------
+
+This is independent of the properties above and concerns a hypervisor that
+runs *inside* the guest, for example z/VM, or Linux with KVM.  Such a
+hypervisor may start its own guests in ESA/390 mode.  Linux 7.1 and later
+can pass these guests on to the machine, but only when QEMU asks for it;
+older kernels end them with a validity interception.
+
+``nested-esa390=auto|on|off``
+  ``auto``, the default of all machine types, asks the host kernel whenever
+  it has the capability (``KVM_CAP_S390_VSIE_ESAMODE``).  ``on`` requires
+  it: QEMU ends with an error message on a host without it, also as the
+  destination of a migration.  ``off`` never asks, which is how QEMU
+  behaved before the property existed.
+
+The setting is not part of the migration stream and the guest hypervisor
+has no indication of it.  With ``auto``, a guest that moves from a host
+with the capability to a host without it keeps running, but the nested
+ESA/390-mode guests of its hypervisor fail from then on; use ``on`` where
+hosts with older kernels may be migration targets.  The guest itself always
+runs in z/Architecture mode unless ``esa390-cm`` is set.
+
 SCLP CPU features (experimental)
 --------------------------------
 

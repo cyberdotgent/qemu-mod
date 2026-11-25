@@ -34,6 +34,7 @@ struct S390CcwMachineState {
     bool dea_key_wrap;
     bool esa390_cm;
     bool esa390_dat;
+    OnOffAuto nested_esa390;
     bool pv;
     bool secure_boot;
     uint8_t loadparm[8];

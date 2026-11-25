@@ -47,6 +47,7 @@
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/qapi-type-infos-machine-s390x.h"
 #include "qapi/visitor.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qapi/qapi-visit-machine-s390x.h"
 #include "hw/s390x/cpu-topology.h"
 #include "kvm/kvm_s390x.h"
@@ -285,6 +286,10 @@ static void ccw_init(MachineState *machine)
 
     if (ms->esa390_cm && !kvm_enabled()) {
         error_report("machine property esa390-cm=on requires KVM");
+        exit(1);
+    }
+    if (ms->nested_esa390 == ON_OFF_AUTO_ON && !kvm_enabled()) {
+        error_report("machine property nested-esa390=on requires KVM");
         exit(1);
     }
     if (ms->esa390_dat && !ms->esa390_cm) {
@@ -862,6 +867,20 @@ static inline void machine_set_esa390_dat(Object *obj, bool value,
     ms->esa390_dat = value;
 }
 
+static int machine_get_nested_esa390(Object *obj, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    return ms->nested_esa390;
+}
+
+static void machine_set_nested_esa390(Object *obj, int value, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    ms->nested_esa390 = value;
+}
+
 static inline bool machine_get_dea_key_wrap(Object *obj, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
@@ -1231,6 +1250,16 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             "translation before it switches to z/Architecture; the topmost "
             "megabyte of storage is hidden from the guest and holds shadow "
             "tables (KVM only)");
+
+    object_class_property_add_enum(oc, "nested-esa390", "OnOffAuto",
+                                   &OnOffAuto_type_info,
+                                   machine_get_nested_esa390,
+                                   machine_set_nested_esa390);
+    object_class_property_set_description(oc, "nested-esa390",
+            "let a hypervisor in the guest run its own guests in ESA/390 "
+            "mode: auto (default) where the host kernel can, on to require "
+            "it, off to refuse such guests as kernels before Linux 7.1 do "
+            "(KVM only)");
 
     object_class_property_add_bool(oc, "dea-key-wrap",
                                    machine_get_dea_key_wrap,

@@ -30,6 +30,7 @@
 #include "system/kvm_int.h"
 #include "qemu/cutils.h"
 #include "qapi/error.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
@@ -331,6 +332,41 @@ int kvm_arch_get_default_type(MachineState *ms)
     return 0;
 }
 
+/*
+ * A hypervisor in the guest may want to run its own guests with state
+ * descriptions in ESA/390 format, as machines allow.  The kernel (Linux 7.1
+ * and later) passes those on only when asked to; without it, and on older
+ * kernels, such a nested guest ends in a validity interception.  Nothing
+ * tells the guest hypervisor which of the two it will get, and nothing
+ * else changes for the guest, so the default is to ask whenever the kernel
+ * can.  nested-esa390=on makes a host without it refuse to start the
+ * machine (for instance as a migration target), off keeps the old
+ * behaviour.
+ */
+static int kvm_s390_nested_esa390_init(MachineState *ms, KVMState *s)
+{
+    OnOffAuto want = ON_OFF_AUTO_AUTO;
+
+    if (object_property_find(OBJECT(ms), "nested-esa390")) {
+        want = object_property_get_enum(OBJECT(ms), "nested-esa390",
+                                        &OnOffAuto_type_info, &error_abort);
+    }
+    if (want == ON_OFF_AUTO_OFF) {
+        return 0;
+    }
+    if (kvm_check_extension(s, KVM_CAP_S390_VSIE_ESAMODE) > 0 &&
+        !kvm_vm_enable_cap(s, KVM_CAP_S390_VSIE_ESAMODE, 0)) {
+        return 0;
+    }
+    if (want == ON_OFF_AUTO_ON) {
+        error_report("The KVM of this host kernel cannot run nested guests "
+                     "in ESA/390 mode, which machine property "
+                     "nested-esa390=on asks for");
+        return -ENOTSUP;
+    }
+    return 0;
+}
+
 int kvm_arch_init(MachineState *ms, KVMState *s)
 {
     int required_caps[] = {
@@ -367,6 +403,10 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
 
     /* must precede the CPU model and the creation of the first vCPU */
     if (kvm_s390_esa390_init(ms, s) < 0) {
+        return -ENOTSUP;
+    }
+
+    if (kvm_s390_nested_esa390_init(ms, s) < 0) {
         return -ENOTSUP;
     }
 
