@@ -316,6 +316,7 @@ qtests_s390x = \
   ['3590-ccw-test'] + \
   ['eckd-ccw-test'] + \
   ['fba-ccw-test'] + \
+  ['css-measurement-test'] + \
   ['qeth-ccw-test'] + \
   ['boot-serial-test',
    's390x-ipl-test',
