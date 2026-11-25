@@ -34,6 +34,7 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "hw/s390x/sclp.h"
 #include "hw/s390x/event-facility.h"
 #include "hw/s390x/ebcdic.h"
@@ -125,9 +126,12 @@ struct SCLPFileAccess {
     /* the request in flight and then its result, in guest byte order */
     SclpFileRequest req;
     uint16_t req_len;
-    bool busy;              /* worker thread running (BQL) */
+    bool busy;              /* a worker thread exists, not joined (BQL) */
+    bool done;              /* the worker is finished with the request (BQL) */
     bool cancel;
+    QemuCond done_cond;     /* signals done, waited for with the BQL */
     QemuThread thread;
+    VMChangeStateEntry *vmstate_change;
 };
 
 static bool can_handle_event(uint8_t type)
@@ -673,24 +677,41 @@ static void *sclp_file_worker(void *opaque)
     }
 
     bql_lock();
-    fa->event.event_pending = true;
-    sclp_service_interrupt(0);
+    /* A request that was cancelled (reset, unplug) has no result. */
+    if (!qatomic_read(&fa->cancel)) {
+        fa->event.event_pending = true;
+        sclp_service_interrupt(0);
+    }
+    /* Nothing of the device is touched after this point. */
+    fa->done = true;
+    qemu_cond_broadcast(&fa->done_cond);
     bql_unlock();
     return NULL;
 }
 
-/* Wait for the worker thread. Called with the BQL held. */
+/*
+ * Wait until the worker thread is finished with the request. Called with
+ * the BQL held, which is released while waiting: the worker needs it for
+ * guest memory. Several callers may wait at the same time (a reset and a
+ * service call of another CPU); the thread is joined once, by whoever comes
+ * first after it is done, and that join does not wait for anything that
+ * needs the BQL.
+ */
 static void sclp_file_finish(SCLPFileAccess *fa, bool cancel)
 {
     if (!fa->busy) {
         return;
     }
-    qatomic_set(&fa->cancel, cancel);
-    bql_unlock();
-    qemu_thread_join(&fa->thread);
-    bql_lock();
-    fa->busy = false;
-    qatomic_set(&fa->cancel, false);
+    if (cancel) {
+        qatomic_set(&fa->cancel, true);
+    }
+    while (fa->busy && !fa->done) {
+        qemu_cond_wait_bql(&fa->done_cond);
+    }
+    if (fa->busy) {
+        fa->busy = false;
+        qemu_thread_join(&fa->thread);
+    }
 }
 
 static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
@@ -717,7 +738,7 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
         return SCLP_RC_EVENT_BUFFER_SYNTAX_ERROR;
     }
 
-    if (fa->busy && !event->event_pending) {
+    if (fa->busy && !fa->done) {
         /* one request at a time */
         return SCLP_RC_INVALID_FUNCTION;
     }
@@ -727,6 +748,8 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
 
     memcpy(&fa->req, ebh, need);
     fa->req_len = need;
+    fa->done = false;
+    qatomic_set(&fa->cancel, false);
     fa->busy = true;
     qemu_thread_create(&fa->thread, "sclp-file", sclp_file_worker, fa,
                        QEMU_THREAD_JOINABLE);
@@ -784,8 +807,24 @@ static void sclp_file_set_path(Object *obj, const char *value, Error **errp)
     fa->path = g_strdup(value && *value ? value : NULL);
 }
 
+/*
+ * A request in flight writes guest memory and ends with a pending event.
+ * Let it complete when the VM stops: that is before the last pass over
+ * guest memory of a migration or snapshot, and before the device state is
+ * saved. The guest cannot start another one while it is stopped. The time
+ * the rest of the transfer takes is part of the downtime.
+ */
+static void sclp_file_vm_state_change(void *opaque, bool running,
+                                      RunState state)
+{
+    if (!running) {
+        sclp_file_finish(opaque, false);
+    }
+}
+
 static int sclp_file_pre_save(void *opaque)
 {
+    /* Nothing to wait for, see sclp_file_vm_state_change(). */
     sclp_file_finish(opaque, false);
     return 0;
 }
@@ -812,9 +851,21 @@ static void sclp_file_reset(DeviceState *dev)
     fa->req_len = 0;
 }
 
+static int sclp_file_init(SCLPEvent *event)
+{
+    SCLPFileAccess *fa = SCLP_FILE_ACCESS(event);
+
+    fa->vmstate_change =
+        qemu_add_vm_change_state_handler(sclp_file_vm_state_change, fa);
+    return 0;
+}
+
 static void sclp_file_unrealize(DeviceState *dev)
 {
-    sclp_file_finish(SCLP_FILE_ACCESS(dev), true);
+    SCLPFileAccess *fa = SCLP_FILE_ACCESS(dev);
+
+    g_clear_pointer(&fa->vmstate_change, qemu_del_vm_change_state_handler);
+    sclp_file_finish(fa, true);
 }
 
 static void sclp_file_instance_init(Object *obj)
@@ -822,6 +873,7 @@ static void sclp_file_instance_init(Object *obj)
     SCLPFileAccess *fa = SCLP_FILE_ACCESS(obj);
 
     qemu_mutex_init(&fa->lock);
+    qemu_cond_init(&fa->done_cond);
     fa->root_fd = -1;
 }
 
@@ -833,6 +885,7 @@ static void sclp_file_instance_finalize(Object *obj)
         close(fa->root_fd);
     }
     g_free(fa->path);
+    qemu_cond_destroy(&fa->done_cond);
     qemu_mutex_destroy(&fa->lock);
 }
 
@@ -861,6 +914,7 @@ static void sclp_file_class_init(ObjectClass *klass, const void *data)
     k->get_send_mask = send_mask;
     k->get_receive_mask = receive_mask;
     k->can_handle_event = can_handle_event;
+    k->init = sclp_file_init;
     k->read_event_data = read_event_data;
     k->write_event_data = write_event_data;
 }
