@@ -304,7 +304,7 @@ int main(int argc, char **argv)
     qtest_add_func("/fba-ccw/full-configuration", test_full_configuration);
     qtest_add_func("/fba-ccw/dev9336-shortcut", test_dev9336_shortcut);
     qtest_add_func("/fba-ccw/auto-devnos", test_auto_devnos);
-    if (qtest_has_accel("tcg")) {
+    if (ccw_prog_accel()) {
         qtest_add_func("/fba-ccw/io/2g-boundary", test_io_2g_boundary);
         qtest_add_func("/fba-ccw/io/skip", test_io_skip);
         qtest_add_func("/fba-ccw/io/identity", test_identity);

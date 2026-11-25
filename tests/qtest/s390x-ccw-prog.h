@@ -1,7 +1,7 @@
 /*
  * Run channel programs on emulated s390x CCW devices from a qtest
  *
- * A tiny guest program, IPLed as a raw kernel image under TCG, enables the
+ * A tiny guest program, IPLed as a raw kernel image, enables the
  * subchannel and then waits for the test.  Each time the test sets the GO
  * byte, the program issues START SUBCHANNEL with the ORB at CCW_PROG_ORB,
  * polls TEST SUBCHANNEL until status is pending, stores the IRB at
@@ -150,12 +150,27 @@ static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
     return ccw_prog_wait(qts, irb);
 }
 
-/* Start QEMU with the guest program and the given devices under TCG. */
+/*
+ * The accelerator that runs the guest program: KVM where the host offers
+ * it, else TCG; NULL if there is none.
+ */
+static inline const char *ccw_prog_accel(void)
+{
+    if (qtest_has_accel("kvm")) {
+        return "kvm";
+    }
+    if (qtest_has_accel("tcg")) {
+        return "tcg";
+    }
+    return NULL;
+}
+
+/* Start QEMU with the guest program and the given devices. */
 static inline QTestState *ccw_prog_start(const char *image, const char *mem,
                                          const char *devices)
 {
-    return qtest_initf("-nodefaults -accel tcg -m %s -kernel %s %s",
-                       mem, image, devices);
+    return qtest_initf("-nodefaults -accel %s -m %s -kernel %s %s",
+                       ccw_prog_accel(), mem, image, devices);
 }
 
 #endif

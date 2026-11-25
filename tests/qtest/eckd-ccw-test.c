@@ -471,8 +471,8 @@ static void test_migration_orientation(void)
     g_assert_cmpint(ccw_prog_run(src, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
     g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
 
-    dst = qtest_initf("-nodefaults -accel tcg -m 3G -kernel %s %s "
-                      "-incoming %s", image, devices, uri);
+    dst = qtest_initf("-nodefaults -accel %s -m 3G -kernel %s %s "
+                      "-incoming %s", ccw_prog_accel(), image, devices, uri);
     qtest_qmp_assert_success(src, "{'execute': 'migrate', "
                              "'arguments': {'uri': %s}}", uri);
     wait_migration_completed(src);
@@ -527,8 +527,8 @@ static void test_migration_during_io(void)
         ccw_prog_set_ccw(src, head - 1, 0x07, head < 14 ? CCW_FLAG_CC : 0,
                          sizeof(seek), CCW_PROG_DATA + head * 8);
     }
-    dst = qtest_initf("-nodefaults -accel tcg -m 3G -kernel %s %s "
-                      "-incoming %s", image, devices, uri);
+    dst = qtest_initf("-nodefaults -accel %s -m 3G -kernel %s %s "
+                      "-incoming %s", ccw_prog_accel(), image, devices, uri);
     ccw_prog_go(src, CCW_ORB_FMT | CCW_ORB_C64);
     qtest_qmp_assert_success(src, "{'execute': 'migrate', "
                              "'arguments': {'uri': %s}}", uri);
@@ -741,7 +741,7 @@ int main(int argc, char **argv)
                    test_header_size_any_file_sequence);
     qtest_add_func("/eckd-ccw/cylinders-property", test_cylinders_property);
     qtest_add_func("/eckd-ccw/identity-invalid", test_identity_invalid);
-    if (qtest_has_accel("tcg")) {
+    if (ccw_prog_accel()) {
         qtest_add_func("/eckd-ccw/io/identity", test_identity);
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
         qtest_add_func("/eckd-ccw/io/track-cache-invalidation",
