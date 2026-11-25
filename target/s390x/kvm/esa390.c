@@ -13,6 +13,8 @@
  *
  *   kvm_s390_esa390_init()        machine properties -> kernel, once
  *   kvm_s390_esa390_cm_enabled()  the VM was set up for the mode
+ *   kvm_s390_esa390_dat_reserve() storage at the top that the guest is
+ *                                 not told about
  *   kvm_s390_set_arch_mode()      put the configuration into a mode
  *   kvm_s390_get_arch_mode()      the mode the configuration is in
  *
@@ -32,9 +34,19 @@
 #include "system/kvm.h"
 #include "system/kvm_int.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "hw/core/boards.h"
 
+/*
+ * ESA/390 address translation in the mode: the kernel keeps shadow tables
+ * in an area of guest absolute storage that QEMU sets aside for it, the
+ * topmost megabyte.
+ */
+#define ESA390_DAT_AREA_SIZE (1 * MiB)
+#define ESA390_DAT_MIN_RAM (16 * MiB)
+
 static bool cap_esa390_cm;
+static uint64_t esa390_dat_area_size;
 
 /*
  * The capability number is provisional: do not trust it alone.  After the
@@ -81,7 +93,43 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
         return -ENOTSUP;
     }
     cap_esa390_cm = true;
+
+    if (object_property_get_bool(OBJECT(ms), "esa390-dat", NULL)) {
+        struct kvm_s390_esa390_dat_area area = {
+            .base = ms->ram_size - ESA390_DAT_AREA_SIZE,
+            .size = ESA390_DAT_AREA_SIZE,
+        };
+        struct kvm_device_attr attr = {
+            .group = KVM_S390_VM_ARCH_MODE,
+            .attr = KVM_S390_VM_ARCH_MODE_DAT_AREA,
+            .addr = (uint64_t)&area,
+        };
+
+        if (ms->ram_size < ESA390_DAT_MIN_RAM) {
+            error_report("machine property esa390-dat=on needs at least "
+                         "16 MiB of memory");
+            return -EINVAL;
+        }
+        if (kvm_vm_ioctl(s, KVM_HAS_DEVICE_ATTR, &attr) ||
+            kvm_vm_ioctl(s, KVM_SET_DEVICE_ATTR, &attr)) {
+            error_report("The KVM of this host kernel does not support "
+                         "ESA/390 address translation in the "
+                         "ESA/390-compatibility mode, which machine "
+                         "property esa390-dat=on needs");
+            return -ENOTSUP;
+        }
+        esa390_dat_area_size = ESA390_DAT_AREA_SIZE;
+    }
     return 0;
+}
+
+/*
+ * Size of the storage at the top of the configuration that is set aside
+ * (esa390-dat) and must not be reported to the guest as its own; 0 if none.
+ */
+uint64_t kvm_s390_esa390_dat_reserve(void)
+{
+    return esa390_dat_area_size;
 }
 
 bool kvm_s390_esa390_cm_enabled(void)

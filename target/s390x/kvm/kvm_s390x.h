@@ -31,6 +31,7 @@ int kvm_s390_get_protected_dump(void);
 /* ESA/390-compatibility mode (esa390.c) */
 int kvm_s390_esa390_init(MachineState *ms, struct KVMState *s);
 bool kvm_s390_esa390_cm_enabled(void);
+uint64_t kvm_s390_esa390_dat_reserve(void);
 int kvm_s390_set_arch_mode(bool esa);
 int kvm_s390_get_arch_mode(void);
 

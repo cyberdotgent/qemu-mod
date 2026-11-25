@@ -26,6 +26,7 @@
 #include "hw/s390x/cpu-topology.h"
 #include "hw/s390x/s390-virtio-ccw.h"
 #include "hw/s390x/storage-keys.h"
+#include "target/s390x/kvm/kvm_s390x.h"
 
 static SCLPDevice *get_sclp_device(void)
 {
@@ -191,7 +192,7 @@ static void read_SCP_info(SCLPDevice *sclp, SCCB *sccb)
      * memory device region, which is not exposed through SCLP but through
      * diag500.
      */
-    rnmax = machine->ram_size / increment;
+    rnmax = (machine->ram_size - kvm_s390_esa390_dat_reserve()) / increment;
     if (rnmax < 0x10000) {
         read_info->rnmax = cpu_to_be16(rnmax);
     } else {

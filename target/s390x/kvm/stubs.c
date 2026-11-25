@@ -153,6 +153,11 @@ bool kvm_s390_esa390_cm_enabled(void)
     return false;
 }
 
+uint64_t kvm_s390_esa390_dat_reserve(void)
+{
+    return 0;
+}
+
 int kvm_s390_set_arch_mode(bool esa)
 {
     return esa ? -ENOTSUP : 0;

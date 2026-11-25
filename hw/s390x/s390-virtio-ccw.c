@@ -287,6 +287,10 @@ static void ccw_init(MachineState *machine)
         error_report("machine property esa390-cm=on requires KVM");
         exit(1);
     }
+    if (ms->esa390_dat && !ms->esa390_cm) {
+        error_report("machine property esa390-dat=on requires esa390-cm=on");
+        exit(1);
+    }
 
     ms->sclp = SCLP(object_new(TYPE_SCLP));
     object_property_add_child(OBJECT(machine), TYPE_SCLP, OBJECT(ms->sclp));
@@ -843,6 +847,21 @@ static inline void machine_set_esa390_cm(Object *obj, bool value,
     ms->esa390_cm = value;
 }
 
+static inline bool machine_get_esa390_dat(Object *obj, Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    return ms->esa390_dat;
+}
+
+static inline void machine_set_esa390_dat(Object *obj, bool value,
+                                          Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    ms->esa390_dat = value;
+}
+
 static inline bool machine_get_dea_key_wrap(Object *obj, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
@@ -1163,6 +1182,15 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             "start the configuration in the ESA/390-compatibility mode; "
             "the guest switches to z/Architecture with SIGP set-architecture "
             "(KVM only)");
+
+    object_class_property_add_bool(oc, "esa390-dat",
+                                   machine_get_esa390_dat,
+                                   machine_set_esa390_dat);
+    object_class_property_set_description(oc, "esa390-dat",
+            "with esa390-cm: let the guest use ESA/390 dynamic address "
+            "translation before it switches to z/Architecture; the topmost "
+            "megabyte of storage is hidden from the guest and holds shadow "
+            "tables (KVM only)");
 
     object_class_property_add_bool(oc, "dea-key-wrap",
                                    machine_get_dea_key_wrap,
