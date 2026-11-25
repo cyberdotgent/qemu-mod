@@ -561,11 +561,12 @@ static void s390_machine_reset(MachineState *machine, ResetType type)
      * clears the configuration; only a CPU reset or a system-reset-normal
      * would leave the mode alone, and those do not come through here.
      */
-    if (ms->esa390_cm && reset_type != S390_RESET_PV) {
-        if (kvm_s390_set_arch_mode(true)) {
-            error_report("could not put the configuration into the "
-                         "ESA/390-compatibility mode");
-        }
+    if (ms->esa390_cm && reset_type != S390_RESET_PV &&
+        kvm_s390_set_arch_mode(true)) {
+        error_report("could not put the configuration into the "
+                     "ESA/390-compatibility mode; it stays in "
+                     "z/Architecture mode");
+    } else if (ms->esa390_cm && reset_type != S390_RESET_PV) {
         CPU_FOREACH(t) {
             CPUS390XState *env = &S390_CPU(t)->env;
 

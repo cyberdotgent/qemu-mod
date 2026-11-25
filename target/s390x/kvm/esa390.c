@@ -8,21 +8,31 @@
  *
  * The kernel interface for this is that of a kernel series for Linux 7.3
  * and not part of upstream Linux (see the PROVISIONAL blocks in
- * linux-headers/).  The kernel offers the capability only when its kvm
- * module was loaded with esa390_cm=1, wants KVM_CAP_S390_USER_SIGP enabled
- * first, and leaves everything SIGP set-architecture defines apart from
- * the format of the state descriptions to user space.  Everything
- * QEMU knows about it is in this file, behind the functions declared in
- * kvm_s390x.h under "ESA/390-compatibility mode":
+ * linux-headers/).  The kernel offers the capability on every host, wants
+ * KVM_CAP_S390_USER_SIGP enabled first, and leaves everything SIGP
+ * set-architecture defines apart from the format of the state descriptions
+ * to user space.  Of the facility list it only keeps bit 2 (z/Architecture
+ * mode active) in line with the mode; the bits that say whether the
+ * configuration offers the mode at all (138, 168) are QEMU's.  Whether the
+ * machine, or the hypervisor below the host, runs state descriptions in the
+ * ESA/390 format is only known when a vCPU is first run in the mode: KVM_RUN
+ * fails with EINVAL if not.  Everything QEMU knows about it is in this file,
+ * behind the functions declared in kvm_s390x.h under "ESA/390-compatibility
+ * mode":
  *
  *   kvm_s390_esa390_init()        machine properties -> kernel, once
  *   kvm_s390_esa390_cm_enabled()  the VM was set up for the mode
+ *   kvm_s390_esa390_fac_list()    the facility bits of the mode in the
+ *                                 CPU model given to the kernel
  *   kvm_s390_esa390_dat_reserve() storage at the top that the guest is
  *                                 not told about
  *   kvm_s390_set_arch_mode()      put the configuration into a mode
  *   kvm_s390_get_arch_mode()      the mode the configuration is in
  *   kvm_s390_esa390_put_arch_regs() hand a CPU's registers that a mode
  *                                 change alters to the kernel
+ *   kvm_s390_esa390_note_exit()   a vCPU ran: the host runs the mode
+ *   kvm_s390_esa390_run_failed()  explain a failed KVM_RUN in the mode
+ *   kvm_s390_esa390_guest_debug() guest debugging is refused in the mode
  *
  * A change of the kernel interface, or moving work from the kernel into
  * QEMU, lands here; the callers (machine reset, register synchronisation,
@@ -54,6 +64,12 @@
 
 static bool cap_esa390_cm;
 static uint64_t esa390_dat_area_size;
+/* the mode the configuration was last put into */
+static bool arch_mode_esa;
+/* a vCPU came back from KVM_RUN with an exit while in the mode */
+static bool esa390_cm_ran;
+/* the refusal of guest debugging was reported since the mode was entered */
+static bool esa390_debug_warned;
 
 /*
  * The capability number is provisional: do not trust it alone.  After the
@@ -97,8 +113,7 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
         error_report("The KVM of this host kernel does not offer the "
                      "ESA/390-compatibility mode, which machine property "
                      "esa390-cm=on (a default of machine czam-compat) "
-                     "needs: it takes a kernel with that support and the "
-                     "kvm module parameter esa390_cm=1");
+                     "needs: it takes a kernel with that support");
         return -ENOTSUP;
     }
     cap_esa390_cm = true;
@@ -136,6 +151,23 @@ int kvm_s390_esa390_init(MachineState *ms, KVMState *s)
 }
 
 /*
+ * The facility bits of a configuration that offers the mode, in the list
+ * that QEMU gives the kernel as the CPU model (KVM_S390_VM_CPU_PROCESSOR):
+ * the ESA/390-compatibility-mode facility (168) is installed and the
+ * configuration-z/Architecture-architectural-mode facility (138), which says
+ * that the configuration always runs in z/Architecture, is not.  Bit 2
+ * (z/Architecture mode active) is the kernel's: it changes with the mode.
+ */
+void kvm_s390_esa390_fac_list(uint8_t *fac_list)
+{
+    if (!cap_esa390_cm) {
+        return;
+    }
+    fac_list[138 / 8] &= ~(0x80 >> (138 % 8));
+    fac_list[168 / 8] |= 0x80 >> (168 % 8);
+}
+
+/*
  * Size of the storage at the top of the configuration that is set aside
  * (esa390-dat) and must not be reported to the guest as its own; 0 if none.
  */
@@ -160,10 +192,25 @@ int kvm_s390_set_arch_mode(bool esa)
         .addr = (uint64_t)&mode,
     };
 
+    int ret;
+
     if (!cap_esa390_cm) {
         return esa ? -ENOTSUP : 0;
     }
-    return kvm_vm_ioctl(kvm_state, KVM_SET_DEVICE_ATTR, &attr);
+    ret = kvm_vm_ioctl(kvm_state, KVM_SET_DEVICE_ATTR, &attr);
+    if (!ret) {
+        if (esa && !arch_mode_esa) {
+            esa390_debug_warned = false;
+        }
+        arch_mode_esa = esa;
+    } else if (ret == -EINVAL && esa) {
+        /* the mode is valid: the kernel refuses because of guest debugging */
+        error_report("KVM does not put the configuration into the "
+                     "ESA/390-compatibility mode while guest debugging is "
+                     "enabled (single-stepping, hardware breakpoints or "
+                     "watchpoints of the gdbstub): remove them first");
+    }
+    return ret;
 }
 
 /* 1: ESA/390-compatibility mode, 0: z/Architecture, < 0: not switchable */
@@ -201,4 +248,57 @@ void kvm_s390_esa390_put_arch_regs(CPUState *cs)
            sizeof(cs->kvm_run->s.regs.crs));
     cs->kvm_run->s.regs.prefix = env->psa;
     cs->kvm_run->kvm_dirty_regs |= KVM_SYNC_CRS | KVM_SYNC_PREFIX;
+}
+
+/* Called for every exit of a vCPU from KVM_RUN that was not an error. */
+void kvm_s390_esa390_note_exit(void)
+{
+    if (arch_mode_esa && !esa390_cm_ran) {
+        esa390_cm_ran = true;
+    }
+}
+
+/*
+ * KVM_RUN failed: if the configuration is in the mode, say what a failure
+ * there most likely means.  The kernel fails KVM_RUN with EINVAL when the
+ * machine, or a hypervisor below the host, answers an ESA/390-format state
+ * description with a validity interception; nothing tells QEMU in advance.
+ */
+void kvm_s390_esa390_run_failed(CPUState *cs, int run_ret)
+{
+    if (!cap_esa390_cm || !arch_mode_esa || run_ret != -EINVAL) {
+        return;
+    }
+    if (!esa390_cm_ran) {
+        error_report("CPU %d could not be run in the ESA/390-compatibility "
+                     "mode: the machine, or the hypervisor this host runs "
+                     "under, does not run guests in that mode (if that is "
+                     "a KVM host, its QEMU needs nested-esa390=on or auto "
+                     "and a kernel with KVM_CAP_S390_VSIE_ESAMODE).  "
+                     "Machine property esa390-cm=on (a default of machine "
+                     "czam-compat) cannot be used on this host",
+                     cs->cpu_index);
+    } else {
+        error_report("CPU %d failed in the ESA/390-compatibility mode; "
+                     "the host kernel log may give the reason",
+                     cs->cpu_index);
+    }
+}
+
+/*
+ * KVM refuses guest debugging in the mode (KVM_SET_GUEST_DEBUG with
+ * KVM_GUESTDBG_ENABLE fails with EINVAL).  Say so instead of letting a
+ * single step silently become a continue.  Software breakpoints do not need
+ * it and keep working.
+ */
+void kvm_s390_esa390_guest_debug(struct kvm_guest_debug *dbg)
+{
+    if (!cap_esa390_cm || !arch_mode_esa ||
+        !(dbg->control & KVM_GUESTDBG_ENABLE) || esa390_debug_warned) {
+        return;
+    }
+    esa390_debug_warned = true;
+    warn_report("guest debugging (single-stepping, hardware breakpoints "
+                "and watchpoints) is not available while the guest is in "
+                "the ESA/390-compatibility mode: KVM refuses the request");
 }

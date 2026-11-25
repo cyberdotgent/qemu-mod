@@ -1049,6 +1049,7 @@ void kvm_arch_update_guest_debug(CPUState *cpu, struct kvm_guest_debug *dbg)
         dbg->arch.nr_hw_bp = 0;
         dbg->arch.hw_bp = NULL;
     }
+    kvm_s390_esa390_guest_debug(dbg);
 }
 
 void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
@@ -2100,6 +2101,8 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
     S390CPU *cpu = S390_CPU(cs);
     int ret = 0;
 
+    kvm_s390_esa390_note_exit();
+
     /* Traced single-steps re-enter KVM without the BQL or a state sync. */
     if (s390_kvm_itrace_exit(cs, run)) {
         return 0;
@@ -2766,6 +2769,7 @@ bool kvm_s390_apply_cpu_model(const S390CPUModel *model, Error **errp)
     /* configure cpu features indicated via STFL(e) */
     s390_fill_feat_block(model->features, S390_FEAT_TYPE_STFL,
                          (uint8_t *) prop.fac_list);
+    kvm_s390_esa390_fac_list((uint8_t *) prop.fac_list);
     rc = kvm_vm_ioctl(kvm_state, KVM_SET_DEVICE_ATTR, &attr);
     if (rc) {
         error_setg(errp, "KVM: Error configuring the CPU model: %d", rc);

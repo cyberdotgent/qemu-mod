@@ -39,6 +39,9 @@
 #include "qemu/bswap.h"
 #include "exec/tswap.h"
 #include "exec/target_page.h"
+#ifdef TARGET_S390X
+#include "target/s390x/kvm/kvm_s390x.h"
+#endif
 #include "system/memory.h"
 #include "qemu/event_notifier.h"
 #include "qemu/main-loop.h"
@@ -3525,6 +3528,9 @@ int kvm_cpu_exec(CPUState *cpu)
                             "VCPU can only run on primary threads with all "
                             "secondary threads offline.\n");
                 }
+#endif
+#ifdef TARGET_S390X
+                kvm_s390_esa390_run_failed(cpu, run_ret);
 #endif
                 ret = -1;
                 break;

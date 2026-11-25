@@ -19,13 +19,21 @@ and ``czam`` machine types start in that mode.  The machine type
    kernel's KVM that is not part of upstream Linux, and the interface to it
    is provisional (see the ``PROVISIONAL`` blocks in ``linux-headers/`` and
    ``target/s390x/kvm/esa390.c``).  QEMU speaks the interface of the kernel
-   series for Linux 7.3; that kernel offers the mode only when its ``kvm``
-   module is loaded with ``esa390_cm=1``, and ``esa390-dat`` additionally
-   needs ``esa390_lab_dat=1``.  QEMU checks for the support when it
-   starts and ends with an error message naming the property if the kernel
-   does not have it, or if the accelerator is not KVM.  With the properties
-   off, which is the default of every machine type but ``czam-compat``,
-   nothing changes.
+   series for Linux 7.3; ``esa390-dat`` additionally needs a lab patch of
+   that series and its ``kvm`` module parameter ``esa390_lab_dat=1``.
+   QEMU checks for the support when it starts and ends with an error
+   message naming the property if the kernel does not have it, or if the
+   accelerator is not KVM.  Whether the machine, or a hypervisor below the
+   host, runs guests in the mode is only known when the first CPU runs:
+   if it does not, QEMU reports that and stops the guest (for a KVM host
+   below, its QEMU needs ``nested-esa390``).  With the properties off,
+   which is the default of every machine type but ``czam-compat``, nothing
+   changes.
+
+With ``esa390-cm=on`` QEMU presents the ESA/390-compatibility-mode facility
+(facility bit 168) and not the configuration-z/Architecture-architectural-mode
+facility (bit 138) in the CPU model; the kernel keeps bit 2 (z/Architecture
+mode active) in line with the mode.
 
 ``esa390-cm=on|off``
   The configuration starts in the ESA/390-compatibility mode, and is put
@@ -52,6 +60,11 @@ Limitations:
   keeps running.  Once it has switched to z/Architecture it migrates as
   usual.  Source and destination need the same setting of both properties.
 * Protected virtualization is not available with the mode.
+* KVM refuses guest debugging in the mode: single-stepping, hardware
+  breakpoints and watchpoints of the gdbstub are refused (with a warning)
+  while the guest is in the mode, and the configuration cannot enter the
+  mode (SIGP set-architecture, or a reset that belongs to a load) while
+  they are in use.  Software breakpoints are not affected.
 
 SIGP set-architecture is executed by QEMU: the kernel changes the format
 in which it runs the CPUs, QEMU the PSW, control registers and prefix as

@@ -29,12 +29,17 @@ int kvm_s390_get_hpage(void);
 int kvm_s390_get_protected_dump(void);
 
 /* ESA/390-compatibility mode (esa390.c) */
+struct kvm_guest_debug;
 int kvm_s390_esa390_init(MachineState *ms, struct KVMState *s);
 bool kvm_s390_esa390_cm_enabled(void);
+void kvm_s390_esa390_fac_list(uint8_t *fac_list);
 uint64_t kvm_s390_esa390_dat_reserve(void);
 int kvm_s390_set_arch_mode(bool esa);
 int kvm_s390_get_arch_mode(void);
 void kvm_s390_esa390_put_arch_regs(CPUState *cs);
+void kvm_s390_esa390_note_exit(void);
+void kvm_s390_esa390_run_failed(CPUState *cs, int run_ret);
+void kvm_s390_esa390_guest_debug(struct kvm_guest_debug *dbg);
 
 int kvm_s390_get_ri(void);
 int kvm_s390_get_zpci_op(void);
