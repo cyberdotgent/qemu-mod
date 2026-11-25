@@ -199,6 +199,59 @@ static void s390_ins_add(GPtrArray *regions, uint64_t addr,
     g_ptr_array_add(regions, new);
 }
 
+/*
+ * A medium that was copied to a host directory often has its files in lower
+ * case while the INS file names them in upper case, or the other way round.
+ * When a component does not exist as written, look each part of its name up
+ * without regard to case.  A part that matches more than one directory entry
+ * is not resolved.  Returns the path found, or NULL.
+ */
+static char *s390_ins_find_nocase(const char *directory, const char *name)
+{
+    g_auto(GStrv) parts = g_strsplit(name, "/", -1);
+    g_autofree char *path = g_strdup(directory);
+
+    for (unsigned int i = 0; parts[i]; i++) {
+        g_autofree char *exact = NULL;
+        g_autofree char *match = NULL;
+        g_autofree char *next = NULL;
+        const char *entry;
+        bool ambiguous = false;
+        GDir *dir;
+
+        if (!*parts[i] || !strcmp(parts[i], ".")) {
+            continue;
+        }
+        exact = g_build_filename(path, parts[i], NULL);
+        if (g_file_test(exact, G_FILE_TEST_EXISTS)) {
+            g_free(path);
+            path = g_steal_pointer(&exact);
+            continue;
+        }
+        dir = g_dir_open(path, 0, NULL);
+        if (!dir) {
+            return NULL;
+        }
+        while ((entry = g_dir_read_name(dir))) {
+            if (!g_ascii_strcasecmp(entry, parts[i])) {
+                if (match) {
+                    ambiguous = true;
+                    break;
+                }
+                match = g_strdup(entry);
+            }
+        }
+        g_dir_close(dir);
+        if (!match || ambiguous) {
+            return NULL;
+        }
+        next = g_build_filename(path, match, NULL);
+        g_free(path);
+        path = g_steal_pointer(&next);
+    }
+    return g_steal_pointer(&path);
+}
+
 static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
                              Error **errp)
 {
@@ -259,6 +312,14 @@ static int s390_ipl_load_ins(const char *filename, uint64_t ram_size,
             return -1;
         }
         component = g_build_filename(directory, component_name, NULL);
+        if (!g_file_test(component, G_FILE_TEST_EXISTS)) {
+            char *found = s390_ins_find_nocase(directory, component_name);
+
+            if (found) {
+                g_free(component);
+                component = found;
+            }
+        }
         if (!g_file_get_contents(component, &data, &size, NULL)) {
             error_setg(errp, "%s:%u: could not load component '%s'",
                        filename, line_no + 1, component);
