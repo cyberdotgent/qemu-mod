@@ -122,6 +122,12 @@ typedef struct ReadCsiInfo {
 #define SCCB_CPU_FEATURE_LEN 6
 #define SCLP_CPU_FEATURE_SIE_XA_MODE             0x40
 
+/*
+ * Experimental: bits ORed into the feature bytes of every CPU entry of
+ * Read SCP Info / Read CPU Info (machine property x-sclp-cpu-features).
+ */
+extern uint8_t sclp_cpu_features_or[SCCB_CPU_FEATURE_LEN];
+
 /* CPU information */
 typedef struct CPUEntry {
     uint8_t address;

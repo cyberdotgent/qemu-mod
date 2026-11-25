@@ -85,6 +85,8 @@ static bool sccb_verify_boundary(uint64_t sccb_addr, uint16_t sccb_len,
     return false;
 }
 
+uint8_t sclp_cpu_features_or[SCCB_CPU_FEATURE_LEN];
+
 static void prepare_cpu_entries(MachineState *ms, CPUEntry *entry, int *count)
 {
     uint8_t features[SCCB_CPU_FEATURE_LEN] = { 0 };
@@ -94,6 +96,9 @@ static void prepare_cpu_entries(MachineState *ms, CPUEntry *entry, int *count)
     /* SIE XA mode is a base processor characteristic, not an assist bit. */
     if (!s390_is_pv()) {
         features[0] |= SCLP_CPU_FEATURE_SIE_XA_MODE;
+    }
+    for (i = 0; i < SCCB_CPU_FEATURE_LEN; i++) {
+        features[i] |= sclp_cpu_features_or[i];
     }
     for (i = 0, *count = 0; i < ms->possible_cpus->len; i++) {
         if (!ms->possible_cpus->cpus[i].cpu) {

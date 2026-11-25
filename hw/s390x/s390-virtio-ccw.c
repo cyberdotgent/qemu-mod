@@ -877,6 +877,46 @@ static inline void machine_set_dea_key_wrap(Object *obj, bool value,
     ms->dea_key_wrap = value;
 }
 
+static void machine_set_sclp_cpu_features(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    char *val;
+    size_t i, len;
+
+    if (!visit_type_str(v, name, &val, errp)) {
+        return;
+    }
+    len = strlen(val);
+    if (len % 2 || len > 2 * SCCB_CPU_FEATURE_LEN ||
+        strspn(val, "0123456789abcdefABCDEF") != len) {
+        error_setg(errp, "x-sclp-cpu-features: up to %d bytes in hex",
+                   SCCB_CPU_FEATURE_LEN);
+        g_free(val);
+        return;
+    }
+    memset(sclp_cpu_features_or, 0, sizeof(sclp_cpu_features_or));
+    for (i = 0; i < len / 2; i++) {
+        char b[3] = { val[2 * i], val[2 * i + 1], 0 };
+
+        sclp_cpu_features_or[i] = strtoul(b, NULL, 16);
+    }
+    g_free(val);
+}
+
+static void machine_get_sclp_cpu_features(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    g_autofree char *str = g_malloc0(2 * SCCB_CPU_FEATURE_LEN + 1);
+    int i;
+
+    for (i = 0; i < SCCB_CPU_FEATURE_LEN; i++) {
+        sprintf(str + 2 * i, "%02x", sclp_cpu_features_or[i]);
+    }
+    visit_type_str(v, name, &str, errp);
+}
+
 static void machine_get_loadparm(Object *obj, Visitor *v,
                                  const char *name, void *opaque,
                                  Error **errp)
@@ -1197,6 +1237,14 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
                                    machine_set_dea_key_wrap);
     object_class_property_set_description(oc, "dea-key-wrap",
             "enable/disable DEA key wrapping using the CPACF wrapping key");
+
+    object_class_property_add(oc, "x-sclp-cpu-features", "str",
+                              &str_type_info,
+                              machine_get_sclp_cpu_features,
+                              machine_set_sclp_cpu_features, NULL, NULL);
+    object_class_property_set_description(oc, "x-sclp-cpu-features",
+            "Experimental: hex bytes ORed into the feature bytes of the"
+            " SCLP CPU entries");
 
     object_class_property_add(oc, "loadparm", "loadparm", &str_type_info,
                               machine_get_loadparm, machine_set_loadparm,
