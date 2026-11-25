@@ -2138,6 +2138,8 @@ static void eckd_reset_hold(Object *obj, ResetType type)
     eckd->update_active = false;
     eckd->update_done = false;
     eckd->read_active = false;
+    eckd->read_advanced = false;
+    eckd->record_consumed = false;
     /*
      * The device loses its orientation, and the image may have been
      * replaced or reverted while the guest was reset (loadvm, PVE
