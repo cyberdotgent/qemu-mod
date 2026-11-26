@@ -18,6 +18,7 @@
 #include "system/qtest.h"
 #include "migration/qemu-file-types.h"
 #include "migration/register.h"
+#include "qemu/host-utils.h"
 
 void s390_init_tod(void)
 {
@@ -48,6 +49,35 @@ S390TODState *s390_get_todstate(void)
     }
 
     return ts;
+}
+
+/*
+ * The TOD clock value (with epoch index) of the host's CLOCK_REALTIME.
+ * CLOCK_REALTIME is POSIX time: UTC without leap seconds, so the result
+ * counts no leap seconds either (like a TOD clock that was set to UTC
+ * and steered, rather than one that includes the leap seconds).
+ * Bit 51 of the TOD clock is one microsecond, i.e. the clock advances
+ * 4096 units per microsecond, 512/125 per nanosecond.
+ */
+void s390_tod_from_host_clock(S390TOD *tod)
+{
+    struct timespec ts;
+    uint64_t lo, hi, sub;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    /* seconds * 4096000000 (128 bit) */
+    mulu64(&lo, &hi, (uint64_t)ts.tv_sec, 4096000000ULL);
+    sub = ((uint64_t)ts.tv_nsec * 512) / 125;
+    lo += sub;
+    if (lo < sub) {
+        hi++;
+    }
+    lo += TOD_UNIX_EPOCH;
+    if (lo < TOD_UNIX_EPOCH) {
+        hi++;
+    }
+    tod->high = hi;
+    tod->low = lo;
 }
 
 #define S390_TOD_CLOCK_VALUE_MISSING    0x00

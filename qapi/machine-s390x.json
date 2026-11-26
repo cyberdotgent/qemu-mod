@@ -137,6 +137,31 @@
 }
 
 ##
+# @S390TodSource:
+#
+# Where an s390x KVM guest's time-of-day (TOD) clock is set from
+# when the guest is started.
+#
+# @machine: do not set the TOD clock; the guest sees the TOD clock
+#     of the host machine (epoch difference 0).  This is the
+#     default.
+#
+# @host: set the guest TOD clock once from the host's
+#     CLOCK_REALTIME when the guest is first started: UTC as POSIX
+#     time, i.e. without leap seconds.  It has no effect on an
+#     incoming migration or a loaded snapshot, which carry the TOD
+#     clock, nor on a system reset, which does not reset the TOD
+#     clock.
+#
+# Under TCG the TOD clock is always derived from the host's clock,
+# whatever the value.
+#
+# Since: 11.2
+##
+{ 'enum': 'S390TodSource',
+  'data': [ 'machine', 'host' ] }
+
+##
 # @BootCertificates:
 #     Boot certificates for secure IPL.
 #

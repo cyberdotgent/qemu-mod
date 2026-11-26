@@ -37,6 +37,13 @@ struct S390TODState {
     S390TOD base;
     /* Used by KVM to remember if the TOD is stopped and base is valid. */
     bool stopped;
+    /*
+     * Used by KVM: set the TOD from the host's CLOCK_REALTIME when the VM
+     * starts running for the first time (machine property tod-source=host).
+     * Cleared once that happened, or when the TOD was set otherwise before
+     * (incoming migration, loadvm).
+     */
+    bool set_from_host;
 
     /*
      * STORE CLOCK and STORE CLOCK EXTENDED must return globally unique,
@@ -62,5 +69,6 @@ struct S390TODClass {
 
 void s390_init_tod(void);
 S390TODState *s390_get_todstate(void);
+void s390_tod_from_host_clock(S390TOD *tod);
 
 #endif

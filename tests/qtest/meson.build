@@ -322,6 +322,7 @@ qtests_s390x = \
   ['boot-serial-test',
    's390x-ipl-test',
    's390x-skeys-test',
+   's390x-tod-test',
    'drive_del-test',
    'device-plug-test',
    'virtio-ccw-test',

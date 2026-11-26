@@ -47,6 +47,7 @@ struct S390CcwMachineState {
     uint64_t max_pagesize;
     BootCertificatesList *boot_certs;
     bool ext_measurement_block;
+    S390TodSource tod_source;
     bool chsc_config_token_set;
     uint8_t chsc_config_token[64];
 
@@ -89,6 +90,7 @@ bool s390_mainframe_lpar_identity(uint16_t *number, uint8_t name_ebcdic[8]);
  * the subchannels.
  */
 bool s390_css_ext_measurement_block(void);
+bool s390_tod_source_is_host(void);
 uint64_t s390_mainframe_storage_increment(void);
 /* LPAR-personality overlays for SCLP Read SCP Info and CHSC (see .c) */
 void s390_mainframe_patch_read_info(uint8_t *read_info);

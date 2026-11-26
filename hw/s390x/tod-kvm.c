@@ -13,6 +13,8 @@
 #include "qemu/module.h"
 #include "system/runstate.h"
 #include "hw/s390x/tod.h"
+#include "hw/s390x/s390-virtio-ccw.h"
+#include "qemu/error-report.h"
 #include "target/s390x/kvm/pv.h"
 #include "kvm/kvm_s390x.h"
 
@@ -70,6 +72,8 @@ static void kvm_s390_tod_set(S390TODState *td, const S390TOD *tod, Error **errp)
         error_propagate(errp, local_err);
         return;
     }
+    /* The TOD now has a value from elsewhere: keep it. */
+    td->set_from_host = false;
 
     if (runstate_is_running()) {
         td->stopped = false;
@@ -90,6 +94,26 @@ static void kvm_s390_tod_vm_state_change(void *opaque, bool running,
      * it on resume.
      */
     if (s390_is_pv()) {
+        return;
+    }
+
+    if (running && td->set_from_host) {
+        /*
+         * tod-source=host: the first start of a fresh VM (not an incoming
+         * migration or loadvm, which set the TOD and clear the flag).  This
+         * runs before any vCPU is resumed.  The TOD is set only this once;
+         * later stop/cont and system_reset keep it running, as a reset
+         * does not reset the TOD clock of a real machine either.
+         */
+        S390TOD tod;
+
+        td->set_from_host = false;
+        s390_tod_from_host_clock(&tod);
+        kvm_s390_set_tod_raw(&tod, &local_err);
+        if (local_err) {
+            warn_report_err(local_err);
+        }
+        td->stopped = false;
         return;
     }
 
@@ -131,6 +155,8 @@ static void kvm_s390_tod_realize(DeviceState *dev, Error **errp)
      * removed), registering here and never unregistering is good enough.
      */
     qemu_add_vm_change_state_handler(kvm_s390_tod_vm_state_change, td);
+
+    td->set_from_host = s390_tod_source_is_host();
 }
 
 static void kvm_s390_tod_class_init(ObjectClass *oc, const void *data)

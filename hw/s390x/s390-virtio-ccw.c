@@ -1152,6 +1152,26 @@ bool s390_css_ext_measurement_block(void)
     return S390_CCW_MACHINE(obj)->ext_measurement_block;
 }
 
+static int machine_get_tod_source(Object *obj, Error **errp)
+{
+    return S390_CCW_MACHINE(obj)->tod_source;
+}
+
+static void machine_set_tod_source(Object *obj, int value, Error **errp)
+{
+    S390_CCW_MACHINE(obj)->tod_source = value;
+}
+
+bool s390_tod_source_is_host(void)
+{
+    Object *obj = qdev_get_machine();
+
+    if (!obj || !object_dynamic_cast(obj, TYPE_S390_CCW_MACHINE)) {
+        return false;
+    }
+    return S390_CCW_MACHINE(obj)->tod_source == S390_TOD_SOURCE_HOST;
+}
+
 static inline bool machine_get_secure_boot(Object *obj, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
@@ -1243,6 +1263,16 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "ext-measurement-block",
             "provide the extended-I/O-measurement-block facility of the "
             "channel subsystem (format-1 measurement blocks)");
+
+    object_class_property_add_enum(oc, "tod-source", "S390TodSource",
+                                   &S390TodSource_type_info,
+                                   machine_get_tod_source,
+                                   machine_set_tod_source);
+    object_class_property_set_description(oc, "tod-source",
+            "where the guest TOD clock is set from when the guest is first "
+            "started (KVM): machine (default) leaves the TOD clock of the "
+            "host machine, host sets it from the host's CLOCK_REALTIME "
+            "(UTC, POSIX time without leap seconds)");
 
     object_class_property_add_bool(oc, "esa390-cm",
                                    machine_get_esa390_cm,
