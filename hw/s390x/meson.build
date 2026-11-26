@@ -50,6 +50,7 @@ s390x_ss.add(when: ['CONFIG_S390_CCW_VIRTIO', 'CONFIG_KVM'], if_true: files(
   'iucv.c',
   'iucv-echo.c',
   'iucv-net.c',
+  'iucv-tcpip.c',
   'zvm-personality.c',
 ))
 s390x_ss.add(when: 'CONFIG_VFIO', if_true: files('s390-pci-vfio.c'))

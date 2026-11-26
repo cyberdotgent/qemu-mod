@@ -109,3 +109,9 @@ zvm_diag8(const char *cmd, int rc) "CP command \"%s\" rc %d"
 
 # iucv-net.c
 iucv_net_path(const char *name, unsigned pathid, const char *state) "%s: path %u %s"
+
+# iucv-tcpip.c
+iucv_tcpip_init(unsigned pathid, unsigned apitype, unsigned nsock, const char *res) "path %u apitype %u sockets %u: %s"
+iucv_tcpip_call(unsigned pathid, unsigned call, unsigned lo, uint32_t len, uint32_t anslen) "path %u call %u socket/arg %u len %u anslen %u"
+iucv_tcpip_reply(unsigned pathid, unsigned call, unsigned lo, int rc, int err) "path %u call %u socket/arg %u rc %d errno %d"
+iucv_tcpip_refused(uint32_t ip) "destination 0x%08x refused by the policy"
