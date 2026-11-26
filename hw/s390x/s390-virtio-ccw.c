@@ -1680,6 +1680,14 @@ static void mainframe_instance_init(Object *obj)
 
     ms->lpar_name = g_strdup(MAINFRAME_DEFAULT_LPAR_NAME);
     ms->lpar_number = MAINFRAME_DEFAULT_LPAR_NUMBER;
+    /*
+     * Without the extended-I/O-measurement-word facility (general
+     * characteristic 50), which QEMU does not provide, some operating
+     * systems stop in a wait state during IPL when characteristic 48 is
+     * offered.  Operating systems that use measurement blocks fall back to
+     * format 0.  The property can still be set to on.
+     */
+    ms->ext_measurement_block = false;
 }
 
 static void mainframe_instance_finalize(Object *obj)
@@ -1755,6 +1763,7 @@ static void czam_v1_class_init(ObjectClass *oc, const void *data)
  *   esa390-cm=on              start in the ESA/390-compatibility mode
  *   esa390-dat=on             ESA/390 address translation in that mode
  *   ext-measurement-block=off no extended-I/O-measurement-block facility
+ *                             (also the czam default)
  *
  * The first two need KVM support that is not in upstream Linux; the
  * machine does not start without it (target/s390x/kvm/esa390.c).

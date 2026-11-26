@@ -352,7 +352,13 @@ static void test_characteristics_mainframe(void)
 {
     Guest g;
 
+    /* Off by default on the machine types that mirror a partition */
     guest_start_machine(&g, "czam", "");
+    g_assert_false(chsc_general_char(&g, 48));
+    g_assert_false(chsc_general_char(&g, 50));
+    guest_stop(&g);
+
+    guest_start_machine(&g, "czam", ",ext-measurement-block=on");
     g_assert_true(chsc_general_char(&g, 48));
     g_assert_false(chsc_general_char(&g, 50));
     guest_stop(&g);
