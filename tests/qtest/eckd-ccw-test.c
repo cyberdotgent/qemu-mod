@@ -1340,6 +1340,79 @@ static void test_3380_ipl(void)
     unlink(path);
 }
 
+/*
+ * A Locate Record "Read Tracks" domain of two tracks read with two Read
+ * Track commands: the second Read Track advances to the next track
+ * (3990/9390 Storage Control Reference, Read Track).  Tracks 0/1 and 0/2
+ * hold R0 and an R1 with distinct contents; each buffer must receive R0's
+ * count, its data, R1's count and data, then the X'FF' pseudo count.
+ */
+static void test_read_track_domain(void)
+{
+    uint8_t data1[ECKD_R1_LENGTH], data2[ECKD_R1_LENGTH];
+    uint8_t extent[16] = { 0 }, locate[16] = { 0 };
+    const unsigned int len = 8 + 8 + 8 + ECKD_R1_LENGTH + 8;
+    uint8_t buf[2][8 + 8 + 8 + ECKD_R1_LENGTH + 8];
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+    CcwProgIrb irb;
+
+    memset(data1, 0x11, sizeof(data1));
+    memset(data2, 0x22, sizeof(data2));
+    path = create_ckd64_image();
+    ckd_write_r1(path, 1, data1);
+    ckd_write_r1(path, 2, data2);
+    qts = eckd_prog_start(image, path);
+
+    /* Define Extent: tracks 0/0 to 0/14. */
+    stw_be_p(extent + 14, CKD_HEADS - 1);
+    /* Locate Record: Read Tracks (0x0c), 2 tracks, seek/search 0/1, R0. */
+    locate[0] = 0x0c;
+    locate[3] = 2;
+    stw_be_p(locate + 6, 1);            /* seek address: CC 0, HH 1 */
+    stw_be_p(locate + 10, 1);           /* search argument: CC 0, HH 1 */
+    locate[12] = 0;
+    qtest_memwrite(qts, CCW_PROG_DATA, extent, sizeof(extent));
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x20, locate, sizeof(locate));
+    qtest_memset(qts, CCW_PROG_DATA + 0x100, 0, 2 * 0x100);
+    ccw_prog_set_ccw(qts, 0, 0x63, CCW_FLAG_CC, sizeof(extent),
+                     CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x47, CCW_FLAG_CC, sizeof(locate),
+                     CCW_PROG_DATA + 0x20);
+    ccw_prog_set_ccw(qts, 2, 0xde, CCW_FLAG_CC | CCW_FLAG_SLI, 0x100,
+                     CCW_PROG_DATA + 0x100);
+    ccw_prog_set_ccw(qts, 3, 0xde, CCW_FLAG_SLI, 0x100,
+                     CCW_PROG_DATA + 0x200);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    eckd_expect_ok(qts, &irb);
+    qtest_memread(qts, CCW_PROG_DATA + 0x100, buf[0], len);
+    qtest_memread(qts, CCW_PROG_DATA + 0x200, buf[1], len);
+    for (int t = 0; t < 2; t++) {
+        const uint8_t *b = buf[t];
+
+        g_test_message("track %d: R0 %02x%02x%02x%02x%02x R1 data %02x", t,
+                       b[0], b[1], b[2], b[3], b[4], b[8 + 8 + 8]);
+        /* R0 count field: CC 0, HH 1 + t, R 0, KL 0, DL 8 */
+        g_assert_cmphex(lduw_be_p(b + 2), ==, 1 + t);
+        g_assert_cmphex(b[4], ==, 0);
+        /* R1 count field and data */
+        g_assert_cmphex(lduw_be_p(b + 16 + 2), ==, 1 + t);
+        g_assert_cmphex(b[16 + 4], ==, 1);
+        g_assert_cmpmem(b + 24, ECKD_R1_LENGTH, t ? data2 : data1,
+                        ECKD_R1_LENGTH);
+        for (int i = 0; i < 8; i++) {
+            g_assert_cmphex(b[24 + ECKD_R1_LENGTH + i], ==, 0xff);
+        }
+    }
+    /* The final status belongs to the second Read Track. */
+    g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 4 * 8);
+    g_assert_cmphex(irb.count, ==, 0x100 - len);
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1367,6 +1440,8 @@ int main(int argc, char **argv)
                        test_track_cache_invalidation);
         qtest_add_func("/eckd-ccw/io/write-ckd-record-number",
                        test_write_ckd_record_number);
+        qtest_add_func("/eckd-ccw/io/read-track-domain",
+                       test_read_track_domain);
         qtest_add_func("/eckd-ccw/io/scsw-ccw-format",
                        test_scsw_ccw_format);
         qtest_add_func("/eckd-ccw/io/migration-orientation",
