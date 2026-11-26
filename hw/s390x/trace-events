@@ -106,3 +106,6 @@ iucv_guest_reply(unsigned pathid, uint32_t msgid, uint32_t len) "path %u msg %u 
 
 # zvm-personality.c
 zvm_diag8(const char *cmd, int rc) "CP command \"%s\" rc %d"
+
+# iucv-net.c
+iucv_net_path(const char *name, unsigned pathid, const char *state) "%s: path %u %s"
