@@ -116,6 +116,9 @@ void iucv_reply(IUCVService *svc, IUCVPath *path, IUCVMessage *msg,
                 const void *data, uint32_t len);
 void iucv_reject(IUCVService *svc, IUCVPath *path, IUCVMessage *msg);
 
+/* the user ID of the guest (s390-iucv userid=, else the machine's) */
+const char *s390_iucv_userid(void);
+
 /* user IDs in EBCDIC, blank padded */
 void iucv_userid_from_str(uint8_t *userid, const char *str);
 

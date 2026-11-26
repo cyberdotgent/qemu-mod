@@ -38,6 +38,7 @@
 #include "target/s390x/s390x-internal.h"
 #include "target/s390x/kvm/kvm_s390x.h"
 #include "trace.h"
+#include "hw/s390x/s390-virtio-ccw.h"
 #include <linux/kvm.h>
 
 /* function codes in general register 0 */
@@ -149,6 +150,8 @@ typedef struct IUCVMsg {
     uint32_t done;              /* bytes the guest received */
     uint32_t reply_max;
     bool received;              /* two-way: waiting for REPLY */
+    bool busy;                  /* the service's message() runs */
+    bool dead;                  /* completed during message(): free after */
 } IUCVMsg;
 
 struct IUCVPath {
@@ -593,8 +596,15 @@ void iucv_sever(IUCVService *svc, IUCVPath *path, const uint8_t *user)
     trace_iucv_sever(path->id, "service");
     /* the guest's two-way messages end with the path */
     QTAILQ_FOREACH_SAFE(m, &path->msgs, next, n) {
-        if (m->from_guest) {
+        if (!m->from_guest || m->dead) {
+            continue;
+        }
+        if (m->two_way) {
             complete_guest_msg(s, path, m, AUD_SVRD, m->ans_len, NULL);
+        }
+        if (m->busy) {
+            m->dead = true;
+        } else {
             msg_free(path, m);
         }
     }
@@ -667,7 +677,11 @@ void iucv_reply(IUCVService *svc, IUCVPath *path, IUCVMessage *msg,
     trace_iucv_reply(path->id, m->id, len);
     complete_guest_msg(s, path, m, audit, residual, NULL);
     path->guest_out--;
-    msg_free(path, m);
+    if (m->busy) {
+        m->dead = true;
+    } else {
+        msg_free(path, m);
+    }
 }
 
 void iucv_reject(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
@@ -676,7 +690,11 @@ void iucv_reject(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
 
     complete_guest_msg(svc->iucv, path, m, AUD_RJCT, m->ans_len, NULL);
     path->guest_out--;
-    msg_free(path, m);
+    if (m->busy) {
+        m->dead = true;
+    } else {
+        msg_free(path, m);
+    }
 }
 
 void iucv_userid_from_str(uint8_t *userid, const char *str)
@@ -689,6 +707,14 @@ void iucv_userid_from_str(uint8_t *userid, const char *str)
     }
     tmp[8] = 0;
     ebcdic_put(userid, tmp, 8);
+}
+
+const char *s390_iucv_userid(void)
+{
+    if (iucv_state && iucv_state->userid_str) {
+        return iucv_state->userid_str;
+    }
+    return s390_zvm_userid();
 }
 
 /* the instruction */
@@ -949,10 +975,14 @@ static int f_send(IUCVCall *k)
     call_rc(k, 0);
 
     sc = IUCV_SERVICE_GET_CLASS(path->svc);
+    m->busy = true;
     sc->message(path->svc, path, &m->pub);
-    if (!m->two_way) {
+    m->busy = false;
+    if (m->dead) {
+        msg_free(path, m);
+    } else if (!m->two_way) {
         /* received by the service; one-way PRMDATA has no completion */
-        if (!m->prmdata && path_get(s, path->id) == path) {
+        if (!m->prmdata && path->state == PATH_ACTIVE) {
             complete_guest_msg(s, path, m, 0, 0, NULL);
         }
         msg_free(path, m);
@@ -1474,7 +1504,7 @@ static void iucv_realize(DeviceState *dev, Error **errp)
     if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
         return;
     }
-    iucv_userid_from_str(s->userid, s->userid_str);
+    iucv_userid_from_str(s->userid, s390_iucv_userid());
     s->ncpus = ms->smp.max_cpus;
     s->cpus = g_new0(IUCVCpu, s->ncpus);
     s->paths = g_new0(IUCVPath *, s->maxconn);
