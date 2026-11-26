@@ -1647,6 +1647,126 @@ static void test_io_media_perm_empty(void)
     unlink(rw);
 }
 
+/*
+ * Device initialisation as an operating system varies a drive online, on
+ * an empty drive: Sense ID, Set/Sense Path Group ID, Assign, Mode Set, Read
+ * Device Characteristics and Set Tape-Write-Immediate work without a
+ * medium; motion commands get intervention required.  A grouped path only
+ * accepts its own ID; a system reset ungroups and unassigns; the path
+ * group migrates.
+ */
+static void snid(TapeIo *t, uint8_t *state, uint8_t *pgid)
+{
+    uint8_t buf[12];
+
+    tape_ok(t, 0x34, 12, TAPE_SENSE_BUF);
+    qtest_memread(t->qts, TAPE_SENSE_BUF, buf, sizeof(buf));
+    *state = buf[0];
+    if (pgid) {
+        memcpy(pgid, buf + 1, 11);
+    }
+}
+
+static CcwProgIrb spid(TapeIo *t, uint8_t function, uint8_t id)
+{
+    uint8_t buf[12];
+
+    buf[0] = function;
+    memset(buf + 1, id, 11);
+    qtest_memwrite(t->qts, TAPE_SENSE_BUF, buf, sizeof(buf));
+    return tape_ccw(t, 0xaf, 0, 12, TAPE_SENSE_BUF);
+}
+
+static void test_io_path_group(void)
+{
+    g_autofree char *state = tape_new_image("pgstate");
+    uint8_t st, id[11], expect[11];
+    TapeIo t = { 0 };
+    g_autofree char *status = NULL;
+    CcwProgIrb irb;
+
+    if (!tape_io_start(&t, NULL, NULL, NULL)) {
+        unlink(state);
+        return;
+    }
+    tape_ok(&t, 0xe4, 7, TAPE_SENSE_BUF);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0x80);
+    irb = spid(&t, 0x80, 0x5a);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    snid(&t, &st, id);
+    memset(expect, 0x5a, sizeof(expect));
+    g_assert_cmphex(st, ==, 0xc0);
+    g_assert(!memcmp(id, expect, sizeof(id)));
+    /* another ID: rejected; the own one again: fine */
+    tape_expect_uc(&t, spid(&t, 0x80, 0x33), 0x80, 0x27, NULL);
+    g_assert_cmphex(spid(&t, 0x80, 0x5a).dstat, ==, CCW_DSTAT_CE_DE);
+
+    memset(id, 0x5a, sizeof(id));
+    qtest_memwrite(t.qts, TAPE_SENSE_BUF, id, sizeof(id));
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF);
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF);
+    /* assigned to another ID: assigned elsewhere */
+    memset(id, 0x66, sizeof(id));
+    qtest_memwrite(t.qts, TAPE_SENSE_BUF, id, sizeof(id));
+    tape_expect_uc(&t, tape_ccw(&t, 0xb7, 0, 11, TAPE_SENSE_BUF),
+                   0x01, 0x45, NULL);
+    qtest_writeb(t.qts, TAPE_SENSE_BUF, 0);
+    tape_ok(&t, 0xdb, 1, TAPE_SENSE_BUF);
+    tape_ok(&t, 0x64, 64, TAPE_SENSE_BUF);
+    tape_ok(&t, 0xc3, 1, 0);
+    tape_ok(&t, TAPE_READ_BLOCK_ID, 8, TAPE_SENSE_BUF);
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND, 0, 1, 0), 0x40, 0x43,
+                   NULL);
+
+    /* The path group migrates */
+    status = migrate_to_file(t.qts, state);
+    g_assert_cmpstr(status, ==, "completed");
+    tape_io_stop(&t);
+    g_assert_true(tape_io_start(&t, NULL, NULL, "-incoming defer"));
+    g_free(status);
+    status = migrate_from_file(t.qts, state);
+    g_assert_cmpstr(status, ==, "completed");
+    snid(&t, &st, id);
+    g_assert_cmphex(st, ==, 0xc0);
+    g_assert(!memcmp(id, expect, sizeof(id)));
+
+    /* A system reset ungroups and unassigns */
+    qtest_qmp_assert_success(t.qts, "{'execute': 'system_reset'}");
+    qtest_qmp_eventwait(t.qts, "RESET");
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0x80);
+    g_assert_cmphex(spid(&t, 0x80, 0x33).dstat, ==, CCW_DSTAT_CE_DE);
+    memset(id, 0x33, sizeof(id));
+    qtest_memwrite(t.qts, TAPE_SENSE_BUF, id, sizeof(id));
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF);
+    /* resign */
+    g_assert_cmphex(spid(&t, 0xc0, 0).dstat, ==, CCW_DSTAT_CE_DE);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0x80);
+    tape_ok(&t, 0xc7, 11, TAPE_SENSE_BUF);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(state);
+}
+
+/* Synchronize and Set Tape-Write-Immediate on a read-only medium */
+static void test_io_sync_read_only(void)
+{
+    g_autofree char *aws = create_aws_image();
+    TapeIo t = { 0 };
+
+    if (!tape_io_start_file(&t, aws, false, NULL)) {
+        unlink(aws);
+        return;
+    }
+    tape_ok(&t, 0xc3, 1, 0);
+    tape_ok(&t, 0x43, 1, 0);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1692,6 +1812,8 @@ int main(int argc, char **argv)
                    test_io_media_perm_from_rw);
     qtest_add_func("/3590-ccw/io/media-perm-empty",
                    test_io_media_perm_empty);
+    qtest_add_func("/3590-ccw/io/path-group", test_io_path_group);
+    qtest_add_func("/3590-ccw/io/sync-read-only", test_io_sync_read_only);
     qtest_add_func("/3590-ccw/io/perf", test_io_perf);
     return g_test_run();
 }

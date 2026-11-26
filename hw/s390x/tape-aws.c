@@ -595,7 +595,8 @@ AwsTapeResult aws_tape_sync(AwsTape *tape)
         return AWS_TAPE_FENCED;
     }
     if (!blk_is_writable(tape->blk)) {
-        return AWS_TAPE_WRITE_PROTECTED;
+        /* Nothing can be buffered for a read-only medium. */
+        return AWS_TAPE_OK;
     }
     ret = blk_flush(tape->blk);
     if (ret < 0) {

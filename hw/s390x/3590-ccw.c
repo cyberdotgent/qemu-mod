@@ -39,6 +39,7 @@
 #define TAPE_CMD_ERASE_GAP        0x17
 #define TAPE_CMD_WRITE_MARK       0x1f
 #define TAPE_CMD_READ_BLOCK_ID    0x22
+#define TAPE_CMD_SENSE_PGID       0x34
 #define TAPE_CMD_BACKSPACE_BLOCK  0x27
 #define TAPE_CMD_BACKSPACE_FILE   0x2f
 #define TAPE_CMD_FSPACE_BLOCK     0x37
@@ -50,6 +51,8 @@
 #define TAPE_CMD_MEDIUM_SENSE     0xc2
 #define TAPE_CMD_WRITE_IMMEDIATE  0xc3
 #define TAPE_CMD_ASSIGN           0xb7
+#define TAPE_CMD_SET_PGID         0xaf
+#define TAPE_CMD_UNASSIGN         0xc7
 #define TAPE_CMD_MODE_SET         0xdb
 #define TAPE_CMD_SENSE_ID         0xe4
 
@@ -58,6 +61,7 @@
 #define TAPE_SENSE_EQUIPMENT      0x10
 #define TAPE_SENSE_DATA_CHECK     0x08
 #define TAPE_SENSE_DEFERRED_CHECK 0x02
+#define TAPE_SENSE_ASSIGNED_ELSEWHERE 0x01
 
 #define TAPE_ERA_READ_DATA_CHECK  0x23
 #define TAPE_ERA_WRITE_DATA_CHECK 0x25
@@ -69,6 +73,7 @@
 #define TAPE_ERA_PHYSICAL_EOT     0x38
 #define TAPE_ERA_BACKWARD_AT_BOT  0x39
 #define TAPE_ERA_DRIVE_NOT_READY  0x43
+#define TAPE_ERA_ASSIGNED_ELSEWHERE 0x45
 #define TAPE_ERA_VOLUME_FENCED    0x47
 
 /*
@@ -138,6 +143,8 @@ struct Tape3590CcwDevice {
     bool tray_open;
     bool write_immediate;
     uint8_t partition_id[11];
+    /* Path group ID of the (only) channel path; zero = ungrouped */
+    uint8_t pgid[11];
     /* Medium length parsed on the migration destination, or -1 */
     int64_t local_length;
     /* A migrated position on a writable medium awaits validation */
@@ -573,6 +580,32 @@ static int tape3590_write(Tape3590CcwDevice *tape, const CCW1 *ccw)
     return tape3590_write_result(tape, result);
 }
 
+/*
+ * Commands a drive completes also when it is not ready (3490E Hardware
+ * Reference, command attributes): the sense and identification commands,
+ * path groups and assignment, mode setting.  The operating system brings
+ * an empty drive online with them.
+ */
+static bool tape3590_without_medium(uint8_t cmd)
+{
+    switch (cmd) {
+    case TAPE_CMD_SENSE:
+    case TAPE_CMD_SENSE_ID:
+    case TAPE_CMD_SENSE_PGID:
+    case TAPE_CMD_SET_PGID:
+    case TAPE_CMD_ASSIGN:
+    case TAPE_CMD_UNASSIGN:
+    case TAPE_CMD_RDC:
+    case TAPE_CMD_MODE_SET:
+    case TAPE_CMD_READ_BLOCK_ID:
+    case TAPE_CMD_WRITE_IMMEDIATE:
+    case TAPE_CMD_MEDIUM_SENSE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
 {
     Tape3590CcwDevice *tape = sch->driver_data;
@@ -586,8 +619,7 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     trace_tape3590_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count,
                        ccw.flags, tape->medium.block_id);
 
-    if (tape->tray_open && ccw.cmd_code != TAPE_CMD_SENSE &&
-        ccw.cmd_code != TAPE_CMD_SENSE_ID) {
+    if (tape->tray_open && !tape3590_without_medium(ccw.cmd_code)) {
         return tape3590_sense_rc(tape,
                                  tape3590_unit_check_era(tape,
                                                 TAPE_SENSE_INTERVENTION,
@@ -726,6 +758,9 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     case TAPE_CMD_WRITE_IMMEDIATE:
         tape->write_immediate = true;
         sch->curr_status.scsw.count = ccw.count;
+        if (tape->tray_open) {
+            return 0;
+        }
         result = aws_tape_sync(&tape->medium);
         return result == AWS_TAPE_OK ? 0 : tape3590_write_result(tape, result);
     case TAPE_CMD_ASSIGN:
@@ -734,15 +769,73 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
                                  sizeof(tape->partition_id))) {
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
         }
+        /*
+         * The drive is assigned to the ID given (all zeros: the path's
+         * own).  Assigned to another ID: assigned elsewhere (sense byte 0
+         * bit 7, ERA 45).
+         */
         if (!buffer_is_zero(buf, sizeof(tape->partition_id)) &&
+            !buffer_is_zero(tape->partition_id,
+                            sizeof(tape->partition_id)) &&
             memcmp(buf, tape->partition_id, sizeof(tape->partition_id))) {
-            return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
+            return tape3590_unit_check_era(tape,
+                                           TAPE_SENSE_ASSIGNED_ELSEWHERE,
+                                           TAPE_ERA_ASSIGNED_ELSEWHERE);
         }
         if (!buffer_is_zero(buf, sizeof(tape->partition_id))) {
             memcpy(tape->partition_id, buf, sizeof(tape->partition_id));
         }
         sch->curr_status.scsw.count =
             ccw_dstream_residual_count(&sch->cds);
+        return 0;
+    case TAPE_CMD_UNASSIGN:
+        if (ccw.count < sizeof(tape->partition_id) ||
+            ccw_dstream_read_buf(&sch->cds, buf,
+                                 sizeof(tape->partition_id))) {
+            return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
+        }
+        memset(tape->partition_id, 0, sizeof(tape->partition_id));
+        sch->curr_status.scsw.count =
+            ccw_dstream_residual_count(&sch->cds);
+        return 0;
+    case TAPE_CMD_SENSE_PGID:
+        /*
+         * Byte 0: path state, bits 0-1: 10 ungrouped, 11 grouped;
+         * bytes 1-11: the path group ID.
+         */
+        buf[0] = buffer_is_zero(tape->pgid, sizeof(tape->pgid)) ? 0x80 : 0xc0;
+        memcpy(buf + 1, tape->pgid, sizeof(tape->pgid));
+        return tape3590_copy_response(tape, &ccw, buf, 12);
+    case TAPE_CMD_SET_PGID:
+        /*
+         * Byte 0: function control (bit 0 multipath mode, bits 1-2:
+         * 00 establish, 01 disband, 10 resign), bytes 1-11: the ID.  A
+         * grouped path accepts only its own ID again.
+         */
+        if (ccw.count < 12 || ccw_dstream_read_buf(&sch->cds, buf, 12)) {
+            return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                           TAPE_ERA_COMMAND_REJECT);
+        }
+        switch (buf[0] & 0x60) {
+        case 0x00:
+            if (buffer_is_zero(buf + 1, sizeof(tape->pgid)) ||
+                (!buffer_is_zero(tape->pgid, sizeof(tape->pgid)) &&
+                 memcmp(tape->pgid, buf + 1, sizeof(tape->pgid)))) {
+                return tape3590_unit_check_era(tape,
+                                               TAPE_SENSE_COMMAND_REJECT,
+                                               TAPE_ERA_COMMAND_REJECT);
+            }
+            memcpy(tape->pgid, buf + 1, sizeof(tape->pgid));
+            break;
+        case 0x20:
+        case 0x40:
+            memset(tape->pgid, 0, sizeof(tape->pgid));
+            break;
+        default:
+            return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                           TAPE_ERA_COMMAND_REJECT);
+        }
+        sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
         return 0;
     case TAPE_CMD_MODE_SET:
         if (!ccw.count || ccw_dstream_read_buf(&sch->cds, buf, 1)) {
@@ -770,6 +863,13 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
      */
     tape->record_length = tape->record_offset = 0;
     tape->write_immediate = false;
+    /*
+     * A system reset resets the path: it leaves its path group, and the
+     * assignment made through it ends.  Otherwise a re-IPLed system, with
+     * a new path group ID, could not group or assign the drive again.
+     */
+    memset(tape->pgid, 0, sizeof(tape->pgid));
+    memset(tape->partition_id, 0, sizeof(tape->partition_id));
     if (tc->parent_phases.hold) {
         tc->parent_phases.hold(obj, type);
     }
@@ -1028,6 +1128,25 @@ static void tape3590_vm_state_change(void *opaque, bool running,
  * destination must mount the same AWS image (shared storage or a copy
  * made by the management layer).
  */
+static bool tape3590_pgid_needed(void *opaque)
+{
+    Tape3590CcwDevice *tape = opaque;
+
+    return !buffer_is_zero(tape->pgid, sizeof(tape->pgid));
+}
+
+/* Sent only while the path is grouped: older streams stay loadable. */
+static const VMStateDescription vmstate_tape3590_pgid = {
+    .name = "3590-ccw/pgid",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tape3590_pgid_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(pgid, Tape3590CcwDevice, 11),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_tape3590 = {
     .name = "3590-ccw",
     .version_id = 1,
@@ -1045,6 +1164,10 @@ static const VMStateDescription vmstate_tape3590 = {
         VMSTATE_UINT16(medium.previous_length, Tape3590CcwDevice),
         VMSTATE_BOOL(medium.fenced, Tape3590CcwDevice),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_tape3590_pgid,
+        NULL
     },
 };
 
