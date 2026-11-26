@@ -105,6 +105,7 @@ struct kvm_s390_psw {
 #define KVM_S390_RESTART		0xfffe0003u
 #define KVM_S390_INT_PFAULT_INIT	0xfffe0004u
 #define KVM_S390_INT_PFAULT_DONE	0xfffe0005u
+#define KVM_S390_INT_EXT_USER		0xfffe0006u
 #define KVM_S390_MCHK			0xfffe1000u
 #define KVM_S390_INT_CLOCK_COMP		0xffff1004u
 #define KVM_S390_INT_CPU_TIMER		0xffff1005u
@@ -171,6 +172,21 @@ struct kvm_s390_extcall_info {
 	__u16 code;
 };
 
+/* an external interruption user space emulates, KVM_S390_INT_EXT_USER */
+struct kvm_s390_ext_user_info {
+	__u64 subclass;		/* control register 0 bits enabling it */
+	__u16 code;		/* external-interruption code */
+	__u16 cpu_addr;		/* with KVM_S390_EXT_USER_CPU_ADDR */
+	__u32 params;		/* with KVM_S390_EXT_USER_PARAMS */
+	__u64 params2;		/* with KVM_S390_EXT_USER_PARAMS2 */
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define KVM_S390_EXT_USER_CPU_ADDR	0x01
+#define KVM_S390_EXT_USER_PARAMS	0x02
+#define KVM_S390_EXT_USER_PARAMS2	0x04
+
 struct kvm_s390_emerg_info {
 	__u16 code;
 };
@@ -200,6 +216,7 @@ struct kvm_s390_irq {
 		struct kvm_s390_prefix_info prefix;
 		struct kvm_s390_stop_info stop;
 		struct kvm_s390_mchk_info mchk;
+		struct kvm_s390_ext_user_info ext_user;
 		char reserved[64];
 	} u;
 };

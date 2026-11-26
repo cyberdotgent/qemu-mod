@@ -1002,6 +1002,7 @@ struct kvm_enable_cap {
  * with scripts/update-linux-headers.sh.
  */
 #define KVM_CAP_S390_ESA390_CM 253
+#define KVM_CAP_S390_USER_EXT_IRQ 254
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
