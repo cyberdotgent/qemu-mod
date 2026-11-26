@@ -60,7 +60,7 @@ enum {
     IUCV_SEVER = 15,
     IUCV_SETMASK = 16,
     IUCV_SETCMASK = 17,
-    IUCV_IPOLL = 18,
+    IUCV_IPOLL = 21,
 };
 
 /* parameter list (IPARML) and interruption record offsets */
@@ -1104,11 +1104,6 @@ static int f_reply(IUCVCall *k)
         buf = g_memdup2(k->p + P_RMMSG, 8);
         len = 8;
     } else {
-        /* some guests put a plain reply buffer into the first pair */
-        if (!a.list && !a.addr && !a.total) {
-            a.addr = get32(k->p, P_BFADR1);
-            a.total = get32(k->p, P_BFLN1F);
-        }
         rc = area_check(&a, 0x1b);
         if (rc) {
             if (rc < 0) {
