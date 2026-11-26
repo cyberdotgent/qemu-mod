@@ -8,6 +8,11 @@
  * Written from the description of the IUCV functions in z/VM CP
  * Programming Services and the behaviour of guests that use them.
  *
+ * Without any IUCV device, B2F0 keeps its operation exception (as on a
+ * machine without a hypervisor). "-device s390-iucv,available=off" makes
+ * it end with condition code 3 in the supervisor state, which is what a
+ * guest sees under a hypervisor that does not offer IUCV to it.
+ *
  * Not provided: control buffers and control paths, paths between two
  * guests, connections a service opens to the guest, TEST MESSAGE, the
  * storage-key checks of the data areas.
@@ -173,6 +178,7 @@ struct S390IUCVState {
     DeviceState parent_obj;
 
     char *userid_str;
+    bool available;
     uint32_t maxconn;
 
     uint8_t userid[8];
@@ -1340,8 +1346,7 @@ static int iucv_instruction(S390CPU *cpu, uint16_t ipa, uint32_t ipb)
     uint8_t fc = env->regs[0] & 0xff;
     uint8_t b2 = ipb >> 28;
     uint64_t addr = (b2 ? env->regs[b2] : 0) + ((ipb >> 16) & 0xfff);
-    IUCVCall k = { .cpu = cpu, .env = env, .s = s,
-                   .c = &s->cpus[CPU(cpu)->cpu_index] };
+    IUCVCall k = { .cpu = cpu, .env = env, .s = s };
     unsigned i;
     bool any = false;
 
@@ -1350,6 +1355,12 @@ static int iucv_instruction(S390CPU *cpu, uint16_t ipa, uint32_t ipb)
         return 0;
     }
     trace_iucv_instruction(CPU(cpu)->cpu_index, fc);
+    if (!s->available) {
+        /* as under a hypervisor without IUCV for this guest */
+        setcc(cpu, 3);
+        return 0;
+    }
+    k.c = &s->cpus[CPU(cpu)->cpu_index];
     for (i = 0; i < s->ncpus; i++) {
         any |= s->cpus[i].declared;
     }
@@ -1452,6 +1463,13 @@ static void iucv_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "maxconn must be 1 to 65535");
         return;
     }
+    if (!s->available) {
+        /* only the instruction: condition code 3 */
+        if (kvm_s390_user_operexec_init(0xb2f0, iucv_instruction, errp)) {
+            iucv_state = s;
+        }
+        return;
+    }
     if (!kvm_s390_user_ext_irq_init(&iucv_irq_ops, CR0_IUCV, errp) ||
         !kvm_s390_user_operexec_init(0xb2f0, iucv_instruction, errp)) {
         return;
@@ -1474,6 +1492,12 @@ static void iucv_realize(DeviceState *dev, Error **errp)
 static const Property iucv_properties[] = {
     DEFINE_PROP_STRING("userid", S390IUCVState, userid_str),
     DEFINE_PROP_UINT32("maxconn", S390IUCVState, maxconn, 255),
+    /*
+     * off: the instruction ends with condition code 3 in the supervisor
+     * state ("IUCV not available", as under a hypervisor that offers no
+     * IUCV to the guest) and no services can be added.
+     */
+    DEFINE_PROP_BOOL("available", S390IUCVState, available, true),
 };
 
 static void iucv_class_init(ObjectClass *oc, const void *data)
@@ -1481,7 +1505,7 @@ static void iucv_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = iucv_realize;
-    dc->user_creatable = false;
+    dc->hotpluggable = false;
     device_class_set_props(dc, iucv_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
@@ -1524,6 +1548,10 @@ static void iucv_service_realize(DeviceState *dev, Error **errp)
     }
     s = iucv_get(errp);
     if (!s) {
+        return;
+    }
+    if (!s->available) {
+        error_setg(errp, "IUCV is configured as not available");
         return;
     }
     iucv_userid_from_str(svc->userid, svc->name);
