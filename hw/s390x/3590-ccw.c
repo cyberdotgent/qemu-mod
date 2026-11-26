@@ -13,8 +13,10 @@
 #include "hw/s390x/tape-aws.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "qemu/aio.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "system/block-backend.h"
@@ -60,12 +62,28 @@
 #define TAPE_ERA_READ_DATA_CHECK  0x23
 #define TAPE_ERA_WRITE_DATA_CHECK 0x25
 #define TAPE_ERA_COMMAND_REJECT   0x27
+#define TAPE_ERA_UNLOAD_COMPLETE  0x2b
 #define TAPE_ERA_WRITE_PROTECTED  0x30
 #define TAPE_ERA_TAPE_VOID        0x31
 #define TAPE_ERA_END_OF_DATA      0x36
 #define TAPE_ERA_PHYSICAL_EOT     0x38
 #define TAPE_ERA_BACKWARD_AT_BOT  0x39
+#define TAPE_ERA_DRIVE_NOT_READY  0x43
 #define TAPE_ERA_VOLUME_FENCED    0x47
+
+/*
+ * 3590 sense: byte 2 bits 0-1 basic recovery action, bytes 4-5 the
+ * reason/qualifier code (the 3480/3490 sense has the channel block number
+ * in bytes 4-6 instead).  The codes a 3590 reports for the conditions this
+ * drive raises, as the Linux tape_3590 driver interprets them.
+ */
+#define TAPE_BRA_PERMANENT        0
+#define TAPE_BRA_CONTINUE         1
+#define TAPE_RC_BACKWARD_AT_BOP   0x3010
+#define TAPE_RC_END_OF_PARTITION  0x3012
+#define TAPE_RC_END_OF_DATA       0x3020
+#define TAPE_RC_UNLOAD_COMPLETE   0x3123
+#define TAPE_RC_NOT_READY         0x4010
 
 /* Sense byte 1 */
 #define TAPE_SENSE1_LOCATE_FAILURE 0x80
@@ -153,6 +171,34 @@ static void tape3590_cancel(SubchDev *sch)
     tape->write_immediate = false;
 }
 
+/*
+ * The permissions follow the medium, as with floppies: none while the drive
+ * is unloaded, so that any medium can be inserted, and writing when a loaded
+ * medium allows it.  The file-protect state the guest sees (sense byte 1,
+ * write-protect unit checks) follows from that.
+ */
+static bool tape3590_update_perm(Tape3590CcwDevice *tape, bool loaded,
+                                 Error **errp)
+{
+    uint64_t perm = 0;
+
+    if (loaded) {
+        perm = BLK_PERM_CONSISTENT_READ;
+        if (blk_supports_write_perm(tape->blk)) {
+            perm |= BLK_PERM_WRITE | BLK_PERM_RESIZE;
+        }
+    }
+    return blk_set_perm(tape->blk, perm, BLK_PERM_ALL, errp) >= 0;
+}
+
+/* Unload: the guest's Rewind Unload, a failed restore, or the tray opens */
+static void tape3590_unload(Tape3590CcwDevice *tape)
+{
+    tape->tray_open = true;
+    aws_tape_rewind(&tape->medium);
+    tape3590_update_perm(tape, false, &error_abort);
+}
+
 static void tape3590_change_media(void *opaque, bool load, Error **errp)
 {
     Tape3590CcwDevice *tape = opaque;
@@ -162,6 +208,10 @@ static void tape3590_change_media(void *opaque, bool load, Error **errp)
             error_setg(errp, "cannot close 3590 tape drive without a medium");
             return;
         }
+        if (!tape3590_update_perm(tape, true, errp)) {
+            tape3590_update_perm(tape, false, &error_abort);
+            return;
+        }
         /*
          * Block I/O to removable media is unavailable while its tray is
          * reported open.  Close it before validating the AWS stream.
@@ -169,12 +219,11 @@ static void tape3590_change_media(void *opaque, bool load, Error **errp)
         tape->tray_open = false;
         aws_tape_init(&tape->medium, tape->blk, errp);
         if (*errp) {
-            tape->tray_open = true;
+            tape3590_unload(tape);
             return;
         }
     } else {
-        tape->tray_open = true;
-        aws_tape_rewind(&tape->medium);
+        tape3590_unload(tape);
     }
     tape->record_length = tape->record_offset = 0;
     if (CCW_DEVICE(tape)->sch) {
@@ -209,10 +258,12 @@ static int tape3590_unit_check_era(Tape3590CcwDevice *tape, uint8_t sense,
         if (!tape->medium.block_id) {
             sch->sense_data[1] |= TAPE_SENSE1_BOT;
         }
-        /* Bytes 4-6: channel logical block number, bits 8-31 */
-        sch->sense_data[4] = tape->medium.block_id >> 16;
-        sch->sense_data[5] = tape->medium.block_id >> 8;
-        sch->sense_data[6] = tape->medium.block_id;
+        if (tape->identity->dev_type != 0x3590) {
+            /* Bytes 4-6: channel logical block number, bits 8-31 */
+            sch->sense_data[4] = tape->medium.block_id >> 16;
+            sch->sense_data[5] = tape->medium.block_id >> 8;
+            sch->sense_data[6] = tape->medium.block_id;
+        }
     }
     sch->sense_data[3] = era;
     schib->scsw.dstat = SCSW_DSTAT_CHANNEL_END |
@@ -224,6 +275,20 @@ static int tape3590_unit_check_era(Tape3590CcwDevice *tape, uint8_t sense,
                         SCSW_STCTL_ALERT | SCSW_STCTL_STATUS_PEND;
     schib->scsw.cpa = sch->channel_prog + 8;
     return -EIO;
+}
+
+/* Add the 3590 reason code and basic recovery action to the sense */
+static int tape3590_sense_rc(Tape3590CcwDevice *tape, int rc,
+                             uint16_t rc_rqc, uint8_t bra)
+{
+    uint8_t *sense = CCW_DEVICE(tape)->sch->sense_data;
+
+    if (tape->identity->dev_type == 0x3590) {
+        sense[2] = (sense[2] & 0x3f) | (bra << 6);
+        sense[4] = rc_rqc >> 8;
+        sense[5] = rc_rqc;
+    }
+    return rc;
 }
 
 static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
@@ -250,9 +315,13 @@ static int tape3590_read_result(Tape3590CcwDevice *tape,
                                      TAPE_ERA_END_OF_DATA :
                                      TAPE_ERA_TAPE_VOID);
         sch->sense_data[2] = 0x10;
-        return rc;
+        return tape3590_sense_rc(tape, rc, TAPE_RC_END_OF_DATA,
+                                 TAPE_BRA_PERMANENT);
     case AWS_TAPE_BOT:
-        return tape3590_unit_check_era(tape, 0, TAPE_ERA_BACKWARD_AT_BOT);
+        return tape3590_sense_rc(tape,
+                                 tape3590_unit_check_era(tape, 0,
+                                                TAPE_ERA_BACKWARD_AT_BOT),
+                                 TAPE_RC_BACKWARD_AT_BOP, TAPE_BRA_PERMANENT);
     case AWS_TAPE_IO_ERROR:
         return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
                                        TAPE_ERA_PHYSICAL_EOT);
@@ -444,8 +513,12 @@ static int tape3590_write_result(Tape3590CcwDevice *tape,
          * Physical end of tape: the end of the volume, or no more room on
          * the host.  Nothing of the block is on the medium.
          */
-        return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
-                                       TAPE_ERA_PHYSICAL_EOT);
+        return tape3590_sense_rc(tape,
+                                 tape3590_unit_check_era(tape,
+                                                TAPE_SENSE_EQUIPMENT,
+                                                TAPE_ERA_PHYSICAL_EOT),
+                                 TAPE_RC_END_OF_PARTITION,
+                                 TAPE_BRA_PERMANENT);
     case AWS_TAPE_FENCED:
         return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT |
                                        TAPE_SENSE_DEFERRED_CHECK,
@@ -515,7 +588,11 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
 
     if (tape->tray_open && ccw.cmd_code != TAPE_CMD_SENSE &&
         ccw.cmd_code != TAPE_CMD_SENSE_ID) {
-        return tape3590_unit_check(tape, TAPE_SENSE_INTERVENTION);
+        return tape3590_sense_rc(tape,
+                                 tape3590_unit_check_era(tape,
+                                                TAPE_SENSE_INTERVENTION,
+                                                TAPE_ERA_DRIVE_NOT_READY),
+                                 TAPE_RC_NOT_READY, TAPE_BRA_PERMANENT);
     }
 
     switch (ccw.cmd_code) {
@@ -535,10 +612,19 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         sch->curr_status.scsw.count = ccw.count;
         return 0;
     case TAPE_CMD_REWIND_UNLOAD:
-        aws_tape_rewind(&tape->medium);
-        tape->tray_open = true;
+        /*
+         * The drive ends Rewind Unload with unit check once the cartridge
+         * is out: ERA 2B (unload complete) on the 3480/3490, reason code
+         * 3123 with "continue" on the 3590.  That ends the chain; a command
+         * chained to it (Linux chains a No-Operation) would find the drive
+         * not ready.
+         */
+        tape3590_unload(tape);
         sch->curr_status.scsw.count = ccw.count;
-        return 0;
+        return tape3590_sense_rc(tape,
+                                 tape3590_unit_check_era(tape, 0,
+                                                TAPE_ERA_UNLOAD_COMPLETE),
+                                 TAPE_RC_UNLOAD_COMPLETE, TAPE_BRA_CONTINUE);
     case TAPE_CMD_ERASE_GAP:
         sch->curr_status.scsw.count = ccw.count;
         result = aws_tape_erase_gap(&tape->medium);
@@ -589,7 +675,8 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
                                              TAPE_ERA_END_OF_DATA);
 
             sch->sense_data[1] |= TAPE_SENSE1_LOCATE_FAILURE;
-            return rc;
+            return tape3590_sense_rc(tape, rc, TAPE_RC_END_OF_DATA,
+                                     TAPE_BRA_PERMANENT);
         }
         return result == AWS_TAPE_OK ? 0 :
                tape3590_read_result(tape, result);
@@ -736,7 +823,6 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
     CCWDeviceClass *cdk = CCW_DEVICE_GET_CLASS(cdev);
     SubchDev *sch;
     uint16_t chpid;
-    uint64_t perm = BLK_PERM_CONSISTENT_READ;
     Error *local_err = NULL;
 
     tape->identity = tape3590_find_identity(tape->ident);
@@ -764,13 +850,10 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
         }
         blk_unref(tape->blk);
     }
-    if (blk_supports_write_perm(tape->blk)) {
-        perm |= BLK_PERM_WRITE | BLK_PERM_RESIZE;
-    }
-    if (blk_set_perm(tape->blk, perm, BLK_PERM_ALL, errp) < 0) {
+    tape->tray_open = !blk_is_inserted(tape->blk);
+    if (!tape3590_update_perm(tape, !tape->tray_open, errp)) {
         return;
     }
-    tape->tray_open = !blk_is_inserted(tape->blk);
     if (!tape->tray_open && runstate_check(RUN_STATE_INMIGRATE) &&
         blk_is_writable(tape->blk)) {
         /*
@@ -841,6 +924,15 @@ static void tape3590_unrealize(DeviceState *dev)
     aws_tape_cleanup(&tape->medium);
 }
 
+static void tape3590_unloaded_bh(void *opaque)
+{
+    Tape3590CcwDevice *tape = opaque;
+
+    if (tape->tray_open) {
+        tape3590_update_perm(tape, false, &error_abort);
+    }
+}
+
 static int tape3590_pre_load(void *opaque)
 {
     Tape3590CcwDevice *tape = opaque;
@@ -867,8 +959,14 @@ static int tape3590_post_load(void *opaque, int version_id)
     /* Channel programs run synchronously: no buffered record survives. */
     tape->record_length = tape->record_offset = 0;
     if (tape->tray_open) {
-        /* Unloaded: a remount repositions the medium at load point. */
+        /*
+         * Unloaded: a remount repositions the medium at load point.  The
+         * permissions are dropped from the main loop: loading the state
+         * runs in a coroutine, where they cannot change.
+         */
         aws_tape_rewind(&tape->medium);
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                tape3590_unloaded_bh, tape);
         return 0;
     }
     if (!blk_is_inserted(tape->blk)) {
@@ -917,8 +1015,7 @@ static void tape3590_vm_state_change(void *opaque, bool running,
         error_reportf_err(local_err, "3590-ccw %04x: migrated position "
                           "unusable, medium unloaded: ",
                           CCW_DEVICE(tape)->sch->devno);
-        tape->tray_open = true;
-        aws_tape_rewind(&tape->medium);
+        tape3590_unload(tape);
     }
 }
 

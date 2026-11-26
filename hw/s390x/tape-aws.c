@@ -503,7 +503,14 @@ static AwsTapeResult aws_tape_commit(AwsTape *tape, const uint8_t *data,
     if (ret < 0) {
         return aws_tape_rollback(tape, tape->offset, ret);
     }
-    if (new_end < tape->length) {
+    /*
+     * Growing an empty file, the file-posix driver writes a whole zeroed
+     * sector to speed up later alignment probing, so the file ends up with
+     * zeros behind a short first write.  Cut them off: other AWS readers
+     * would take them for a chunk header.
+     */
+    if (new_end < tape->length ||
+        (!tape->length && new_end < BDRV_SECTOR_SIZE)) {
         ret = blk_truncate(tape->blk, new_end, false, PREALLOC_MODE_OFF, 0,
                            &local_err);
         if (ret < 0) {

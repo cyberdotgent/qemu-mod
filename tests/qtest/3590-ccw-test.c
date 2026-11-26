@@ -469,8 +469,9 @@ static bool tape_io_start(TapeIo *t, const char *drive_args,
     if (!t->image) {
         t->image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
     }
-    devices = g_strdup_printf("%s -device 3590-ccw,drive=tape,"
-                              "devno=fe.0.0580,id=tape0%s%s %s", drive_args,
+    devices = g_strdup_printf("%s -device 3590-ccw,%sdevno=fe.0.0580,"
+                              "id=tape0%s%s %s", drive_args ?: "",
+                              drive_args ? "drive=tape," : "",
                               dev_args ? "," : "", dev_args ?: "",
                               extra ?: "");
     t->qts = qtest_initf("-nodefaults -accel kvm -m 64M -kernel %s %s",
@@ -890,7 +891,8 @@ static void test_io_space_status(void)
     tape_ok(&t, TAPE_FSF, 1, 0);
     g_assert_cmphex(tape_block_id(&t), ==, 4);
     tape_expect_uc(&t, tape_ccw(&t, TAPE_FSB, 0, 1, 0), 0x08, 0x36, sense);
-    g_assert_cmphex(sense[6], ==, 4);
+    /* 3590 sense: reason code 3020 (end of data) in bytes 4-5 */
+    g_assert_cmphex(lduw_be_p(sense + 4), ==, 0x3020);
     tape_expect_uc(&t, tape_ccw(&t, TAPE_READ, CCW_FLAG_SLI, 80, TAPE_BUF2),
                    0x08, 0x36, NULL);
     tape_expect_uc(&t, tape_ccw(&t, TAPE_FSF, 0, 1, 0), 0x08, 0x36, NULL);
@@ -1070,7 +1072,8 @@ static void test_io_eot_capacity(void)
     }
     irb = tape_ccw(&t, TAPE_ERASE_GAP, 0, 1, 0);
     g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE | DSTAT_UE);
-    tape_ok(&t, TAPE_REWIND_UNLOAD, 1, 0);
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+                   NULL);
     tape_io_stop(&t);
 
     g_assert_cmpuint(aws_check_file(aws, &size), ==, 12);
@@ -1444,12 +1447,13 @@ static void test_io_volume_switch(void)
     tape_write_block(&t, (const uint8_t *)"EOV1", 4);
     tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
     tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
-    tape_ok(&t, TAPE_REWIND_UNLOAD, 1, 0);
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+                   NULL);
     g_assert_true(tape_tray_open(t.qts));
 
     /* Not ready while unloaded */
     tape_expect_uc(&t, tape_ccw(&t, TAPE_READ, CCW_FLAG_SLI, 80, TAPE_BUF2),
-                   0x40, 0, NULL);
+                   0x40, 0x43, NULL);
 
     qtest_qmp_assert_success(t.qts,
         "{'execute': 'blockdev-change-medium', 'arguments': {"
@@ -1474,6 +1478,173 @@ static void test_io_volume_switch(void)
     tape_io_free(&t);
     unlink(vol1);
     unlink(vol2);
+}
+
+/*
+ * Rewind Unload as Linux issues it (Mode Set, Rewind Unload, No-Operation,
+ * command-chained): unit check with "unload complete" ends the chain, so
+ * the No-Operation never meets the unloaded drive.  3590 sense: reason
+ * code 3123, basic recovery action "continue"; 3490 sense: ERA 2B and the
+ * block number in bytes 4-6.
+ */
+static void do_test_io_rewind_unload(const char *ident)
+{
+    g_autofree char *aws = create_aws_image();
+    bool native = !strcmp(ident, "ident=3590");
+    uint8_t sense[32];
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+
+    if (!tape_io_start_file(&t, aws, false, ident)) {
+        unlink(aws);
+        return;
+    }
+    tape_ok(&t, TAPE_FSB, 1, 0);
+    qtest_writeb(t.qts, TAPE_SENSE_BUF, 0);
+    ccw_prog_set_ccw(t.qts, 0, 0xdb, CCW_FLAG_CC, 1, TAPE_SENSE_BUF);
+    ccw_prog_set_ccw(t.qts, 1, TAPE_REWIND_UNLOAD, CCW_FLAG_CC, 1, 0);
+    ccw_prog_set_ccw(t.qts, 2, 0x03, 0, 1, 0);
+    g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 0);
+    g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 16);
+    tape_expect_uc(&t, irb, 0, 0x2b, sense);
+    if (native) {
+        g_assert_cmphex(lduw_be_p(sense + 4), ==, 0x3123);
+        g_assert_cmphex(sense[2] >> 6, ==, 1);
+    }
+    g_assert_true(tape_tray_open(t.qts));
+
+    /* Not ready now: intervention required, ERA 43 */
+    tape_expect_uc(&t, tape_ccw(&t, 0x03, 0, 1, 0), 0x40, 0x43, sense);
+    if (native) {
+        g_assert_cmphex(lduw_be_p(sense + 4), ==, 0x4010);
+    }
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
+static void test_io_rewind_unload_3590(void)
+{
+    do_test_io_rewind_unload("ident=3590");
+}
+
+static void test_io_rewind_unload_3490(void)
+{
+    do_test_io_rewind_unload("ident=3490");
+}
+
+/* 3490 sense: channel block number in bytes 4-6 */
+static void test_io_sense_3490(void)
+{
+    g_autofree char *aws = create_other_aws_image();   /* block, mark */
+    uint8_t sense[32];
+    TapeIo t = { 0 };
+
+    if (!tape_io_start_file(&t, aws, false, "ident=3490")) {
+        unlink(aws);
+        return;
+    }
+    tape_ok(&t, TAPE_FSF, 1, 0);
+    g_assert_cmphex(tape_block_id(&t), ==, 2);
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_FSB, 0, 1, 0), 0x08, 0x36, sense);
+    g_assert_cmphex(sense[4] << 16 | sense[5] << 8 | sense[6], ==,
+                    tape_block_id(&t));
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
+/* Change media between read-only and writable images (QMP), both ways */
+static void change_medium(TapeIo *t, const char *path, bool writable)
+{
+    CcwProgIrb irb;
+
+    qtest_qmp_assert_success(t->qts,
+        "{'execute': 'blockdev-change-medium', 'arguments': {"
+        " 'id': 'tape0', 'filename': %s, 'format': 'raw',"
+        " 'read-only-mode': %s}}", path,
+        writable ? "read-write" : "read-only");
+    g_assert_false(tape_tray_open(t->qts));
+    /* attention from the mount */
+    ccw_prog_set_ccw(t->qts, 0, 0x03, CCW_FLAG_SLI, 1, 0);
+    g_assert_cmpint(ccw_prog_run(t->qts, CCW_ORB_FMT, &irb), ==, 1);
+    g_assert_cmphex(irb.dstat, ==, 0x80 | 0x04);
+}
+
+static void expect_protected(TapeIo *t, bool protected)
+{
+    uint8_t sense[32];
+
+    tape_sense(t, sense);
+    g_assert_cmphex(sense[1] & 0x02, ==, protected ? 0x02 : 0);
+    if (protected) {
+        tape_expect_uc(t, tape_ccw(t, TAPE_WRITE_MARK, 0, 1, 0),
+                       0x80, 0x30, NULL);
+    } else {
+        tape_mark(t);
+    }
+}
+
+static void do_test_io_media_perm(bool start_writable)
+{
+    g_autofree char *ro = create_aws_image();
+    g_autofree char *rw = tape_new_image("rw");
+    g_autofree char *rw2 = tape_new_image("rw2");
+    TapeIo t = { 0 };
+
+    if (!tape_io_start_file(&t, start_writable ? rw : ro, start_writable,
+                            NULL)) {
+        unlink(ro);
+        unlink(rw);
+        unlink(rw2);
+        return;
+    }
+    expect_protected(&t, !start_writable);
+    change_medium(&t, start_writable ? ro : rw2, !start_writable);
+    expect_protected(&t, start_writable);
+    change_medium(&t, start_writable ? rw2 : ro, start_writable);
+    expect_protected(&t, !start_writable);
+
+    /* After the guest unloads, any medium can be inserted */
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+                   NULL);
+    change_medium(&t, start_writable ? ro : rw, !start_writable);
+    expect_protected(&t, start_writable);
+    tape_io_stop(&t);
+    g_assert_cmpuint(aws_check_file(rw, NULL), ==, 1);
+    g_assert_cmpuint(aws_check_file(rw2, NULL), ==, 1);
+    tape_io_free(&t);
+    unlink(ro);
+    unlink(rw);
+    unlink(rw2);
+}
+
+static void test_io_media_perm_from_ro(void)
+{
+    do_test_io_media_perm(false);
+}
+
+static void test_io_media_perm_from_rw(void)
+{
+    do_test_io_media_perm(true);
+}
+
+/* An empty drive gets a writable medium */
+static void test_io_media_perm_empty(void)
+{
+    g_autofree char *rw = tape_new_image("rwe");
+    TapeIo t = { 0 };
+
+    if (!tape_io_start(&t, NULL, NULL, NULL)) {
+        unlink(rw);
+        return;
+    }
+    change_medium(&t, rw, true);
+    expect_protected(&t, false);
+    tape_io_stop(&t);
+    g_assert_cmpuint(aws_check_file(rw, NULL), ==, 1);
+    tape_io_free(&t);
+    unlink(rw);
 }
 
 int main(int argc, char **argv)
@@ -1510,6 +1681,17 @@ int main(int argc, char **argv)
     qtest_add_func("/3590-ccw/io/migration-positioned",
                    test_io_migration_positioned);
     qtest_add_func("/3590-ccw/io/volume-switch", test_io_volume_switch);
+    qtest_add_func("/3590-ccw/io/rewind-unload-3590",
+                   test_io_rewind_unload_3590);
+    qtest_add_func("/3590-ccw/io/rewind-unload-3490",
+                   test_io_rewind_unload_3490);
+    qtest_add_func("/3590-ccw/io/sense-3490", test_io_sense_3490);
+    qtest_add_func("/3590-ccw/io/media-perm-from-ro",
+                   test_io_media_perm_from_ro);
+    qtest_add_func("/3590-ccw/io/media-perm-from-rw",
+                   test_io_media_perm_from_rw);
+    qtest_add_func("/3590-ccw/io/media-perm-empty",
+                   test_io_media_perm_empty);
     qtest_add_func("/3590-ccw/io/perf", test_io_perf);
     return g_test_run();
 }
