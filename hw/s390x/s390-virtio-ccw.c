@@ -1405,10 +1405,12 @@ static const TypeInfo ccw_machine_info = {
 static void ccw_machine_11_2_instance_options(MachineState *machine)
 {
     /*
-     * A CPU version of 0xff marks a z/VM virtual CPU.  KVM guests are not
-     * running under z/VM, so expose the value used by current real hardware.
+     * A CPU version of X'FF' marks a z/VM virtual CPU, and some operating
+     * systems then rely on z/VM services.  KVM guests are not running under
+     * z/VM: with the host CPU model they see the version of the host's own
+     * CPU (X'00' in a logical partition), with the other models X'00'.
      */
-    s390_set_kvm_cpu_version(0);
+    s390_set_kvm_cpu_version(S390_KVM_CPU_VERSION_HOST);
 }
 
 static void ccw_machine_11_2_class_options(MachineClass *mc)
@@ -1817,6 +1819,8 @@ DEFINE_TYPES(mainframe_types)
 static void ccw_machine_11_1_instance_options(MachineState *machine)
 {
     ccw_machine_11_2_instance_options(machine);
+    /* Version X'00' for every CPU model, also with the host model. */
+    s390_set_kvm_cpu_version(S390_KVM_CPU_VERSION_ZERO);
 }
 
 static void ccw_machine_11_1_class_options(MachineClass *mc)
@@ -1839,7 +1843,7 @@ static void ccw_machine_11_0_instance_options(MachineState *machine)
 {
     ccw_machine_11_1_instance_options(machine);
     /* Preserve the CPU identification exposed by older machine types. */
-    s390_set_kvm_cpu_version(0xff);
+    s390_set_kvm_cpu_version(S390_KVM_CPU_VERSION_VM);
 }
 
 static void ccw_machine_11_0_class_options(MachineClass *mc)

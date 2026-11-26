@@ -507,6 +507,27 @@ static bool check_compatibility(const S390CPUModel *max_model,
     return false;
 }
 
+static S390KvmCpuVersion s390_kvm_cpu_version = S390_KVM_CPU_VERSION_VM;
+
+/*
+ * The CPU version of a KVM guest CPU, chosen by the machine type.  Under
+ * KVM, the max model carries the version of the host's own CPU.
+ */
+static uint8_t s390_kvm_guest_cpu_version(const S390CPUClass *xcc,
+                                          const S390CPUModel *max_model)
+{
+    switch (s390_kvm_cpu_version) {
+    case S390_KVM_CPU_VERSION_VM:
+        return 0xff;
+    case S390_KVM_CPU_VERSION_ZERO:
+        return 0;
+    case S390_KVM_CPU_VERSION_HOST:
+    default:
+        /* Only "host" and "max" are not migration safe. */
+        return xcc->is_migration_safe ? 0 : max_model->cpu_ver;
+    }
+}
+
 S390CPUModel *get_max_cpu_model(Error **errp)
 {
     static S390CPUModel max_model;
@@ -557,7 +578,11 @@ void s390_realize_cpu_model(CPUState *cs, Error **errp)
     cpu->model->lowest_ibc = max_model->lowest_ibc;
     cpu->model->cpu_id = max_model->cpu_id;
     cpu->model->cpu_id_format = max_model->cpu_id_format;
-    cpu->model->cpu_ver = max_model->cpu_ver;
+    if (kvm_enabled()) {
+        cpu->model->cpu_ver = s390_kvm_guest_cpu_version(xcc, max_model);
+    } else {
+        cpu->model->cpu_ver = max_model->cpu_ver;
+    }
 
     check_consistency(cpu->model);
     if (!check_compatibility(max_model, cpu->model, errp)) {
@@ -706,17 +731,11 @@ static void s390_cpu_model_initfn(Object *obj)
 }
 
 static S390CPUModel s390_qemu_cpu_model;
-static uint8_t s390_kvm_cpu_version = 0xff;
 
-void s390_set_kvm_cpu_version(uint8_t version)
+void s390_set_kvm_cpu_version(S390KvmCpuVersion version)
 {
     g_assert(QTAILQ_EMPTY_RCU(&cpus_queue));
     s390_kvm_cpu_version = version;
-}
-
-uint8_t s390_get_kvm_cpu_version(void)
-{
-    return s390_kvm_cpu_version;
 }
 
 /* Set the qemu CPU model (on machine initialization). Must not be called

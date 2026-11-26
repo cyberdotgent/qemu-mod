@@ -34,6 +34,22 @@ properties ``lpar-name`` (default ``QEMUKVM``) and ``lpar-number``
 ``czam-v1`` replaces the former ``mtm-3907`` machine (same machine, new
 name; the old name is no longer accepted).
 
+The CPU version code that STORE CPU ID (STIDP) returns under KVM depends
+on the machine type.  X'FF' marks a CPU of a z/VM virtual machine, and some
+operating systems then use z/VM services (DIAGNOSE) that KVM does not
+provide:
+
+- ``czam`` and ``s390-ccw-virtio-11.2``: with the host-dependent CPU models
+  (``-cpu host``, ``-cpu max``) the version of the host's own CPU, as the
+  host reports it (X'00' when the host runs in a logical partition);
+  with the other CPU models X'00'.
+- ``s390-ccw-virtio-11.1``: X'00' with every CPU model.
+- ``s390-ccw-virtio-11.0`` and older: X'FF' (the KVM default).
+
+The CPU identification and machine type fields are not affected.  The
+version code is not part of the migration stream: the destination computes
+it again.
+
 ``czam-compat`` (experimental) is ``czam`` for operating systems from
 before the z/Architecture-only machines.  It differs from ``czam`` only in
 the defaults of three machine properties, described in
