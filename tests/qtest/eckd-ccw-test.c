@@ -1413,6 +1413,144 @@ static void test_read_track_domain(void)
     unlink(image);
 }
 
+/* Format track @cyl/@head of @path with R0 and a 64-byte R1 holding @data. */
+static void ckd_write_r1_at(const char *path, uint16_t cyl, uint16_t head,
+                            const uint8_t *data)
+{
+    uint8_t track[5 + 16 + 8 + ECKD_R1_LENGTH + 8] = { 0 };
+    uint8_t *r1 = track + 5 + 16;
+    int fd = open(path, O_WRONLY);
+
+    g_assert_cmpint(fd, >=, 0);
+    stw_be_p(track + 1, cyl);           /* home address */
+    stw_be_p(track + 3, head);
+    stw_be_p(track + 5, cyl);           /* R0 count field, 8 zero bytes */
+    stw_be_p(track + 5 + 2, head);
+    stw_be_p(track + 5 + 6, 8);
+    stw_be_p(r1, cyl);                  /* R1: record number 1, key 0 */
+    stw_be_p(r1 + 2, head);
+    r1[4] = 1;
+    stw_be_p(r1 + 6, ECKD_R1_LENGTH);
+    memcpy(r1 + 8, data, ECKD_R1_LENGTH);
+    memset(r1 + 8 + ECKD_R1_LENGTH, 0xff, 8);
+    g_assert_cmpint(pwrite(fd, track, sizeof(track),
+                           CKD_HEADER_SIZE +
+                           ((int64_t)cyl * CKD_HEADS + head) * CKD_TRACK_SIZE),
+                    ==, sizeof(track));
+    close(fd);
+}
+
+/* Seek argument BBCCHH for @cyl/@head at @addr. */
+static void eckd_put_seek(QTestState *qts, uint64_t addr, uint16_t cyl,
+                          uint16_t head)
+{
+    uint8_t seek[6] = { 0 };
+
+    stw_be_p(seek + 2, cyl);
+    stw_be_p(seek + 4, head);
+    qtest_memwrite(qts, addr, seek, sizeof(seek));
+}
+
+/*
+ * Read Data transfers the data area of the record whose count or key area
+ * the device is oriented to; oriented to the index point or the home
+ * address it orients to the next count area other than record zero (3990
+ * Storage Control Reference, Read Data).  Record zero is reached only from
+ * a count orientation, e.g. a Search ID Equal on R0.
+ *
+ * The DASD error recovery of an older operating system restarts a
+ * multitrack Read Data that ended in End of Cylinder by seeking to the next
+ * cylinder, reading the home address and re-driving the Read Data: it must
+ * get record 1, not R0's eight data bytes (program fetch then rejected the
+ * load module, "bad RLD/text count").
+ */
+static void test_read_data_skips_r0(void)
+{
+    uint8_t data0[ECKD_R1_LENGTH], data1[ECKD_R1_LENGTH], buf[ECKD_R1_LENGTH];
+    uint8_t search[5] = { 0 };
+    uint8_t sense[32];
+    g_autofree char *path = NULL;
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts;
+    CcwProgIrb irb;
+
+    memset(data0, 0x5a, sizeof(data0));
+    memset(data1, 0xa5, sizeof(data1));
+    path = create_ckd_image_full("CKD_P064", 0, 2, 2, 0);
+    ckd_write_r1_at(path, 0, CKD_HEADS - 1, data0);
+    ckd_write_r1_at(path, 1, 0, data1);
+    qts = eckd_prog_start(image, path);
+
+    /* Seek, Read Data: R1 (64 bytes, no incorrect length). */
+    eckd_put_seek(qts, CCW_PROG_DATA, 1, 0);
+    qtest_memset(qts, CCW_PROG_DATA + 0x100, 0, sizeof(buf));
+    ccw_prog_set_ccw(qts, 0, 0x07, CCW_FLAG_CC, 6, CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x06, 0, ECKD_R1_LENGTH, CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    eckd_expect_ok(qts, &irb);
+    qtest_memread(qts, CCW_PROG_DATA + 0x100, buf, sizeof(buf));
+    g_assert_cmpmem(buf, sizeof(buf), data1, sizeof(data1));
+
+    /* Seek, Read Home Address, Read Data: R1 as well. */
+    qtest_memset(qts, CCW_PROG_DATA + 0x100, 0, sizeof(buf));
+    ccw_prog_set_ccw(qts, 0, 0x07, CCW_FLAG_CC, 6, CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x1a, CCW_FLAG_CC, 5, CCW_PROG_DATA + 0x80);
+    ccw_prog_set_ccw(qts, 2, 0x06, 0, ECKD_R1_LENGTH, CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    eckd_expect_ok(qts, &irb);
+    qtest_memread(qts, CCW_PROG_DATA + 0x100, buf, sizeof(buf));
+    g_assert_cmpmem(buf, sizeof(buf), data1, sizeof(data1));
+
+    /* Seek, Search ID Equal R0, TIC back, Read Data: R0's eight bytes. */
+    stw_be_p(search, 1);
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x80, search, sizeof(search));
+    qtest_memset(qts, CCW_PROG_DATA + 0x100, 0xee, sizeof(buf));
+    ccw_prog_set_ccw(qts, 0, 0x07, CCW_FLAG_CC, 6, CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x31, CCW_FLAG_CC, 5, CCW_PROG_DATA + 0x80);
+    ccw_prog_set_ccw(qts, 2, 0x08, 0, 0, CCW_PROG_CCWS + 8);
+    ccw_prog_set_ccw(qts, 3, 0x06, 0, 8, CCW_PROG_DATA + 0x100);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    eckd_expect_ok(qts, &irb);
+    qtest_memread(qts, CCW_PROG_DATA + 0x100, buf, 9);
+    for (int i = 0; i < 8; i++) {
+        g_assert_cmphex(buf[i], ==, 0);
+    }
+    g_assert_cmphex(buf[8], ==, 0xee);
+
+    /*
+     * Multitrack Read Data past the last record of the cylinder: End of
+     * Cylinder.  The recovery (Seek next cylinder, Read Home Address,
+     * multitrack Read Data again) then reads record 1 of the new cylinder.
+     */
+    eckd_put_seek(qts, CCW_PROG_DATA, 0, CKD_HEADS - 1);
+    ccw_prog_set_ccw(qts, 0, 0x07, CCW_FLAG_CC, 6, CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x86, CCW_FLAG_CC, ECKD_R1_LENGTH,
+                     CCW_PROG_DATA + 0x100);
+    ccw_prog_set_ccw(qts, 2, 0x86, 0, ECKD_R1_LENGTH, CCW_PROG_DATA + 0x200);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE | CCW_DSTAT_UC);
+    g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 3 * 8);
+    qtest_memread(qts, CCW_PROG_DATA + 0x100, buf, sizeof(buf));
+    g_assert_cmpmem(buf, sizeof(buf), data0, sizeof(data0));
+    eckd_run_read(qts, 0x04, sizeof(sense), sense);
+    g_assert_cmphex(sense[1] & 0x20, ==, 0x20);        /* End of Cylinder */
+
+    eckd_put_seek(qts, CCW_PROG_DATA, 1, 0);
+    qtest_memset(qts, CCW_PROG_DATA + 0x200, 0, sizeof(buf));
+    ccw_prog_set_ccw(qts, 0, 0x07, CCW_FLAG_CC, 6, CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x1a, CCW_FLAG_CC | CCW_FLAG_SKIP, 5,
+                     CCW_PROG_DATA + 0x80);
+    ccw_prog_set_ccw(qts, 2, 0x86, 0, ECKD_R1_LENGTH, CCW_PROG_DATA + 0x200);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    eckd_expect_ok(qts, &irb);
+    qtest_memread(qts, CCW_PROG_DATA + 0x200, buf, sizeof(buf));
+    g_assert_cmpmem(buf, sizeof(buf), data1, sizeof(data1));
+
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1440,6 +1578,8 @@ int main(int argc, char **argv)
                        test_track_cache_invalidation);
         qtest_add_func("/eckd-ccw/io/write-ckd-record-number",
                        test_write_ckd_record_number);
+        qtest_add_func("/eckd-ccw/io/read-data-skips-r0",
+                       test_read_data_skips_r0);
         qtest_add_func("/eckd-ccw/io/read-track-domain",
                        test_read_track_domain);
         qtest_add_func("/eckd-ccw/io/scsw-ccw-format",
