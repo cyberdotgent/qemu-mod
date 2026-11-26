@@ -179,7 +179,7 @@ static void test_snapshot(void)
         unlink(image);
         return;
     }
-    qts = qtest_initf("-nodefaults -accel tcg -m 32 -kernel %s "
+    qts = qtest_initf("-nodefaults -accel kvm -m 32 -kernel %s "
                       "-drive if=none,id=snap,file=%s,format=qcow2",
                       image, disk);
     wait_byte(qts, PROG_READY);
@@ -213,7 +213,8 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
-    if (qtest_has_accel("tcg")) {
+    /* The guest program runs under KVM only (this tree does not use TCG). */
+    if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
         qtest_add_func("/s390x/skeys/snapshot", test_snapshot);
     }
 

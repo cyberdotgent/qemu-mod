@@ -278,13 +278,17 @@ static void test_machine(const void *data)
 
     /*
      * Make sure that this test uses tcg if available: It is used as a
-     * fast-enough smoketest for that.
+     * fast-enough smoketest for that.  Not on s390x, where this tree runs
+     * guests under KVM only.
      */
     qts = qtest_initf("%s %s -M %s -no-shutdown "
                       "-chardev file,id=serial0,path=%s "
-                      "-serial chardev:serial0 -accel tcg -accel kvm %s",
+                      "-serial chardev:serial0 %s %s",
                       codeparam, code ? codetmp : "", test->machine,
-                      serialtmp, test->extra);
+                      serialtmp,
+                      g_str_equal(qtest_get_arch(), "s390x") ?
+                      "-accel kvm" : "-accel tcg -accel kvm",
+                      test->extra);
     if (code) {
         unlink(codetmp);
     }
@@ -311,6 +315,11 @@ int main(int argc, char *argv[])
 
     if (!qtest_has_accel("tcg") && !qtest_has_accel("kvm")) {
         g_test_skip("No KVM or TCG accelerator available");
+        return 0;
+    }
+    if (g_str_equal(arch, "s390x") &&
+        (!qtest_has_accel("kvm") || access("/dev/kvm", R_OK | W_OK))) {
+        g_test_skip("s390x runs guests under KVM only");
         return 0;
     }
 

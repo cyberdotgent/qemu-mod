@@ -151,16 +151,13 @@ static inline int ccw_prog_run(QTestState *qts, uint16_t orb_ctrl0,
 }
 
 /*
- * The accelerator that runs the guest program: KVM where the host offers
- * it, else TCG; NULL if there is none.
+ * The accelerator that runs the guest program: KVM only (this tree does not
+ * run guests under TCG); NULL where the host does not offer it.
  */
 static inline const char *ccw_prog_accel(void)
 {
-    if (qtest_has_accel("kvm")) {
+    if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
         return "kvm";
-    }
-    if (qtest_has_accel("tcg")) {
-        return "tcg";
     }
     return NULL;
 }

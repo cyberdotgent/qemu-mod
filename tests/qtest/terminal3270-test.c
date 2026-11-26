@@ -616,6 +616,11 @@ static void test_client_before_enable(void)
     int fd;
     int i;
 
+    if (!ccw_prog_accel()) {
+        g_test_skip("needs KVM to run the guest program");
+        unlink(image);
+        return;
+    }
     /* The ccw_prog guest program, with the sequence above instead. */
     {
         int img = open(image, O_WRONLY);

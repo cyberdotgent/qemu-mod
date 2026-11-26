@@ -364,7 +364,7 @@ static void test_ipl_fba_program(void)
     g_assert_cmpint(ftruncate(fd, 1024 * 1024), ==, 0);
     close(fd);
 
-    qts = qtest_initf("-nodefaults -accel tcg "
+    qts = qtest_initf("-nodefaults -accel kvm "
                       "-drive if=none,id=fba,file=%s,format=raw "
                       "-device fba-ccw,drive=fba,devno=fe.0.0200 -ipl 200",
                       path);
@@ -406,7 +406,7 @@ static void test_ipl_eckd_program(void)
     g_assert_cmpint(ftruncate(fd, 512 + 15 * 56832), ==, 0);
     close(fd);
 
-    qts = qtest_initf("-nodefaults -accel tcg "
+    qts = qtest_initf("-nodefaults -accel kvm "
                       "-drive if=none,id=ckd,file=%s,format=raw "
                       "-device eckd-ccw,drive=ckd,devno=fe.0.0300 -ipl 300",
                       path);
@@ -427,7 +427,8 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     qtest_add_func("/s390x/ipl/properties", test_ipl_properties);
-    if (qtest_has_accel("tcg")) {
+    /* The IPL programs run under KVM only (this tree does not use TCG). */
+    if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
         qtest_add_func("/s390x/ipl/fba-program", test_ipl_fba_program);
         qtest_add_func("/s390x/ipl/eckd-program", test_ipl_eckd_program);
     }
