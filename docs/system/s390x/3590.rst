@@ -111,6 +111,18 @@ Use ``blockdev-open-tray`` followed by ``blockdev-remove-medium`` to unmount
 it.  A media change resets tape position and raises device attention when the
 subchannel is enabled.
 
+The drive writes to a medium only when the medium is writable
+(``read-only-mode`` of ``blockdev-change-medium``, ``read-only`` of the
+node); a read-only medium is file protected.  This is decided at each mount,
+so a drive can take writable and read-only media in any order.  While the
+drive is unloaded it holds no permissions on its medium.
+
+Rewind Unload rewinds and unloads the medium (the tray is then open, the
+medium stays inserted until removed) and ends with unit check "unload
+complete" (ERA 2B; on the 3590 also reason code 3123, recovery action
+"continue"), as the drives do.  A command chained to it is not executed.
+Commands to the unloaded drive get intervention required (ERA 43).
+
 IPL and CZAM recovery media
 ---------------------------
 
