@@ -16,6 +16,7 @@
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/units.h"
 #include "system/block-backend.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
@@ -61,9 +62,16 @@
 #define TAPE_ERA_COMMAND_REJECT   0x27
 #define TAPE_ERA_WRITE_PROTECTED  0x30
 #define TAPE_ERA_TAPE_VOID        0x31
+#define TAPE_ERA_END_OF_DATA      0x36
 #define TAPE_ERA_PHYSICAL_EOT     0x38
 #define TAPE_ERA_BACKWARD_AT_BOT  0x39
 #define TAPE_ERA_VOLUME_FENCED    0x47
+
+/* Sense byte 1 */
+#define TAPE_SENSE1_LOCATE_FAILURE 0x80
+#define TAPE_SENSE1_ONLINE         0x40
+#define TAPE_SENSE1_BOT            0x08
+#define TAPE_SENSE1_WRITE_PROTECT  0x02
 
 typedef struct TapeIdentity {
     const char *name;
@@ -73,6 +81,13 @@ typedef struct TapeIdentity {
     uint8_t dev_model;
     uint8_t mdr;
     uint8_t obr;
+    /*
+     * Width of the logical block number in the block ID of Read Block ID
+     * and Locate Block: 22 bits on the 3480/3490 family (bits 10-31, under
+     * the wrap, segment and format bits), the whole 32 bits on a 3590.
+     * The drives without block IDs use the 3590 commands as well.
+     */
+    uint8_t block_id_bits;
 } TapeIdentity;
 
 /*
@@ -80,17 +95,17 @@ typedef struct TapeIdentity {
  * these supported tape identities and model pairings.
  */
 static const TapeIdentity tape_identities[] = {
-    { "3410", 0x3115, 0x01, 0x3410, 0x01 },
-    { "3411", 0x3115, 0x01, 0x3411, 0x01 },
-    { "3420", 0x3803, 0x02, 0x3420, 0x06 },
-    { "3422", 0x3422, 0x01, 0x3422, 0x01 },
-    { "3430", 0x3422, 0x01, 0x3430, 0x01 },
-    { "3480", 0x3480, 0x31, 0x3480, 0x31, 0x41, 0x80 },
-    { "3490", 0x3490, 0x50, 0x3490, 0x50, 0x42, 0x81 },
-    { "3590", 0x3590, 0x11, 0x3590, 0x60, 0x46, 0x83 },
-    { "8809", 0x8809, 0x01, 0x8809, 0x01 },
-    { "9347", 0x9347, 0x01, 0x9347, 0x01 },
-    { "9348", 0x9348, 0x01, 0x9348, 0x01 },
+    { "3410", 0x3115, 0x01, 0x3410, 0x01, 0, 0, 32 },
+    { "3411", 0x3115, 0x01, 0x3411, 0x01, 0, 0, 32 },
+    { "3420", 0x3803, 0x02, 0x3420, 0x06, 0, 0, 32 },
+    { "3422", 0x3422, 0x01, 0x3422, 0x01, 0, 0, 32 },
+    { "3430", 0x3422, 0x01, 0x3430, 0x01, 0, 0, 32 },
+    { "3480", 0x3480, 0x31, 0x3480, 0x31, 0x41, 0x80, 22 },
+    { "3490", 0x3490, 0x50, 0x3490, 0x50, 0x42, 0x81, 22 },
+    { "3590", 0x3590, 0x11, 0x3590, 0x60, 0x46, 0x83, 32 },
+    { "8809", 0x8809, 0x01, 0x8809, 0x01, 0, 0, 32 },
+    { "9347", 0x9347, 0x01, 0x9347, 0x01, 0, 0, 32 },
+    { "9348", 0x9348, 0x01, 0x9348, 0x01, 0, 0, 32 },
 };
 
 struct Tape3590CcwDevice {
@@ -110,6 +125,11 @@ struct Tape3590CcwDevice {
     /* A migrated position on a writable medium awaits validation */
     bool restore_pending;
     VMChangeStateEntry *vmstate_change;
+    /* Limits of the medium (see tape-aws.h), 0 = largest possible */
+    uint64_t capacity;
+    uint32_t max_blocks;
+    uint64_t eot_margin;
+    uint32_t eot_margin_blocks;
 };
 
 static const TapeIdentity *tape3590_find_identity(const char *name)
@@ -181,6 +201,19 @@ static int tape3590_unit_check_era(Tape3590CcwDevice *tape, uint8_t sense,
 
     memset(sch->sense_data, 0, sizeof(sch->sense_data));
     sch->sense_data[0] = sense;
+    sch->sense_data[1] = TAPE_SENSE1_ONLINE;
+    if (!tape->tray_open) {
+        if (!blk_is_writable(tape->blk)) {
+            sch->sense_data[1] |= TAPE_SENSE1_WRITE_PROTECT;
+        }
+        if (!tape->medium.block_id) {
+            sch->sense_data[1] |= TAPE_SENSE1_BOT;
+        }
+        /* Bytes 4-6: channel logical block number, bits 8-31 */
+        sch->sense_data[4] = tape->medium.block_id >> 16;
+        sch->sense_data[5] = tape->medium.block_id >> 8;
+        sch->sense_data[6] = tape->medium.block_id;
+    }
     sch->sense_data[3] = era;
     schib->scsw.dstat = SCSW_DSTAT_CHANNEL_END |
                         SCSW_DSTAT_DEVICE_END |
@@ -201,34 +234,33 @@ static int tape3590_unit_check(Tape3590CcwDevice *tape, uint8_t sense)
 static int tape3590_read_result(Tape3590CcwDevice *tape,
                                 AwsTapeResult result)
 {
+    SubchDev *sch = CCW_DEVICE(tape)->sch;
+    int rc;
+
     switch (result) {
     case AWS_TAPE_EOT:
         /*
-         * Hercules' AWS backend reports a header read at physical EOF as
-         * EMPTYTAPE.  For a 3590 that is data check, permanent-error/OBR
-         * logging in sense byte 2, and ERA 31 (tape void).
+         * The end of the recorded data.  A drive reports the end-of-data
+         * mark it finds after the last block written as data check with
+         * ERA 36; a medium with nothing on it is a tape void (ERA 31).
+         * Permanent error, OBR logging in sense byte 2.
          */
-        {
-            int rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
-                                              TAPE_ERA_TAPE_VOID);
-
-            CCW_DEVICE(tape)->sch->sense_data[2] = 0x10;
-            return rc;
-        }
+        rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                     tape->medium.length ?
+                                     TAPE_ERA_END_OF_DATA :
+                                     TAPE_ERA_TAPE_VOID);
+        sch->sense_data[2] = 0x10;
+        return rc;
     case AWS_TAPE_BOT:
-        return tape3590_unit_check_era(tape, 0,
-                                       TAPE_ERA_BACKWARD_AT_BOT);
+        return tape3590_unit_check_era(tape, 0, TAPE_ERA_BACKWARD_AT_BOT);
     case AWS_TAPE_IO_ERROR:
         return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
                                        TAPE_ERA_PHYSICAL_EOT);
     default:
-        {
-            int rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
-                                              TAPE_ERA_READ_DATA_CHECK);
-
-            CCW_DEVICE(tape)->sch->sense_data[2] = 0x10;
-            return rc;
-        }
+        rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                     TAPE_ERA_READ_DATA_CHECK);
+        sch->sense_data[2] = 0x10;
+        return rc;
     }
 }
 
@@ -301,22 +333,40 @@ static void tape3590_unsolicited_sense(Tape3590CcwDevice *tape, uint8_t *buf)
     buf[30] = (devno & 0x0f) | ((devno & 0x0f) << 4);
 }
 
+/* Is this CCW the data-chained continuation of the previous one? */
+static bool tape3590_data_chained(SubchDev *sch)
+{
+    return sch->last_cmd_valid && (sch->last_cmd.flags & CCW_FLAG_DC);
+}
+
 static int tape3590_read(Tape3590CcwDevice *tape, const CCW1 *ccw,
                          bool previous)
 {
     SubchDev *sch = CCW_DEVICE(tape)->sch;
-    bool continuation = sch->last_cmd_valid &&
-                        (sch->last_cmd.flags & CCW_FLAG_DC) &&
-                        tape->record_offset < tape->record_length;
     AwsTapeResult result;
     size_t record_length;
     uint32_t available, length;
 
-    if (!continuation) {
+    /*
+     * A data-chained continuation goes on with the block the first CCW
+     * started, also when that block is exhausted: the device has ended the
+     * transfer, and the next block is never read into the same chain.
+     */
+    if (!tape3590_data_chained(sch)) {
+        tape->record_length = tape->record_offset = 0;
         if (previous) {
+            /*
+             * Read Previous transfers the block before the position in
+             * forward order and leaves the position in front of it.  A
+             * tape mark is spaced over (unit exception), BOT is ERA 39.
+             */
             result = aws_tape_backspace(&tape->medium);
+            if (result == AWS_TAPE_MARK) {
+                sch->curr_status.scsw.count = ccw->count;
+                return tape3590_unit_exception(tape);
+            }
             if (result != AWS_TAPE_OK) {
-                return tape3590_unit_check(tape, TAPE_SENSE_DATA_CHECK);
+                return tape3590_read_result(tape, result);
             }
         }
         result = aws_tape_read(&tape->medium, tape->record,
@@ -329,12 +379,10 @@ static int tape3590_read(Tape3590CcwDevice *tape, const CCW1 *ccw,
             return tape3590_read_result(tape, result);
         }
         tape->record_length = record_length;
-        tape->record_offset = 0;
         if (previous) {
-            /* Read Previous leaves the medium before the returned block. */
             result = aws_tape_backspace(&tape->medium);
             if (result != AWS_TAPE_OK) {
-                return tape3590_unit_check(tape, TAPE_SENSE_DATA_CHECK);
+                return tape3590_read_result(tape, result);
             }
         }
     }
@@ -350,30 +398,27 @@ static int tape3590_read(Tape3590CcwDevice *tape, const CCW1 *ccw,
     return 0;
 }
 
+/*
+ * Forward/Backward Space Block move over one block or tape mark, with unit
+ * exception for a tape mark.  Forward/Backward Space File move over blocks
+ * up to and including the next tape mark, without unit exception; Backward
+ * Space File leaves the position in front of (on the BOT side of) it.
+ */
 static int tape3590_space(Tape3590CcwDevice *tape, bool forward,
                           bool to_mark)
 {
     AwsTapeResult result;
-    size_t length;
 
     do {
-        if (forward) {
-            result = aws_tape_read(&tape->medium, tape->record,
-                                   AWS_TAPE_MAX_RECORD, &length);
-        } else {
-            result = aws_tape_backspace(&tape->medium);
-            if (result == AWS_TAPE_OK && to_mark) {
-                AwsTape position = tape->medium;
-
-                result = aws_tape_read(&tape->medium, tape->record,
-                                       AWS_TAPE_MAX_RECORD, &length);
-                tape->medium = position;
-            }
-        }
+        result = forward ? aws_tape_skip(&tape->medium) :
+                           aws_tape_backspace(&tape->medium);
         if (result != AWS_TAPE_OK && result != AWS_TAPE_MARK) {
             return tape3590_read_result(tape, result);
         }
     } while (to_mark && result != AWS_TAPE_MARK);
+    if (!to_mark && result == AWS_TAPE_MARK) {
+        return tape3590_unit_exception(tape);
+    }
     return 0;
 }
 
@@ -382,17 +427,32 @@ static int tape3590_write_result(Tape3590CcwDevice *tape,
 {
     switch (result) {
     case AWS_TAPE_OK:
+        /*
+         * Logical end of tape: a write-type command that ends at or past
+         * the early-warning point completes with unit exception.  The
+         * block is written; the program ends the volume.
+         */
+        if (aws_tape_past_warning(&tape->medium)) {
+            return tape3590_unit_exception(tape);
+        }
         return 0;
     case AWS_TAPE_WRITE_PROTECTED:
         return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
                                        TAPE_ERA_WRITE_PROTECTED);
     case AWS_TAPE_NO_SPACE:
+        /*
+         * Physical end of tape: the end of the volume, or no more room on
+         * the host.  Nothing of the block is on the medium.
+         */
         return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT,
                                        TAPE_ERA_PHYSICAL_EOT);
     case AWS_TAPE_FENCED:
         return tape3590_unit_check_era(tape, TAPE_SENSE_EQUIPMENT |
                                        TAPE_SENSE_DEFERRED_CHECK,
                                        TAPE_ERA_VOLUME_FENCED);
+    case AWS_TAPE_TOO_LARGE:
+        return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                       TAPE_ERA_COMMAND_REJECT);
     default:
         return tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
                                        TAPE_ERA_WRITE_DATA_CHECK);
@@ -405,19 +465,35 @@ static int tape3590_write(Tape3590CcwDevice *tape, const CCW1 *ccw)
     AwsTapeResult result;
 
     /*
-     * Hercules rejects data chaining for writes.  Besides matching that
-     * behavior, keeping a record within one CCW makes overwrite-and-truncate
-     * failure handling unambiguous.
+     * One Write command writes one block, whose data may come from several
+     * data-chained CCWs: a CCW moves at most 65535 bytes, a block can have
+     * 256 KiB.  Collect the data and write the block when the last CCW of
+     * the chain has delivered its part.
      */
-    if ((ccw->flags & CCW_FLAG_DC) || !ccw->count) {
+    if (!tape3590_data_chained(sch)) {
+        tape->record_length = tape->record_offset = 0;
+    }
+    if (!ccw->count) {
         return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
                                        TAPE_ERA_COMMAND_REJECT);
     }
-    if (ccw_dstream_read_buf(&sch->cds, tape->record, ccw->count)) {
+    if (ccw->count > AWS_TAPE_MAX_RECORD - tape->record_length) {
+        tape->record_length = 0;
+        return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                       TAPE_ERA_COMMAND_REJECT);
+    }
+    if (ccw_dstream_read_buf(&sch->cds, tape->record + tape->record_length,
+                             ccw->count)) {
+        tape->record_length = 0;
         return -EFAULT;
     }
+    tape->record_length += ccw->count;
     sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
-    result = aws_tape_write(&tape->medium, tape->record, ccw->count);
+    if (ccw->flags & CCW_FLAG_DC) {
+        return 0;
+    }
+    result = aws_tape_write(&tape->medium, tape->record, tape->record_length);
+    tape->record_length = 0;
     if (result == AWS_TAPE_OK && tape->write_immediate) {
         result = aws_tape_sync(&tape->medium);
     }
@@ -491,7 +567,8 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         return tape3590_space(tape, true, true);
     case TAPE_CMD_SYNCHRONIZE:
         sch->curr_status.scsw.count = ccw.count;
-        return tape3590_write_result(tape, aws_tape_sync(&tape->medium));
+        result = aws_tape_sync(&tape->medium);
+        return result == AWS_TAPE_OK ? 0 : tape3590_write_result(tape, result);
     case TAPE_CMD_READ_BLOCK_ID:
         stl_be_p(buf, tape->medium.block_id);
         stl_be_p(buf + 4, tape->medium.block_id);
@@ -501,10 +578,21 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
         }
         block_id = ldl_be_p(buf);
+        if (tape->identity->block_id_bits < 32) {
+            block_id &= (1u << tape->identity->block_id_bits) - 1;
+        }
         result = aws_tape_locate(&tape->medium, block_id);
         sch->curr_status.scsw.count = ccw.count - 4;
+        if (result == AWS_TAPE_NOT_FOUND) {
+            /* The block is beyond the end of the data: locate failure. */
+            int rc = tape3590_unit_check_era(tape, TAPE_SENSE_DATA_CHECK,
+                                             TAPE_ERA_END_OF_DATA);
+
+            sch->sense_data[1] |= TAPE_SENSE1_LOCATE_FAILURE;
+            return rc;
+        }
         return result == AWS_TAPE_OK ? 0 :
-               tape3590_unit_check(tape, TAPE_SENSE_DATA_CHECK);
+               tape3590_read_result(tape, result);
     case TAPE_CMD_SENSE:
         if (buffer_is_zero(sch->sense_data, 32)) {
             tape3590_unsolicited_sense(tape, buf);
@@ -551,7 +639,8 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
     case TAPE_CMD_WRITE_IMMEDIATE:
         tape->write_immediate = true;
         sch->curr_status.scsw.count = ccw.count;
-        return tape3590_write_result(tape, aws_tape_sync(&tape->medium));
+        result = aws_tape_sync(&tape->medium);
+        return result == AWS_TAPE_OK ? 0 : tape3590_write_result(tape, result);
     case TAPE_CMD_ASSIGN:
         if (ccw.count < sizeof(tape->partition_id) ||
             ccw_dstream_read_buf(&sch->cds, buf,
@@ -602,6 +691,44 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
 static void tape3590_vm_state_change(void *opaque, bool running,
                                      RunState state);
 
+/*
+ * The volume ends at the most restrictive of: the blocks the block ID of
+ * the drive can number, the optional max-blocks and capacity properties
+ * (which can only lower it) and whatever room the host has.  Logical end
+ * of tape is reported eot-margin bytes / eot-margin-blocks blocks before
+ * the first two (automatic: 128 MiB or 8192 blocks, at most an eighth).
+ */
+static bool tape3590_set_limits(Tape3590CcwDevice *tape, Error **errp)
+{
+    uint32_t limit = tape->identity->block_id_bits < 32 ?
+                     AWS_TAPE_MAX_BLOCKS_22 : AWS_TAPE_MAX_BLOCKS_32;
+    uint32_t max_blocks = tape->max_blocks ?: limit;
+
+    if (max_blocks > limit) {
+        error_setg(errp, "max-blocks=%" PRIu32 " exceeds the %" PRIu32
+                   " blocks the block ID of a %s can address",
+                   tape->max_blocks, limit, tape->identity->name);
+        return false;
+    }
+    if (tape->capacity > INT64_MAX) {
+        error_setg(errp, "capacity too large");
+        return false;
+    }
+    if (tape->eot_margin && (!tape->capacity ||
+                             tape->eot_margin >= tape->capacity)) {
+        error_setg(errp, "eot-margin needs a larger capacity");
+        return false;
+    }
+    if (tape->eot_margin_blocks >= max_blocks) {
+        error_setg(errp, "eot-margin-blocks must be below the %" PRIu32
+                   "-block limit", max_blocks);
+        return false;
+    }
+    aws_tape_set_limits(&tape->medium, tape->capacity, max_blocks,
+                        tape->eot_margin, tape->eot_margin_blocks);
+    return true;
+}
+
 static void tape3590_realize(DeviceState *dev, Error **errp)
 {
     Tape3590CcwDevice *tape = TAPE_3590_CCW(dev);
@@ -617,6 +744,9 @@ static void tape3590_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "Invalid 3590 identity '%s'; expected one of "
                    "3410, 3411, 3420, 3422, 3430, 3480, 3490, 3590, "
                    "8809, 9347, 9348", tape->ident);
+        return;
+    }
+    if (!tape3590_set_limits(tape, errp)) {
         return;
     }
 
@@ -696,6 +826,7 @@ fail_record:
     qemu_del_vm_change_state_handler(tape->vmstate_change);
     tape->vmstate_change = NULL;
     g_clear_pointer(&tape->record, g_free);
+    aws_tape_cleanup(&tape->medium);
 }
 
 static void tape3590_unrealize(DeviceState *dev)
@@ -707,6 +838,7 @@ static void tape3590_unrealize(DeviceState *dev)
         tape->vmstate_change = NULL;
     }
     g_clear_pointer(&tape->record, g_free);
+    aws_tape_cleanup(&tape->medium);
 }
 
 static int tape3590_pre_load(void *opaque)
@@ -823,6 +955,11 @@ static const Property tape3590_properties[] = {
     DEFINE_PROP_DRIVE("drive", Tape3590CcwDevice, blk),
     DEFINE_PROP_STRING("ident", Tape3590CcwDevice, ident),
     DEFINE_PROP_CCW_LOADPARM("loadparm", CcwDevice, loadparm),
+    DEFINE_PROP_SIZE("capacity", Tape3590CcwDevice, capacity, 0),
+    DEFINE_PROP_UINT32("max-blocks", Tape3590CcwDevice, max_blocks, 0),
+    DEFINE_PROP_SIZE("eot-margin", Tape3590CcwDevice, eot_margin, 0),
+    DEFINE_PROP_UINT32("eot-margin-blocks", Tape3590CcwDevice,
+                       eot_margin_blocks, 0),
 };
 
 static void tape3590_class_init(ObjectClass *klass, const void *data)

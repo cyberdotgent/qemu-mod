@@ -669,6 +669,10 @@ static QemuOptsList qemu_dev3590_opts = {
         { .name = "ident", .type = QEMU_OPT_STRING },
         { .name = "readonly", .type = QEMU_OPT_BOOL },
         { .name = "id", .type = QEMU_OPT_STRING },
+        { .name = "capacity", .type = QEMU_OPT_STRING },
+        { .name = "max-blocks", .type = QEMU_OPT_STRING },
+        { .name = "eot-margin", .type = QEMU_OPT_STRING },
+        { .name = "eot-margin-blocks", .type = QEMU_OPT_STRING },
         { /* end of list */ }
     },
 };
@@ -1907,7 +1911,11 @@ static bool dev9336_add(const char *optarg, Error **errp)
 
 static bool dev3590_add_opts(QemuOpts *opts, Error **errp)
 {
+    static const char * const limit_opts[] = {
+        "capacity", "max-blocks", "eot-margin", "eot-margin-blocks",
+    };
     static unsigned int index;
+    size_t i;
     g_autofree char *generated_drive_id = NULL;
     g_autofree char *generated_device_id = NULL;
     g_autofree char *normalized_devno = NULL;
@@ -1955,6 +1963,13 @@ static bool dev3590_add_opts(QemuOpts *opts, Error **errp)
         (drive && !qemu_opt_set(device_opts, "drive", drive, errp)) ||
         (ident && !qemu_opt_set(device_opts, "ident", ident, errp))) {
         goto fail;
+    }
+    for (i = 0; i < ARRAY_SIZE(limit_opts); i++) {
+        const char *value = qemu_opt_get(opts, limit_opts[i]);
+
+        if (value && !qemu_opt_set(device_opts, limit_opts[i], value, errp)) {
+            goto fail;
+        }
     }
     if (devno) {
         if (sscanf(devno, "%x%n", &short_devno, &consumed) == 1 &&

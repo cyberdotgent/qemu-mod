@@ -1241,7 +1241,9 @@ ERST
 
 DEF("dev3590", HAS_ARG, QEMU_OPTION_dev3590,
     "-dev3590 [file=file][,devno=ccw-address][,ident=type][,readonly=on|off][,id=id]\n"
+    "         [,capacity=size][,max-blocks=n][,eot-margin=size][,eot-margin-blocks=n]\n"
     "-dev3590 drive=node[,devno=ccw-address][,ident=type][,id=id]\n"
+    "         [,capacity=size][,max-blocks=n][,eot-margin=size][,eot-margin-blocks=n]\n"
     "                add an AWS-backed IBM 3590 A50 tape drive\n",
     QEMU_ARCH_S390X)
 SRST
@@ -1255,8 +1257,11 @@ SRST
     four-digit hexadecimal ``devno`` such as ``580`` or ``0580`` means
     ``fe.0.0580``. ``ident`` selects a compatibility identity from ``3410``,
     ``3411``, ``3420``, ``3422``, ``3430``, ``3480``, ``3490``, ``3590``,
-    ``8809``, ``9347``, and ``9348``; it defaults to ``3590``. The option can
-    be repeated for multiple tape drives.
+    ``8809``, ``9347``, and ``9348``; it defaults to ``3590``. ``capacity``
+    (bytes of AWS data) and ``max-blocks`` lower the end of the volume from
+    the largest the block ID can address; logical end of tape is reported
+    ``eot-margin`` bytes or ``eot-margin-blocks`` blocks before it (see the
+    3590 documentation). The option can be repeated for multiple tape drives.
 ERST
 
 DEF("dev3390", HAS_ARG, QEMU_OPTION_dev3390,
