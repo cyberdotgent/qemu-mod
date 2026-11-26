@@ -935,6 +935,411 @@ static void test_cylinders_property(void)
     unlink(zpdt);
 }
 
+/*
+ * 3390 identity bytes, recorded before the 3380 identity was added: the
+ * default device keeps presenting exactly these.
+ */
+static const uint8_t eckd_3390_sense_id[24] = {
+    0xff, 0x21, 0x07, 0xe8, 0x33, 0x90, 0x02, 0x00,
+    0x40, 0xfa, 0x01, 0x00, 0x41, 0x27, 0x00, 0x04,
+    0x42, 0x3e, 0x01, 0xa0, 0x43, 0x3e, 0x00, 0x08,
+};
+static const uint8_t eckd_3390_rdc[64] = {
+    0x21, 0x07, 0xe8, 0x33, 0x90, 0x02, 0x52, 0x80,
+    0x10, 0xb7, 0x20, 0x26, 0x00, 0x01, 0x00, 0x0f,
+    0xe0, 0x00, 0xe5, 0xa2, 0x05, 0x94, 0x02, 0x22,
+    0x13, 0x09, 0x06, 0x74, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x26, 0x26, 0x1f, 0x02, 0xdf, 0xee, 0x00, 0x01,
+    0x06, 0x77, 0x08, 0x00, 0x00, 0x00, 0x48, 0x00,
+    0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+};
+
+static void eckd_run_read(QTestState *qts, uint8_t cmd, uint16_t count,
+                          uint8_t *buf)
+{
+    CcwProgIrb irb;
+
+    qtest_memset(qts, CCW_PROG_DATA, 0, count);
+    ccw_prog_set_ccw(qts, 0, cmd, CCW_FLAG_SLI, count, CCW_PROG_DATA);
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb), ==, 0);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    qtest_memread(qts, CCW_PROG_DATA, buf, count);
+}
+
+static void eckd_print_bytes(const char *what, const uint8_t *buf,
+                             size_t length)
+{
+    g_test_message("%s:", what);
+    for (size_t i = 0; i < length; i += 8) {
+        g_autoptr(GString) line = g_string_new(NULL);
+
+        for (size_t j = i; j < length && j < i + 8; j++) {
+            g_string_append_printf(line, "0x%02x, ", buf[j]);
+        }
+        g_test_message("%s", line->str);
+    }
+}
+
+static void test_3390_identity_bytes(void)
+{
+    g_autofree char *path = create_ckd64_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts = eckd_prog_start_opts(image, path, "");
+    uint8_t buf[64];
+
+    eckd_run_read(qts, 0xe4, 24, buf);
+    eckd_print_bytes("Sense ID", buf, 24);
+    g_assert_cmpmem(buf, 24, eckd_3390_sense_id, 24);
+    eckd_run_read(qts, 0x64, 64, buf);
+    eckd_print_bytes("RDC", buf, 64);
+    g_assert_cmpmem(buf, 64, eckd_3390_rdc, 64);
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
+#define CKD3380_TRACK_SIZE 47616
+
+/*
+ * A CKD_P370 image in the 3380 track format (header device type X'80',
+ * 47616-byte track slots, as Hercules writes them) of @cylinders
+ * cylinders; the tracks of cylinder 0 hold home address, R0 and the end.
+ */
+static char *create_3380_image(unsigned int cylinders)
+{
+    uint8_t header[CKD_HEADER_SIZE] = { 0 };
+    uint8_t track[29] = { 0 };
+    char *path = NULL;
+    int fd = g_file_open_tmp("qemu-eckd-3380-XXXXXX.ckd", &path, NULL);
+    unsigned int head;
+
+    g_assert_cmpint(fd, >=, 0);
+    memcpy(header, "CKD_P370", 8);
+    stl_le_p(header + 8, CKD_HEADS);
+    stl_le_p(header + 12, CKD3380_TRACK_SIZE);
+    header[16] = 0x80;
+    memcpy(header + 20, "VOL380", 6);
+    g_assert_cmpint(write(fd, header, sizeof(header)), ==, sizeof(header));
+    for (head = 0; head < CKD_HEADS; head++) {
+        memset(track, 0, sizeof(track));
+        stw_be_p(track + 3, head);
+        stw_be_p(track + 7, head);
+        stw_be_p(track + 11, 8);
+        memset(track + 21, 0xff, 8);
+        g_assert_cmpint(pwrite(fd, track, sizeof(track),
+                               CKD_HEADER_SIZE +
+                               (int64_t)head * CKD3380_TRACK_SIZE), ==,
+                        sizeof(track));
+    }
+    g_assert_cmpint(ftruncate(fd, CKD_HEADER_SIZE + (int64_t)cylinders *
+                              CKD_HEADS * CKD3380_TRACK_SIZE), ==, 0);
+    close(fd);
+    return path;
+}
+
+/* The device bytes of RDC that tell a 3380 (IBM GA32-0274, appendix A). */
+static void eckd_check_rdc_3380(const uint8_t *rdc, uint16_t primary,
+                                uint16_t alternate_tracks)
+{
+    g_assert_cmphex(lduw_be_p(rdc + 3), ==, 0x3380);
+    g_assert_cmphex(rdc[10], ==, 0x20);
+    g_assert_cmphex(rdc[11], ==, 0x0e);
+    g_assert_cmpuint(lduw_be_p(rdc + 12), ==, primary);
+    g_assert_cmpuint(lduw_be_p(rdc + 14), ==, 15);
+    g_assert_cmpuint(rdc[16], ==, 222);
+    g_assert_cmpuint(ldl_be_p(rdc + 16) & 0xffffff, ==, 47968);
+    g_assert_cmpuint(lduw_be_p(rdc + 20), ==, 1088);
+    g_assert_cmpuint(rdc[22], ==, 1);
+    g_assert_cmpuint(rdc[23], ==, 32);
+    g_assert_cmpuint(lduw_be_p(rdc + 24), ==, 492);
+    g_assert_cmpuint(lduw_be_p(rdc + 26), ==, 236);
+    g_assert_cmpuint(lduw_be_p(rdc + 28), ==, alternate_tracks ? primary : 0);
+    g_assert_cmpuint(lduw_be_p(rdc + 30), ==, alternate_tracks);
+    g_assert_cmphex(rdc[40], ==, 0x0e);
+    g_assert_cmphex(rdc[41], ==, 0x0e);
+    g_assert_cmpuint(lduw_be_p(rdc + 44), ==, 47988);
+    g_assert_cmpuint(rdc[48], ==, 0);
+    g_assert_cmphex(lduw_be_p(rdc + 49), ==, 0x5007);
+}
+
+/*
+ * A 3380 image makes a 3380 on a 3990 by default; a 3380-1 image with its
+ * alternate cylinder (886 cylinders) reports 885 primary cylinders.
+ */
+static void test_3380_identity(void)
+{
+    g_autofree char *path = create_3380_image(1);
+    g_autofree char *path886 = create_3380_image(886);
+    g_autofree char *path3390 = create_ckd64_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    static const uint8_t ciws[16] = {
+        0x40, 0xfa, 0x01, 0x00, 0x41, 0x27, 0x00, 0x04,
+        0x42, 0x3e, 0x01, 0xa0, 0x43, 0x3e, 0x00, 0x08,
+    };
+    QTestState *qts;
+    uint8_t buf[64];
+
+    qts = eckd_prog_start_opts(image, path, "");
+    eckd_check_identity(qts, 0x3990, 0xe9, 0x3380, 0x02);
+    eckd_run_read(qts, 0xe4, 24, buf);
+    g_assert_cmpmem(buf + 8, 16, ciws, 16);
+    eckd_run_read(qts, 0x64, 64, buf);
+    eckd_check_rdc_3380(buf, 1, 0);
+    qtest_quit(qts);
+
+    qts = eckd_prog_start_opts(image, path886, "");
+    eckd_run_read(qts, 0x64, 64, buf);
+    g_assert_cmphex(buf[5], ==, 0x02);
+    eckd_check_rdc_3380(buf, 885, 15);
+    qtest_quit(qts);
+
+    /* 3380 identity on a 3390 image: 3380 track format in RDC. */
+    qts = eckd_prog_start_opts(image, path3390, ",device-type=0x3380");
+    eckd_check_identity(qts, 0x3990, 0xe9, 0x3380, 0x02);
+    eckd_run_read(qts, 0x64, 64, buf);
+    eckd_check_rdc_3380(buf, 1, 0);
+    qtest_quit(qts);
+
+    /* A 3880 has no command information words: Sense ID is 7 bytes. */
+    qts = eckd_prog_start_opts(image, path, ",control-unit-type=0x3880,"
+                               "control-unit-model=0x05");
+    eckd_run_read(qts, 0xe4, 7, buf);
+    g_assert_cmphex(lduw_be_p(buf + 1), ==, 0x3880);
+    g_assert_cmphex(buf[3], ==, 0x05);
+    g_assert_cmphex(lduw_be_p(buf + 4), ==, 0x3380);
+    {
+        CcwProgIrb irb;
+
+        /* 24 bytes asked for without SLI: incorrect length, 7 sent */
+        ccw_prog_set_ccw(qts, 0, 0xe4, 0, 24, CCW_PROG_DATA);
+        g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, &irb),
+                        ==, 0);
+        g_assert_cmphex(irb.cstat, ==, 0x40);
+        g_assert_cmpuint(irb.count, ==, 24 - 7);
+    }
+    qtest_quit(qts);
+
+    unlink(path);
+    unlink(path886);
+    unlink(path3390);
+    unlink(image);
+}
+
+static void test_3380_identity_invalid(void)
+{
+    g_autofree char *path = create_3380_image(1);
+
+    assert_device_fails(path, ",device-type=0x3390",
+                        "device-type 3390 needs an image with 3390 tracks");
+    unlink(path);
+}
+
+/*
+ * Format-write records behind R0 of track 0/@head in one channel program:
+ * Define Extent, Locate Record (Format Write, orient on R@after), then one
+ * Write CKD per record (key length @kl, data lengths @dl[]).  Returns the
+ * IRB of the program.
+ */
+static void eckd_format_records(QTestState *qts, uint16_t head, uint8_t after,
+                                uint8_t first, unsigned int count, uint8_t kl,
+                                uint16_t dl, CcwProgIrb *irb)
+{
+    uint8_t extent[16] = { 0 }, locate[16] = { 0 }, count_area[8];
+    uint64_t data = CCW_PROG_DATA + 0x100;
+    unsigned int i;
+
+    g_assert_cmpuint(count, <=, 30);
+    stw_be_p(extent + 14, CKD_HEADS - 1);
+    locate[0] = 0x03;
+    locate[3] = count;
+    stw_be_p(locate + 6, head);         /* seek address CCHH */
+    stw_be_p(locate + 10, head);        /* search argument CCHHR */
+    locate[12] = after;
+    qtest_memwrite(qts, CCW_PROG_DATA, extent, sizeof(extent));
+    qtest_memwrite(qts, CCW_PROG_DATA + 0x20, locate, sizeof(locate));
+    ccw_prog_set_ccw(qts, 0, 0x63, CCW_FLAG_CC, sizeof(extent),
+                     CCW_PROG_DATA);
+    ccw_prog_set_ccw(qts, 1, 0x47, CCW_FLAG_CC, sizeof(locate),
+                     CCW_PROG_DATA + 0x20);
+    for (i = 0; i < count; i++) {
+        memset(count_area, 0, sizeof(count_area));
+        stw_be_p(count_area + 2, head);
+        count_area[4] = first + i;
+        count_area[5] = kl;
+        stw_be_p(count_area + 6, dl);
+        /* key and data stay zero: the device pads a short transfer */
+        qtest_memwrite(qts, data + i * 8, count_area, 8);
+        ccw_prog_set_ccw(qts, 2 + i, 0x1d,
+                         i + 1 < count ? CCW_FLAG_CC : 0, 8, data + i * 8);
+    }
+    g_assert_cmpint(ccw_prog_run(qts, CCW_ORB_FMT | CCW_ORB_C64, irb), ==, 0);
+}
+
+static void eckd_expect_ok(QTestState *qts, const CcwProgIrb *irb)
+{
+    if (irb->dstat & CCW_DSTAT_UC) {
+        uint8_t sense[32];
+
+        eckd_run_read(qts, 0x04, sizeof(sense), sense);
+        eckd_print_bytes("unexpected unit check, sense", sense, 32);
+        g_test_message("CCW address %x", irb->cpa);
+    }
+    g_assert_cmphex(irb->cstat, ==, 0);
+    g_assert_cmphex(irb->dstat, ==, CCW_DSTAT_CE_DE);
+}
+
+/* Unit check, sense byte 1 Invalid Track Format: the record does not fit. */
+static void eckd_expect_track_full(QTestState *qts, const CcwProgIrb *irb)
+{
+    uint8_t sense[32];
+
+    g_assert_cmphex(irb->dstat, ==, CCW_DSTAT_CE_DE | CCW_DSTAT_UC);
+    eckd_run_read(qts, 0x04, sizeof(sense), sense);
+    g_assert_cmphex(sense[0], ==, 0);
+    g_assert_cmphex(sense[1], ==, 0x40);
+}
+
+/*
+ * Write CKD keeps to the 3380 track capacity (formula 1, 47968 bytes):
+ * one record of 47476 bytes, or 83 records of 80 bytes (576 bytes of
+ * track each), or a keyed record of 8 + 47220 bytes fill a track.
+ */
+static void check_3380_track_capacity(const char *path, const char *extra,
+                                      int64_t track_size)
+{
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts = eckd_prog_start_opts(image, path, extra);
+    uint8_t count_area[8];
+    CcwProgIrb irb;
+    int fd;
+
+    /* Head 1: the largest record, then nothing more. */
+    eckd_format_records(qts, 1, 0, 1, 1, 0, 47476, &irb);
+    eckd_expect_ok(qts, &irb);
+    eckd_format_records(qts, 1, 1, 2, 1, 0, 1, &irb);
+    eckd_expect_track_full(qts, &irb);
+
+    /* Head 2: one byte more than the largest record does not fit. */
+    eckd_format_records(qts, 2, 0, 1, 1, 0, 47477, &irb);
+    eckd_expect_track_full(qts, &irb);
+
+    /* Head 3: 83 records of 80 bytes, not 84. */
+    eckd_format_records(qts, 3, 0, 1, 30, 0, 80, &irb);
+    eckd_expect_ok(qts, &irb);
+    eckd_format_records(qts, 3, 30, 31, 30, 0, 80, &irb);
+    eckd_expect_ok(qts, &irb);
+    eckd_format_records(qts, 3, 60, 61, 23, 0, 80, &irb);
+    eckd_expect_ok(qts, &irb);
+    eckd_format_records(qts, 3, 83, 84, 1, 0, 80, &irb);
+    eckd_expect_track_full(qts, &irb);
+
+    /* Head 4: a keyed record. */
+    eckd_format_records(qts, 4, 0, 1, 1, 8, 47221, &irb);
+    eckd_expect_track_full(qts, &irb);
+    eckd_format_records(qts, 4, 0, 1, 1, 8, 47220, &irb);
+    eckd_expect_ok(qts, &irb);
+    qtest_quit(qts);
+
+    /* The image holds R83 of head 3 and the end of track behind it. */
+    fd = open(path, O_RDONLY);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(pread(fd, count_area, 8,
+                          CKD_HEADER_SIZE + 3 * track_size + 5 + 16 +
+                          82 * (8 + 80)), ==, 8);
+    g_assert_cmphex(count_area[4], ==, 83);
+    g_assert_cmpuint(lduw_be_p(count_area + 6), ==, 80);
+    g_assert_cmpint(pread(fd, count_area, 8,
+                          CKD_HEADER_SIZE + 3 * track_size + 5 + 16 +
+                          83 * (8 + 80)), ==, 8);
+    for (int i = 0; i < 8; i++) {
+        g_assert_cmphex(count_area[i], ==, 0xff);
+    }
+    close(fd);
+    unlink(image);
+}
+
+static void test_3380_track_capacity(void)
+{
+    g_autofree char *path = create_3380_image(1);
+    g_autofree char *path3390 = create_ckd64_image();
+
+    check_3380_track_capacity(path, "", CKD3380_TRACK_SIZE);
+    /* The same on 3390 tracks with a 3380 identity. */
+    check_3380_track_capacity(path3390, ",device-type=0x3380",
+                              CKD_TRACK_SIZE);
+    unlink(path);
+    unlink(path3390);
+}
+
+/* A 3390 is not limited to 3380 tracks: two records beyond 47968 bytes. */
+static void test_3390_beyond_3380_capacity(void)
+{
+    g_autofree char *path = create_ckd64_image();
+    g_autofree char *image = ccw_prog_create_image(CCW_PROG_SID_OF(0));
+    QTestState *qts = eckd_prog_start_opts(image, path, "");
+    CcwProgIrb irb;
+
+    eckd_format_records(qts, 1, 0, 1, 1, 0, 47477, &irb);
+    eckd_expect_ok(qts, &irb);
+    eckd_format_records(qts, 1, 1, 2, 1, 0, 4096, &irb);
+    eckd_expect_ok(qts, &irb);
+    qtest_quit(qts);
+    unlink(path);
+    unlink(image);
+}
+
+/* Read IPL and IPL from a 3380 image: the program loops at 0x18. */
+static void test_3380_ipl(void)
+{
+    static const uint8_t ipl_psw_ccw[16] = {
+        0x00, 0x08, 0x00, 0x00, 0x80, 0x00, 0x00, 0x18,
+        0x06, 0x00, 0x00, 0x18, 0x20, 0x00, 0x00, 0x04,
+    };
+    static const uint8_t ipl_loop[4] = { 0xa7, 0xf4, 0x00, 0x00 };
+    uint8_t track[5 + 16 + 8 + 24 + 8 + 4 + 8] = { 0 };
+    uint8_t *r1 = track + 5 + 16, *r2 = r1 + 8 + 24;
+    g_autofree char *path = create_3380_image(1);
+    g_autofree char *regs = NULL;
+    QTestState *qts;
+    int fd, i;
+
+    stw_be_p(track + 5 + 6, 8);         /* R0 */
+    r1[4] = 1;
+    stw_be_p(r1 + 6, 24);
+    memcpy(r1 + 8, ipl_psw_ccw, sizeof(ipl_psw_ccw));
+    r2[4] = 2;
+    stw_be_p(r2 + 6, 4);
+    memcpy(r2 + 8, ipl_loop, sizeof(ipl_loop));
+    memset(r2 + 8 + 4, 0xff, 8);
+    fd = open(path, O_WRONLY);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(pwrite(fd, track, sizeof(track), CKD_HEADER_SIZE), ==,
+                    sizeof(track));
+    close(fd);
+
+    qts = qtest_initf("-nodefaults -accel kvm -m 128M "
+                      "-drive if=none,id=ckd,file=%s,format=raw "
+                      "-device eckd-ccw,drive=ckd,devno=fe.0.0300 -ipl 300",
+                      path);
+    for (i = 0; i < 500; i++) {
+        const char *addr;
+
+        g_free(regs);
+        regs = qtest_hmp(qts, "info registers");
+        addr = strstr(regs, " addr ");
+        g_assert_nonnull(addr);
+        if (g_ascii_strtoull(addr + 6, NULL, 16) == 0x18) {
+            break;
+        }
+        g_usleep(10000);
+    }
+    g_assert_cmpint(i, <, 500);
+    qtest_quit(qts);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -953,6 +1358,8 @@ int main(int argc, char **argv)
                    test_header_size_any_file_sequence);
     qtest_add_func("/eckd-ccw/cylinders-property", test_cylinders_property);
     qtest_add_func("/eckd-ccw/identity-invalid", test_identity_invalid);
+    qtest_add_func("/eckd-ccw/3380-identity-invalid",
+                   test_3380_identity_invalid);
     if (ccw_prog_accel()) {
         qtest_add_func("/eckd-ccw/io/identity", test_identity);
         qtest_add_func("/eckd-ccw/io/2g-boundary", test_io_2g_boundary);
@@ -968,6 +1375,17 @@ int main(int argc, char **argv)
                        test_migration_read_orientation);
         qtest_add_func("/eckd-ccw/io/migration-during-io",
                        test_migration_during_io);
+        qtest_add_func("/eckd-ccw/io/3390-identity-bytes",
+                       test_3390_identity_bytes);
+        qtest_add_func("/eckd-ccw/io/3380-identity", test_3380_identity);
+        qtest_add_func("/eckd-ccw/io/3380-track-capacity",
+                       test_3380_track_capacity);
+        qtest_add_func("/eckd-ccw/io/3390-beyond-3380-capacity",
+                       test_3390_beyond_3380_capacity);
+    }
+    /* The IPL test runs the firmware: KVM only. */
+    if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
+        qtest_add_func("/eckd-ccw/io/3380-ipl", test_3380_ipl);
     }
     return g_test_run();
 }

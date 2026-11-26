@@ -28,11 +28,50 @@ argument against physical count fields on the selected track.  Data
 orientation advances to the next count field in track order; CKD record
 numbers are labels and need not be consecutive.
 
+3380 disks
+----------
+
+Operating systems from before the 3390 often support only 3380 disks.  The
+device has a 3380 identity: a 3380 on a 3990 storage control in Sense ID
+(model X'02' for up to 886 cylinders, X'0A' up to 1772, X'1E' above: 3380
+A/D/J, E and K) and the 3380 track format in Read Device Characteristics:
+222 sectors, 47,968 bytes per track after home address and record zero
+(1,088 bytes), track-capacity formula 1 with the factors 32, 492 and 236,
+largest record 47,476 bytes.  Write Count, Key and Data keeps to that
+capacity and ends with unit check, Invalid Track Format, when a record does
+not fit.  The device accepts the same channel commands with either
+identity.
+
+A 3380 identity is selected by the image or by the ``device-type``
+property:
+
+* Images in the 3380 track format (header device type X'80', 47,616-byte
+  track slots, as Hercules creates them for a 3380) are 3380 disks by
+  default.  Such an image can only be a 3380.
+* A 3390 image becomes a 3380 disk with ``device-type=0x3380``; its records
+  then stay within the 3380 track capacity, so its tracks can later be
+  copied to a 3380 image.
+
+The control unit is a 3990 (model E9) for a 3380 and a 2107 (model E8) for
+a 3390 unless ``control-unit-type`` and ``control-unit-model`` say
+otherwise.  A 3880 control unit (``control-unit-type=0x3880`` with a
+model) has no command information words: Sense ID then returns 7 bytes.
+
+Hercules 3380 images with alternate cylinders (885 + 1, 1770 + 2 or 2655 + 3
+cylinders) report the standard number of primary cylinders and the
+alternate cylinder(s) in Read Device Characteristics; all cylinders stay
+accessible.  Compressed Hercules images (CCKD, with or without shadow files)
+are not a device format; Hercules' ``dasdcopy`` converts them, shadow files
+merged, into the plain format::
+
+  dasdcopy -o CKD base.dsk "sf=base_*.dsk" plain.ckd
+
 Volume size
 -----------
 
 The image is a 512-byte device header followed by one 56,832-byte track slot
-per track, so a volume of *n* cylinders needs 512 + *n* × 852,480 bytes. The
+per track (47,616 bytes for 3380 tracks), so a 3390 volume of *n* cylinders
+needs 512 + *n* × 852,480 bytes (3380: 512 + *n* × 714,240). The
 number of cylinders comes from the header's 16-bit little-endian
 ``high_cylinder`` field at offset 18:
 

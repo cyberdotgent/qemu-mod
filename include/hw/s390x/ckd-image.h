@@ -28,6 +28,8 @@ typedef struct CkdImageRecord {
 typedef struct CkdImage {
     BlockBackend *blk;
     bool image64;
+    /* Device type of the track format (header byte 16): 0x3390 or 0x3380 */
+    uint16_t device_type;
     uint32_t cylinders;
     uint32_t heads;
     uint32_t track_size;

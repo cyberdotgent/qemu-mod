@@ -22,9 +22,26 @@
 #define CKD_RECORD_HEADER_SIZE 8
 #define CKD_END_TRACK_SIZE 8
 #define CKD_R0_DATA_SIZE 8
-#define CKD_3390_HEADS 15
-#define CKD_3390_MAX_CYLINDERS 65520
-#define CKD_3390_TRACK_SIZE 56832
+#define CKD_HEADS 15
+#define CKD_MAX_CYLINDERS 65520
+
+/*
+ * The track formats of an image.  The track slot holds the track header,
+ * a standard R0, the largest record the device takes and the end-of-track
+ * marker, rounded up to 512 bytes: 3390 tracks take a record of 56664
+ * bytes, 3380 tracks one of 47476 bytes.  The header names the device by
+ * the low byte of its type.
+ */
+typedef struct CkdTrackFormat {
+    uint8_t header_type;
+    uint16_t device_type;
+    uint32_t track_size;
+} CkdTrackFormat;
+
+static const CkdTrackFormat ckd_track_formats[] = {
+    { 0x90, 0x3390, 56832 },
+    { 0x80, 0x3380, 47616 },
+};
 
 typedef struct QEMU_PACKED CkdDeviceHeader {
     uint8_t identifier[8];
@@ -200,6 +217,7 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, uint32_t cylinders,
     uint64_t cylinder_size;
     uint16_t high_cylinder;
     uint8_t ha[CKD_TRACK_HEADER_SIZE];
+    unsigned int i;
 
     memset(image, 0, sizeof(*image));
     length = blk_getlength(blk);
@@ -225,9 +243,15 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, uint32_t cylinders,
 
     image->heads = le32_to_cpu(header.heads);
     image->track_size = le32_to_cpu(header.track_size);
-    if (header.device_type != 0x90 || image->heads != CKD_3390_HEADS ||
-        image->track_size != CKD_3390_TRACK_SIZE) {
-        error_setg(errp, "unsupported CKD geometry");
+    for (i = 0; i < ARRAY_SIZE(ckd_track_formats); i++) {
+        if (header.device_type == ckd_track_formats[i].header_type &&
+            image->track_size == ckd_track_formats[i].track_size) {
+            image->device_type = ckd_track_formats[i].device_type;
+        }
+    }
+    if (!image->device_type || image->heads != CKD_HEADS) {
+        error_setg(errp, "unsupported CKD geometry (only 3390 and 3380 "
+                   "track formats with 15 heads)");
         return false;
     }
 
@@ -260,9 +284,9 @@ bool ckd_image_open(CkdImage *image, BlockBackend *blk, uint32_t cylinders,
         image->cylinders = data_length / cylinder_size;
     }
 
-    if (!image->cylinders || image->cylinders > CKD_3390_MAX_CYLINDERS) {
+    if (!image->cylinders || image->cylinders > CKD_MAX_CYLINDERS) {
         error_setg(errp, "CKD cylinder count %u is outside 1..%u",
-                   image->cylinders, CKD_3390_MAX_CYLINDERS);
+                   image->cylinders, CKD_MAX_CYLINDERS);
         return false;
     }
     if (header.file_sequence &&

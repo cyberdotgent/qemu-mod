@@ -1,5 +1,5 @@
 /*
- * Emulated IBM 2107 storage control with 3390 ECKD DASD
+ * Emulated IBM 2107/3990 storage control with 3390 or 3380 ECKD DASD
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -25,10 +25,26 @@
 #define ECKD_AUTO_DEVNO 0x0300
 #define ECKD_CU_TYPE 0x2107
 #define ECKD_CU_MODEL 0xe8
-#define ECKD_DEV_TYPE 0x3390
 #define ECKD_CHPID_TYPE 0x1f
+/* Largest track slot of an image (3390); 3380 images have smaller ones. */
 #define ECKD_TRACK_SIZE 56832
 #define ECKD_MAX_RECORD_SIZE (8 + UINT8_MAX + UINT16_MAX)
+
+/*
+ * 3380 track format as a 3990 storage control reports it in Read Device
+ * Characteristics (IBM GA32-0274, appendix A, 3380 columns): 222 sectors,
+ * 47968 bytes usable after home address and a standard R0 (1088 bytes),
+ * track-capacity formula 1 with the factors F1-F3, largest R0 data area.
+ */
+#define ECKD_3380_TYPE_CODE 0x0e
+#define ECKD_3380_SECTORS 222
+#define ECKD_3380_TRACK_CAPACITY 47968
+#define ECKD_3380_HA_R0 1088
+#define ECKD_3380_F1 32
+#define ECKD_3380_F2 492
+#define ECKD_3380_F3 236
+#define ECKD_3380_R0_MAX 47988
+#define ECKD_3380_RPS 0x5007
 
 #define CMD_WRITE 0x05
 #define CMD_READ 0x06
@@ -119,10 +135,13 @@ struct EckdCcwDevice {
 
     /*
      * Identity presented in Sense ID, RDC, RCD and RSSD (properties
-     * control-unit-type/-model, device-type/-model).  Default: 2107-E8
-     * control unit, 3390 device; a model of 0 is derived from the type
-     * (and for the device from the cylinder count).  The geometry always
-     * stays the image's (3390 tracks).
+     * control-unit-type/-model, device-type/-model).  A device type of 0
+     * is the image's track format (3390 or 3380); a control-unit type of
+     * 0 is a 2107 for a 3390 and a 3990 for a 3380; a model of 0 is
+     * derived from the type (and for the device from the cylinder count).
+     * A 3380 identity works on 3390 and 3380 images: Read Device
+     * Characteristics reports the 3380 track format and Write CKD keeps to
+     * its track capacity.  The cylinders are the image's.
      */
     uint16_t cu_type;
     uint8_t cu_model;
@@ -269,16 +288,52 @@ static uint8_t eckd_model(uint32_t cylinders)
     return 0x0c;
 }
 
+/*
+ * Primary cylinders of the 3380 models (A/D/J, E, K): 885 per density
+ * step, followed by one alternate cylinder per step.  Hercules images made
+ * with alternate cylinders (dasdinit -a) hold those too.
+ */
+static const uint16_t eckd_3380_primary_cylinders[] = { 885, 1770, 2655 };
+
 /* Sense ID model of a 3380 with @cylinders cylinders (A/D/J, E, K). */
 static uint8_t eckd_model_3380(uint32_t cylinders)
 {
-    if (cylinders <= 885) {
+    if (cylinders <= 885 + 1) {
         return 0x02;
     }
-    if (cylinders <= 1770) {
+    if (cylinders <= 1770 + 2) {
         return 0x0a;
     }
     return 0x1e;
+}
+
+/*
+ * The primary cylinders of a 3380 identity: all cylinders of the image,
+ * except where the image is a standard model with its alternate cylinders.
+ */
+static uint32_t eckd_3380_primary(uint32_t cylinders)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(eckd_3380_primary_cylinders); i++) {
+        uint32_t primary = eckd_3380_primary_cylinders[i];
+
+        if (cylinders > primary && cylinders <= primary + i + 1) {
+            return primary;
+        }
+    }
+    return cylinders;
+}
+
+/* Space a record takes on a 3380 track (RDC track-capacity formula 1). */
+static uint32_t eckd_3380_space(uint8_t key_length, uint16_t data_length)
+{
+    uint32_t space = ROUND_UP(ECKD_3380_F2 + data_length, ECKD_3380_F1);
+
+    if (key_length) {
+        space += ROUND_UP(ECKD_3380_F3 + key_length, ECKD_3380_F1);
+    }
+    return space;
 }
 
 /*
@@ -288,6 +343,18 @@ static uint8_t eckd_model_3380(uint32_t cylinders)
  */
 static bool eckd_resolve_identity(EckdCcwDevice *eckd, Error **errp)
 {
+    if (!eckd->dev_type) {
+        eckd->dev_type = eckd->image.device_type;
+    }
+    if (eckd->image.device_type == 0x3380 && eckd->dev_type != 0x3380) {
+        error_setg(errp, "eckd-ccw: device-type %04x needs an image with "
+                   "3390 tracks; this image has 3380 tracks",
+                   eckd->dev_type);
+        return false;
+    }
+    if (!eckd->cu_type) {
+        eckd->cu_type = eckd->dev_type == 0x3380 ? 0x3990 : ECKD_CU_TYPE;
+    }
     if (!eckd->cu_model) {
         switch (eckd->cu_type) {
         case 0x2105:
@@ -651,7 +718,11 @@ static void eckd_advance_record(EckdCcwDevice *eckd,
     }
 }
 
-static void eckd_build_sense_id(EckdCcwDevice *eckd, uint8_t *buf)
+/*
+ * Sense ID: 24 bytes with command information words, 7 bytes without them
+ * on a 3880, which has none.  Returns the length.
+ */
+static uint32_t eckd_build_sense_id(EckdCcwDevice *eckd, uint8_t *buf)
 {
     static const uint32_t ciws[] = {
         0x40fa0100, 0x41270004, 0x423e01a0, 0x433e0008,
@@ -664,9 +735,46 @@ static void eckd_build_sense_id(EckdCcwDevice *eckd, uint8_t *buf)
     buf[3] = eckd->cu_model;
     stw_be_p(buf + 4, eckd->dev_type);
     buf[6] = eckd->dev_model;
+    if (eckd->cu_type == 0x3880) {
+        return 7;
+    }
     for (i = 0; i < ARRAY_SIZE(ciws); i++) {
         stl_be_p(buf + 8 + i * 4, ciws[i]);
     }
+    return 24;
+}
+
+/*
+ * The device bytes of Read Device Characteristics for a 3380 (the control
+ * unit bytes are those of the 3390): 3380 track format, the alternate
+ * cylinders of a standard model behind its primary cylinders.
+ */
+static void eckd_build_rdc_3380(EckdCcwDevice *eckd, uint8_t *buf)
+{
+    uint32_t primary = eckd_3380_primary(eckd->image.cylinders);
+    uint32_t alternate = eckd->image.cylinders - primary;
+
+    buf[11] = ECKD_3380_TYPE_CODE;
+    stw_be_p(buf + 12, primary);
+    buf[16] = ECKD_3380_SECTORS;
+    buf[17] = 0;
+    stw_be_p(buf + 18, ECKD_3380_TRACK_CAPACITY);
+    stw_be_p(buf + 20, ECKD_3380_HA_R0);
+    buf[22] = 1;
+    buf[23] = ECKD_3380_F1;
+    stw_be_p(buf + 24, ECKD_3380_F2);
+    stw_be_p(buf + 26, ECKD_3380_F3);
+    if (alternate) {
+        stw_be_p(buf + 28, primary);
+        stw_be_p(buf + 30, alternate * eckd->image.heads);
+    }
+    buf[40] = ECKD_3380_TYPE_CODE;
+    buf[41] = ECKD_3380_TYPE_CODE;
+    stw_be_p(buf + 44, ECKD_3380_R0_MAX);
+    buf[48] = 0;
+    stw_be_p(buf + 49, ECKD_3380_RPS);
+    buf[57] = 0;
+    stl_be_p(buf + 60, 0);
 }
 
 static void eckd_build_rdc(EckdCcwDevice *eckd, uint8_t *buf)
@@ -703,6 +811,9 @@ static void eckd_build_rdc(EckdCcwDevice *eckd, uint8_t *buf)
     buf[54] = 0x48;
     buf[57] = 0xff;
     stl_be_p(buf + 60, eckd->image.cylinders);
+    if (eckd->dev_type == 0x3380) {
+        eckd_build_rdc_3380(eckd, buf);
+    }
 }
 
 static void eckd_ned_text(uint8_t *dest, const char *ascii, size_t length)
@@ -1261,6 +1372,34 @@ static int eckd_write_r0(EckdCcwDevice *eckd, const CCW1 *ccw)
     return eckd_format_commit(eckd);
 }
 
+/*
+ * Whether a record with @key_length and @data_length fits on the 3380 track
+ * being formatted behind the records already there: the sum of the spaces
+ * of the records after R0 (formula 1), plus what a nonstandard R0 takes
+ * beyond a standard one, must not exceed the track capacity.
+ */
+static bool eckd_3380_fits(EckdCcwDevice *eckd, uint8_t key_length,
+                           uint16_t data_length)
+{
+    const uint8_t *track = eckd->format_track;
+    int64_t used = eckd_3380_space(key_length, data_length);
+    uint32_t offset = 5;
+    bool r0 = true;
+
+    while (offset + 8 <= eckd->format_used) {
+        uint8_t kl = track[offset + 5];
+        uint16_t dl = lduw_be_p(track + offset + 6);
+
+        used += eckd_3380_space(kl, dl);
+        if (r0) {
+            used -= eckd_3380_space(0, 8);
+            r0 = false;
+        }
+        offset += 8 + kl + dl;
+    }
+    return used <= ECKD_3380_TRACK_CAPACITY;
+}
+
 static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
 {
     SubchDev *sch = CCW_DEVICE(eckd)->sch;
@@ -1383,8 +1522,13 @@ static int eckd_write_ckd(EckdCcwDevice *eckd, const CCW1 *ccw)
     trace_eckd_write_ckd(sch->devno, cylinder, head, data[4], data[5],
                          lduw_be_p(data + 6), eckd->write_used,
                          eckd->format_used);
-    if (eckd->format_used + required + 8 > ECKD_TRACK_SIZE) {
+    if (eckd->format_used + required + 8 > eckd->image.track_size) {
         return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
+    }
+    if (eckd->dev_type == 0x3380 &&
+        !eckd_3380_fits(eckd, data[5], lduw_be_p(data + 6))) {
+        /* GA32-0274 Write CKD: insufficient space, invalid track format */
+        return eckd_unit_check(eckd, 0, SENSE1_INVALID_TRACK);
     }
     /*
      * The record identifier is taken from the count area as given: the
@@ -1848,7 +1992,7 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
         eckd_format_begin(eckd);
         return eckd_format_commit(eckd);
     case CMD_WRITE_FULL_TRACK:
-        if (ccw.count > ECKD_TRACK_SIZE) {
+        if (ccw.count > eckd->image.track_size) {
             return eckd_unit_check(eckd, SENSE_OVERRUN, 0);
         }
         if (eckd_read_guest(eckd, eckd->format_track, ccw.count)) {
@@ -1862,8 +2006,8 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
         eckd_build_rdc(eckd, buf);
         return eckd_copy_response(eckd, &ccw, buf, 64);
     case 0xe4:
-        eckd_build_sense_id(eckd, buf);
-        return eckd_copy_response(eckd, &ccw, buf, 24);
+        return eckd_copy_response(eckd, &ccw, buf,
+                                  eckd_build_sense_id(eckd, buf));
     case CMD_RCD:
         eckd_build_rcd(eckd, buf);
         return eckd_copy_response(eckd, &ccw, buf, 256);
@@ -2351,10 +2495,9 @@ static const Property eckd_properties[] = {
                        UINT16_MAX),
     DEFINE_PROP_UINT16("fla", EckdCcwDevice, fla, UINT16_MAX),
     DEFINE_PROP_UINT16("chpid", EckdCcwDevice, chpid, UINT16_MAX),
-    DEFINE_PROP_UINT16("control-unit-type", EckdCcwDevice, cu_type,
-                       ECKD_CU_TYPE),
+    DEFINE_PROP_UINT16("control-unit-type", EckdCcwDevice, cu_type, 0),
     DEFINE_PROP_UINT8("control-unit-model", EckdCcwDevice, cu_model, 0),
-    DEFINE_PROP_UINT16("device-type", EckdCcwDevice, dev_type, ECKD_DEV_TYPE),
+    DEFINE_PROP_UINT16("device-type", EckdCcwDevice, dev_type, 0),
     DEFINE_PROP_UINT8("device-model", EckdCcwDevice, dev_model, 0),
     DEFINE_PROP_UINT32("cylinders", EckdCcwDevice, cylinders, 0),
 };
@@ -2397,7 +2540,7 @@ static int eckd_post_load(void *opaque, int version_id)
     EckdCcwDevice *eckd = opaque;
     CkdImage *image = &eckd->image;
 
-    if (eckd->format_used > ECKD_TRACK_SIZE ||
+    if (eckd->format_used > image->track_size ||
         eckd->write_used > ECKD_MAX_RECORD_SIZE ||
         eckd->write_expected > ECKD_MAX_RECORD_SIZE ||
         eckd->rssd_length > sizeof(eckd->rssd_data)) {
