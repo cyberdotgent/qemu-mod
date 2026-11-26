@@ -1128,6 +1128,31 @@ static int eckd_read_record(EckdCcwDevice *eckd, const CCW1 *ccw,
         eckd->read_active = false;
         eckd->read_used = 0;
         record = eckd_current_record(eckd, command & 0x80);
+        if (record && record->number == 0 && !eckd->search_count_advance &&
+            ((command & 0x7f) == CMD_READ ||
+             (command & 0x7f) == CMD_READ_KD)) {
+            /*
+             * Read Data and Read Key and Data transfer the record whose
+             * count or key area the device is oriented to.  Oriented to
+             * the index point or the home address (after a Seek, Read Home
+             * Address, or a Locate Record with home address or index
+             * orientation) they orient to the next count area other than
+             * record zero (3990/9390 Storage Control Reference, Read Data
+             * and Read Key and Data).
+             *
+             * The DASD error recovery of an older operating system relies
+             * on this when it restarts a multitrack Read Data that ended
+             * with End of Cylinder: it orients to the start of the next
+             * cylinder and re-drives the Read Data, expecting record 1.
+             * Returning record 0 there handed eight bytes of R0 data to
+             * program fetch in place of a load module record.
+             */
+            const CkdImageRecord *next =
+                eckd_next_record(&eckd->image, record);
+
+            eckd->record = next ? next->number : UINT8_MAX + 1;
+            record = eckd_current_record(eckd, command & 0x80);
+        }
     }
     if (!record) {
         return eckd_no_record(eckd);
@@ -1959,7 +1984,9 @@ static int eckd_ccw_cmd(SubchDev *sch, CCW1 ccw)
                 return ret;
             }
         }
+        /* Oriented to the home address: no count area has been passed. */
         eckd->record = 0;
+        eckd->search_count_advance = false;
         return eckd_copy_response(eckd, &ccw, eckd->image.track, 5);
     case CMD_READ_R0:
         eckd->record = 0;
