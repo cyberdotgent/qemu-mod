@@ -91,3 +91,15 @@ sclp_file_request(unsigned cmd, const char *name, uint64_t offset, uint64_t leng
 sclp_file_load(unsigned type, unsigned f0, unsigned f1, unsigned f2, unsigned pcx, unsigned ldflg) "load by name: type=0x%02x flags=0x%02x 0x%02x 0x%02x pcx=0x%02x ldflg=0x%02x"
 sclp_file_ftp(unsigned pgsize, unsigned srcflg, unsigned spare, unsigned pcx, unsigned ldflg, uint64_t fsize, uint64_t failaddr) "file command: pgsize=0x%02x srcflg=0x%02x spare=0x%02x pcx=0x%02x ldflg=0x%02x fsize=%" PRIu64 " failaddr=0x%" PRIx64
 sclp_file_result(unsigned cmd, unsigned code, uint64_t length, uint64_t fsize) "cmd=0x%x code=0x%02x length=%" PRIu64 " fsize=%" PRIu64
+
+# iucv.c
+iucv_instruction(int cpu, unsigned fc) "cpu %d function %u"
+iucv_dclbfr(int cpu, uint32_t buf) "cpu %d buffer 0x%x"
+iucv_queue_irq(unsigned type, unsigned pathid, uint32_t msgid) "type %u path %u msg %u"
+iucv_present(int cpu, unsigned type, unsigned pathid, uint32_t msgid) "cpu %d type %u path %u msg %u"
+iucv_connect(unsigned pathid, const char *svc, int rc) "path %u to %s rc %d"
+iucv_sever(unsigned pathid, const char *by) "path %u by the %s"
+iucv_send(unsigned pathid, uint32_t msgid, uint32_t trgcls, uint32_t len, bool two_way) "path %u msg %u class 0x%x len %u two-way %d"
+iucv_receive(unsigned pathid, uint32_t msgid, uint32_t len, uint32_t left) "path %u msg %u got %u left %u"
+iucv_reply(unsigned pathid, uint32_t msgid, uint32_t len) "path %u msg %u reply len %u"
+iucv_guest_reply(unsigned pathid, uint32_t msgid, uint32_t len) "path %u msg %u guest reply len %u"
