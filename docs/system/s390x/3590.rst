@@ -36,7 +36,15 @@ The implemented commands cover Write, Write Tape Mark, Synchronize, Erase
 Gap, Read IPL, NOP, Sense, Read Forward, Rewind, Read Previous, Rewind
 Unload, Read Block ID, forward and backward block/file spacing, Locate, Read
 Media Characteristics, Read Device Characteristics, Medium Sense, Mode Set,
-Set Tape-Write Immediate, and Sense ID.  The maximum logical record size is
+Set Tape-Write Immediate, Sense ID, Set and Sense Path Group ID, Assign,
+Unassign, Read Buffered Log and Load Display.  Read Buffered Log returns a
+64-byte format-30 log with zero counters.  Load Display keeps the message the
+drive would show, as long as its format control byte says (until the next
+motion, the cartridge is removed or the drive is loaded); the QOM property
+``display`` of the drive returns it, and the ``tape3590_display`` trace event
+reports changes.  Mode Set takes tape-write-immediate and supervisor inhibit
+(supervisor commands later in the same chain are rejected); the compaction
+bit is accepted and has no effect.  The maximum logical record size is
 256 KiB.  A CCW moves at most 65535 bytes, so Read and Write take larger
 blocks through data chaining: the data of all CCWs of a data chain form one
 block.
@@ -119,7 +127,7 @@ drive is unloaded it holds no permissions on its medium.
 
 Rewind Unload rewinds and unloads the medium (the tray is then open, the
 medium stays inserted until removed) and ends with unit check "unload
-complete" (ERA 2B; on the 3590 also reason code 3123, recovery action
+complete" (ERA 52; on the 3590 also reason code 3123, recovery action
 "continue"), as the drives do.  A command chained to it is not executed.
 Commands to the unloaded drive get intervention required (ERA 43).
 

@@ -9,6 +9,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/3590-ccw.h"
 #include "hw/s390x/css-bridge.h"
+#include "hw/s390x/ebcdic.h"
 #include "hw/s390x/ipl.h"
 #include "hw/s390x/tape-aws.h"
 #include "migration/vmstate.h"
@@ -39,6 +40,7 @@
 #define TAPE_CMD_ERASE_GAP        0x17
 #define TAPE_CMD_WRITE_MARK       0x1f
 #define TAPE_CMD_READ_BLOCK_ID    0x22
+#define TAPE_CMD_READ_BUFFERED_LOG 0x24
 #define TAPE_CMD_SENSE_PGID       0x34
 #define TAPE_CMD_BACKSPACE_BLOCK  0x27
 #define TAPE_CMD_BACKSPACE_FILE   0x2f
@@ -46,6 +48,7 @@
 #define TAPE_CMD_FSPACE_FILE      0x3f
 #define TAPE_CMD_SYNCHRONIZE      0x43
 #define TAPE_CMD_LOCATE           0x4f
+#define TAPE_CMD_LOAD_DISPLAY     0x9f
 #define TAPE_CMD_READ_MED_CHAR    0x62
 #define TAPE_CMD_RDC              0x64
 #define TAPE_CMD_MEDIUM_SENSE     0xc2
@@ -66,7 +69,7 @@
 #define TAPE_ERA_READ_DATA_CHECK  0x23
 #define TAPE_ERA_WRITE_DATA_CHECK 0x25
 #define TAPE_ERA_COMMAND_REJECT   0x27
-#define TAPE_ERA_UNLOAD_COMPLETE  0x2b
+#define TAPE_ERA_UNLOAD_COMPLETE  0x52
 #define TAPE_ERA_WRITE_PROTECTED  0x30
 #define TAPE_ERA_TAPE_VOID        0x31
 #define TAPE_ERA_END_OF_DATA      0x36
@@ -145,6 +148,12 @@ struct Tape3590CcwDevice {
     uint8_t partition_id[11];
     /* Path group ID of the (only) channel path; zero = ungrouped */
     uint8_t pgid[11];
+    /* Mode Set "supervisor inhibit" for the rest of the command chain */
+    bool supervisor_inhibit;
+    /* Load Display: function, the two messages (ASCII), what is shown */
+    uint8_t display_function;
+    char display_msg[2][9];
+    char display[18];
     /* Medium length parsed on the migration destination, or -1 */
     int64_t local_length;
     /* A migrated position on a writable medium awaits validation */
@@ -199,8 +208,52 @@ static bool tape3590_update_perm(Tape3590CcwDevice *tape, bool loaded,
 }
 
 /* Unload: the guest's Rewind Unload, a failed restore, or the tray opens */
+/*
+ * The message display (Load Display): what the drive shows, kept until the
+ * event the function in the format control byte names.
+ */
+#define DISPLAY_UNTIL_MOTION      0
+#define DISPLAY_UNTIL_REMOVED     1
+#define DISPLAY_UNTIL_LOADED      2
+#define DISPLAY_NO_CHANGE         3
+#define DISPLAY_BOTH              7
+
+static void tape3590_set_display(Tape3590CcwDevice *tape, const char *text)
+{
+    if (strcmp(tape->display, text)) {
+        pstrcpy(tape->display, sizeof(tape->display), text);
+        trace_tape3590_display(CCW_DEVICE(tape)->sch ?
+                               CCW_DEVICE(tape)->sch->devno : 0,
+                               tape->display);
+    }
+}
+
+/* @event: DISPLAY_UNTIL_MOTION, _REMOVED or _LOADED happened */
+static void tape3590_display_event(Tape3590CcwDevice *tape, int event)
+{
+    int function = tape->display_function;
+
+    if (!tape->display[0]) {
+        return;
+    }
+    if (function == event ||
+        (function == DISPLAY_BOTH && event != DISPLAY_UNTIL_MOTION)) {
+        if (function == DISPLAY_BOTH && event == DISPLAY_UNTIL_REMOVED &&
+            tape->display_msg[1][0]) {
+            /* the first message goes with the cartridge, the second stays */
+            tape3590_set_display(tape, tape->display_msg[1]);
+            tape->display_function = DISPLAY_UNTIL_LOADED;
+            return;
+        }
+        tape3590_set_display(tape, "");
+    }
+}
+
 static void tape3590_unload(Tape3590CcwDevice *tape)
 {
+    if (!tape->tray_open) {
+        tape3590_display_event(tape, DISPLAY_UNTIL_REMOVED);
+    }
     tape->tray_open = true;
     aws_tape_rewind(&tape->medium);
     tape3590_update_perm(tape, false, &error_abort);
@@ -224,6 +277,7 @@ static void tape3590_change_media(void *opaque, bool load, Error **errp)
          * reported open.  Close it before validating the AWS stream.
          */
         tape->tray_open = false;
+        tape3590_display_event(tape, DISPLAY_UNTIL_LOADED);
         aws_tape_init(&tape->medium, tape->blk, errp);
         if (*errp) {
             tape3590_unload(tape);
@@ -586,6 +640,105 @@ static int tape3590_write(Tape3590CcwDevice *tape, const CCW1 *ccw)
  * path groups and assignment, mode setting.  The operating system brings
  * an empty drive online with them.
  */
+/*
+ * Load Display: a format control byte and two 8-character EBCDIC messages.
+ * The text shown is kept for the management layer (QOM property "display")
+ * and traced; nothing else depends on it.
+ */
+static void tape3590_load_display(Tape3590CcwDevice *tape, const uint8_t *buf)
+{
+    int function = buf[0] >> 5;
+    bool alternate = buf[0] & 0x10;
+    bool high = buf[0] & 0x04;
+    char text[sizeof(tape->display)];
+    int i, j;
+
+    if (function == DISPLAY_NO_CHANGE || (function >= 4 && function < 7)) {
+        return;
+    }
+    if ((function == DISPLAY_UNTIL_REMOVED && tape->tray_open) ||
+        (function == DISPLAY_UNTIL_LOADED && !tape->tray_open)) {
+        /* Not kept, and the program is not told */
+        return;
+    }
+    for (i = 0; i < 2; i++) {
+        for (j = 0; j < 8; j++) {
+            uint8_t c = ebcdic2ascii[buf[1 + i * 8 + j]];
+
+            tape->display_msg[i][j] = c >= 0x20 && c < 0x7f ? c : ' ';
+        }
+        tape->display_msg[i][8] = 0;
+        g_strchomp(tape->display_msg[i]);
+    }
+    tape->display_function = function;
+    if (function == DISPLAY_BOTH && tape->tray_open) {
+        pstrcpy(text, sizeof(text), tape->display_msg[1]);
+        tape->display_function = DISPLAY_UNTIL_LOADED;
+    } else if (alternate || function == DISPLAY_BOTH) {
+        snprintf(text, sizeof(text), "%s/%s", tape->display_msg[0],
+                 tape->display_msg[1]);
+    } else {
+        pstrcpy(text, sizeof(text), tape->display_msg[high ? 1 : 0]);
+    }
+    tape3590_set_display(tape, text);
+}
+
+/*
+ * Read Buffered Log: 64 bytes of buffered log data, format 30.  This drive
+ * counts nothing, so the log is the common sense bytes (drive state,
+ * channel block number, drive and control unit identification) with zero
+ * counters.
+ */
+static void tape3590_buffered_log(Tape3590CcwDevice *tape, uint8_t *buf)
+{
+    tape3590_unsolicited_sense(tape, buf);
+    buf[7] = 0x30;
+    if (!tape->tray_open) {
+        buf[4] = tape->medium.block_id >> 16;
+        buf[5] = tape->medium.block_id >> 8;
+        buf[6] = tape->medium.block_id;
+    }
+}
+
+/* Commands that move the tape */
+static bool tape3590_motion_command(uint8_t cmd)
+{
+    switch (cmd) {
+    case TAPE_CMD_WRITE:
+    case TAPE_CMD_READ_IPL:
+    case TAPE_CMD_READ_FORWARD:
+    case TAPE_CMD_READ_PREVIOUS:
+    case TAPE_CMD_REWIND:
+    case TAPE_CMD_REWIND_UNLOAD:
+    case TAPE_CMD_ERASE_GAP:
+    case TAPE_CMD_WRITE_MARK:
+    case TAPE_CMD_BACKSPACE_BLOCK:
+    case TAPE_CMD_BACKSPACE_FILE:
+    case TAPE_CMD_FSPACE_BLOCK:
+    case TAPE_CMD_FSPACE_FILE:
+    case TAPE_CMD_LOCATE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Supervisor commands, which Mode Set can inhibit for the rest of a chain */
+static bool tape3590_supervisor_command(uint8_t cmd)
+{
+    switch (cmd) {
+    case TAPE_CMD_SET_PGID:
+    case TAPE_CMD_SENSE_PGID:
+    case TAPE_CMD_ASSIGN:
+    case TAPE_CMD_UNASSIGN:
+    case TAPE_CMD_LOAD_DISPLAY:
+    case TAPE_CMD_MODE_SET:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool tape3590_without_medium(uint8_t cmd)
 {
     switch (cmd) {
@@ -600,6 +753,8 @@ static bool tape3590_without_medium(uint8_t cmd)
     case TAPE_CMD_READ_BLOCK_ID:
     case TAPE_CMD_WRITE_IMMEDIATE:
     case TAPE_CMD_MEDIUM_SENSE:
+    case TAPE_CMD_READ_BUFFERED_LOG:
+    case TAPE_CMD_LOAD_DISPLAY:
         return true;
     default:
         return false;
@@ -615,9 +770,16 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
 
     if (!sch->last_cmd_valid) {
         tape->write_immediate = false;
+        tape->supervisor_inhibit = false;
     }
     trace_tape3590_ccw(sch->devno, ccw.cmd_code, ccw.cda, ccw.count,
                        ccw.flags, tape->medium.block_id);
+
+    if (tape->supervisor_inhibit &&
+        tape3590_supervisor_command(ccw.cmd_code)) {
+        return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                       TAPE_ERA_COMMAND_REJECT);
+    }
 
     if (tape->tray_open && !tape3590_without_medium(ccw.cmd_code)) {
         return tape3590_sense_rc(tape,
@@ -625,6 +787,9 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
                                                 TAPE_SENSE_INTERVENTION,
                                                 TAPE_ERA_DRIVE_NOT_READY),
                                  TAPE_RC_NOT_READY, TAPE_BRA_PERMANENT);
+    }
+    if (tape3590_motion_command(ccw.cmd_code)) {
+        tape3590_display_event(tape, DISPLAY_UNTIL_MOTION);
     }
 
     switch (ccw.cmd_code) {
@@ -841,9 +1006,28 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         if (!ccw.count || ccw_dstream_read_buf(&sch->cds, buf, 1)) {
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
         }
+        /*
+         * Bit 2 tape-write-immediate, bit 3 supervisor inhibit, bit 4 IDRC
+         * (compaction: nothing to do for an AWS image), for the rest of
+         * the chain.
+         */
         if (buf[0] & 0x20) {
             tape->write_immediate = true;
         }
+        if (buf[0] & 0x10) {
+            tape->supervisor_inhibit = true;
+        }
+        sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
+        return 0;
+    case TAPE_CMD_READ_BUFFERED_LOG:
+        tape3590_buffered_log(tape, buf);
+        return tape3590_copy_response(tape, &ccw, buf, 64);
+    case TAPE_CMD_LOAD_DISPLAY:
+        if (ccw.count < 17 || ccw_dstream_read_buf(&sch->cds, buf, 17)) {
+            return tape3590_unit_check_era(tape, TAPE_SENSE_COMMAND_REJECT,
+                                           TAPE_ERA_COMMAND_REJECT);
+        }
+        tape3590_load_display(tape, buf);
         sch->curr_status.scsw.count = ccw_dstream_residual_count(&sch->cds);
         return 0;
     default:
@@ -870,6 +1054,7 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
      */
     memset(tape->pgid, 0, sizeof(tape->pgid));
     memset(tape->partition_id, 0, sizeof(tape->partition_id));
+    tape->supervisor_inhibit = false;
     if (tc->parent_phases.hold) {
         tc->parent_phases.hold(obj, type);
     }
@@ -1182,6 +1367,11 @@ static const Property tape3590_properties[] = {
                        eot_margin_blocks, 0),
 };
 
+static char *tape3590_get_display(Object *obj, Error **errp)
+{
+    return g_strdup(TAPE_3590_CCW(obj)->display);
+}
+
 static void tape3590_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1194,6 +1384,9 @@ static void tape3590_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_tape3590;
     dc->hotpluggable = false;
     device_class_set_props(dc, tape3590_properties);
+    /* The drive's message display as set by Load Display (read only) */
+    object_class_property_add_str(klass, "display", tape3590_get_display,
+                                  NULL);
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
     cdk->build_iplb = s390_ipl_build_ccw_iplb;
     resettable_class_set_parent_phases(rc, NULL, tape3590_reset_hold, NULL,

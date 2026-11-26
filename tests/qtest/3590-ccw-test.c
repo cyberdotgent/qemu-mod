@@ -9,6 +9,7 @@
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
 #include "s390x-ccw-prog.h"
+#include "hw/s390x/ebcdic.h"
 
 static char *create_aws_image(void)
 {
@@ -1072,7 +1073,7 @@ static void test_io_eot_capacity(void)
     }
     irb = tape_ccw(&t, TAPE_ERASE_GAP, 0, 1, 0);
     g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE | DSTAT_UE);
-    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
                    NULL);
     tape_io_stop(&t);
 
@@ -1447,7 +1448,7 @@ static void test_io_volume_switch(void)
     tape_write_block(&t, (const uint8_t *)"EOV1", 4);
     tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
     tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
-    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
                    NULL);
     g_assert_true(tape_tray_open(t.qts));
 
@@ -1506,7 +1507,7 @@ static void do_test_io_rewind_unload(const char *ident)
     ccw_prog_set_ccw(t.qts, 2, 0x03, 0, 1, 0);
     g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 0);
     g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 16);
-    tape_expect_uc(&t, irb, 0, 0x2b, sense);
+    tape_expect_uc(&t, irb, 0, 0x52, sense);
     if (native) {
         g_assert_cmphex(lduw_be_p(sense + 4), ==, 0x3123);
         g_assert_cmphex(sense[2] >> 6, ==, 1);
@@ -1606,7 +1607,7 @@ static void do_test_io_media_perm(bool start_writable)
     expect_protected(&t, !start_writable);
 
     /* After the guest unloads, any medium can be inserted */
-    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x2b,
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
                    NULL);
     change_medium(&t, start_writable ? ro : rw, !start_writable);
     expect_protected(&t, start_writable);
@@ -1767,6 +1768,234 @@ static void test_io_sync_read_only(void)
     unlink(aws);
 }
 
+/*
+ * Read Buffered Log (0x24), which an operating system issues at close and
+ * when it positions: 64 bytes, format 30, also on an empty drive.
+ */
+static void test_io_read_buffered_log(void)
+{
+    g_autofree char *aws = create_other_aws_image();
+    uint8_t log[64];
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+
+    if (!tape_io_start_file(&t, aws, false, "ident=3490")) {
+        unlink(aws);
+        return;
+    }
+    tape_ok(&t, TAPE_FSB, 1, 0);
+    irb = tape_ccw(&t, 0x24, 0, 64, TAPE_BUF);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    g_assert_cmphex(irb.cstat, ==, 0);
+    g_assert_cmpuint(irb.count, ==, 0);
+    qtest_memread(t.qts, TAPE_BUF, log, sizeof(log));
+    g_assert_cmphex(log[7], ==, 0x30);
+    g_assert_cmphex(log[1] & 0x40, ==, 0x40);
+    g_assert_cmphex(log[6], ==, 1);
+    /* shorter with SLI */
+    tape_ok(&t, 0x24, 32, TAPE_BUF);
+    /* unloaded drive */
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
+                   NULL);
+    tape_ok(&t, 0x24, 64, TAPE_BUF);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
+static void load_display(TapeIo *t, uint8_t fcb, const char *m0,
+                         const char *m1)
+{
+    uint8_t buf[17];
+    int i;
+
+    buf[0] = fcb;
+    for (i = 0; i < 8; i++) {
+        buf[1 + i] = ascii2ebcdic[(uint8_t)(i < strlen(m0) ? m0[i] : ' ')];
+        buf[9 + i] = ascii2ebcdic[(uint8_t)(i < strlen(m1) ? m1[i] : ' ')];
+    }
+    qtest_memwrite(t->qts, TAPE_BUF, buf, sizeof(buf));
+    tape_ok(t, 0x9f, 17, TAPE_BUF);
+}
+
+static void expect_display(TapeIo *t, const char *text)
+{
+    g_autofree char *shown = qom_get_string(t->qts,
+                                            "/machine/peripheral/tape0",
+                                            "display");
+
+    g_assert_cmpstr(shown, ==, text);
+}
+
+/*
+ * Load Display (0x9F): mount and demount messages, kept until the event
+ * the format control byte names, readable as QOM property "display".
+ */
+static void test_io_load_display(void)
+{
+    g_autofree char *aws = create_other_aws_image();
+    TapeIo t = { 0 };
+
+    if (!tape_io_start(&t, NULL, NULL, NULL)) {
+        unlink(aws);
+        return;
+    }
+    expect_display(&t, "");
+    /* mount message on an empty drive: until loaded */
+    load_display(&t, 0x40, "MCMP113", "");
+    expect_display(&t, "MCMP113");
+    /* "until removed" on an empty drive is not kept */
+    load_display(&t, 0x20, "XXXX", "");
+    expect_display(&t, "MCMP113");
+    change_medium(&t, aws, false);
+    expect_display(&t, "");
+
+    /* until the next motion */
+    load_display(&t, 0x00, "READY", "");
+    expect_display(&t, "READY");
+    tape_ok(&t, TAPE_REWIND, 1, 0);
+    expect_display(&t, "");
+
+    /* demount + mount, alternating: the first goes with the cartridge */
+    load_display(&t, 0xe0, "DCMP113", "MCMP114");
+    expect_display(&t, "DCMP113/MCMP114");
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
+                   NULL);
+    expect_display(&t, "MCMP114");
+    tape_ok(&t, TAPE_SENSE, 32, TAPE_SENSE_BUF);
+    change_medium(&t, aws, false);
+    expect_display(&t, "");
+
+    /* low/high message, function 011 changes nothing */
+    load_display(&t, 0x24, "LOW", "HIGH");
+    expect_display(&t, "HIGH");
+    load_display(&t, 0x60, "NOPE", "");
+    expect_display(&t, "HIGH");
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
+/*
+ * Mode Set (0xDB): accepted on an empty drive (an operating system issues
+ * it around mount and demount) for each identity; supervisor inhibit
+ * rejects supervisor commands later in the same chain only.
+ */
+static void test_io_mode_set(void)
+{
+    static const char * const idents[] = {
+        "ident=3590", "ident=3490", "ident=3480",
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(idents); i++) {
+        TapeIo t = { 0 };
+        CcwProgIrb irb;
+
+        if (!tape_io_start(&t, NULL, idents[i], NULL)) {
+            return;
+        }
+        qtest_writeb(t.qts, TAPE_SENSE_BUF, 0x08);      /* IDRC */
+        tape_ok(&t, 0xdb, 1, TAPE_SENSE_BUF);
+        qtest_writeb(t.qts, TAPE_SENSE_BUF, 0x20);      /* write immediate */
+        tape_ok(&t, 0xdb, 1, TAPE_SENSE_BUF);
+
+        /* supervisor inhibit, then Sense Path Group ID in the chain */
+        qtest_writeb(t.qts, TAPE_SENSE_BUF, 0x10);
+        ccw_prog_set_ccw(t.qts, 0, 0xdb, CCW_FLAG_CC, 1, TAPE_SENSE_BUF);
+        ccw_prog_set_ccw(t.qts, 1, 0x34, 0, 12, TAPE_BUF);
+        g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 0);
+        g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 16);
+        tape_expect_uc(&t, irb, 0x80, 0x27, NULL);
+        /* not in the next chain */
+        tape_ok(&t, 0x34, 12, TAPE_BUF);
+        tape_io_stop(&t);
+        tape_io_free(&t);
+    }
+}
+
+/*
+ * Bringing a drive online as the system does it (from a trace): No-Op,
+ * Sense ID, then Sense + Sense ID + Read Device Characteristics chained,
+ * Set Path Group ID, Assign, Sense Path Group ID; empty drive, 3490 and
+ * 3590 identities.  Nothing may be rejected.
+ */
+static void do_test_io_vary_online(const char *ident)
+{
+    uint8_t pgid[12] = { 0x80, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                         0x07, 0x08, 0x09, 0x0a };
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+
+    if (!tape_io_start(&t, NULL, ident, NULL)) {
+        return;
+    }
+    irb = tape_ccw(&t, 0x03, CCW_FLAG_SLI | CCW_FLAG_SKIP, 1, 0);
+    tape_expect_uc(&t, irb, 0x40, 0x43, NULL);      /* no medium: not ready */
+    tape_ok(&t, 0xe4, 256, TAPE_BUF);
+    ccw_prog_set_ccw(t.qts, 0, 0x04, CCW_FLAG_CC | CCW_FLAG_SLI, 32,
+                     TAPE_BUF);
+    ccw_prog_set_ccw(t.qts, 1, 0xe4, CCW_FLAG_CC | CCW_FLAG_SLI, 20,
+                     TAPE_BUF + 32);
+    ccw_prog_set_ccw(t.qts, 2, 0x64, CCW_FLAG_SLI, 64, TAPE_BUF + 64);
+    g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 0);
+    g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    g_assert_cmphex(irb.cpa, ==, CCW_PROG_CCWS + 24);
+    qtest_memwrite(t.qts, TAPE_SENSE_BUF, pgid, sizeof(pgid));
+    tape_ok(&t, 0xaf, 12, TAPE_SENSE_BUF);
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF + 1);
+    tape_ok(&t, 0x34, 12, TAPE_BUF);
+    g_assert_cmphex(qtest_readb(t.qts, TAPE_BUF), ==, 0xc0);
+    /* vary offline and online again */
+    tape_ok(&t, 0xc7, 11, TAPE_SENSE_BUF + 1);
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF + 1);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+}
+
+static void test_io_vary_online_3490(void)
+{
+    do_test_io_vary_online("ident=3490");
+}
+
+static void test_io_vary_online_3590(void)
+{
+    do_test_io_vary_online("ident=3590");
+}
+
+/*
+ * The next job's mount after the system unloaded the drive: HMP "change"
+ * of the same image, read-only, must load it and raise attention.
+ */
+static void test_io_remount_same(void)
+{
+    g_autofree char *aws = create_other_aws_image();
+    g_autofree char *out = NULL;
+    g_autofree char *cmd = NULL;
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+
+    if (!tape_io_start_file(&t, aws, false, NULL)) {
+        unlink(aws);
+        return;
+    }
+    tape_ok(&t, TAPE_FSB, 1, 0);
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_REWIND_UNLOAD, 0, 1, 0), 0, 0x52,
+                   NULL);
+    g_assert_true(tape_tray_open(t.qts));
+    cmd = g_strdup_printf("change tape %s raw read-only", aws);
+    out = qtest_hmp(t.qts, "%s", cmd);
+    g_assert_cmpstr(out, ==, "");
+    g_assert_false(tape_tray_open(t.qts));
+    ccw_prog_set_ccw(t.qts, 0, 0x03, CCW_FLAG_SLI, 1, 0);
+    g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 1);
+    g_assert_cmphex(irb.dstat, ==, 0x80 | 0x04);
+    tape_read_expect(&t, (const uint8_t *)"QEMU", 4);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(aws);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1814,6 +2043,13 @@ int main(int argc, char **argv)
                    test_io_media_perm_empty);
     qtest_add_func("/3590-ccw/io/path-group", test_io_path_group);
     qtest_add_func("/3590-ccw/io/sync-read-only", test_io_sync_read_only);
+    qtest_add_func("/3590-ccw/io/read-buffered-log",
+                   test_io_read_buffered_log);
+    qtest_add_func("/3590-ccw/io/load-display", test_io_load_display);
+    qtest_add_func("/3590-ccw/io/mode-set", test_io_mode_set);
+    qtest_add_func("/3590-ccw/io/vary-online-3490", test_io_vary_online_3490);
+    qtest_add_func("/3590-ccw/io/vary-online-3590", test_io_vary_online_3590);
+    qtest_add_func("/3590-ccw/io/remount-same", test_io_remount_same);
     qtest_add_func("/3590-ccw/io/perf", test_io_perf);
     return g_test_run();
 }

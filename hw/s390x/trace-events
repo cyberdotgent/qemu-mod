@@ -15,6 +15,7 @@ css_ccw(uint16_t devno, uint64_t addr, uint8_t cmd, uint32_t cda, uint16_t count
 css_ccw_error(uint16_t devno, uint64_t addr, int ret) "CSS: devno=0x%04x ccw=0x%" PRIx64 " error=%d"
 
 # 3590-ccw.c
+tape3590_display(uint16_t devno, const char *text) "3590-CCW: devno=0x%04x display \"%s\""
 tape3590_ccw(uint16_t devno, uint8_t cmd, uint32_t cda, uint16_t count, uint8_t flags, uint32_t block_id) "3590-CCW: devno=0x%04x cmd=0x%02x cda=0x%08x count=0x%04x flags=0x%02x block=0x%08x"
 
 # eckd-ccw.c
