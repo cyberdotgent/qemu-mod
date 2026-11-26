@@ -56,6 +56,22 @@
 #define BIOS_MAX_SIZE                   0x300000UL
 #define IPL_PSW_MASK                    (PSW_MASK_32 | PSW_MASK_64)
 
+/* Is the file an ELF file of the 31-bit (ESA/390) architecture? */
+static bool s390_ipl_is_elf32(const char *path)
+{
+    uint8_t ident[EI_NIDENT];
+    bool elf32 = false;
+    int fd = open(path, O_RDONLY | O_BINARY);
+
+    if (fd >= 0) {
+        elf32 = read(fd, ident, sizeof(ident)) == sizeof(ident) &&
+                !memcmp(ident, ELFMAG, SELFMAG) &&
+                ident[EI_CLASS] == ELFCLASS32;
+        close(fd);
+    }
+    return elf32;
+}
+
 /* Place the IPLB chain immediately before the BIOS in memory */
 static uint64_t find_iplb_chain_addr(uint64_t bios_addr, uint16_t count)
 {
@@ -362,6 +378,7 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
     char *magic;
     int kernel_size;
     bool short_psw_image = false;
+    bool linux_entry;
 
     int bios_size;
     char *bios_filename;
@@ -468,12 +485,21 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
          * kernel parameters here as well. Note: For old kernels (up to 3.2)
          * we can not rely on the ELF entry point - it was 0x800 (the SALIPL
          * loader) and it won't work. For this case we force it to 0x10000, too.
+         *
+         * A 31-bit Linux kernel image is entered through its IPL PSW and has
+         * the parameter area at the same place: -append fills it there too.
+         * The initrd fields are 8 bytes long in both layouts.
          */
-        if (pentry == KERN_IMAGE_START || pentry == 0x800) {
+        linux_entry = pentry == KERN_IMAGE_START || pentry == 0x800;
+        ipl->start_addr = linux_entry ? KERN_IMAGE_START : pentry;
+        if (!short_psw_image && s390_ipl_is_elf32(ipl->kernel)) {
+            /* ESA/390 kernel: 31-bit addressing, no extended addressing */
+            ipl->start_mask = PSW_MASK_32;
+        }
+        if (linux_entry || (short_psw_image && ipl->cmdline[0])) {
             size_t cmdline_size = strlen(ipl->cmdline) + 1;
             char *parm_area = rom_ptr(KERN_PARM_AREA, cmdline_size);
 
-            ipl->start_addr = KERN_IMAGE_START;
             /* Overwrite parameters in the kernel image, which are "rom" */
             if (parm_area) {
                 uint64_t max_cmdline_size = get_max_kernel_cmdline_size();
@@ -488,8 +514,6 @@ static void s390_ipl_realize(DeviceState *dev, Error **errp)
 
                 strcpy(parm_area, ipl->cmdline);
             }
-        } else {
-            ipl->start_addr = pentry;
         }
 
         if (ipl->initrd) {

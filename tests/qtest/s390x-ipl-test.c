@@ -245,6 +245,116 @@ static void test_ins_list_load(void)
     g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
+/* The PSW of CPU 0, from "info registers". */
+static void cpu0_psw(QTestState *qts, uint64_t *mask, uint64_t *addr)
+{
+    g_autofree char *regs = qtest_hmp(qts, "info registers");
+    const char *m = strstr(regs, "PSW=mask ");
+    const char *a = strstr(regs, " addr ");
+
+    g_assert_nonnull(m);
+    g_assert_nonnull(a);
+    *mask = g_ascii_strtoull(m + 9, NULL, 16);
+    *addr = g_ascii_strtoull(a + 6, NULL, 16);
+}
+
+#define LINUX31_SIZE   0x10800
+#define LINUX31_PARM   0x10400
+
+static void assert_linux31_parameters(QTestState *qts, uint32_t initrd_size)
+{
+    char cmdline[16];
+
+    qtest_memread(qts, LINUX31_PARM + 0x80, cmdline, sizeof(cmdline));
+    g_assert_cmpstr(cmdline, ==, "ro switch_amode");
+    /* 8-byte fields: a 31-bit kernel reads their second word */
+    g_assert_cmphex(qtest_readq(qts, LINUX31_PARM + 8), ==, 0x800000);
+    g_assert_cmphex(qtest_readq(qts, LINUX31_PARM + 0x10), ==, initrd_size);
+    g_assert_cmphex(qtest_readl(qts, 0x800000), ==, 0x1f8b0800);
+}
+
+/*
+ * A 31-bit Linux kernel image starts with its IPL PSW; -append and -initrd
+ * fill its parameter area, and the CPU starts at the IPL PSW, 31-bit.
+ */
+static void test_linux31_image(void)
+{
+    static const uint8_t initrd[] = { 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0 };
+    g_autofree uint8_t *image = g_malloc0(LINUX31_SIZE);
+    g_autofree char *directory = g_dir_make_tmp("qemu-s390-l31-XXXXXX", NULL);
+    g_autofree char *image_path = g_build_filename(directory, "image", NULL);
+    g_autofree char *initrd_path = g_build_filename(directory, "initrd", NULL);
+    uint64_t mask, addr;
+    QTestState *qts;
+
+    stl_be_p(image, 0x00080000);
+    stl_be_p(image + 4, 0x80000298);
+    g_assert_true(g_file_set_contents(image_path, (const char *)image,
+                                      LINUX31_SIZE, NULL));
+    g_assert_true(g_file_set_contents(initrd_path, (const char *)initrd,
+                                      sizeof(initrd), NULL));
+
+    qts = qtest_initf("-nodefaults -S -kernel %s -initrd %s "
+                      "-append 'ro switch_amode'", image_path, initrd_path);
+    assert_linux31_parameters(qts, sizeof(initrd));
+    cpu0_psw(qts, &mask, &addr);
+    g_assert_cmphex(mask, ==, 0x0000000080000000ULL);
+    g_assert_cmphex(addr, ==, 0x298);
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_remove(initrd_path), ==, 0);
+    g_assert_cmpint(g_remove(image_path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+/*
+ * A 31-bit ELF kernel (ELFCLASS32, EM_S390) is entered at 0x10000 with a
+ * PSW for 31-bit addressing, not the z/Architecture one.
+ */
+static void test_linux31_elf(void)
+{
+    static const uint8_t initrd[] = { 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0 };
+    const size_t hdrs = 52 + 32, size = hdrs + LINUX31_SIZE;
+    g_autofree uint8_t *elf = g_malloc0(size);
+    g_autofree char *directory = g_dir_make_tmp("qemu-s390-l31-XXXXXX", NULL);
+    g_autofree char *elf_path = g_build_filename(directory, "vmlinux", NULL);
+    g_autofree char *initrd_path = g_build_filename(directory, "initrd", NULL);
+    uint8_t *ph = elf + 52;
+    uint64_t mask, addr;
+    QTestState *qts;
+
+    memcpy(elf, "\x7f" "ELF\x01\x02\x01", 7);   /* 32-bit, big endian */
+    stw_be_p(elf + 16, 2);                      /* ET_EXEC */
+    stw_be_p(elf + 18, 22);                     /* EM_S390 */
+    stl_be_p(elf + 20, 1);
+    stl_be_p(elf + 24, 0x10000);                /* entry */
+    stl_be_p(elf + 28, 52);                     /* phoff */
+    stw_be_p(elf + 40, 52);
+    stw_be_p(elf + 42, 32);
+    stw_be_p(elf + 44, 1);
+    stl_be_p(ph, 1);                            /* PT_LOAD */
+    stl_be_p(ph + 4, hdrs);
+    stl_be_p(ph + 16, LINUX31_SIZE);
+    stl_be_p(ph + 20, LINUX31_SIZE);
+    stl_be_p(ph + 24, 7);
+    g_assert_true(g_file_set_contents(elf_path, (const char *)elf, size,
+                                      NULL));
+    g_assert_true(g_file_set_contents(initrd_path, (const char *)initrd,
+                                      sizeof(initrd), NULL));
+
+    qts = qtest_initf("-nodefaults -S -kernel %s -initrd %s "
+                      "-append 'ro switch_amode'", elf_path, initrd_path);
+    assert_linux31_parameters(qts, sizeof(initrd));
+    cpu0_psw(qts, &mask, &addr);
+    g_assert_cmphex(mask, ==, 0x0000000080000000ULL);
+    g_assert_cmphex(addr, ==, 0x10000);
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_remove(initrd_path), ==, 0);
+    g_assert_cmpint(g_remove(elf_path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
 /* Find a property of a device type, as device-list-properties reports it */
 static QDict *find_device_property(QTestState *qts, const char *type,
                                    const char *name)
@@ -427,6 +537,8 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/errors", test_ipl_errors);
     qtest_add_func("/s390x/ipl/ins-list-load", test_ins_list_load);
     qtest_add_func("/s390x/ipl/properties", test_ipl_properties);
+    qtest_add_func("/s390x/ipl/linux31-image", test_linux31_image);
+    qtest_add_func("/s390x/ipl/linux31-elf", test_linux31_elf);
     /* The IPL programs run under KVM only (this tree does not use TCG). */
     if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
         qtest_add_func("/s390x/ipl/fba-program", test_ipl_fba_program);
