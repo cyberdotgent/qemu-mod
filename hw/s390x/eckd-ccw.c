@@ -1545,6 +1545,20 @@ static int eckd_read_track(EckdCcwDevice *eckd, const CCW1 *ccw)
 {
     int ret;
 
+    /*
+     * The first Read Track of a Locate Record domain reads the track the
+     * Locate Record oriented to; each further Read Track advances to the
+     * next track first (3990/9390 Storage Control Reference, Read Track).
+     * Without that, a multi-track read returned the first track again,
+     * and an older operating system's partitioned data set copy utility
+     * failed on every member that does not fit in one track.
+     */
+    if (eckd->prev_cmd_valid && eckd->prev_cmd.cmd_code == CMD_READ_TRACK) {
+        ret = eckd_next_track(eckd);
+        if (ret) {
+            return ret;
+        }
+    }
     ret = ckd_image_load_track(&eckd->image, eckd->cylinder, eckd->head);
     if (ret < 0) {
         return eckd_unit_check(eckd, SENSE_DATA_CHECK,
