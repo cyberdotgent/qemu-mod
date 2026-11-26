@@ -1555,6 +1555,16 @@ void s390_ipl_prepare_cpu(S390CPU *cpu)
 
     cpu->env.psw.addr = ipl->start_addr;
     cpu->env.psw.mask = ipl->start_mask;
+    /*
+     * Every load puts a machine with the ESA/390-compatibility mode into
+     * that mode, which has no extended addressing: start a Linux kernel the
+     * way an IPL in ESA/390 mode reaches it, with 31-bit addressing.  The
+     * entry at 0x10000 is 31-bit code that switches the configuration to
+     * z/Architecture itself (SIGP set architecture).
+     */
+    if (S390_CCW_MACHINE(qdev_get_machine())->esa390_cm) {
+        cpu->env.psw.mask &= ~PSW_MASK_64;
+    }
 
     s390_ipl_create_cert_store(&ipl->cert_store);
 

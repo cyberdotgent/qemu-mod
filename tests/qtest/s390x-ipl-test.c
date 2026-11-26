@@ -11,6 +11,26 @@
 #include "qobject/qlist.h"
 #include "qobject/qbool.h"
 #include <glib/gstdio.h>
+#include <sys/ioctl.h>
+
+/* KVM_CHECK_EXTENSION and KVM_CAP_S390_ESA390_CM, without the kernel headers */
+#define IPL_TEST_KVM_CHECK_EXTENSION _IO(0xAE, 0x03)
+#define IPL_TEST_KVM_CAP_S390_ESA390_CM 253
+
+/* Whether the host KVM offers the ESA/390-compatibility mode */
+static bool host_has_esa390_cm(void)
+{
+    int fd = open("/dev/kvm", O_RDWR);
+    int ret;
+
+    if (fd < 0) {
+        return false;
+    }
+    ret = ioctl(fd, IPL_TEST_KVM_CHECK_EXTENSION,
+                IPL_TEST_KVM_CAP_S390_ESA390_CM);
+    close(fd);
+    return ret > 0;
+}
 
 static void assert_machine_string(QTestState *qts, const char *property,
                                   const char *expected)
@@ -355,6 +375,45 @@ static void test_linux31_elf(void)
     g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
+/*
+ * A 64-bit Linux kernel image (S390EP at 0x10008) on a machine that starts
+ * in the ESA/390-compatibility mode: entered at 0x10000 with a 31-bit PSW,
+ * since an ESA/390 PSW has no extended-addressing bit.
+ */
+static void test_linux64_esa_mode(void)
+{
+    g_autofree uint8_t *image = g_malloc0(LINUX31_SIZE);
+    g_autofree char *directory = g_dir_make_tmp("qemu-s390-l64-XXXXXX", NULL);
+    g_autofree char *image_path = g_build_filename(directory, "image", NULL);
+    uint64_t mask, addr;
+    QTestState *qts;
+
+    if (!host_has_esa390_cm()) {
+        g_test_skip("host KVM has no ESA/390-compatibility mode");
+        return;
+    }
+    memcpy(image + 0x10008, "S390EP", 6);
+    g_assert_true(g_file_set_contents(image_path, (const char *)image,
+                                      LINUX31_SIZE, NULL));
+
+    qts = qtest_initf("-nodefaults -S -accel kvm -machine czam-compat "
+                      "-kernel %s -append quiet", image_path);
+    cpu0_psw(qts, &mask, &addr);
+    g_assert_cmphex(mask, ==, 0x0000000080000000ULL);
+    g_assert_cmphex(addr, ==, 0x10000);
+    qtest_quit(qts);
+
+    qts = qtest_initf("-nodefaults -S -accel kvm -machine czam "
+                      "-kernel %s -append quiet", image_path);
+    cpu0_psw(qts, &mask, &addr);
+    g_assert_cmphex(mask, ==, 0x0000000180000000ULL);
+    g_assert_cmphex(addr, ==, 0x10000);
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_remove(image_path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
 /* Find a property of a device type, as device-list-properties reports it */
 static QDict *find_device_property(QTestState *qts, const char *type,
                                    const char *name)
@@ -541,6 +600,7 @@ int main(int argc, char **argv)
     qtest_add_func("/s390x/ipl/linux31-elf", test_linux31_elf);
     /* The IPL programs run under KVM only (this tree does not use TCG). */
     if (qtest_has_accel("kvm") && !access("/dev/kvm", R_OK | W_OK)) {
+        qtest_add_func("/s390x/ipl/linux64-esa-mode", test_linux64_esa_mode);
         qtest_add_func("/s390x/ipl/fba-program", test_ipl_fba_program);
         qtest_add_func("/s390x/ipl/eckd-program", test_ipl_eckd_program);
     }
