@@ -1408,6 +1408,74 @@ static void test_io_perf(void)
     unlink(aws);
 }
 
+/*
+ * A volume switch as at end of volume: logical end of tape on volume 1,
+ * trailer labels, Rewind Unload, the operator mounts a new empty image for
+ * writing (blockdev-change-medium), the drive presents attention, and
+ * writing continues on volume 2.
+ */
+static void test_io_volume_switch(void)
+{
+    g_autofree char *vol1 = tape_new_image("vol1");
+    g_autofree char *vol2 = tape_new_image("vol2");
+    g_autofree char *drive = g_strdup_printf(
+        "-drive if=none,id=tape,format=raw,file=%s,read-only=off", vol1);
+    uint8_t block[1000];
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+    int i;
+
+    if (!tape_io_start(&t, drive, "capacity=8K,eot-margin=2K", NULL)) {
+        unlink(vol1);
+        unlink(vol2);
+        return;
+    }
+    tape_write_label(&t, "VOL1V00001");
+    for (i = 0; ; i++) {
+        fill_block(block, sizeof(block), i);
+        irb = tape_write_block(&t, block, sizeof(block));
+        if (irb.dstat & DSTAT_UE) {
+            break;
+        }
+        g_assert_cmphex(irb.dstat, ==, CCW_DSTAT_CE_DE);
+    }
+    g_assert_cmpint(i, ==, 6);   /* 86 + 7 * 1006 >= 6 KiB */
+    tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
+    tape_write_block(&t, (const uint8_t *)"EOV1", 4);
+    tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
+    tape_ccw(&t, TAPE_WRITE_MARK, 0, 1, 0);
+    tape_ok(&t, TAPE_REWIND_UNLOAD, 1, 0);
+    g_assert_true(tape_tray_open(t.qts));
+
+    /* Not ready while unloaded */
+    tape_expect_uc(&t, tape_ccw(&t, TAPE_READ, CCW_FLAG_SLI, 80, TAPE_BUF2),
+                   0x40, 0, NULL);
+
+    qtest_qmp_assert_success(t.qts,
+        "{'execute': 'blockdev-change-medium', 'arguments': {"
+        " 'id': 'tape0', 'filename': %s, 'format': 'raw',"
+        " 'read-only-mode': 'read-write'}}", vol2);
+    g_assert_false(tape_tray_open(t.qts));
+
+    /* The mount is reported by attention: SSCH finds status pending */
+    ccw_prog_set_ccw(t.qts, 0, 0x03, CCW_FLAG_SLI, 1, 0);
+    g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 1);
+    g_assert_cmphex(irb.dstat, ==, 0x80 | 0x04);
+
+    tape_write_label(&t, "VOL1V00002");
+    fill_block(block, sizeof(block), i);
+    tape_write_ok(&t, block, sizeof(block));
+    tape_ok(&t, TAPE_REWIND, 1, 0);
+    tape_read_label(&t, "VOL1V00002");
+    tape_read_expect(&t, block, sizeof(block));
+    tape_io_stop(&t);
+    g_assert_cmpuint(aws_check_file(vol1, NULL), ==, 12);
+    g_assert_cmpuint(aws_check_file(vol2, NULL), ==, 2);
+    tape_io_free(&t);
+    unlink(vol1);
+    unlink(vol2);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1441,6 +1509,7 @@ int main(int argc, char **argv)
     qtest_add_func("/3590-ccw/io/unaligned-image", test_io_unaligned_image);
     qtest_add_func("/3590-ccw/io/migration-positioned",
                    test_io_migration_positioned);
+    qtest_add_func("/3590-ccw/io/volume-switch", test_io_volume_switch);
     qtest_add_func("/3590-ccw/io/perf", test_io_perf);
     return g_test_run();
 }
