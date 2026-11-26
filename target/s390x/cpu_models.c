@@ -26,6 +26,7 @@
 #ifndef CONFIG_USER_ONLY
 #include "system/system.h"
 #include "target/s390x/kvm/pv.h"
+#include "hw/s390x/s390-virtio-ccw.h"
 #include CONFIG_DEVICES
 #endif
 
@@ -516,6 +517,10 @@ static S390KvmCpuVersion s390_kvm_cpu_version = S390_KVM_CPU_VERSION_VM;
 static uint8_t s390_kvm_guest_cpu_version(const S390CPUClass *xcc,
                                           const S390CPUModel *max_model)
 {
+    if (s390_zvm_personality()) {
+        /* the version code of a z/VM virtual CPU */
+        return 0xff;
+    }
     switch (s390_kvm_cpu_version) {
     case S390_KVM_CPU_VERSION_VM:
         return 0xff;

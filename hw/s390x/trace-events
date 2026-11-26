@@ -103,3 +103,6 @@ iucv_send(unsigned pathid, uint32_t msgid, uint32_t trgcls, uint32_t len, bool t
 iucv_receive(unsigned pathid, uint32_t msgid, uint32_t len, uint32_t left) "path %u msg %u got %u left %u"
 iucv_reply(unsigned pathid, uint32_t msgid, uint32_t len) "path %u msg %u reply len %u"
 iucv_guest_reply(unsigned pathid, uint32_t msgid, uint32_t len) "path %u msg %u guest reply len %u"
+
+# zvm-personality.c
+zvm_diag8(const char *cmd, int rc) "CP command \"%s\" rc %d"

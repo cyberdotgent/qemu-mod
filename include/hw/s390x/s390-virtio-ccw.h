@@ -33,6 +33,8 @@ struct S390CcwMachineState {
     bool aes_key_wrap;
     bool dea_key_wrap;
     bool esa390_cm;
+    bool zvm_personality;
+    char *zvm_userid;
     bool esa390_dat;
     OnOffAuto nested_esa390;
     bool pv;
@@ -96,6 +98,11 @@ uint64_t s390_mainframe_storage_increment(void);
 void s390_mainframe_patch_read_info(uint8_t *read_info);
 bool s390_mainframe_chsc_characteristics(uint32_t *general_chars,
                                          uint32_t *chsc_chars);
+/* z/VM personality (zvm-personality.c) */
+bool s390_zvm_personality(void);
+const char *s390_zvm_userid(void);
+void s390_zvm_diag8(S390CPU *cpu, int rx, int ry);
+
 /* The machine performs the z/OS STSI compatibility handshake (kvm.c). */
 bool s390_mainframe_zos_compat(void);
 

@@ -1757,6 +1757,11 @@ static int handle_diag(S390CPU *cpu, struct kvm_run *run, uint32_t ipb)
         kvm_handle_diag_508(cpu, run);
         break;
     default:
+        if (func_code == 0x008 && s390_zvm_personality()) {
+            s390_zvm_diag8(cpu, (run->s390_sieic.ipa & 0xf0) >> 4,
+                           run->s390_sieic.ipa & 0x0f);
+            break;
+        }
         trace_kvm_insn_diag(func_code);
         kvm_s390_program_interrupt(cpu, PGM_SPECIFICATION);
         break;
@@ -2009,6 +2014,14 @@ static void insert_stsi_3_2_2(S390CPU *cpu, __u64 addr, uint8_t ar)
                                                     strlen(qemu_name)));
     }
     sysib.vm[0].ext_name_encoding = 2; /* 2 = UTF-8 */
+    if (s390_zvm_personality()) {
+        const char *uid = s390_zvm_userid();
+
+        memset(sysib.vm[0].cpi, 0x40, sizeof(sysib.vm[0].cpi));
+        ebcdic_put(sysib.vm[0].cpi, "z/VM", 4);
+        memset(sysib.vm[0].name, 0x40, sizeof(sysib.vm[0].name));
+        ebcdic_put(sysib.vm[0].name, uid, strlen(uid));
+    }
     /* If hypervisor specifies zero Extended Name in STSI322 SYSIB, it's
      * considered by s390 as not capable of providing any Extended Name.
      * Therefore if no name was specified on qemu invocation, we go with the

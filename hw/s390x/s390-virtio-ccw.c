@@ -847,6 +847,34 @@ static inline void machine_set_aes_key_wrap(Object *obj, bool value,
     ms->aes_key_wrap = value;
 }
 
+static bool machine_get_zvm_personality(Object *obj, Error **errp)
+{
+    return S390_CCW_MACHINE(obj)->zvm_personality;
+}
+
+static void machine_set_zvm_personality(Object *obj, bool value, Error **errp)
+{
+    S390_CCW_MACHINE(obj)->zvm_personality = value;
+}
+
+static char *machine_get_zvm_userid(Object *obj, Error **errp)
+{
+    return g_strdup(S390_CCW_MACHINE(obj)->zvm_userid);
+}
+
+static void machine_set_zvm_userid(Object *obj, const char *value,
+                                   Error **errp)
+{
+    S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
+
+    if (!*value || strlen(value) > 8) {
+        error_setg(errp, "zvm-userid must have 1 to 8 characters");
+        return;
+    }
+    g_free(ms->zvm_userid);
+    ms->zvm_userid = g_ascii_strup(value, -1);
+}
+
 static inline bool machine_get_esa390_cm(Object *obj, Error **errp)
 {
     S390CcwMachineState *ms = S390_CCW_MACHINE(obj);
@@ -1273,6 +1301,20 @@ static void ccw_machine_class_init(ObjectClass *oc, const void *data)
             "started (KVM): machine (default) leaves the TOD clock of the "
             "host machine, host sets it from the host's CLOCK_REALTIME "
             "(UTC, POSIX time without leap seconds)");
+
+    object_class_property_add_bool(oc, "zvm-personality",
+                                   machine_get_zvm_personality,
+                                   machine_set_zvm_personality);
+    object_class_property_set_description(oc, "zvm-personality",
+            "present the machine as a z/VM virtual machine (STSI 3.2.2, CPU "
+            "version X'FF', CP commands through DIAGNOSE X'08') for guest "
+            "drivers that use IUCV only under z/VM");
+    object_class_property_add_str(oc, "zvm-userid",
+                                  machine_get_zvm_userid,
+                                  machine_set_zvm_userid);
+    object_class_property_set_description(oc, "zvm-userid",
+            "user ID of the virtual machine for the z/VM personality and "
+            "IUCV (default: GUEST)");
 
     object_class_property_add_bool(oc, "esa390-cm",
                                    machine_get_esa390_cm,
@@ -1724,6 +1766,26 @@ static void mainframe_instance_init(Object *obj)
 static void mainframe_instance_finalize(Object *obj)
 {
     g_free(S390_CCW_MACHINE(obj)->lpar_name);
+}
+
+bool s390_zvm_personality(void)
+{
+    Object *m = qdev_get_machine();
+
+    return object_dynamic_cast(m, TYPE_S390_CCW_MACHINE) &&
+           S390_CCW_MACHINE(m)->zvm_personality;
+}
+
+const char *s390_zvm_userid(void)
+{
+    Object *m = qdev_get_machine();
+    S390CcwMachineState *ms;
+
+    if (!object_dynamic_cast(m, TYPE_S390_CCW_MACHINE)) {
+        return "GUEST";
+    }
+    ms = S390_CCW_MACHINE(m);
+    return ms->zvm_userid ? ms->zvm_userid : "GUEST";
 }
 
 bool s390_mainframe_zos_compat(void)
