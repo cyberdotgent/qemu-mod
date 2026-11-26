@@ -148,6 +148,8 @@ struct Tape3590CcwDevice {
     uint8_t partition_id[11];
     /* Path group ID of the (only) channel path; zero = ungrouped */
     uint8_t pgid[11];
+    /* Assigned (Assign without Unassign); partition_id holds the ID */
+    bool assigned;
     /* Mode Set "supervisor inhibit" for the rest of the command chain */
     bool supervisor_inhibit;
     /* Load Display: function, the two messages (ASCII), what is shown */
@@ -950,6 +952,7 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
         if (!buffer_is_zero(buf, sizeof(tape->partition_id))) {
             memcpy(tape->partition_id, buf, sizeof(tape->partition_id));
         }
+        tape->assigned = true;
         sch->curr_status.scsw.count =
             ccw_dstream_residual_count(&sch->cds);
         return 0;
@@ -960,15 +963,23 @@ static int tape3590_ccw_cb(SubchDev *sch, CCW1 ccw)
             return tape3590_unit_check(tape, TAPE_SENSE_COMMAND_REJECT);
         }
         memset(tape->partition_id, 0, sizeof(tape->partition_id));
+        tape->assigned = false;
         sch->curr_status.scsw.count =
             ccw_dstream_residual_count(&sch->cds);
         return 0;
     case TAPE_CMD_SENSE_PGID:
         /*
-         * Byte 0: path state, bits 0-1: 10 ungrouped, 11 grouped;
-         * bytes 1-11: the path group ID.
+         * Byte 0: bits 0-1 pathing status (10 ungrouped, 11 grouped), bits
+         * 2-3 partitioning state (00 implicitly enabled, 11 explicitly
+         * enabled: assigned through this path), bit 4 path mode (always
+         * single path on a tape drive); bytes 1-11: the path group ID.
+         * The system checks after Assign that the drive reports itself
+         * assigned, and boxes it ("assign lost") if not.
          */
         buf[0] = buffer_is_zero(tape->pgid, sizeof(tape->pgid)) ? 0x80 : 0xc0;
+        if (tape->assigned) {
+            buf[0] |= 0x30;
+        }
         memcpy(buf + 1, tape->pgid, sizeof(tape->pgid));
         return tape3590_copy_response(tape, &ccw, buf, 12);
     case TAPE_CMD_SET_PGID:
@@ -1054,6 +1065,7 @@ static void tape3590_reset_hold(Object *obj, ResetType type)
      */
     memset(tape->pgid, 0, sizeof(tape->pgid));
     memset(tape->partition_id, 0, sizeof(tape->partition_id));
+    tape->assigned = false;
     tape->supervisor_inhibit = false;
     if (tc->parent_phases.hold) {
         tc->parent_phases.hold(obj, type);
@@ -1223,6 +1235,7 @@ static int tape3590_pre_load(void *opaque)
     Tape3590CcwDevice *tape = opaque;
 
     tape->local_length = tape->tray_open ? -1 : tape->medium.length;
+    tape->assigned = false;
     return 0;
 }
 
@@ -1230,6 +1243,11 @@ static int tape3590_post_load(void *opaque, int version_id)
 {
     Tape3590CcwDevice *tape = opaque;
     SubchDev *sch = CCW_DEVICE(tape)->sch;
+
+    /* Streams without the "assigned" subsection: assigned if an ID is set */
+    if (!buffer_is_zero(tape->partition_id, sizeof(tape->partition_id))) {
+        tape->assigned = true;
+    }
 
     if (sch->id.cu_type != tape->identity->cu_type ||
         sch->id.dev_type != tape->identity->dev_type ||
@@ -1332,6 +1350,23 @@ static const VMStateDescription vmstate_tape3590_pgid = {
     },
 };
 
+static bool tape3590_assigned_needed(void *opaque)
+{
+    return ((Tape3590CcwDevice *)opaque)->assigned;
+}
+
+/* Sent only while assigned */
+static const VMStateDescription vmstate_tape3590_assigned = {
+    .name = "3590-ccw/assigned",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tape3590_assigned_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(assigned, Tape3590CcwDevice),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_tape3590 = {
     .name = "3590-ccw",
     .version_id = 1,
@@ -1352,6 +1387,7 @@ static const VMStateDescription vmstate_tape3590 = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_tape3590_pgid,
+        &vmstate_tape3590_assigned,
         NULL
     },
 };

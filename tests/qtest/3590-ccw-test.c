@@ -1729,7 +1729,7 @@ static void test_io_path_group(void)
     status = migrate_from_file(t.qts, state);
     g_assert_cmpstr(status, ==, "completed");
     snid(&t, &st, id);
-    g_assert_cmphex(st, ==, 0xc0);
+    g_assert_cmphex(st, ==, 0xf0);              /* grouped, assigned */
     g_assert(!memcmp(id, expect, sizeof(id)));
 
     /* A system reset ungroups and unassigns */
@@ -1741,11 +1741,13 @@ static void test_io_path_group(void)
     memset(id, 0x33, sizeof(id));
     qtest_memwrite(t.qts, TAPE_SENSE_BUF, id, sizeof(id));
     tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF);
-    /* resign */
+    /* resign: ungrouped, the assignment stays until Unassign */
     g_assert_cmphex(spid(&t, 0xc0, 0).dstat, ==, CCW_DSTAT_CE_DE);
     snid(&t, &st, NULL);
-    g_assert_cmphex(st, ==, 0x80);
+    g_assert_cmphex(st, ==, 0xb0);
     tape_ok(&t, 0xc7, 11, TAPE_SENSE_BUF);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0x80);
     tape_io_stop(&t);
     tape_io_free(&t);
     unlink(state);
@@ -1945,7 +1947,8 @@ static void do_test_io_vary_online(const char *ident)
     tape_ok(&t, 0xaf, 12, TAPE_SENSE_BUF);
     tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF + 1);
     tape_ok(&t, 0x34, 12, TAPE_BUF);
-    g_assert_cmphex(qtest_readb(t.qts, TAPE_BUF), ==, 0xc0);
+    /* grouped and assigned (explicitly enabled) */
+    g_assert_cmphex(qtest_readb(t.qts, TAPE_BUF), ==, 0xf0);
     /* vary offline and online again */
     tape_ok(&t, 0xc7, 11, TAPE_SENSE_BUF + 1);
     tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF + 1);
@@ -1994,6 +1997,86 @@ static void test_io_remount_same(void)
     tape_io_stop(&t);
     tape_io_free(&t);
     unlink(aws);
+}
+
+/*
+ * The first vary online after IPL, as traced: at IPL time the system
+ * groups the path (Set Path Group ID) without assigning; at the vary it
+ * assigns and then checks with Sense Path Group ID that the drive reports
+ * itself assigned (partitioning state "explicitly enabled", byte 0 bits
+ * 2-3); if not, it boxes the drive ("assign lost").  Unassign, a system
+ * reset and migration.
+ */
+static void do_test_io_snid_assigned(const char *ident)
+{
+    g_autofree char *state = tape_new_image("snidstate");
+    g_autofree char *status = NULL;
+    uint8_t pgid[12] = { 0x80, 0x05, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                         0x77, 0x88, 0x99, 0xaa };
+    uint8_t st;
+    TapeIo t = { 0 };
+    CcwProgIrb irb;
+
+    if (!tape_io_start(&t, NULL, ident, NULL)) {
+        unlink(state);
+        return;
+    }
+    /* IPL time */
+    tape_ok(&t, 0xe4, 256, TAPE_BUF);
+    ccw_prog_set_ccw(t.qts, 0, 0x04, CCW_FLAG_CC | CCW_FLAG_SLI, 32,
+                     TAPE_BUF);
+    ccw_prog_set_ccw(t.qts, 1, 0xe4, CCW_FLAG_CC | CCW_FLAG_SLI, 20,
+                     TAPE_BUF + 32);
+    ccw_prog_set_ccw(t.qts, 2, 0x64, CCW_FLAG_SLI, 64, TAPE_BUF + 64);
+    g_assert_cmpint(ccw_prog_run(t.qts, CCW_ORB_FMT, &irb), ==, 0);
+    qtest_memwrite(t.qts, TAPE_SENSE_BUF, pgid, sizeof(pgid));
+    tape_ok(&t, 0xaf, 12, TAPE_SENSE_BUF);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0xc0);              /* grouped, not assigned */
+
+    /* vary online: Assign, then the check */
+    tape_ok(&t, 0xb7, 11, TAPE_SENSE_BUF + 1);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0xf0);              /* grouped, assigned */
+
+    /* survives migration */
+    status = migrate_to_file(t.qts, state);
+    g_assert_cmpstr(status, ==, "completed");
+    tape_io_stop(&t);
+    g_assert_true(tape_io_start(&t, NULL, ident, "-incoming defer"));
+    g_free(status);
+    status = migrate_from_file(t.qts, state);
+    g_assert_cmpstr(status, ==, "completed");
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0xf0);
+
+    /* vary offline */
+    tape_ok(&t, 0xc7, 11, TAPE_SENSE_BUF + 1);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0xc0);
+
+    /* Assign with a zero ID (the path's own), then a system reset */
+    qtest_memset(t.qts, TAPE_BUF, 0, 11);
+    tape_ok(&t, 0xb7, 11, TAPE_BUF);
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0xf0);
+    qtest_qmp_assert_success(t.qts, "{'execute': 'system_reset'}");
+    qtest_qmp_eventwait(t.qts, "RESET");
+    snid(&t, &st, NULL);
+    g_assert_cmphex(st, ==, 0x80);
+    tape_io_stop(&t);
+    tape_io_free(&t);
+    unlink(state);
+}
+
+static void test_io_snid_assigned_3590(void)
+{
+    do_test_io_snid_assigned("ident=3590");
+}
+
+static void test_io_snid_assigned_3490(void)
+{
+    do_test_io_snid_assigned("ident=3490");
 }
 
 int main(int argc, char **argv)
@@ -2050,6 +2133,10 @@ int main(int argc, char **argv)
     qtest_add_func("/3590-ccw/io/vary-online-3490", test_io_vary_online_3490);
     qtest_add_func("/3590-ccw/io/vary-online-3590", test_io_vary_online_3590);
     qtest_add_func("/3590-ccw/io/remount-same", test_io_remount_same);
+    qtest_add_func("/3590-ccw/io/snid-assigned-3590",
+                   test_io_snid_assigned_3590);
+    qtest_add_func("/3590-ccw/io/snid-assigned-3490",
+                   test_io_snid_assigned_3490);
     qtest_add_func("/3590-ccw/io/perf", test_io_perf);
     return g_test_run();
 }
