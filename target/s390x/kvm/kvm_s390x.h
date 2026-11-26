@@ -63,6 +63,35 @@ void kvm_s390_stop_interrupt(S390CPU *cpu);
 void kvm_s390_set_diag318(CPUState *cs, uint64_t diag318_info);
 int kvm_s390_topology_set_mtcr(uint64_t attr);
 
+/*
+ * Interruptions and instructions emulated by devices (for instance a
+ * hypervisor service such as IUCV).
+ */
+struct kvm_s390_ext_user_info;
+typedef struct S390UserExtIrqOps {
+    /* Without the BQL: whether an interruption may be waiting for @cpu. */
+    bool (*pending)(S390CPU *cpu);
+    /*
+     * With the BQL, when KVM can present an interruption to @cpu before it
+     * executes another instruction: choose one, perform what belongs to
+     * its presentation (for instance storing data into guest memory) and
+     * describe it in @info. Return false if there is none for @cpu.
+     */
+    bool (*present)(S390CPU *cpu, struct kvm_s390_ext_user_info *info);
+} S390UserExtIrqOps;
+bool kvm_s390_user_ext_irq_init(const S390UserExtIrqOps *ops,
+                                uint64_t cr0_subclass, Error **errp);
+void kvm_s390_user_ext_irq_kick(S390CPU *cpu);
+
+/*
+ * Handler for an instruction that the machine does not have: called with
+ * the BQL and the registers synchronized; the PSW addresses the next
+ * instruction. Returns 0 or an EXCP_ code as the intercept handlers do.
+ */
+typedef int (*S390UserOpExcHandler)(S390CPU *cpu, uint16_t ipa, uint32_t ipb);
+bool kvm_s390_user_operexec_init(uint16_t ipa, S390UserOpExcHandler fn,
+                                 Error **errp);
+
 /* itrace.c: KVM single-step instruction tracer */
 struct kvm_run;
 void s390_kvm_itrace_arm(void);

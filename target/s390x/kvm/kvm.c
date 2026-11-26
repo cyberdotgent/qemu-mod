@@ -155,6 +155,10 @@ static int cap_protected;
 static int cap_zpci_op;
 static int cap_protected_dump;
 
+static const S390UserExtIrqOps *user_ext_ops;
+static uint16_t user_operexec_ipa;
+static S390UserOpExcHandler user_operexec_fn;
+
 static bool mem_op_storage_key_support;
 
 static int active_cmma;
@@ -1052,9 +1056,90 @@ void kvm_arch_update_guest_debug(CPUState *cpu, struct kvm_guest_debug *dbg)
     kvm_s390_esa390_guest_debug(dbg);
 }
 
+bool kvm_s390_user_ext_irq_init(const S390UserExtIrqOps *ops,
+                                uint64_t cr0_subclass, Error **errp)
+{
+    if (user_ext_ops) {
+        error_setg(errp, "external interruptions of QEMU are in use already");
+        return false;
+    }
+    if (!kvm_check_extension(kvm_state, KVM_CAP_S390_USER_EXT_IRQ)) {
+        error_setg(errp, "KVM cannot present external interruptions of QEMU "
+                   "(KVM_CAP_S390_USER_EXT_IRQ missing)");
+        return false;
+    }
+    if (kvm_vm_enable_cap(kvm_state, KVM_CAP_S390_USER_EXT_IRQ, 0,
+                          cr0_subclass)) {
+        error_setg(errp, "KVM_CAP_S390_USER_EXT_IRQ could not be enabled");
+        return false;
+    }
+    user_ext_ops = ops;
+    return true;
+}
+
+/* an interruption may have become pending for @cpu: get it out of KVM_RUN */
+void kvm_s390_user_ext_irq_kick(S390CPU *cpu)
+{
+    qemu_cpu_kick(CPU(cpu));
+}
+
+bool kvm_s390_user_operexec_init(uint16_t ipa, S390UserOpExcHandler fn,
+                                 Error **errp)
+{
+    if (user_operexec_fn) {
+        error_setg(errp, "an instruction of QEMU is in use already");
+        return false;
+    }
+    if (!kvm_check_extension(kvm_state, KVM_CAP_S390_USER_OPEREXEC) ||
+        kvm_vm_enable_cap(kvm_state, KVM_CAP_S390_USER_OPEREXEC, 0)) {
+        error_setg(errp, "KVM cannot forward operation exceptions "
+                   "(KVM_CAP_S390_USER_OPEREXEC missing)");
+        return false;
+    }
+    user_operexec_ipa = ipa;
+    user_operexec_fn = fn;
+    return true;
+}
+
+/*
+ * The interrupt-window protocol: KVM_RUN returns with
+ * KVM_EXIT_IRQ_WINDOW_OPEN when the vCPU can take an interruption, which
+ * is then presented before the guest executes another instruction.
+ */
+static void kvm_s390_user_ext_irq_pre_run(CPUState *cs, struct kvm_run *run)
+{
+    S390CPU *cpu = S390_CPU(cs);
+    struct kvm_s390_irq irq = { .type = KVM_S390_INT_EXT_USER };
+
+    run->request_interrupt_window = 0;
+    if (!user_ext_ops->pending(cpu)) {
+        return;
+    }
+    trace_kvm_user_ext_irq(cs->cpu_index, run->ready_for_interrupt_injection);
+    if (run->ready_for_interrupt_injection) {
+        bool present;
+
+        bql_lock();
+        present = user_ext_ops->present(cpu, &irq.u.ext_user);
+        if (present && kvm_vcpu_ioctl(cs, KVM_S390_IRQ, &irq)) {
+            error_report("KVM failed to inject external interruption 0x%x",
+                         irq.u.ext_user.code);
+        }
+        bql_unlock();
+        run->ready_for_interrupt_injection = 0;
+        if (!user_ext_ops->pending(cpu)) {
+            return;
+        }
+    }
+    run->request_interrupt_window = 1;
+}
+
 void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
 {
     s390_kvm_itrace_pre_run(cpu);
+    if (user_ext_ops) {
+        kvm_s390_user_ext_irq_pre_run(cpu, run);
+    }
 }
 
 MemTxAttrs kvm_arch_post_run(CPUState *cs, struct kvm_run *run)
@@ -1812,6 +1897,11 @@ static int handle_intercept(S390CPU *cpu)
             r = EXCP_HALTED;
             break;
         case ICPT_OPEREXC:
+            if (user_operexec_fn && run->s390_sieic.ipa == user_operexec_ipa) {
+                r = user_operexec_fn(cpu, run->s390_sieic.ipa,
+                                     run->s390_sieic.ipb);
+                break;
+            }
             /* check for break points */
             r = handle_sw_breakpoint(cpu, run);
             if (r == -ENOENT) {

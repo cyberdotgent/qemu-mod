@@ -13,6 +13,24 @@ int kvm_s390_get_protected_dump(void)
     return false;
 }
 
+bool kvm_s390_user_ext_irq_init(const S390UserExtIrqOps *ops,
+                                uint64_t cr0_subclass, Error **errp)
+{
+    error_setg(errp, "this needs KVM");
+    return false;
+}
+
+void kvm_s390_user_ext_irq_kick(S390CPU *cpu)
+{
+}
+
+bool kvm_s390_user_operexec_init(uint16_t ipa, S390UserOpExcHandler fn,
+                                 Error **errp)
+{
+    error_setg(errp, "this needs KVM");
+    return false;
+}
+
 bool s390_is_pv(void)
 {
     return false;
