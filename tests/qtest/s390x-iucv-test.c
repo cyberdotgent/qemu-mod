@@ -198,10 +198,30 @@ static void test_none(void)
     unlink(path);
 }
 
-/* The host side of the TCP/IP tests */
+/*
+ * The TCP/IP service owns its address on the network of its backend. The
+ * tests put it on a user-mode network (10.0.2.0/24): the host is 10.0.2.2
+ * there, so the service reaches echo servers of the test on the loopback,
+ * and a forward of the user-mode network lets the test connect to the
+ * service's address. Frame-level checks use a socket backend.
+ */
+#define TCPIP_ARGS "-device iucv-tcpip,name=TCPIP,netdev=n0," \
+                   "mac=52:54:00:12:34:57,ip=10.0.2.15/24,gateway=10.0.2.2," \
+                   "dns=10.0.2.3,hostname=probe,domain=example.org"
+
+static bool skip_without_slirp(void)
+{
+#ifdef CONFIG_SLIRP
+    return false;
+#else
+    g_test_skip("needs user-mode networking (slirp)");
+    return true;
+#endif
+}
 
 typedef struct NetHelper {
     int echo_fd;                /* listening echo server, or -1 */
+    int udp_fd;                 /* UDP echo server, or -1 */
     uint16_t fwd_port;          /* host port forwarded to the guest */
     const char *send;           /* the client sends this ... */
     const char *expect;         /* ... and expects this answer */
@@ -221,6 +241,20 @@ static int listen_loopback(uint16_t *port)
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     g_assert_cmpint(bind(fd, (struct sockaddr *)&a, sizeof(a)), ==, 0);
     g_assert_cmpint(listen(fd, 4), ==, 0);
+    g_assert_cmpint(getsockname(fd, (struct sockaddr *)&a, &alen), ==, 0);
+    *port = ntohs(a.sin_port);
+    return fd;
+}
+
+static int udp_loopback(uint16_t *port)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET };
+    socklen_t alen = sizeof(a);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    g_assert_cmpint(bind(fd, (struct sockaddr *)&a, sizeof(a)), ==, 0);
     g_assert_cmpint(getsockname(fd, (struct sockaddr *)&a, &alen), ==, 0);
     *port = ntohs(a.sin_port);
     return fd;
@@ -280,6 +314,18 @@ static gpointer net_helper(gpointer opaque)
         struct pollfd p[2];
         int n = 0;
 
+        if (h->udp_fd >= 0) {
+            char buf[256];
+            struct sockaddr_in from;
+            socklen_t flen = sizeof(from);
+            ssize_t len = recvfrom(h->udp_fd, buf, sizeof(buf), MSG_DONTWAIT,
+                                   (struct sockaddr *)&from, &flen);
+
+            if (len > 0) {
+                sendto(h->udp_fd, buf, len, 0, (struct sockaddr *)&from,
+                       flen);
+            }
+        }
         if (h->echo_fd >= 0) {
             p[n].fd = conn >= 0 ? conn : h->echo_fd;
             p[n++].events = POLLIN;
@@ -310,32 +356,32 @@ static gpointer net_helper(gpointer opaque)
 }
 
 /*
- * The TCP/IP service: a connection out to an echo server on the host's
- * loopback (allow-host), one in through a forwarded port, the policy for
- * link-local and denied networks.
+ * The TCP/IP service: a connection out to an echo server of the host, a
+ * refused one, UDP to an echo server, one in to the service's address.
  */
 static void test_tcpip(void)
 {
     NetHelper h = { .send = "ping", .expect = "pong" };
     g_autofree char *path = NULL;
     g_autofree char *args = NULL;
-    uint16_t echo_port;
+    uint16_t echo_port, udp_port;
     QTestState *qts;
     GThread *thread;
     uint32_t res;
 
-    if (skip_without_iucv(true)) {
+    if (skip_without_iucv(true) || skip_without_slirp()) {
         return;
     }
     h.echo_fd = listen_loopback(&echo_port);
+    h.udp_fd = udp_loopback(&udp_port);
     h.fwd_port = free_port();
     path = write_guest(iucv_guest_tcpip, iucv_guest_tcpip_len);
-    args = g_strdup_printf("-device iucv-tcpip,name=TCPIP,ip=10.0.2.15/24,"
-                           "allow-host=on,hostfwd-addr=127.0.0.1,"
-                           "hostfwd=tcp:%u-23,deny=192.0.2.0/24",
-                           h.fwd_port);
+    args = g_strdup_printf("-netdev user,id=n0,net=10.0.2.0/24,"
+                           "host=10.0.2.2,hostfwd=tcp:127.0.0.1:%u-"
+                           "10.0.2.15:23 " TCPIP_ARGS, h.fwd_port);
     qts = start_guest(path, args);
     qtest_writew(qts, G_PARAM, echo_port);
+    qtest_writew(qts, G_PARAM + 2, udp_port);
     thread = g_thread_new("iucv-net-helper", net_helper, &h);
     run_guest(qts);
     res = wait_result(qts);
@@ -352,51 +398,29 @@ static void test_tcpip(void)
     g_assert_true(h.client_ok);
     qtest_quit(qts);
     close(h.echo_fd);
-    unlink(path);
-}
-
-/* Without allow-host, the host's loopback is out of reach */
-static void test_tcpip_no_host(void)
-{
-    g_autofree char *path = NULL;
-    uint16_t echo_port;
-    QTestState *qts;
-    int echo_fd;
-
-    if (skip_without_iucv(true)) {
-        return;
-    }
-    echo_fd = listen_loopback(&echo_port);
-    path = write_guest(iucv_guest_tcpip, iucv_guest_tcpip_len);
-    qts = start_guest(path, "-device iucv-tcpip,name=TCPIP,ip=10.0.2.15/24");
-    qtest_writew(qts, G_PARAM, echo_port);
-    run_guest(qts);
-    /* step 4, CONNECT to 127.0.0.1, fails with ENETUNREACH (VM 51) */
-    g_assert_cmphex(wait_result(qts), ==, 4);
-    g_assert_cmpuint(qtest_readl(qts, G_ERRNO), ==, 51);
-    qtest_quit(qts);
-    close(echo_fd);
+    close(h.udp_fd);
     unlink(path);
 }
 
 /* Two paths: GIVESOCKET/TAKESOCKET, SELECT, CANCEL, PURGE */
 static void test_tcpip_two_paths(void)
 {
-    NetHelper h = { .echo_fd = -1, .send = "data", .expect = "ok" };
+    NetHelper h = { .echo_fd = -1, .udp_fd = -1, .send = "data",
+                    .expect = "ok" };
     g_autofree char *path = NULL;
     g_autofree char *args = NULL;
     QTestState *qts;
     GThread *thread;
     uint32_t res;
 
-    if (skip_without_iucv(true)) {
+    if (skip_without_iucv(true) || skip_without_slirp()) {
         return;
     }
     h.fwd_port = free_port();
     path = write_guest(iucv_guest_tcpip2, iucv_guest_tcpip2_len);
-    args = g_strdup_printf("-device iucv-tcpip,name=TCPIP,ip=10.0.2.15/24,"
-                           "hostfwd-addr=127.0.0.1,hostfwd=tcp:%u-21",
-                           h.fwd_port);
+    args = g_strdup_printf("-netdev user,id=n0,net=10.0.2.0/24,"
+                           "host=10.0.2.2,hostfwd=tcp:127.0.0.1:%u-"
+                           "10.0.2.15:21 " TCPIP_ARGS, h.fwd_port);
     qts = start_guest(path, args);
     thread = g_thread_new("iucv-net-helper", net_helper, &h);
     run_guest(qts);
@@ -608,6 +632,117 @@ static void test_net_mtu(void)
     unlink(path);
 }
 
+/*
+ * The service is a station of its own on the network: it announces its
+ * address, answers ARP for it (and only for it) and ICMP echo, without any
+ * help of the guest.
+ */
+#define STK_IP          0x0a00020f      /* 10.0.2.15 */
+#define PEER_IP         0x0a000263      /* 10.0.2.99 */
+
+static const uint8_t stk_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 };
+static const uint8_t peer_mac[6] = { 0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcd };
+
+static void make_arp_request(uint8_t *f, uint32_t target)
+{
+    memset(f, 0, 42);
+    memset(f, 0xff, 6);
+    memcpy(f + 6, peer_mac, 6);
+    stw_be_p(f + 12, 0x0806);
+    stw_be_p(f + 14, 1);
+    stw_be_p(f + 16, 0x0800);
+    f[18] = 6;
+    f[19] = 4;
+    stw_be_p(f + 20, 1);
+    memcpy(f + 22, peer_mac, 6);
+    stl_be_p(f + 28, PEER_IP);
+    stl_be_p(f + 38, target);
+}
+
+static void test_tcpip_arp_icmp(void)
+{
+    g_autofree char *path = NULL;
+    g_autofree char *args = NULL;
+    uint8_t frame[2048], ping[14 + 20 + 8 + 32];
+    size_t len;
+    QTestState *qts;
+    int sv[2], i;
+
+    if (skip_without_iucv(true)) {
+        return;
+    }
+    g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), ==, 0);
+    path = write_guest(iucv_guest_idle, iucv_guest_idle_len);
+    args = g_strdup_printf("-netdev socket,id=n0,fd=%d " TCPIP_ARGS, sv[1]);
+    qts = start_guest(path, args);
+    close(sv[1]);
+    run_guest(qts);
+    g_assert_cmphex(wait_result(qts), ==, 0);
+
+    /* the gratuitous ARP of the address */
+    len = read_frame(sv[0], frame, sizeof(frame));
+    g_assert_cmpuint(len, >=, 42);
+    g_assert_cmphex(lduw_be_p(frame + 12), ==, 0x0806);
+    g_assert_cmpmem(frame + 6, 6, stk_mac, 6);
+    g_assert_cmphex(ldl_be_p(frame + 28), ==, STK_IP);
+    g_assert_cmphex(ldl_be_p(frame + 38), ==, STK_IP);
+
+    /* a request for another address is not answered, one for its own is */
+    make_arp_request(frame, 0x0a000210);
+    write_frame(sv[0], frame, 42);
+    make_arp_request(frame, STK_IP);
+    write_frame(sv[0], frame, 42);
+    len = read_frame(sv[0], frame, sizeof(frame));
+    g_assert_cmpuint(len, >=, 42);
+    g_assert_cmpmem(frame, 6, peer_mac, 6);
+    g_assert_cmpmem(frame + 6, 6, stk_mac, 6);
+    g_assert_cmphex(lduw_be_p(frame + 12), ==, 0x0806);
+    g_assert_cmphex(lduw_be_p(frame + 20), ==, 2);
+    g_assert_cmpmem(frame + 22, 6, stk_mac, 6);
+    g_assert_cmphex(ldl_be_p(frame + 28), ==, STK_IP);
+    g_assert_cmpmem(frame + 32, 6, peer_mac, 6);
+    g_assert_cmphex(ldl_be_p(frame + 38), ==, PEER_IP);
+
+    /* ICMP echo */
+    memset(ping, 0, sizeof(ping));
+    memcpy(ping, stk_mac, 6);
+    memcpy(ping + 6, peer_mac, 6);
+    stw_be_p(ping + 12, 0x0800);
+    ping[14] = 0x45;
+    stw_be_p(ping + 16, 20 + 8 + 32);
+    stw_be_p(ping + 18, 0x4242);
+    ping[22] = 64;
+    ping[23] = IPPROTO_ICMP;
+    stl_be_p(ping + 26, PEER_IP);
+    stl_be_p(ping + 30, STK_IP);
+    stw_be_p(ping + 24, ip_checksum(ping + 14, 20));
+    ping[34] = 8;                               /* echo request */
+    stw_be_p(ping + 38, 0x1234);                /* identifier */
+    stw_be_p(ping + 40, 7);                     /* sequence */
+    for (i = 0; i < 32; i++) {
+        ping[42 + i] = i;
+    }
+    stw_be_p(ping + 36, ip_checksum(ping + 34, 8 + 32));
+    write_frame(sv[0], ping, sizeof(ping));
+    len = read_frame(sv[0], frame, sizeof(frame));
+    g_assert_cmpuint(len, >=, sizeof(ping));
+    g_assert_cmpmem(frame, 6, peer_mac, 6);
+    g_assert_cmphex(lduw_be_p(frame + 12), ==, 0x0800);
+    g_assert_cmphex(frame[23], ==, IPPROTO_ICMP);
+    g_assert_cmphex(ldl_be_p(frame + 26), ==, STK_IP);
+    g_assert_cmphex(ldl_be_p(frame + 30), ==, PEER_IP);
+    g_assert_cmphex(ip_checksum(frame + 14, 20), ==, 0);
+    g_assert_cmphex(frame[34], ==, 0);          /* echo reply */
+    g_assert_cmphex(lduw_be_p(frame + 38), ==, 0x1234);
+    g_assert_cmphex(lduw_be_p(frame + 40), ==, 7);
+    g_assert_cmpmem(frame + 42, 32, ping + 42, 32);
+    g_assert_cmphex(ip_checksum(frame + 34, 8 + 32), ==, 0);
+
+    qtest_quit(qts);
+    close(sv[0]);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -618,7 +753,7 @@ int main(int argc, char **argv)
     qtest_add_func("/iucv/unavailable", test_unavailable);
     qtest_add_func("/iucv/none", test_none);
     qtest_add_func("/iucv/tcpip/basic", test_tcpip);
-    qtest_add_func("/iucv/tcpip/no-host", test_tcpip_no_host);
+    qtest_add_func("/iucv/tcpip/arp-icmp", test_tcpip_arp_icmp);
     qtest_add_func("/iucv/tcpip/two-paths", test_tcpip_two_paths);
     qtest_add_func("/iucv/net/mtu", test_net_mtu);
 

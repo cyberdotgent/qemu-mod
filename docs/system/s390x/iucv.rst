@@ -47,27 +47,36 @@ Services
     ip addr add A.B.C.D peer GATEWAY dev iucv0
     ip link set iucv0 up
 
-``-device iucv-tcpip,name=PEER,ip=A.B.C.D/LEN[,...]``
+``-device iucv-tcpip,name=PEER,netdev=ID,ip=A.B.C.D/LEN[,gateway=A.B.C.D][,mac=MAC][,...]``
   The socket interface of a VM TCP/IP virtual machine (``IUCVAPI``, API types
-  2 and 3), run on sockets of the host with a policy:
+  2 and 3) on a TCP/IP stack of its own (lwIP, built from
+  ``subprojects/lwip``). Like the TCPIP virtual machine with its network
+  adapter, the service is a host on the network of its backend (for instance
+  a tap device on a bridge): it has its own MAC address, owns the address
+  ``ip``, answers ARP and ICMP echo for it and terminates TCP and UDP itself.
+  The guest's sockets are sockets of that stack; others reach the guest at
+  ``ip`` like any host, and the guest reaches the network through
+  ``gateway``. Nothing goes through the sockets of the host. A process has
+  one such stack, so at most one ``iucv-tcpip`` device.
 
-  - outgoing connections and datagrams leave from the host like NAT; the guest
-    sees the address ``ip``;
-  - the host's loopback and own addresses are refused unless
-    ``allow-host=on``; link-local, multicast, reserved and broadcast
-    destinations (including the broadcast and network addresses of the host's
-    subnets) are always refused, and so are the networks in
-    ``deny=CIDR[;CIDR...]``;
-  - the guest can accept connections only on ports forwarded to it with
-    ``hostfwd=tcp:HOSTPORT-GUESTPORT[;udp:HOSTPORT-GUESTPORT...]``; the host
-    port is opened when the guest binds the guest port, on
-    ``hostfwd-addr`` (default all addresses);
-  - ``dns=A.B.C.D`` is an address the guest can use as its name server; its
-    DNS traffic goes to the first name server of the host;
-  - raw sockets are limited to ICMP echo through unprivileged ICMP sockets,
-    with ``raw=on``;
+  - ``dns=A.B.C.D[;A.B.C.D...]`` (up to three), ``hostname`` and ``domain``
+    describe the guest's network configuration; ``hostname`` is the answer
+    of GETHOSTNAME (default ``qemu``). The interface has no name-resolution
+    call: the guest's resolver sends its queries to its name servers itself.
+  - ``mtu`` (default 1500) is the MTU of the network side.
+  - raw sockets are offered for ICMP (PING); received datagrams carry their
+    IPv4 header.
+  - ``127.0.0.1`` and the own address reach the stack itself.
   - ``max-sockets`` (default 256) is the size of the socket table of a path,
-    ``max-host-sockets`` (default 512) limits the host sockets of all paths.
+    ``max-open-sockets`` (default 512) limits the sockets of all paths
+    together. The stack has fixed pools for its control blocks, a receive
+    window of 32 segments per connection and at most 64 waiting datagrams
+    (256 KiB) per datagram socket.
+
+  For example, on a bridge of the host::
+
+    -netdev tap,id=n1,ifname=tap1,script=no,downscript=no
+    -device iucv-tcpip,name=TCPIP,netdev=n1,mac=52:54:00:12:34:58,ip=192.0.2.20/24,gateway=192.0.2.1,dns=192.0.2.53,hostname=guest,domain=example.com
 
 Limits for untrusted guests
 ---------------------------

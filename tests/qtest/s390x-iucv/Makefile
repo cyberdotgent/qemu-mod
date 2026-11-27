@@ -7,7 +7,7 @@
 # run "make" here (on s390x, or with CROSS_PREFIX=s390x-linux-gnu-) and
 # commit both the source and the header.
 
-PROGS = cp regs smp unavailable tcpip tcpip2 net
+PROGS = cp regs smp unavailable tcpip tcpip2 net idle
 
 .PHONY: all clean
 all: ../s390x-iucv-guests.h

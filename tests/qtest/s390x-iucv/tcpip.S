@@ -1,10 +1,11 @@
 /*
- * IUCV guest program: the TCP/IP service (iucv-tcpip, name TCPIP),
- * apitype 3. Needs a TCP echo server on 127.0.0.1 (allow-host=on), whose
- * port the test stores at 0x2f00 before the guest starts, a client that
- * connects to the port forwarded to guest port 23, sends "ping" and
- * expects "pong", and deny=192.0.2.0/24. 0x2000: 0 = pass, else the
- * failing step; 0x2010 last rc, 0x2014 last errno.
+ * IUCV guest program: the TCP/IP service (iucv-tcpip, name TCPIP, address
+ * 10.0.2.15/24), apitype 3. Needs a host 10.0.2.2 on the network of the
+ * service with a TCP echo server and a UDP echo server, whose ports the
+ * test stores at 0x2f00 and 0x2f02 before the guest starts, nothing
+ * listening on its port 1, and a client that connects to 10.0.2.15 port
+ * 23, sends "ping" and expects "pong". 0x2000: 0 = pass, else the failing
+ * step; 0x2010 last rc, 0x2014 last errno.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -79,7 +80,9 @@ _start:
 	larl	%r2,reqs
 	llilf	%r3,0x4000
 	mvc	0(256,%r3),0(%r2)		/* request templates */
+	mvc	0x100(256,%r3),0x100(%r2)
 	mvc	0x32(2,%r3),0xf00(%r11)		/* port of the echo server */
+	mvc	0x116(2,%r3),0xf02(%r11)	/* port of the UDP echo server */
 
 	STEP	1
 	CLEARP
@@ -106,7 +109,7 @@ _start:
 	STEP	3				/* SOCKET 5, stream */
 	CALL	25<<16,0x4020,16,0x5000,8
 	RC	5
-	STEP	4				/* CONNECT 127.0.0.1:7777 */
+	STEP	4				/* CONNECT 10.0.2.2, echo */
 	CALL	(4<<16)|5,0x4030,16,0x5000,8
 	RC	0
 	STEP	5				/* WRITE "hello" */
@@ -140,19 +143,31 @@ _start:
 	chsi	4(%r13),1000
 	jne	fail
 
-	STEP	11				/* CONNECT 169.254.1.1: refused */
+	STEP	11				/* CONNECT 10.0.2.2:1: refused */
 	CALL	25<<16,0x40b0,16,0x5000,8	/* SOCKET 8 */
 	RC	8
 	CALL	(4<<16)|8,0x40c0,16,0x5000,8
 	RC	-1
-	chsi	4(%r13),51
+	chsi	4(%r13),61
 	jne	fail
+	CALL	(3<<16)|8,0,0,0x5000,8,0x80	/* CLOSE 8 */
+	RC	0
 
-	STEP	16				/* CONNECT to a denied network */
-	CALL	(4<<16)|8,0x40f0,16,0x5000,8
-	RC	-1
-	chsi	4(%r13),51
+	STEP	16				/* UDP: SENDTO the echo, RECV */
+	CALL	25<<16,0x4100,16,0x5000,8	/* SOCKET 9, datagram */
+	RC	9
+	CALL	(22<<16)|9,0x4110,25,0x5000,8
+	RC	5
+	CALL	(16<<16)|9,0,0,0x5000,88,0x80
+	RC	5
+	llilf	%r3,0x4110+20
+	clc	24(5,%r13),0(%r3)
 	jne	fail
+	llilf	%r3,0x0a000202			/* from 10.0.2.2 */
+	c	%r3,12(%r13)
+	jne	fail
+	CALL	(3<<16)|9,0,0,0x5000,8,0x80	/* CLOSE 9 */
+	RC	0
 
 	STEP	12				/* listener on forwarded port 23 */
 	CALL	25<<16,0x40d0,16,0x5000,8	/* SOCKET 6 */
@@ -222,9 +237,9 @@ reqs:
 	.fill	12,1,0
 /* 0x4020 SOCKET 5 stream */
 	.long	2, 1, 0, 5
-/* 0x4030 sockaddr 127.0.0.1, the port from 0x2f00 */
+/* 0x4030 sockaddr 10.0.2.2, the port from 0x2f00 */
 	.short	2, 0
-	.byte	127,0,0,1
+	.byte	10,0,2,2
 	.fill	8,1,0
 /* 0x4040 WRITE: 20 zero bytes, "hello", "ping" (expected) */
 	.fill	20,1,0
@@ -241,9 +256,9 @@ reqs:
 	.fill	8,1,0
 /* 0x40b0 SOCKET 8 */
 	.long	2, 1, 0, 8
-/* 0x40c0 sockaddr 169.254.1.1:80 */
-	.short	2, 80
-	.byte	169,254,1,1
+/* 0x40c0 sockaddr 10.0.2.2:1 */
+	.short	2, 1
+	.byte	10,0,2,2
 	.fill	8,1,0
 /* 0x40d0 SOCKET 6 */
 	.long	2, 1, 0, 6
@@ -251,7 +266,14 @@ reqs:
 	.short	2, 23
 	.long	0
 	.fill	8,1,0
-/* 0x40f0 sockaddr 192.0.2.1:80 */
-	.short	2, 80
-	.byte	192,0,2,1
+/* 0x40f0 unused */
+	.fill	16,1,0
+/* 0x4100 SOCKET 9 datagram */
+	.long	2, 2, 0, 9
+/* 0x4110 SENDTO: flags, sockaddr 10.0.2.2 (port from 0x2f02), "hello" */
+	.long	0
+	.short	2, 0
+	.byte	10,0,2,2
 	.fill	8,1,0
+	.ascii	"hello"
+	.fill	11,1,0
