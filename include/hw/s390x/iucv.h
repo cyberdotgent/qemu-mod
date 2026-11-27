@@ -6,7 +6,6 @@
  * communication partners of the guest are services inside QEMU (for
  * instance a TCP/IP service or a point-to-point IP link). The core is the
  * transport; each service implements a protocol on top of it.
-
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -47,6 +46,12 @@ struct IUCVServiceClass {
     DeviceClass parent_class;
 
     /*
+     * The largest message of the guest the service takes (0: 1 MiB).
+     * Larger ones are rejected by the core without being copied.
+     */
+    uint32_t max_message;
+
+    /*
      * The guest connects to the service. @user holds the 16 bytes of user
      * data. Return 0 to accept (the path can be used at once), or an
      * IUCV_RC_ code. The service may lower the message limit with
@@ -72,8 +77,10 @@ struct IUCVServiceClass {
     /* the guest quiesced (true) or resumed (false) the path */
     void (*quiesced)(IUCVService *svc, IUCVPath *path, bool quiesced);
     /*
-     * The path is gone: the guest severed it or the machine was reset.
-     * Messages of the guest the service still holds are freed afterwards.
+     * The path is gone: the guest severed it, the machine was reset, or
+     * the service's own iucv_sever() is followed by the guest's SEVER.
+     * Called once per path. Messages of the guest the service still
+     * holds are freed afterwards.
      */
     void (*severed)(IUCVService *svc, IUCVPath *path);
 };

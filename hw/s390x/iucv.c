@@ -16,7 +16,11 @@
  * Not provided: control buffers and control paths, paths between two
  * guests, connections a service opens to the guest, TEST MESSAGE, the
  * storage-key checks of the data areas.
-
+ *
+ * The guest is not trusted: messages larger than a service takes are
+ * rejected without being copied, the message limit of a path is at most
+ * MSGLIM_MAX and counts the guest's messages until their completion has
+ * been taken, and the data its messages hold is limited per machine.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -116,9 +120,14 @@ enum {
 #define IUCV_EXT_CODE   0x4000
 #define CR0_IUCV        0x0000000000000002ULL   /* bit 62 */
 #define MSGLIM_DEFAULT  10
+#define MSGLIM_MAX      255             /* granted to a guest at most */
+#define AREA_ENTRIES_MAX 65536          /* entries of a buffer list */
+#define MSG_MAX_DEFAULT (1024 * 1024)   /* largest message of the guest */
+#define HELD_MAX        (64 * 1024 * 1024)  /* guest data held at once */
 
 typedef struct IUCVIrq {
     QTAILQ_ENTRY(IUCVIrq) next;
+    bool counted;               /* a completion in guest_out of its path */
     uint8_t type;
     uint16_t pathid;
     uint32_t msgid;
@@ -162,9 +171,9 @@ struct IUCVPath {
     uint16_t msglim;
     bool guest_prmdata;         /* the guest takes data in the plist */
     bool guest_quiesced;        /* the guest takes no messages */
-    bool svc_quiesced;
+    bool svc_told;              /* the service's severed() ran */
     uint8_t user[16];           /* user data of the completion */
-    unsigned guest_out;         /* two-way messages of the guest */
+    unsigned guest_out;         /* guest messages, until completion taken */
     unsigned svc_out;           /* messages of the service not finished */
     QTAILQ_HEAD(, IUCVMsg) msgs;
 };
@@ -184,11 +193,11 @@ struct S390IUCVState {
     bool available;
     uint32_t maxconn;
 
-    uint8_t userid[8];
     IUCVCpu *cpus;
     unsigned ncpus;
     IUCVPath **paths;
     uint32_t next_msgid;
+    uint64_t held;              /* bytes of guest messages services hold */
     QTAILQ_HEAD(, IUCVIrq) irqs;
     QTAILQ_HEAD(, IUCVService) services;
     Error *migration_blocker;
@@ -273,7 +282,7 @@ static int area_check(IUCVArea *a, int rc_align)
             return 0x17;
         }
         sum += get32(e, 4);
-        if (n > 65536) {
+        if (n >= AREA_ENTRIES_MAX) {
             return 0x16;
         }
     }
@@ -285,7 +294,7 @@ static int area_check(IUCVArea *a, int rc_align)
  * Returns false on an addressing error.
  */
 static bool area_rw(IUCVArea *a, uint32_t skip,
-                    uint8_t *buf, uint32_t len, bool write)
+                    void *buf, uint32_t len, bool write)
 {
     uint32_t n = 0;
 
@@ -298,7 +307,9 @@ static bool area_rw(IUCVArea *a, uint32_t skip,
         uint8_t e[8];
         uint32_t eaddr, elen, chunk;
 
-        if (!abs_read((a->addr + n++ * 8) & a->amask, e, 8)) {
+        /* the guest may have changed the list since area_check() */
+        if (n > AREA_ENTRIES_MAX ||
+            !abs_read((a->addr + n++ * 8) & a->amask, e, 8)) {
             return false;
         }
         eaddr = get32(e, 0);
@@ -313,7 +324,7 @@ static bool area_rw(IUCVArea *a, uint32_t skip,
             return false;
         }
         skip = 0;
-        buf += chunk;
+        buf = (uint8_t *)buf + chunk;
         len -= chunk;
     }
     return true;
@@ -391,8 +402,8 @@ static void update_pending(S390IUCVState *s)
     }
 }
 
-static void queue_irq(S390IUCVState *s, uint8_t type, uint16_t pathid,
-                      uint32_t msgid, uint8_t *rec)
+static IUCVIrq *queue_irq(S390IUCVState *s, uint8_t type, uint16_t pathid,
+                          uint32_t msgid, uint8_t *rec)
 {
     IUCVIrq *irq = g_new0(IUCVIrq, 1);
 
@@ -405,6 +416,7 @@ static void queue_irq(S390IUCVState *s, uint8_t type, uint16_t pathid,
     QTAILQ_INSERT_TAIL(&s->irqs, irq, next);
     trace_iucv_queue_irq(type, pathid, msgid);
     update_pending(s);
+    return irq;
 }
 
 /* drop queued interruptions of a path (msgid 0: all) of the given types */
@@ -421,6 +433,19 @@ static void drop_irqs(S390IUCVState *s, uint16_t pathid, uint32_t msgid,
         }
     }
     update_pending(s);
+}
+
+/*
+ * A completion of a guest message left the queue: the message no longer
+ * counts against the message limit of its path.
+ */
+static void irq_taken(S390IUCVState *s, IUCVIrq *irq)
+{
+    IUCVPath *path = irq->pathid < s->maxconn ? s->paths[irq->pathid] : NULL;
+
+    if (irq->counted && path && path->guest_out) {
+        path->guest_out--;
+    }
 }
 
 static bool iucv_irq_pending(S390CPU *cpu)
@@ -442,10 +467,11 @@ static bool iucv_irq_present(S390CPU *cpu, struct kvm_s390_ext_user_info *info)
         return false;
     }
     QTAILQ_REMOVE(&s->irqs, irq, next);
+    irq_taken(s, irq);
     if (irq->type > T_RESUMED && !msg_irq_queued(s)) {
         irq->rec[P_POLLFG] = 0x80;
     }
-    if (!abs_write(c->buffer, irq->rec, P_LEN)) {
+    if (!abs_write(mmu_real2abs(&cpu->env, c->buffer), irq->rec, P_LEN)) {
         warn_report_once("IUCV: interruption buffer at 0x%x is not in "
                          "guest storage", c->buffer);
     }
@@ -482,6 +508,9 @@ static uint32_t new_msgid(S390IUCVState *s)
 
 static void msg_free(IUCVPath *path, IUCVMsg *m)
 {
+    if (m->from_guest && m->pub.data && !m->prmdata) {
+        path->svc->iucv->held -= m->pub.len;
+    }
     QTAILQ_REMOVE(&path->msgs, m, next);
     g_free(m->pub.data);
     g_free(m->data);
@@ -506,12 +535,17 @@ static void complete_guest_msg(S390IUCVState *s, IUCVPath *path, IUCVMsg *m,
     put32(rec, P_MSGTAG, m->tag);
     put32(rec, P_BFLN2F, residual);
     queue_irq(s, m->priority ? T_MSG_COMPLETE_PRTY : T_MSG_COMPLETE,
-              path->id, m->id, rec);
+              path->id, m->id, rec)->counted = true;
 }
+
+static void path_sever_service(S390IUCVState *s, IUCVPath *path,
+                               const char *by);
 
 static void path_free(S390IUCVState *s, IUCVPath *path)
 {
     IUCVMsg *m, *n;
+
+    path_sever_service(s, path, NULL);
 
     QTAILQ_FOREACH_SAFE(m, &path->msgs, next, n) {
         msg_free(path, m);
@@ -521,17 +555,24 @@ static void path_free(S390IUCVState *s, IUCVPath *path)
     g_free(path);
 }
 
-/* the service is told and lets go of everything it holds */
-static void path_sever_service(S390IUCVState *s, IUCVPath *path)
+/*
+ * The service is told, once, and lets go of everything it holds; also when
+ * it severed the path itself. @by is NULL when the path is just freed.
+ */
+static void path_sever_service(S390IUCVState *s, IUCVPath *path,
+                               const char *by)
 {
     IUCVServiceClass *sc;
 
-    if (path->state == PATH_SEVERED || !path->svc) {
+    if (path->svc_told || !path->svc) {
         return;
     }
     sc = IUCV_SERVICE_GET_CLASS(path->svc);
+    path->svc_told = true;
     path->state = PATH_SEVERED;
-    trace_iucv_sever(path->id, "guest");
+    if (by) {
+        trace_iucv_sever(path->id, by);
+    }
     if (sc->severed) {
         sc->severed(path->svc, path);
     }
@@ -543,7 +584,7 @@ static void sever_all(S390IUCVState *s)
 
     for (i = 0; i < s->maxconn; i++) {
         if (s->paths[i]) {
-            path_sever_service(s, s->paths[i]);
+            path_sever_service(s, s->paths[i], "reset");
             path_free(s, s->paths[i]);
         }
     }
@@ -608,7 +649,6 @@ void iucv_sever(IUCVService *svc, IUCVPath *path, const uint8_t *user)
             msg_free(path, m);
         }
     }
-    path->guest_out = 0;
     if (user) {
         memcpy(rec + P_USER, user, 16);
     }
@@ -671,12 +711,11 @@ void iucv_reply(IUCVService *svc, IUCVPath *path, IUCVMessage *msg,
     } else {
         residual = m->ans_len - len;
     }
-    if (n && !area_rw(&a, 0, (uint8_t *)data, n, true)) {
+    if (n && !area_rw(&a, 0, (void *)data, n, true)) {
         audit |= AUD_ANAX;
     }
     trace_iucv_reply(path->id, m->id, len);
     complete_guest_msg(s, path, m, audit, residual, NULL);
-    path->guest_out--;
     if (m->busy) {
         m->dead = true;
     } else {
@@ -689,7 +728,6 @@ void iucv_reject(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
     IUCVMsg *m = guest_msg(path, msg);
 
     complete_guest_msg(svc->iucv, path, m, AUD_RJCT, m->ans_len, NULL);
-    path->guest_out--;
     if (m->busy) {
         m->dead = true;
     } else {
@@ -763,7 +801,7 @@ static int f_dclbfr(IUCVCall *k)
     if (k->c->declared) {
         return call_rc(k, 0x13);
     }
-    if (!abs_read(buf, tmp, P_LEN)) {
+    if (!abs_read(mmu_real2abs(k->env, buf), tmp, P_LEN)) {
         kvm_s390_program_interrupt(k->cpu, PGM_ADDRESSING);
         return 0;
     }
@@ -821,7 +859,7 @@ static int f_connect(IUCVCall *k)
     path->id = id;
     path->svc = svc;
     path->state = PATH_ACTIVE;
-    path->msglim = msglim ? msglim : MSGLIM_DEFAULT;
+    path->msglim = MIN(msglim ? msglim : MSGLIM_DEFAULT, MSGLIM_MAX);
     path->guest_prmdata = flags & F_RMDATA;
     path->guest_quiesced = flags & F_BUFLST;
     QTAILQ_INIT(&path->msgs);
@@ -872,7 +910,7 @@ static int f_pathctl(IUCVCall *k, uint8_t fc)
         sc = IUCV_SERVICE_GET_CLASS(path->svc);
         switch (fc) {
         case IUCV_SEVER:
-            path_sever_service(s, path);
+            path_sever_service(s, path, "guest");
             path_free(s, path);
             break;
         case IUCV_QUIESCE:
@@ -902,15 +940,18 @@ static int f_send(IUCVCall *k)
                       .addr = get32(k->p, P_BFADR1),
                       .total = get32(k->p, P_BFLN1F),
                       .amask = addr_mask(k->env) };
+    IUCVArea ans = { .list = flags & F_ANSLST,
+                     .addr = get32(k->p, P_BFADR2),
+                     .total = get32(k->p, P_BFLN2F),
+                     .amask = addr_mask(k->env) };
     IUCVServiceClass *sc;
+    uint32_t max;
+    bool too_big;
     IUCVMsg *m;
     int rc;
 
     if (!path || path->state != PATH_ACTIVE) {
         return call_rc(k, 1);
-    }
-    if (path->svc_quiesced) {
-        return call_rc(k, 2);
     }
     if (flags & F_FGPID) {
         return call_rc(k, 0x1e);
@@ -918,7 +959,8 @@ static int f_send(IUCVCall *k)
     if ((flags & F_RMDATA) && (flags & F_BUFLST)) {
         return call_rc(k, 0x19);
     }
-    if (!(flags & F_NORPY) && path->guest_out >= path->msglim) {
+    /* one-way PRMDATA has no completion, everything else counts */
+    if (path->guest_out >= path->msglim) {
         return call_rc(k, 3);
     }
     if (!(flags & F_RMDATA)) {
@@ -931,6 +973,20 @@ static int f_send(IUCVCall *k)
             return call_rc(k, rc);
         }
     }
+    if (!(flags & F_NORPY)) {
+        rc = area_check(&ans, 0x1b);
+        if (rc < 0) {
+            kvm_s390_program_interrupt(k->cpu, PGM_ADDRESSING);
+            return 0;
+        }
+        if (rc) {
+            return call_rc(k, rc);
+        }
+    }
+    max = IUCV_SERVICE_GET_CLASS(path->svc)->max_message;
+    max = max ? max : MSG_MAX_DEFAULT;
+    too_big = !(flags & F_RMDATA) &&
+              (data.total > max || s->held + data.total > HELD_MAX);
 
     m = g_new0(IUCVMsg, 1);
     m->from_guest = true;
@@ -942,10 +998,10 @@ static int f_send(IUCVCall *k)
     m->srccls = get32(k->p, P_SRCCLS);
     m->tag = get32(k->p, P_MSGTAG);
     if (m->two_way) {
-        m->ans_list = flags & F_ANSLST;
-        m->ans_addr = get32(k->p, P_BFADR2);
-        m->ans_len = get32(k->p, P_BFLN2F);
-        m->ans_amask = addr_mask(k->env);
+        m->ans_list = ans.list;
+        m->ans_addr = ans.addr;
+        m->ans_len = ans.total;
+        m->ans_amask = ans.amask;
     }
     m->pub.id = m->id;
     m->pub.trgcls = m->trgcls;
@@ -956,7 +1012,7 @@ static int f_send(IUCVCall *k)
     if (m->prmdata) {
         m->pub.data = g_memdup2(k->p + P_RMMSG, 8);
         m->pub.len = 8;
-    } else {
+    } else if (!too_big) {
         m->pub.data = g_malloc(data.total ? data.total : 1);
         m->pub.len = data.total;
         if (!area_rw(&data, 0, m->pub.data, data.total, false)) {
@@ -965,14 +1021,22 @@ static int f_send(IUCVCall *k)
             kvm_s390_program_interrupt(k->cpu, PGM_ADDRESSING);
             return 0;
         }
+        s->held += data.total;
     }
     put32(k->p, P_MSGID, m->id);
     QTAILQ_INSERT_TAIL(&path->msgs, m, next);
-    trace_iucv_send(path->id, m->id, m->trgcls, m->pub.len, m->two_way);
-    if (m->two_way) {
+    trace_iucv_send(path->id, m->id, m->trgcls, data.total, m->two_way);
+    if (m->two_way || !m->prmdata) {
         path->guest_out++;
     }
     call_rc(k, 0);
+
+    if (too_big) {
+        /* more than the partner takes: it rejects the message */
+        complete_guest_msg(s, path, m, AUD_RJCT, m->ans_len, NULL);
+        msg_free(path, m);
+        return 0;
+    }
 
     sc = IUCV_SERVICE_GET_CLASS(path->svc);
     m->busy = true;
@@ -984,6 +1048,8 @@ static int f_send(IUCVCall *k)
         /* received by the service; one-way PRMDATA has no completion */
         if (!m->prmdata && path->state == PATH_ACTIVE) {
             complete_guest_msg(s, path, m, 0, 0, NULL);
+        } else if (!m->prmdata && path->guest_out) {
+            path->guest_out--;
         }
         msg_free(path, m);
     }
@@ -1142,7 +1208,7 @@ static int f_reply(IUCVCall *k)
             }
             return call_rc(k, rc);
         }
-        len = MIN(a.total, m->reply_max ? m->reply_max : a.total);
+        len = MIN(a.total, m->reply_max ? m->reply_max : MSG_MAX_DEFAULT);
         buf = g_malloc(len ? len : 1);
         if (len && !area_rw(&a, 0, buf, len, false)) {
             kvm_s390_program_interrupt(k->cpu, PGM_ADDRESSING);
@@ -1220,6 +1286,7 @@ static int f_purge(IUCVCall *k)
             put32(k->p, P_MSGTAG, get32(irq->rec, P_MSGTAG));
             k->p[P_FLAGS1] = irq->rec[P_FLAGS1] & (F_PRTY | F_NORPY);
             QTAILQ_REMOVE(&s->irqs, irq, next);
+            irq_taken(s, irq);
             g_free(irq);
             update_pending(s);
             return call_rc(k, 0);
@@ -1249,7 +1316,9 @@ static int f_purge(IUCVCall *k)
             if (sc->cancelled) {
                 sc->cancelled(p->svc, p, &m->pub);
             }
-            p->guest_out--;
+            if (p->guest_out) {
+                p->guest_out--;         /* it gets no completion */
+            }
             msg_free(p, m);
             return call_rc(k, 0);
         }
@@ -1298,6 +1367,7 @@ static IUCVIrq *take_msg_irq(S390IUCVState *s, uint8_t lo, uint8_t hi,
     }
     if (best) {
         QTAILQ_REMOVE(&s->irqs, best, next);
+        irq_taken(s, best);
         if (!msg_irq_queued(s)) {
             best->rec[P_POLLFG] = 0x80;
         }
@@ -1342,15 +1412,16 @@ static int f_ipoll(IUCVCall *k)
     uint32_t len = get32(k->p, P_BFLN1F), n = 0;
     IUCVIrq *irq;
 
-    if (len < P_LEN || (buf & ~0xfffULL) !=
-                       ((buf + len - 1) & ~0xfffULL)) {
+    /* within one page */
+    if (len < P_LEN || len > 0x1000 ||
+        (buf & ~0xfffULL) != (((uint64_t)buf + len - 1) & ~0xfffULL)) {
         kvm_s390_program_interrupt(k->cpu, PGM_SPECIFICATION);
         return 0;
     }
     while (n + P_LEN <= len &&
            (irq = take_msg_irq(k->s, T_MSG_COMPLETE_PRTY, T_MSG_PENDING, 0,
                                k->p))) {
-        if (!abs_write(buf + n, irq->rec, P_LEN)) {
+        if (!abs_write(mmu_real2abs(k->env, buf + n), irq->rec, P_LEN)) {
             g_free(irq);
             return call_rc(k, 0x5c);
         }
@@ -1504,7 +1575,6 @@ static void iucv_realize(DeviceState *dev, Error **errp)
     if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
         return;
     }
-    iucv_userid_from_str(s->userid, s390_iucv_userid());
     s->ncpus = ms->smp.max_cpus;
     s->cpus = g_new0(IUCVCpu, s->ncpus);
     s->paths = g_new0(IUCVPath *, s->maxconn);
