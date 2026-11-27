@@ -1,6 +1,6 @@
 /*
  * IUCV TCP/IP service: the socket interface of a VM TCP/IP virtual
- * machine over IUCV, on host sockets
+ * machine over IUCV, on a TCP/IP stack of its own
  *
  * Guests written for VM TCP/IP connect an IUCV path to the TCPIP user ID,
  * send an initialization message and then issue each socket call as a
@@ -8,16 +8,20 @@
  * socket number, the reply holds the return value, the error number and
  * the data. Calls that cannot complete at once are answered later.
  *
- * The service runs the calls on non-blocking host sockets with a policy:
- * outgoing traffic is translated like NAT (the guest sees the address it
- * is configured with), connections to the host itself, link-local and
- * configured addresses are refused unless allowed, and the guest can only
- * accept connections on ports that are forwarded to it explicitly.
- * Broadcasts are not offered: SO_BROADCAST is refused, and so are the
- * network and broadcast addresses of the host's own subnets. Raw sockets
- * are limited to ICMP echo through unprivileged ICMP sockets, and only
- * when allowed. The host sockets of all paths together are limited
- * (max-host-sockets).
+ * The service is a host on the network of its network backend (netdev=,
+ * for instance a tap on a bridge), as the TCPIP virtual machine is with
+ * its network adapter: it has its own MAC address and owns the configured
+ * IPv4 address, answers ARP and ICMP echo for it and terminates TCP and
+ * UDP itself, with lwIP. The guest's sockets are the stack's protocol
+ * control blocks. Nothing goes through the sockets of the host.
+ *
+ * lwIP has one global state, so a process has at most one such service.
+ * It runs under the BQL, in the main loop and in the IUCV instruction of
+ * the guest. lwIP must not be entered again while it runs, but a backend
+ * can answer a frame of the stack at once (user-mode networking does), so
+ * received frames are queued and given to the stack by a bottom half. Its
+ * callbacks note events and schedule the same bottom half, which then
+ * works through the pending calls; a timer runs its timeouts.
  *
  * Written from the description of the interface in the VM TCP/IP
  * programmer's documentation.
@@ -30,19 +34,27 @@
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
-#include "qemu/sockets.h"
 #include "qemu/timer.h"
+#include "qemu/sockets.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/s390x/iucv.h"
 #include "hw/s390x/ebcdic.h"
+#include "net/net.h"
 #include "trace.h"
 #include "qemu/bswap.h"
-#include <ifaddrs.h>
-#include <poll.h>
 #include <net/if.h>
-#include <netinet/tcp.h>
-#include <netinet/ip_icmp.h>
-#include <sys/ioctl.h>
+
+#include "lwip/init.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/raw.h"
+#include "lwip/sys.h"
+#include "lwip/tcp.h"
+#include "lwip/udp.h"
+#include "lwip/timeouts.h"
+#include "lwip/prot/ip4.h"
+#include "netif/etharp.h"
+#include "netif/ethernet.h"
 
 #define TYPE_IUCV_TCPIP "iucv-tcpip"
 OBJECT_DECLARE_SIMPLE_TYPE(IUCVTcpip, IUCV_TCPIP)
@@ -63,31 +75,35 @@ enum {
 #define VE_SRCH         3
 #define VE_BADF         9
 #define VE_ACCES        13
-#define VE_FAULT        14
 #define VE_BUSY         16
 #define VE_INVAL        22
 #define VE_MFILE        24
+#define VE_PIPE         32
 #define VE_WOULDBLOCK   35
 #define VE_INPROGRESS   36
 #define VE_ALREADY      37
-#define VE_NOTSOCK      38
+#define VE_DESTADDRREQ  39
 #define VE_MSGSIZE      40
 #define VE_NOPROTOOPT   42
 #define VE_PROTONOSUPPORT 43
 #define VE_SOCKTNOSUPPORT 44
 #define VE_OPNOTSUPP    45
+#define VE_PFNOSUPPORT  46
 #define VE_AFNOSUPPORT  47
+#define VE_ADDRINUSE    48
 #define VE_ADDRNOTAVAIL 49
 #define VE_NETUNREACH   51
+#define VE_CONNABORTED  53
+#define VE_CONNRESET    54
+#define VE_NOBUFS       55
 #define VE_ISCONN       56
 #define VE_NOTCONN      57
+#define VE_TIMEDOUT     60
 #define VE_CONNREFUSED  61
-#define VE_HOSTUNREACH  65
 #define VE_BADCALL      1000
 #define VE_BADLEN       1001
 #define VE_RANGE        1002
 #define VE_INUSE        1003
-#define VE_CONFLICT     1008
 #define VE_CANCELED     1009
 
 #define VM_AF_INET      2
@@ -96,10 +112,74 @@ enum {
 #define SADDR           16      /* AF_INET socket address */
 #define RECV_MAX        65536
 #define SEND_MAX        (1024 * 1024)
+#define UDP_MAX         65507
 #define REQS_MAX        256
 #define NSOCK_MIN       50
+#define BACKLOG_MAX     64
+#define DGRAM_QUEUE     64      /* datagrams waiting on one socket */
+#define DGRAM_BYTES     (256 * 1024)
+#define MTU_MIN         576
+#define MTU_MAX         65535
+#define DNS_MAX         3
+#define RXQ_MAX         1024    /* received frames not yet in the stack */
+
+#define T_STREAM        1
+#define T_DGRAM         2
+#define T_RAW           3
 
 typedef struct TcpPath TcpPath;
+
+/* a datagram received by a UDP or raw socket */
+typedef struct Dgram {
+    QSIMPLEQ_ENTRY(Dgram) next;
+    uint32_t ip;
+    uint16_t port;
+    uint32_t len;
+    uint8_t data[];
+} Dgram;
+
+/*
+ * An endpoint of the stack (a protocol control block with its received
+ * data). GIVESOCKET/TAKESOCKET let two socket numbers share one.
+ */
+typedef struct Conn {
+    IUCVTcpip *s;
+    int refs;
+    int type;
+    struct tcp_pcb *tcp;        /* NULL: closed by the stack (reset ...) */
+    struct udp_pcb *udp;
+    struct raw_pcb *raw;
+    bool listening;
+    bool connecting;
+    bool connected;             /* a TCP connection existed */
+    bool eof;                   /* the peer sent FIN */
+    bool rd_shut;
+    bool wr_shut;
+    int so_error;               /* pending error, VM numbering */
+    /* options without an effect on the stack */
+    bool debug, dontroute, oobinline;
+    bool linger_on;
+    uint32_t linger;
+    /* stream: received data */
+    struct pbuf *rx;
+    /* datagrams */
+    QSIMPLEQ_HEAD(, Dgram) dq;
+    unsigned dq_n;
+    size_t dq_bytes;
+    /* listening: connections the guest has not accepted yet */
+    GQueue pending;
+    unsigned backlog;
+} Conn;
+
+/* a socket number of a path */
+typedef struct TcpSock {
+    Conn *c;
+    bool nonblock;
+    /* GIVESOCKET */
+    bool given;
+    bool taken;
+    uint8_t give_to[16];        /* user ID and subtask, blank = anyone */
+} TcpSock;
 
 /* a pending call */
 typedef struct TcpReq {
@@ -108,25 +188,11 @@ typedef struct TcpReq {
     IUCVMessage *msg;
     uint16_t call;
     uint16_t lo;
+    bool started;               /* CONNECT: this call started it */
+    uint32_t done;              /* SEND on a blocking stream: bytes queued */
     QEMUTimer *timer;
     bool timed_out;
 } TcpReq;
-
-typedef struct TcpSock {
-    int fd;                     /* -1: no host socket (listening, unmapped) */
-    int type;                   /* 1 stream, 2 datagram, 3 raw */
-    bool nonblock;
-    bool listening;
-    bool connecting;
-    bool icmp;                  /* raw ICMP on an ICMP datagram socket */
-    uint16_t port;              /* local port the guest sees */
-    uint32_t dns_peer;          /* datagrams of the resolver come from here */
-    /* GIVESOCKET */
-    bool given;
-    bool taken;
-    uint8_t give_to[16];        /* user ID and subtask, blank = anyone */
-    int so_error;
-} TcpSock;
 
 struct TcpPath {
     IUCVTcpip *s;
@@ -143,175 +209,141 @@ struct TcpPath {
     QTAILQ_ENTRY(TcpPath) next;
 };
 
-/* the host port is bound when the guest binds the guest port */
-typedef struct HostFwd {
-    bool udp;
-    uint16_t host_port;
-    uint16_t guest_port;
-} HostFwd;
-
 struct IUCVTcpip {
     IUCVService parent_obj;
 
+    NICConf conf;
+    NICState *nic;
     char *ip_str;
-    char *hostname;
-    char *hostfwd;
-    char *fwd_addr_str;
+    char *gateway_str;
     char *dns_str;
-    char *deny;
-    bool allow_host;
-    bool raw;
+    char *hostname;
+    char *domain;
+    uint32_t mtu;
     uint32_t max_sockets;
-    uint32_t max_host_sockets;
+    uint32_t max_open;
 
-    uint32_t nfds;              /* host sockets open */
     uint32_t ip;
     uint32_t mask;
-    uint32_t dns;
-    struct in_addr fwd_addr;
-    struct sockaddr_in resolver;
-    HostFwd *fwds;
-    int nfwds;
-    uint32_t *deny_net;
-    uint32_t *deny_mask;
-    int ndeny;
+    uint32_t gateway;
+    uint32_t dns[DNS_MAX];
+    int ndns;
+    uint32_t nconns;            /* endpoints of the stack */
+    struct netif netif;
+    bool netif_added;
+    QEMUBH *bh;
+    QEMUTimer *timer;
+    GQueue rxq;                 /* GByteArray: received frames */
     QTAILQ_HEAD(, TcpPath) paths;
 };
 
+/* lwIP has one state per process */
+static IUCVTcpip *the_stack;
+static bool lwip_ready;
+
+/* for lwIP: the time in milliseconds, random numbers */
+u32_t sys_now(void)
+{
+    return qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+}
+
+uint32_t qemu_lwip_rand(void)
+{
+    return g_random_int();
+}
+
 static void tcp_pump(TcpPath *tp);
 
-/* error numbers: Linux to VM */
-static int vm_errno(int e)
+/* events of the stack: work through the calls later, outside lwIP */
+static void kick(IUCVTcpip *s)
+{
+    qemu_bh_schedule(s->bh);
+}
+
+static void stack_rearm(IUCVTcpip *s)
+{
+    u32_t ms = sys_timeouts_sleeptime();
+
+    if (ms == SYS_TIMEOUTS_SLEEPTIME_INFINITE) {
+        timer_del(s->timer);
+    } else {
+        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ms);
+    }
+}
+
+/* after anything that can have queued packets to the loopback */
+static void stack_run(IUCVTcpip *s)
+{
+    netif_poll_all();
+    stack_rearm(s);
+}
+
+static void stack_timer(void *opaque)
+{
+    sys_check_timeouts();
+    stack_run(opaque);
+}
+
+static void stack_input(IUCVTcpip *s)
+{
+    GByteArray *f;
+
+    while ((f = g_queue_pop_head(&s->rxq))) {
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, f->len, PBUF_RAM);
+
+        if (p) {
+            pbuf_take(p, f->data, f->len);
+            if (s->netif.input(p, &s->netif) != ERR_OK) {
+                pbuf_free(p);
+            }
+        }
+        g_byte_array_free(f, true);
+    }
+}
+
+static void stack_bh(void *opaque)
+{
+    IUCVTcpip *s = opaque;
+    TcpPath *tp, *n;
+
+    stack_input(s);
+    QTAILQ_FOREACH_SAFE(tp, &s->paths, next, n) {
+        if (tp->ready) {
+            tcp_pump(tp);
+        }
+    }
+    stack_run(s);
+}
+
+/* error numbers: lwIP to VM */
+static int vm_err(err_t e)
 {
     switch (e) {
-    case EAGAIN:
-        return VE_WOULDBLOCK;
-    case EINPROGRESS:
-        return VE_INPROGRESS;
-    case EALREADY:
-        return VE_ALREADY;
-    case ENOTSOCK:
-        return VE_NOTSOCK;
-    case EDESTADDRREQ:
-        return 39;
-    case EMSGSIZE:
-        return VE_MSGSIZE;
-    case EPROTOTYPE:
-        return 41;
-    case ENOPROTOOPT:
-        return VE_NOPROTOOPT;
-    case EPROTONOSUPPORT:
-        return VE_PROTONOSUPPORT;
-    case ESOCKTNOSUPPORT:
-        return VE_SOCKTNOSUPPORT;
-    case EOPNOTSUPP:
-        return VE_OPNOTSUPP;
-    case EPFNOSUPPORT:
-        return 46;
-    case EAFNOSUPPORT:
-        return VE_AFNOSUPPORT;
-    case EADDRINUSE:
-        return 48;
-    case EADDRNOTAVAIL:
-        return VE_ADDRNOTAVAIL;
-    case ENETDOWN:
-        return 50;
-    case ENETUNREACH:
+    case ERR_MEM:
+    case ERR_BUF:
+        return VE_NOBUFS;
+    case ERR_RTE:
         return VE_NETUNREACH;
-    case ENETRESET:
-        return 52;
-    case ECONNABORTED:
-        return 53;
-    case ECONNRESET:
-        return 54;
-    case ENOBUFS:
-        return 55;
-    case EISCONN:
+    case ERR_USE:
+        return VE_ADDRINUSE;
+    case ERR_ISCONN:
         return VE_ISCONN;
-    case ENOTCONN:
+    case ERR_ALREADY:
+        return VE_ALREADY;
+    case ERR_INPROGRESS:
+        return VE_INPROGRESS;
+    case ERR_CONN:
+    case ERR_CLSD:
         return VE_NOTCONN;
-    case ESHUTDOWN:
-        return 58;
-    case ETIMEDOUT:
-        return 60;
-    case ECONNREFUSED:
-        return VE_CONNREFUSED;
-    case EHOSTDOWN:
-        return 64;
-    case EHOSTUNREACH:
-        return VE_HOSTUNREACH;
+    case ERR_RST:
+        return VE_CONNRESET;
+    case ERR_ABRT:
+        return VE_CONNABORTED;
+    case ERR_TIMEOUT:
+        return VE_TIMEDOUT;
     default:
-        return e > 0 && e <= 34 ? e : VE_INVAL;
+        return VE_INVAL;
     }
-}
-
-/* the policy for destinations of the guest */
-
-static bool dst_allowed(IUCVTcpip *s, uint32_t ip)
-{
-    struct ifaddrs *ifa, *i;
-    bool host = false;
-    int n;
-
-    if ((ip >> 24) == 0 || (ip >> 24) == 127 ||
-        (ip & 0xffff0000) == 0xa9fe0000 ||      /* 169.254/16 */
-        (ip & 0xf0000000) >= 0xe0000000) {      /* multicast, reserved */
-        /* the deny list does not apply to the host's loopback */
-        return s->allow_host && (ip >> 24) == 127;
-    }
-    for (n = 0; n < s->ndeny; n++) {
-        if ((ip & s->deny_mask[n]) == s->deny_net[n]) {
-            return false;
-        }
-    }
-    if (!getifaddrs(&ifa)) {
-        for (i = ifa; i && !host; i = i->ifa_next) {
-            uint32_t a, m;
-
-            if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) {
-                continue;
-            }
-            a = ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr);
-            m = i->ifa_netmask ?
-                ntohl(((struct sockaddr_in *)i->ifa_netmask)->sin_addr.s_addr)
-                : 0xffffffff;
-            /* the host itself, or a broadcast to one of its subnets */
-            if ((ip == a && !s->allow_host) ||
-                (m != 0xffffffff && m != 0xfffffffe &&
-                 (ip & m) == (a & m) &&
-                 ((ip & ~m) == 0 || (ip & ~m) == ~m))) {
-                host = true;
-            }
-        }
-        freeifaddrs(ifa);
-    }
-    return !host;
-}
-
-/* guest socket address (16 bytes) to a host one; false: refused */
-static bool to_host_addr(IUCVTcpip *s, const uint8_t *g,
-                         struct sockaddr_in *h, int *err)
-{
-    uint32_t ip = ldl_be_p(g + 4);
-    uint16_t port = lduw_be_p(g + 2);
-
-    if (lduw_be_p(g) != VM_AF_INET) {
-        *err = VE_AFNOSUPPORT;
-        return false;
-    }
-    memset(h, 0, sizeof(*h));
-    h->sin_family = AF_INET;
-    h->sin_port = htons(port);
-    if (s->dns && ip == s->dns && port == 53 && s->resolver.sin_family) {
-        *h = s->resolver;
-        return true;
-    }
-    if (!dst_allowed(s, ip)) {
-        *err = VE_NETUNREACH;
-        return false;
-    }
-    h->sin_addr.s_addr = htonl(ip);
-    return true;
 }
 
 static void put_saddr(uint8_t *g, uint32_t ip, uint16_t port)
@@ -320,6 +352,16 @@ static void put_saddr(uint8_t *g, uint32_t ip, uint16_t port)
     stw_be_p(g, VM_AF_INET);
     stw_be_p(g + 2, port);
     stl_be_p(g + 4, ip);
+}
+
+static uint32_t ip_get(const ip_addr_t *a)
+{
+    return a ? lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(a))) : 0;
+}
+
+static void ip_put(ip_addr_t *a, uint32_t ip)
+{
+    ip_addr_set_ip4_u32_val(*a, lwip_htonl(ip));
 }
 
 /* replies */
@@ -366,14 +408,225 @@ static void reply_err(TcpReq *r, int err)
     reply(r, -1, err, NULL, 0);
 }
 
+/* the callbacks of the stack */
+
+static err_t cb_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
+                         err_t err)
+{
+    Conn *c = arg;
+
+    if (!p) {
+        c->eof = true;
+    } else if (c->rd_shut) {
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+    } else if (c->rx) {
+        pbuf_cat(c->rx, p);
+    } else {
+        c->rx = p;
+    }
+    kick(c->s);
+    return ERR_OK;
+}
+
+static err_t cb_tcp_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    Conn *c = arg;
+
+    kick(c->s);
+    return ERR_OK;
+}
+
+/* the stack freed the control block */
+static void cb_tcp_err(void *arg, err_t err)
+{
+    Conn *c = arg;
+
+    c->tcp = NULL;
+    if (c->connecting) {
+        /* a refused or unanswered connection attempt */
+        c->so_error = err == ERR_RST ? VE_CONNREFUSED : VE_TIMEDOUT;
+        c->connecting = false;
+    } else if (err == ERR_RST) {
+        c->so_error = VE_CONNRESET;
+    } else if (err == ERR_ABRT) {
+        /* retransmissions without an answer */
+        c->so_error = VE_TIMEDOUT;
+    } else if (err != ERR_CLSD) {
+        c->so_error = vm_err(err);
+    }
+    kick(c->s);
+}
+
+static err_t cb_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+    Conn *c = arg;
+
+    c->connecting = false;
+    c->connected = true;
+    kick(c->s);
+    return ERR_OK;
+}
+
+static void tcp_callbacks(Conn *c, struct tcp_pcb *pcb)
+{
+    tcp_arg(pcb, c);
+    tcp_recv(pcb, cb_tcp_recv);
+    tcp_sent(pcb, cb_tcp_sent);
+    tcp_err(pcb, cb_tcp_err);
+}
+
+static Conn *conn_new(IUCVTcpip *s, int type)
+{
+    Conn *c = g_new0(Conn, 1);
+
+    c->s = s;
+    c->refs = 1;
+    c->type = type;
+    QSIMPLEQ_INIT(&c->dq);
+    g_queue_init(&c->pending);
+    s->nconns++;
+    return c;
+}
+
+static err_t cb_tcp_accept(void *arg, struct tcp_pcb *npcb, err_t err)
+{
+    Conn *l = arg;
+    IUCVTcpip *s = l->s;
+    Conn *c;
+
+    if (err != ERR_OK || !npcb) {
+        return ERR_VAL;
+    }
+    if (s->nconns >= s->max_open) {
+        tcp_abort(npcb);
+        return ERR_ABRT;
+    }
+    c = conn_new(s, T_STREAM);
+    c->tcp = npcb;
+    c->connected = true;
+    tcp_callbacks(c, npcb);
+    /*
+     * It counts against the backlog until the guest accepts it: with a
+     * full backlog the stack ignores new connection requests, which the
+     * peers repeat, as BSD sockets do.
+     */
+    tcp_backlog_delayed(npcb);
+    g_queue_push_tail(&l->pending, c);
+    kick(s);
+    return ERR_OK;
+}
+
+static void dgram_queue(Conn *c, struct pbuf *p, uint32_t ip, uint16_t port)
+{
+    Dgram *d;
+
+    if (c->rd_shut || c->dq_n >= DGRAM_QUEUE ||
+        c->dq_bytes + p->tot_len > DGRAM_BYTES) {
+        return;
+    }
+    d = g_malloc(sizeof(*d) + p->tot_len);
+    d->ip = ip;
+    d->port = port;
+    d->len = pbuf_copy_partial(p, d->data, p->tot_len, 0);
+    QSIMPLEQ_INSERT_TAIL(&c->dq, d, next);
+    c->dq_n++;
+    c->dq_bytes += d->len;
+    kick(c->s);
+}
+
+static void cb_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                        const ip_addr_t *addr, u16_t port)
+{
+    dgram_queue(arg, p, ip_get(addr), port);
+    pbuf_free(p);
+}
+
+/* raw ICMP: the guest gets the datagram with its IPv4 header */
+static u8_t cb_raw_recv(void *arg, struct raw_pcb *pcb, struct pbuf *p,
+                        const ip_addr_t *addr)
+{
+    dgram_queue(arg, p, ip_get(addr), 0);
+    return 0;                   /* the stack handles it too (echo) */
+}
+
+static void dgram_drop(Conn *c)
+{
+    Dgram *d = QSIMPLEQ_FIRST(&c->dq);
+
+    QSIMPLEQ_REMOVE_HEAD(&c->dq, next);
+    c->dq_n--;
+    c->dq_bytes -= d->len;
+    g_free(d);
+}
+
+static void conn_destroy(Conn *c, bool reset)
+{
+    Conn *p;
+
+    while ((p = g_queue_pop_head(&c->pending))) {
+        conn_destroy(p, true);
+    }
+    if (c->tcp) {
+        struct tcp_pcb *pcb = c->tcp;
+
+        tcp_arg(pcb, NULL);
+        if (c->listening) {
+            tcp_accept(pcb, NULL);
+            tcp_close(pcb);
+        } else {
+            tcp_recv(pcb, NULL);
+            tcp_sent(pcb, NULL);
+            tcp_err(pcb, NULL);
+            /* unread data or a zero linger time end with a reset */
+            if (reset || c->rx || (c->linger_on && !c->linger) ||
+                tcp_close(pcb) != ERR_OK) {
+                tcp_abort(pcb);
+            }
+        }
+    }
+    if (c->udp) {
+        udp_remove(c->udp);
+    }
+    if (c->raw) {
+        raw_remove(c->raw);
+    }
+    if (c->rx) {
+        pbuf_free(c->rx);
+    }
+    while (!QSIMPLEQ_EMPTY(&c->dq)) {
+        dgram_drop(c);
+    }
+    c->s->nconns--;
+    g_free(c);
+}
+
+static void conn_unref(Conn *c, bool reset)
+{
+    if (--c->refs == 0) {
+        conn_destroy(c, reset);
+    }
+}
+
+/* the IP options (SOF_) of the endpoint */
+static u8_t *conn_sopts(Conn *c)
+{
+    if (c->tcp) {
+        return &c->tcp->so_options;
+    } else if (c->udp) {
+        return &c->udp->so_options;
+    } else if (c->raw) {
+        return &c->raw->so_options;
+    }
+    return NULL;
+}
+
 /* sockets */
 
 static TcpSock *sock_get(TcpPath *tp, uint32_t n)
 {
     return n < tp->nsock ? tp->socks[n] : NULL;
 }
-
-static void sock_update_handlers(TcpPath *tp);
 
 static void sock_close(TcpPath *tp, uint32_t n, bool reset)
 {
@@ -382,56 +635,37 @@ static void sock_close(TcpPath *tp, uint32_t n, bool reset)
     if (!so) {
         return;
     }
-    if (so->fd >= 0) {
-        qemu_set_fd_handler(so->fd, NULL, NULL, NULL);
-        if (reset && so->type == 1) {
-            struct linger l = { 1, 0 };
-
-            setsockopt(so->fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
-        }
-        close(so->fd);
-        tp->s->nfds--;
-    }
+    conn_unref(so->c, reset);
     g_free(so);
     tp->socks[n] = NULL;
 }
 
-static uint16_t local_port(TcpSock *so)
+static TcpSock *sock_new(TcpPath *tp, uint32_t n, Conn *c)
 {
-    struct sockaddr_in a;
-    socklen_t l = sizeof(a);
+    TcpSock *so = g_new0(TcpSock, 1);
 
-    if (so->port || so->fd < 0) {
-        return so->port;
-    }
-    if (!getsockname(so->fd, (struct sockaddr *)&a, &l)) {
-        return ntohs(a.sin_port);
-    }
-    return 0;
+    so->c = c;
+    tp->socks[n] = so;
+    return so;
 }
 
-/* a forwarded port the guest listens on */
-static HostFwd *fwd_find(IUCVTcpip *s, bool udp, uint16_t guest_port)
+/* the guest's address and port of a socket address; false: refused */
+static bool get_saddr(const uint8_t *g, ip_addr_t *a, uint16_t *port,
+                      int *err)
 {
-    int i;
-
-    for (i = 0; i < s->nfwds; i++) {
-        if (s->fwds[i].udp == udp && s->fwds[i].guest_port == guest_port) {
-            return &s->fwds[i];
-        }
+    if (lduw_be_p(g) != VM_AF_INET) {
+        *err = VE_AFNOSUPPORT;
+        return false;
     }
-    return NULL;
+    ip_put(a, ldl_be_p(g + 4));
+    *port = lduw_be_p(g + 2);
+    return true;
 }
 
-/* readiness of a host socket, without waiting */
-static short sock_poll(TcpSock *so)
+static bool is_bcast(IUCVTcpip *s, uint32_t ip)
 {
-    struct pollfd p = { .fd = so->fd, .events = POLLIN | POLLOUT | POLLPRI };
-
-    if (so->fd < 0) {
-        return 0;
-    }
-    return poll(&p, 1, 0) > 0 ? p.revents : 0;
+    return ip == 0xffffffff ||
+           (s->mask < 0xfffffffe && ip == (s->ip | ~s->mask));
 }
 
 /* the calls; each returns true when it answered the request */
@@ -439,10 +673,10 @@ static short sock_poll(TcpSock *so)
 static bool c_socket(TcpReq *r)
 {
     TcpPath *tp = r->tp;
+    IUCVTcpip *s = tp->s;
     const uint8_t *b = r->msg->data;
     uint32_t dom, type, proto, n;
-    TcpSock *so;
-    int fd;
+    Conn *c;
 
     if (r->msg->len < 16) {
         reply_err(r, VE_BADLEN);
@@ -464,52 +698,46 @@ static bool c_socket(TcpReq *r)
         reply_err(r, VE_AFNOSUPPORT);
         return true;
     }
-    if (tp->s->nfds >= tp->s->max_host_sockets) {
-        reply_err(r, VE_MFILE);
+    if ((type == T_STREAM && proto && proto != IP_PROTO_TCP) ||
+        (type == T_DGRAM && proto && proto != IP_PROTO_UDP) ||
+        (type == T_RAW && proto != IP_PROTO_ICMP)) {
+        reply_err(r, VE_PROTONOSUPPORT);
         return true;
     }
-    so = g_new0(TcpSock, 1);
-    so->type = type;
-    switch (type) {
-    case 1:
-        if (proto && proto != IPPROTO_TCP) {
-            g_free(so);
-            reply_err(r, VE_PROTONOSUPPORT);
-            return true;
-        }
-        fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
-        break;
-    case 2:
-        if (proto && proto != IPPROTO_UDP) {
-            g_free(so);
-            reply_err(r, VE_PROTONOSUPPORT);
-            return true;
-        }
-        fd = qemu_socket(AF_INET, SOCK_DGRAM, 0);
-        break;
-    case 3:
-        if (!tp->s->raw || proto != IPPROTO_ICMP) {
-            g_free(so);
-            reply_err(r, VE_ACCES);
-            return true;
-        }
-        fd = qemu_socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
-        so->icmp = true;
-        break;
-    default:
-        g_free(so);
+    if (type != T_STREAM && type != T_DGRAM && type != T_RAW) {
         reply_err(r, VE_SOCKTNOSUPPORT);
         return true;
     }
-    if (fd < 0) {
-        g_free(so);
-        reply_err(r, vm_errno(errno));
+    if (s->nconns >= s->max_open) {
+        reply_err(r, VE_MFILE);
         return true;
     }
-    qemu_set_blocking(fd, false, NULL);
-    so->fd = fd;
-    tp->s->nfds++;
-    tp->socks[n] = so;
+    c = conn_new(s, type);
+    switch (type) {
+    case T_STREAM:
+        c->tcp = tcp_new_ip_type(IPADDR_TYPE_V4);
+        if (c->tcp) {
+            tcp_callbacks(c, c->tcp);
+        }
+        break;
+    case T_DGRAM:
+        c->udp = udp_new_ip_type(IPADDR_TYPE_V4);
+        if (c->udp) {
+            udp_recv(c->udp, cb_udp_recv, c);
+        }
+        break;
+    default:
+        c->raw = raw_new_ip_type(IPADDR_TYPE_V4, IP_PROTO_ICMP);
+        if (c->raw) {
+            raw_recv(c->raw, cb_raw_recv, c);
+        }
+    }
+    if (!c->tcp && !c->udp && !c->raw) {
+        conn_destroy(c, true);
+        reply_err(r, VE_NOBUFS);
+        return true;
+    }
+    sock_new(tp, n, c);
     reply(r, n, 0, NULL, 0);
     return true;
 }
@@ -517,70 +745,94 @@ static bool c_socket(TcpReq *r)
 static bool c_bind(TcpReq *r, TcpSock *so)
 {
     IUCVTcpip *s = r->tp->s;
-    const uint8_t *g = r->msg->data;
-    uint32_t ip;
+    Conn *c = so->c;
+    ip_addr_t a;
     uint16_t port;
-    HostFwd *f;
+    uint32_t ip;
+    int e;
+    err_t err;
 
     if (r->msg->len < SADDR) {
         reply_err(r, VE_BADLEN);
         return true;
     }
-    ip = ldl_be_p(g + 4);
-    port = lduw_be_p(g + 2);
-    if (lduw_be_p(g) != VM_AF_INET) {
-        reply_err(r, VE_AFNOSUPPORT);
+    if (!get_saddr(r->msg->data, &a, &port, &e)) {
+        reply_err(r, e);
         return true;
     }
-    if (ip && ip != s->ip) {
+    ip = ldl_be_p(r->msg->data + 4);
+    if (ip && ip != s->ip && ip != 0x7f000001) {
         reply_err(r, VE_ADDRNOTAVAIL);
         return true;
     }
-    if (so->port) {
-        reply_err(r, VE_INVAL);
-        return true;
-    }
-    f = port ? fwd_find(s, so->type == 2, port) : NULL;
-    if (f) {
-        /* the forwarded host port becomes this socket */
-        struct sockaddr_in a = {
-            .sin_family = AF_INET, .sin_port = htons(f->host_port),
-            .sin_addr = s->fwd_addr,
-        };
-        int one = 1;
-
-        setsockopt(so->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(so->fd, (struct sockaddr *)&a, sizeof(a))) {
-            reply_err(r, vm_errno(errno));
+    if (c->tcp) {
+        if (c->tcp->local_port || c->listening) {
+            reply_err(r, VE_INVAL);
             return true;
         }
+        err = tcp_bind(c->tcp, &a, port);
+    } else if (c->udp) {
+        if (c->udp->local_port) {
+            reply_err(r, VE_INVAL);
+            return true;
+        }
+        err = udp_bind(c->udp, &a, port);
+    } else if (c->raw) {
+        err = raw_bind(c->raw, &a);
+    } else {
+        reply_err(r, c->so_error ? c->so_error : VE_INVAL);
+        return true;
     }
-    so->port = port;
+    if (err != ERR_OK) {
+        reply_err(r, vm_err(err));
+        return true;
+    }
     reply(r, 0, 0, NULL, 0);
     return true;
 }
 
 static bool c_listen(TcpReq *r, TcpSock *so)
 {
+    Conn *c = so->c;
     uint32_t backlog = ldl_be_p(r->msg->data + 4);
+    struct tcp_pcb *l;
+    err_t err;
 
-    if (so->type != 1) {
+    if (c->type != T_STREAM) {
         reply_err(r, VE_OPNOTSUPP);
         return true;
     }
-    if (!fwd_find(r->tp->s, false, so->port)) {
-        /* nothing can reach it: no host socket listens */
-        if (so->fd >= 0) {
-            qemu_set_fd_handler(so->fd, NULL, NULL, NULL);
-            close(so->fd);
-            so->fd = -1;
-            r->tp->s->nfds--;
+    backlog = MAX(1, MIN(backlog, BACKLOG_MAX));
+    if (c->listening) {
+        c->backlog = backlog;
+        if (c->tcp) {
+            tcp_backlog_set(c->tcp, backlog);
         }
-    } else if (listen(so->fd, MAX(1, MIN(backlog, 64)))) {
-        reply_err(r, vm_errno(errno));
+        reply(r, 0, 0, NULL, 0);
         return true;
     }
-    so->listening = true;
+    if (!c->tcp || c->connected || c->connecting) {
+        reply_err(r, VE_INVAL);
+        return true;
+    }
+    if (!c->tcp->local_port) {
+        err = tcp_bind(c->tcp, IP4_ADDR_ANY, 0);
+        if (err != ERR_OK) {
+            reply_err(r, vm_err(err));
+            return true;
+        }
+    }
+    l = tcp_listen_with_backlog_and_err(c->tcp, backlog, &err);
+    if (!l) {
+        reply_err(r, vm_err(err));
+        return true;
+    }
+    /* the stack freed the old control block */
+    c->tcp = l;
+    c->listening = true;
+    c->backlog = backlog;
+    tcp_arg(l, c);
+    tcp_accept(l, cb_tcp_accept);
     reply(r, 0, 0, NULL, 0);
     return true;
 }
@@ -589,13 +841,11 @@ static bool c_accept(TcpReq *r, TcpSock *so, bool first)
 {
     TcpPath *tp = r->tp;
     uint32_t n = ldl_be_p(r->msg->data + 4);
-    struct sockaddr_in a;
-    socklen_t l = sizeof(a);
     uint8_t g[SADDR];
     TcpSock *ns;
-    int fd;
+    Conn *c;
 
-    if (!so->listening) {
+    if (!so->c->listening) {
         reply_err(r, VE_INVAL);
         return true;
     }
@@ -610,14 +860,189 @@ static bool c_accept(TcpReq *r, TcpSock *so, bool first)
     if (!first) {
         return false;
     }
-    if (tp->s->nfds >= tp->s->max_host_sockets) {
-        reply_err(r, VE_MFILE);
+    c = g_queue_pop_head(&so->c->pending);
+    if (!c) {
+        if (so->nonblock) {
+            reply_err(r, VE_WOULDBLOCK);
+            return true;
+        }
+        return false;
+    }
+    if (c->tcp) {
+        tcp_backlog_accepted(c->tcp);
+    }
+    ns = sock_new(tp, n, c);
+    ns->nonblock = so->nonblock;
+    c->linger_on = so->c->linger_on;
+    c->linger = so->c->linger;
+    c->oobinline = so->c->oobinline;
+    put_saddr(g, c->tcp ? ip_get(&c->tcp->remote_ip) : 0,
+              c->tcp ? c->tcp->remote_port : 0);
+    reply(r, n, 0, g, SADDR);
+    return true;
+}
+
+static bool c_connect(TcpReq *r, TcpSock *so, bool first)
+{
+    IUCVTcpip *s = r->tp->s;
+    Conn *c = so->c;
+    ip_addr_t a;
+    uint16_t port;
+    uint32_t ip;
+    int e;
+    err_t err;
+
+    if (r->started) {
+        /* the attempt this call started */
+        if (c->connecting) {
+            return false;
+        }
+        if (c->so_error) {
+            e = c->so_error;
+            c->so_error = 0;
+            reply_err(r, e);
+        } else {
+            reply(r, 0, 0, NULL, 0);
+        }
         return true;
     }
-    fd = so->fd < 0 ? -1 : accept(so->fd, (struct sockaddr *)&a, &l);
-    if (fd < 0) {
-        if (so->fd >= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            reply_err(r, vm_errno(errno));
+    if (!first) {
+        return false;
+    }
+    if (r->msg->len < SADDR) {
+        reply_err(r, VE_BADLEN);
+        return true;
+    }
+    if (!get_saddr(r->msg->data, &a, &port, &e)) {
+        reply_err(r, e);
+        return true;
+    }
+    ip = ldl_be_p(r->msg->data + 4);
+    if (c->type != T_STREAM) {
+        if (c->udp) {
+            err = udp_connect(c->udp, &a, port);
+        } else if (c->raw) {
+            err = raw_connect(c->raw, &a);
+        } else {
+            err = ERR_VAL;
+        }
+        if (err != ERR_OK) {
+            reply_err(r, vm_err(err));
+        } else {
+            reply(r, 0, 0, NULL, 0);
+        }
+        return true;
+    }
+    if (c->connecting) {
+        if (so->nonblock) {
+            reply_err(r, VE_ALREADY);
+            return true;
+        }
+        r->started = true;
+        return false;
+    }
+    if (c->so_error) {
+        /* the result of an earlier attempt */
+        e = c->so_error;
+        c->so_error = 0;
+        reply_err(r, e);
+        return true;
+    }
+    if (c->connected) {
+        reply_err(r, VE_ISCONN);
+        return true;
+    }
+    if (c->listening || !c->tcp) {
+        reply_err(r, VE_OPNOTSUPP);
+        return true;
+    }
+    if (!ip || !port || is_bcast(s, ip) || (ip & 0xf0000000) == 0xe0000000) {
+        reply_err(r, VE_ADDRNOTAVAIL);
+        return true;
+    }
+    err = tcp_connect(c->tcp, &a, port, cb_tcp_connected);
+    if (err != ERR_OK) {
+        reply_err(r, vm_err(err));
+        return true;
+    }
+    c->connecting = true;
+    if (so->nonblock) {
+        reply_err(r, VE_INPROGRESS);
+        return true;
+    }
+    r->started = true;
+    return false;
+}
+
+/* a pending error of the socket, taken by the call */
+static bool take_error(TcpReq *r, Conn *c)
+{
+    int e = c->so_error;
+
+    if (!e) {
+        return false;
+    }
+    c->so_error = 0;
+    reply_err(r, e);
+    return true;
+}
+
+/* READ (14) and RECV (16): reply cc, errno, source address, data */
+static bool c_recv(TcpReq *r, TcpSock *so, bool first)
+{
+    Conn *c = so->c;
+    uint32_t want = r->msg->reply_max > 24 ? r->msg->reply_max - 24 : 0;
+    uint32_t flags = r->call == C_RECV ? ldl_be_p(r->msg->data + 4) : 0;
+    bool peek = flags & 2;
+    g_autofree uint8_t *buf = NULL;
+    uint32_t n;
+
+    if (!first) {
+        return false;
+    }
+    if (c->listening) {
+        reply_err(r, VE_NOTCONN);
+        return true;
+    }
+    if (flags & 1) {
+        /* the stack keeps no out-of-band data */
+        reply_err(r, VE_INVAL);
+        return true;
+    }
+    want = MIN(want, RECV_MAX);
+    if (c->type != T_STREAM) {
+        Dgram *d = QSIMPLEQ_FIRST(&c->dq);
+
+        if (!d) {
+            if (so->nonblock) {
+                reply_err(r, VE_WOULDBLOCK);
+                return true;
+            }
+            return false;
+        }
+        n = MIN(want, d->len);      /* the rest of a datagram is lost */
+        buf = g_malloc(SADDR + MAX(n, 1));
+        put_saddr(buf, d->ip, d->port);
+        memcpy(buf + SADDR, d->data, n);
+        if (!peek) {
+            dgram_drop(c);
+        }
+        reply(r, n, 0, buf, SADDR + n);
+        return true;
+    }
+    if (!c->rx) {
+        if (take_error(r, c)) {
+            return true;
+        }
+        if (c->eof || c->rd_shut || (c->connected && !c->tcp)) {
+            uint8_t g[SADDR];
+
+            put_saddr(g, 0, 0);
+            reply(r, 0, 0, g, SADDR);       /* end of file */
+            return true;
+        }
+        if (!c->connected && !c->connecting) {
+            reply_err(r, VE_NOTCONN);
             return true;
         }
         if (so->nonblock) {
@@ -626,158 +1051,39 @@ static bool c_accept(TcpReq *r, TcpSock *so, bool first)
         }
         return false;
     }
-    qemu_set_blocking(fd, false, NULL);
-    tp->s->nfds++;
-    ns = g_new0(TcpSock, 1);
-    ns->fd = fd;
-    ns->type = 1;
-    ns->nonblock = so->nonblock;
-    ns->port = so->port;
-    tp->socks[n] = ns;
-    put_saddr(g, ntohl(a.sin_addr.s_addr), ntohs(a.sin_port));
-    reply(r, n, 0, g, SADDR);
+    n = MIN(want, c->rx->tot_len);
+    buf = g_malloc(SADDR + MAX(n, 1));
+    put_saddr(buf, c->tcp ? ip_get(&c->tcp->remote_ip) : 0,
+              c->tcp ? c->tcp->remote_port : 0);
+    pbuf_copy_partial(c->rx, buf + SADDR, n, 0);
+    if (!peek && n) {
+        c->rx = n == c->rx->tot_len ? (pbuf_free(c->rx), NULL)
+                                     : pbuf_free_header(c->rx, n);
+        if (c->tcp) {
+            tcp_recved(c->tcp, n);
+        }
+    }
+    reply(r, n, 0, buf, SADDR + n);
     return true;
 }
 
-static bool c_connect(TcpReq *r, TcpSock *so, bool first)
+static bool tcp_writable(Conn *c)
 {
-    struct sockaddr_in a;
-    int err, e;
-    socklen_t l = sizeof(e);
-
-    if (so->connecting || so->so_error) {
-        if (!first) {
-            return false;
-        }
-        if (so->connecting &&
-            !(sock_poll(so) & (POLLOUT | POLLERR | POLLHUP))) {
-            if (so->nonblock) {
-                reply_err(r, VE_ALREADY);
-                return true;
-            }
-            return false;
-        }
-        so->connecting = false;
-        getsockopt(so->fd, SOL_SOCKET, SO_ERROR, &e, &l);
-        e = e ? e : so->so_error;
-        so->so_error = 0;
-        if (e) {
-            reply_err(r, vm_errno(e));
-        } else {
-            reply(r, 0, 0, NULL, 0);
-        }
-        return true;
-    }
-    if (r->msg->len < SADDR) {
-        reply_err(r, VE_BADLEN);
-        return true;
-    }
-    if (so->fd < 0 || so->listening) {
-        reply_err(r, VE_OPNOTSUPP);
-        return true;
-    }
-    if (!to_host_addr(r->tp->s, r->msg->data, &a, &err)) {
-        trace_iucv_tcpip_refused(ldl_be_p(r->msg->data + 4));
-        reply_err(r, err);
-        return true;
-    }
-    if (so->type == 2 &&
-        ntohl(a.sin_addr.s_addr) != ldl_be_p(r->msg->data + 4)) {
-        so->dns_peer = ldl_be_p(r->msg->data + 4);
-    }
-    if (!connect(so->fd, (struct sockaddr *)&a, sizeof(a))) {
-        reply(r, 0, 0, NULL, 0);
-        return true;
-    }
-    if (errno != EINPROGRESS) {
-        reply_err(r, vm_errno(errno));
-        return true;
-    }
-    so->connecting = true;
-    if (so->nonblock) {
-        reply_err(r, VE_INPROGRESS);
-        return true;
-    }
-    return false;
-}
-
-/* READ (14) and RECV (16): reply cc, errno, source address, data */
-static bool c_recv(TcpReq *r, TcpSock *so, bool first)
-{
-    uint32_t want = r->msg->reply_max > 24 ? r->msg->reply_max - 24 : 0;
-    uint32_t flags = r->call == C_RECV ? ldl_be_p(r->msg->data + 4) : 0;
-    g_autofree uint8_t *buf = NULL;
-    struct sockaddr_in a = {};
-    socklen_t l = sizeof(a);
-    int hflags = MSG_DONTWAIT;
-    ssize_t n;
-    uint32_t src;
-
-    if (!first) {
-        return false;
-    }
-    if (so->fd < 0 || so->listening) {
-        reply_err(r, VE_NOTCONN);
-        return true;
-    }
-    want = MIN(want, RECV_MAX);
-    buf = g_malloc(16 + MAX(want, 1) + 20);
-    if (flags & 1) {
-        hflags |= MSG_OOB;
-    }
-    if (flags & 2) {
-        hflags |= MSG_PEEK;
-    }
-    if (so->icmp) {
-        /* raw ICMP: the guest gets an IPv4 header in front */
-        n = recvfrom(so->fd, buf + 16 + 20, want > 20 ? want - 20 : 0, hflags,
-                     (struct sockaddr *)&a, &l);
-        if (n >= 0) {
-            uint8_t *ip = buf + 16;
-
-            memset(ip, 0, 20);
-            ip[0] = 0x45;
-            stw_be_p(ip + 2, n + 20);
-            ip[8] = 64;
-            ip[9] = IPPROTO_ICMP;
-            stl_be_p(ip + 12, ntohl(a.sin_addr.s_addr));
-            stl_be_p(ip + 16, r->tp->s->ip);
-            n += 20;
-        }
-    } else {
-        n = recvfrom(so->fd, buf + 16, want, hflags, (struct sockaddr *)&a,
-                     &l);
-    }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (so->nonblock) {
-                reply_err(r, VE_WOULDBLOCK);
-                return true;
-            }
-            return false;
-        }
-        reply_err(r, vm_errno(errno));
-        return true;
-    }
-    src = ntohl(a.sin_addr.s_addr);
-    if (so->dns_peer && a.sin_port == r->tp->s->resolver.sin_port &&
-        a.sin_addr.s_addr == r->tp->s->resolver.sin_addr.s_addr) {
-        src = so->dns_peer;
-    }
-    put_saddr(buf, src, ntohs(a.sin_port));
-    reply(r, n, 0, buf, 16 + n);
-    return true;
+    return c->tcp && tcp_sndbuf(c->tcp) > 0 &&
+           tcp_sndqueuelen(c->tcp) < TCP_SND_QUEUELEN - 1;
 }
 
 /* SEND (20), SENDTO (22), WRITE (26): +0 flags, +4 address, +20 data */
 static bool c_send(TcpReq *r, TcpSock *so, bool first)
 {
+    IUCVTcpip *s = r->tp->s;
+    Conn *c = so->c;
     const uint8_t *b = r->msg->data;
     uint32_t len = r->msg->len;
-    uint32_t flags;
-    struct sockaddr_in a;
-    int err, hflags = MSG_DONTWAIT | MSG_NOSIGNAL;
-    ssize_t n;
+    ip_addr_t a;
+    uint16_t port = 0;
+    int e;
+    err_t err;
 
     if (!first) {
         return false;
@@ -786,198 +1092,296 @@ static bool c_send(TcpReq *r, TcpSock *so, bool first)
         reply_err(r, VE_BADLEN);
         return true;
     }
-    if (so->fd < 0 || so->listening) {
-        reply_err(r, VE_NOTCONN);
-        return true;
-    }
-    flags = r->call == C_WRITE ? 0 : ldl_be_p(b);
-    if (flags & 1) {
-        hflags |= MSG_OOB;
-    }
-    if (flags & 4) {
-        hflags |= MSG_DONTROUTE;
-    }
-    len = MIN(len - 20, SEND_MAX);
-    if (r->call == C_SENDTO) {
-        if (!to_host_addr(r->tp->s, b + 4, &a, &err)) {
-            trace_iucv_tcpip_refused(ldl_be_p(b + 8));
-            reply_err(r, err);
+    len -= 20;
+    if (c->type == T_STREAM) {
+        /*
+         * A blocking send completes when all its data is queued (as with
+         * BSD sockets; guests do not always loop over a short count); a
+         * non-blocking one takes what fits.
+         */
+        len = MIN(len, SEND_MAX);
+        if (c->listening || (!c->connected && !c->connecting)) {
+            reply_err(r, VE_NOTCONN);
             return true;
         }
-        if (ntohl(a.sin_addr.s_addr) != ldl_be_p(b + 8)) {
-            so->dns_peer = ldl_be_p(b + 8);
+        if (!r->done && take_error(r, c)) {
+            return true;
         }
-        if (so->icmp && len >= 20 && (b[20] >> 4) == 4) {
-            /* raw ICMP with an IP header from the guest */
-            uint32_t hl = (b[20] & 0xf) * 4;
-
-            n = hl <= len ? sendto(so->fd, b + 20 + hl, len - hl, hflags,
-                                   (struct sockaddr *)&a, sizeof(a)) : -1;
-            if (n >= 0) {
-                n += hl;
+        if (!c->tcp || c->wr_shut) {
+            if (r->done) {
+                reply(r, r->done, 0, NULL, 0);
+            } else {
+                reply_err(r, c->so_error ? c->so_error : VE_PIPE);
+                c->so_error = 0;
             }
-        } else {
-            n = sendto(so->fd, b + 20, len, hflags, (struct sockaddr *)&a,
-                       sizeof(a));
+            return true;
         }
-    } else {
-        n = send(so->fd, b + 20, len, hflags);
-    }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (so->nonblock) {
-                reply_err(r, VE_WOULDBLOCK);
+        while (r->done < len && !c->connecting && tcp_writable(c)) {
+            uint32_t n = MIN(len - r->done, tcp_sndbuf(c->tcp));
+
+            err = tcp_write(c->tcp, b + 20 + r->done, n,
+                            TCP_WRITE_FLAG_COPY |
+                            (r->done + n < len ? TCP_WRITE_FLAG_MORE : 0));
+            if (err == ERR_MEM) {
+                break;
+            }
+            if (err != ERR_OK) {
+                if (r->done) {
+                    break;
+                }
+                reply_err(r, vm_err(err));
                 return true;
             }
-            return false;
+            r->done += n;
         }
-        reply_err(r, vm_errno(errno));
+        if (r->done) {
+            tcp_output(c->tcp);
+        }
+        if (r->done == len || (so->nonblock && r->done)) {
+            reply(r, r->done, 0, NULL, 0);
+            return true;
+        }
+        if (so->nonblock) {
+            reply_err(r, VE_WOULDBLOCK);
+            return true;
+        }
+        return false;
+    }
+
+    /* datagrams */
+    if (c->wr_shut) {
+        reply_err(r, VE_PIPE);
         return true;
     }
-    reply(r, n, 0, NULL, 0);
+    if (r->call == C_SENDTO) {
+        if (!get_saddr(b + 4, &a, &port, &e)) {
+            reply_err(r, e);
+            return true;
+        }
+    } else if (c->udp && (c->udp->flags & UDP_FLAGS_CONNECTED)) {
+        a = c->udp->remote_ip;
+        port = c->udp->remote_port;
+    } else if (c->raw && (c->raw->flags & RAW_FLAGS_CONNECTED)) {
+        a = c->raw->remote_ip;
+        port = 0;
+    } else {
+        reply_err(r, VE_DESTADDRREQ);
+        return true;
+    }
+    if (len > UDP_MAX) {
+        reply_err(r, VE_MSGSIZE);
+        return true;
+    }
+    if (is_bcast(s, ip_get(&a)) && !(*conn_sopts(c) & SOF_BROADCAST)) {
+        reply_err(r, VE_ACCES);
+        return true;
+    }
+    {
+        const uint8_t *data = b + 20;
+        uint32_t dlen = len, hl = 0;
+        struct pbuf *p;
+
+        if (c->raw && dlen >= 20 && (data[0] >> 4) == 4) {
+            /* raw ICMP with an IPv4 header: the stack makes its own */
+            hl = (data[0] & 0xf) * 4;
+            if (hl < 20 || hl > dlen) {
+                reply_err(r, VE_INVAL);
+                return true;
+            }
+            data += hl;
+            dlen -= hl;
+        }
+        p = pbuf_alloc(PBUF_TRANSPORT, dlen, PBUF_RAM);
+        if (!p) {
+            reply_err(r, VE_NOBUFS);
+            return true;
+        }
+        pbuf_take(p, data, dlen);
+        err = c->udp ? udp_sendto(c->udp, p, &a, port)
+                     : raw_sendto(c->raw, p, &a);
+        pbuf_free(p);
+        if (err != ERR_OK) {
+            reply_err(r, vm_err(err));
+            return true;
+        }
+        reply(r, len, 0, NULL, 0);
+    }
     return true;
 }
 
 static void name_reply(TcpReq *r, TcpSock *so, bool peer)
 {
     IUCVTcpip *s = r->tp->s;
-    struct sockaddr_in a = {};
-    socklen_t l = sizeof(a);
+    Conn *c = so->c;
+    uint32_t ip = 0;
+    uint16_t port = 0;
     uint8_t g[SADDR];
 
-    if (!peer) {
-        put_saddr(g, so->fd >= 0 || so->port ? s->ip : 0, local_port(so));
-        reply(r, 0, 0, g, SADDR);
-        return;
+    if (peer) {
+        if (c->type == T_STREAM && c->tcp && c->connected && !c->listening) {
+            ip = ip_get(&c->tcp->remote_ip);
+            port = c->tcp->remote_port;
+        } else if (c->udp && (c->udp->flags & UDP_FLAGS_CONNECTED)) {
+            ip = ip_get(&c->udp->remote_ip);
+            port = c->udp->remote_port;
+        } else {
+            reply_err(r, VE_NOTCONN);
+            return;
+        }
+    } else if (c->tcp) {
+        ip = ip_get(&c->tcp->local_ip);
+        port = c->tcp->local_port;
+    } else if (c->udp) {
+        ip = ip_get(&c->udp->local_ip);
+        port = c->udp->local_port;
     }
-    if (so->fd < 0 || getpeername(so->fd, (struct sockaddr *)&a, &l)) {
-        reply_err(r, VE_NOTCONN);
-        return;
+    if (!ip && port && c->type == T_STREAM && c->connected) {
+        ip = s->ip;
     }
-    put_saddr(g, so->dns_peer && a.sin_addr.s_addr ==
-                 s->resolver.sin_addr.s_addr ? so->dns_peer :
-                 ntohl(a.sin_addr.s_addr), ntohs(a.sin_port));
+    put_saddr(g, ip, port);
     reply(r, 0, 0, g, SADDR);
 }
 
-/* socket options: VM numbering to Linux */
-static bool sockopt_map(uint32_t level, uint32_t name, int *hl, int *hn)
+/* socket options (VM numbering) */
+enum {
+    O_DEBUG = 0x0001, O_REUSEADDR = 0x0004, O_KEEPALIVE = 0x0008,
+    O_DONTROUTE = 0x0010, O_BROADCAST = 0x0020, O_LINGER = 0x0080,
+    O_OOBINLINE = 0x0100, O_SNDBUF = 0x1001, O_RCVBUF = 0x1002,
+    O_ERROR = 0x1007, O_TYPE = 0x1008,
+    O_TCP_NODELAY = 0x10001,    /* level IPPROTO_TCP, name 1 */
+};
+
+static bool opt_known(uint32_t level, uint32_t name, uint32_t *opt)
 {
     if (level == VM_SOL_SOCKET || level == 0xffffffff) {
-        *hl = SOL_SOCKET;
         switch (name) {
-        case 0x0001:
-            *hn = SO_DEBUG;
-            return true;
-        case 0x0004:
-            *hn = SO_REUSEADDR;
-            return true;
-        case 0x0008:
-            *hn = SO_KEEPALIVE;
-            return true;
-        case 0x0010:
-            *hn = SO_DONTROUTE;
-            return true;
-        case 0x0020:            /* SO_BROADCAST: not offered */
-            return false;
-        case 0x0080:
-            *hn = SO_LINGER;
-            return true;
-        case 0x0100:
-            *hn = SO_OOBINLINE;
-            return true;
-        case 0x1001:
-            *hn = SO_SNDBUF;
-            return true;
-        case 0x1002:
-            *hn = SO_RCVBUF;
-            return true;
-        case 0x1007:
-            *hn = SO_ERROR;
-            return true;
-        case 0x1008:
-            *hn = SO_TYPE;
+        case O_DEBUG: case O_REUSEADDR: case O_KEEPALIVE: case O_DONTROUTE:
+        case O_BROADCAST: case O_LINGER: case O_OOBINLINE: case O_SNDBUF:
+        case O_RCVBUF: case O_ERROR: case O_TYPE:
+            *opt = name;
             return true;
         }
         return false;
     }
-    if (level == IPPROTO_TCP && name == 1) {
-        *hl = IPPROTO_TCP;
-        *hn = TCP_NODELAY;
+    if (level == IP_PROTO_TCP && name == 1) {
+        *opt = O_TCP_NODELAY;
         return true;
     }
     return false;
 }
 
+static u8_t sof_of(uint32_t opt)
+{
+    switch (opt) {
+    case O_REUSEADDR:
+        return SOF_REUSEADDR;
+    case O_KEEPALIVE:
+        return SOF_KEEPALIVE;
+    case O_BROADCAST:
+        return SOF_BROADCAST;
+    }
+    return 0;
+}
+
 static bool c_sockopt(TcpReq *r, TcpSock *so, bool set)
 {
+    Conn *c = so->c;
     const uint8_t *b = r->msg->data;
-    uint32_t level, name;
-    int hl, hn, v = 0;
-    struct linger lg = {};
-    socklen_t l;
+    uint32_t opt, v = 0;
+    u8_t *sopts = conn_sopts(c);
     uint8_t out[8];
 
     if (r->msg->len < 8) {
         reply_err(r, VE_BADLEN);
         return true;
     }
-    level = ldl_be_p(b);
-    name = ldl_be_p(b + 4);
-    if (!sockopt_map(level, name, &hl, &hn)) {
+    if (!opt_known(ldl_be_p(b), ldl_be_p(b + 4), &opt)) {
         reply_err(r, VE_NOPROTOOPT);
         return true;
     }
-    if (so->fd < 0) {
-        if (set) {
-            reply(r, 0, 0, NULL, 0);
-        } else {
-            stl_be_p(out, hn == SO_TYPE ? so->type : 0);
-            reply(r, 0, 0, out, 4);
-        }
-        return true;
-    }
     if (set) {
-        if (r->msg->len < (hn == SO_LINGER ? 16 : 12) ||
-            hn == SO_ERROR || hn == SO_TYPE) {
+        if (r->msg->len < (opt == O_LINGER ? 16 : 12) || opt == O_ERROR ||
+            opt == O_TYPE) {
             reply_err(r, VE_INVAL);
             return true;
         }
-        if (hn == SO_LINGER) {
-            lg.l_onoff = ldl_be_p(b + 8);
-            lg.l_linger = ldl_be_p(b + 12);
-            v = setsockopt(so->fd, hl, hn, &lg, sizeof(lg));
-        } else {
-            v = ldl_be_p(b + 8);
-            v = setsockopt(so->fd, hl, hn, &v, sizeof(v));
+        v = ldl_be_p(b + 8);
+        switch (opt) {
+        case O_LINGER:
+            c->linger_on = v;
+            c->linger = ldl_be_p(b + 12);
+            break;
+        case O_DEBUG:
+            c->debug = v;
+            break;
+        case O_DONTROUTE:
+            c->dontroute = v;
+            break;
+        case O_OOBINLINE:
+            c->oobinline = v;
+            break;
+        case O_TCP_NODELAY:
+            if (c->type != T_STREAM) {
+                reply_err(r, VE_NOPROTOOPT);
+                return true;
+            }
+            if (c->tcp && !c->listening) {
+                if (v) {
+                    tcp_nagle_disable(c->tcp);
+                } else {
+                    tcp_nagle_enable(c->tcp);
+                }
+            }
+            break;
+        case O_SNDBUF:
+        case O_RCVBUF:
+            break;              /* the stack's sizes are fixed */
+        default:
+            if (sopts) {
+                if (v) {
+                    *sopts |= sof_of(opt);
+                } else {
+                    *sopts &= ~sof_of(opt);
+                }
+            }
         }
-        if (v) {
-            reply_err(r, vm_errno(errno));
-        } else {
-            reply(r, 0, 0, NULL, 0);
-        }
+        reply(r, 0, 0, NULL, 0);
         return true;
     }
-    if (hn == SO_LINGER) {
-        l = sizeof(lg);
-        getsockopt(so->fd, hl, hn, &lg, &l);
-        stl_be_p(out, lg.l_onoff);
-        stl_be_p(out + 4, lg.l_linger);
+    switch (opt) {
+    case O_LINGER:
+        stl_be_p(out, c->linger_on);
+        stl_be_p(out + 4, c->linger);
         reply(r, 0, 0, out, 8);
         return true;
-    }
-    l = sizeof(v);
-    if (getsockopt(so->fd, hl, hn, &v, &l)) {
-        reply_err(r, vm_errno(errno));
-        return true;
-    }
-    if (hn == SO_ERROR) {
-        /* a failed connect that SELECT has seen */
-        v = v ? v : so->so_error;
-        so->so_error = 0;
-        v = v ? vm_errno(v) : 0;
-    } else if (hn == SO_TYPE) {
-        v = so->type;
+    case O_DEBUG:
+        v = c->debug;
+        break;
+    case O_DONTROUTE:
+        v = c->dontroute;
+        break;
+    case O_OOBINLINE:
+        v = c->oobinline;
+        break;
+    case O_SNDBUF:
+        v = c->type == T_STREAM ? TCP_SND_BUF : UDP_MAX;
+        break;
+    case O_RCVBUF:
+        v = c->type == T_STREAM ? TCP_WND : DGRAM_BYTES;
+        break;
+    case O_ERROR:
+        v = c->so_error;
+        c->so_error = 0;
+        break;
+    case O_TYPE:
+        v = c->type;
+        break;
+    case O_TCP_NODELAY:
+        v = c->type == T_STREAM && c->tcp && !c->listening &&
+            tcp_nagle_disabled(c->tcp);
+        break;
+    default:
+        v = sopts && (*sopts & sof_of(opt)) ? 1 : 0;
     }
     stl_be_p(out, v);
     reply(r, 0, 0, out, 4);
@@ -1008,10 +1412,11 @@ static void put_ifreq(IUCVTcpip *s, uint8_t *ifr, uint32_t cmd)
 static bool c_ioctl(TcpReq *r, TcpSock *so)
 {
     IUCVTcpip *s = r->tp->s;
+    Conn *c = so->c;
     const uint8_t *b = r->msg->data;
     uint32_t cmd = r->msg->len >= 4 ? ldl_be_p(b) : 0;
     uint8_t out[32];
-    int v = 0;
+    uint32_t v = 0;
 
     switch (cmd) {
     case 0x8004a77e:                            /* FIONBIO */
@@ -1019,14 +1424,16 @@ static bool c_ioctl(TcpReq *r, TcpSock *so)
         reply(r, 0, 0, NULL, 0);
         return true;
     case 0x4004a77f:                            /* FIONREAD */
-        if (so->fd >= 0) {
-            ioctl(so->fd, FIONREAD, &v);
+        if (c->rx) {
+            v = c->rx->tot_len;
+        } else if (!QSIMPLEQ_EMPTY(&c->dq)) {
+            v = QSIMPLEQ_FIRST(&c->dq)->len;
         }
         stl_be_p(out, v);
         reply(r, 0, 0, out, 4);
         return true;
     case 0x4004a707:                            /* SIOCATMARK */
-        stl_be_p(out, so->fd >= 0 ? MAX(sockatmark(so->fd), 0) : 0);
+        stl_be_p(out, 0);
         reply(r, 0, 0, out, 4);
         return true;
     case 0xc020a70d:                            /* SIOCGIFADDR */
@@ -1077,12 +1484,14 @@ static bool blank(const uint8_t *p, int n)
 
 static bool c_givesocket(TcpReq *r, TcpSock *so)
 {
+    Conn *c = so->c;
+
     if (r->msg->len < 40) {
         reply_err(r, VE_BADLEN);
         return true;
     }
-    if (so->type != 1 || so->listening) {
-        reply_err(r, so->listening ? VE_BUSY : VE_OPNOTSUPP);
+    if (c->type != T_STREAM || c->listening) {
+        reply_err(r, c->listening ? VE_BUSY : VE_OPNOTSUPP);
         return true;
     }
     so->given = true;
@@ -1098,8 +1507,7 @@ static bool c_takesocket(TcpReq *r)
     const uint8_t *b = r->msg->data;
     uint32_t his, n;
     uint8_t me[40];
-    TcpSock *so, *ns;
-    int fd;
+    TcpSock *so;
 
     if (r->msg->len < 48) {
         reply_err(r, VE_BADLEN);
@@ -1108,7 +1516,7 @@ static bool c_takesocket(TcpReq *r)
     his = ldl_be_p(b + 40);
     n = ldl_be_p(b + 44);
     if (ldl_be_p(b) != VM_AF_INET) {
-        reply_err(r, 46);
+        reply_err(r, VE_PFNOSUPPORT);
         return true;
     }
     if (n >= tp->nsock) {
@@ -1135,25 +1543,14 @@ static bool c_takesocket(TcpReq *r)
         reply_err(r, VE_ACCES);
         return true;
     }
-    fd = tp->s->nfds < tp->s->max_host_sockets ? dup(so->fd) : -1;
-    if (fd < 0) {
-        reply_err(r, VE_MFILE);
-        return true;
-    }
-    qemu_set_blocking(fd, false, NULL);
-    tp->s->nfds++;
-    ns = g_new0(TcpSock, 1);
-    ns->fd = fd;
-    ns->type = 1;
-    ns->port = so->port;
-    tp->socks[n] = ns;
+    /* both socket numbers name the connection until the giver closes */
+    so->c->refs++;
+    sock_new(tp, n, so->c);
     so->given = false;
     so->taken = true;
     reply(r, n, 0, NULL, 0);
     /* the giver's SELECT sees the exception condition */
-    if (giver != tp) {
-        tcp_pump(giver);
-    }
+    kick(tp->s);
     return true;
 }
 
@@ -1169,12 +1566,42 @@ static void fd_set_bit(uint8_t *set, uint32_t d)
              (1u << (d % 32)));
 }
 
+static bool sock_readable(TcpSock *so)
+{
+    Conn *c = so->c;
+
+    if (c->listening) {
+        return !g_queue_is_empty(&c->pending);
+    }
+    if (c->type != T_STREAM) {
+        return !QSIMPLEQ_EMPTY(&c->dq);
+    }
+    /* data, end of file, an error, or nothing to wait for */
+    return c->rx || c->eof || c->so_error || c->rd_shut ||
+           (c->connected && !c->tcp) || (!c->connected && !c->connecting);
+}
+
+static bool sock_writable(TcpSock *so)
+{
+    Conn *c = so->c;
+
+    if (c->type != T_STREAM) {
+        return true;
+    }
+    if (c->listening || c->connecting) {
+        return false;
+    }
+    /* a send reports the error or the missing connection at once */
+    return tcp_writable(c) || !c->tcp || c->so_error || c->wr_shut ||
+           !c->connected;
+}
+
 static void select_timeout(void *opaque)
 {
     TcpReq *r = opaque;
 
     r->timed_out = true;
-    tcp_pump(r->tp);
+    kick(r->tp->s);
 }
 
 static bool c_select(TcpReq *r)
@@ -1199,7 +1626,6 @@ static bool c_select(TcpReq *r)
     }
     for (d = 0; d < nfds; d++) {
         TcpSock *so;
-        short ev;
 
         if (!(used[0] && fd_isset(in[0], d)) &&
             !(used[1] && fd_isset(in[1], d)) &&
@@ -1211,26 +1637,15 @@ static bool c_select(TcpReq *r)
             reply_err(r, VE_BADF);
             return true;
         }
-        ev = sock_poll(so);
-        if (so->connecting && (ev & POLLOUT)) {
-            int e = 0;
-            socklen_t l = sizeof(e);
-
-            getsockopt(so->fd, SOL_SOCKET, SO_ERROR, &e, &l);
-            so->connecting = false;
-            so->so_error = e;
-        }
-        if (used[0] && fd_isset(in[0], d) && (ev & (POLLIN | POLLHUP |
-                                                    POLLERR))) {
+        if (used[0] && fd_isset(in[0], d) && sock_readable(so)) {
             fd_set_bit(out + 8, d);
             found++;
         }
-        if (used[1] && fd_isset(in[1], d) && !so->listening &&
-            !so->connecting && (ev & (POLLOUT | POLLERR | POLLHUP))) {
+        if (used[1] && fd_isset(in[1], d) && sock_writable(so)) {
             fd_set_bit(out + 8 + fdsize, d);
             found++;
         }
-        if (used[2] && fd_isset(in[2], d) && ((ev & POLLPRI) || so->taken)) {
+        if (used[2] && fd_isset(in[2], d) && so->taken) {
             fd_set_bit(out + 8 + 2 * fdsize, d);
             found++;
         }
@@ -1254,6 +1669,43 @@ static bool c_select(TcpReq *r)
         }
     }
     reply(r, found, 0, out, 8 + 3 * fdsize);
+    return true;
+}
+
+static bool c_shutdown(TcpReq *r, TcpSock *so)
+{
+    Conn *c = so->c;
+    uint32_t how = ldl_be_p(r->msg->data + 4);
+
+    if (how > 2) {
+        reply_err(r, VE_INVAL);
+        return true;
+    }
+    if (c->type == T_STREAM && (c->listening || !c->connected)) {
+        reply_err(r, VE_NOTCONN);
+        return true;
+    }
+    if (how != 1 && !c->rd_shut) {
+        /* received data is dropped from now on; the window stays open */
+        c->rd_shut = true;
+        if (c->rx) {
+            if (c->tcp) {
+                tcp_recved(c->tcp, c->rx->tot_len);
+            }
+            pbuf_free(c->rx);
+            c->rx = NULL;
+        }
+        while (!QSIMPLEQ_EMPTY(&c->dq)) {
+            dgram_drop(c);
+        }
+    }
+    if (how != 0 && !c->wr_shut) {
+        c->wr_shut = true;
+        if (c->tcp) {
+            tcp_shutdown(c->tcp, 0, 1);
+        }
+    }
+    reply(r, 0, 0, NULL, 0);
     return true;
 }
 
@@ -1343,12 +1795,7 @@ static bool tcp_try(TcpReq *r, bool first)
         reply(r, 0, 0, NULL, 0);
         return true;
     case C_SHUTDOWN:
-        if (so->fd >= 0 && shutdown(so->fd, ldl_be_p(b + 4) & 3)) {
-            reply_err(r, vm_errno(errno));
-        } else {
-            reply(r, 0, 0, NULL, 0);
-        }
-        return true;
+        return c_shutdown(r, so);
     case C_FCNTL:
         if (ldl_be_p(b) == 4) {
             so->nonblock = ldl_be_p(b + 4) & VM_FNDELAY;
@@ -1424,55 +1871,6 @@ static void tcp_pump(TcpPath *tp)
             }
         }
     }
-    sock_update_handlers(tp);
-}
-
-static void sock_event(void *opaque)
-{
-    tcp_pump(opaque);
-}
-
-/* host fd handlers for the sockets that have waiting requests */
-static void sock_update_handlers(TcpPath *tp)
-{
-    g_autofree uint8_t *want = g_malloc0(tp->nsock);
-    TcpReq *r;
-    uint32_t i, d;
-
-    QTAILQ_FOREACH(r, &tp->reqs, next) {
-        if (r->call == C_SELECT) {
-            const uint8_t *b = r->msg->data;
-            uint32_t fdsize = r->lo;
-
-            for (d = 0; d < MIN(tp->nsock, fdsize * 8); d++) {
-                if (ldl_be_p(b + 8) && fd_isset(b + 28, d)) {
-                    want[d] |= 1;
-                }
-                if (ldl_be_p(b + 12) && fd_isset(b + 28 + fdsize, d)) {
-                    want[d] |= 2;
-                }
-                /*
-                 * Exceptions (out-of-band data, a taken socket) are not
-                 * watched: read interest would fire on ordinary data and
-                 * spin. They are seen when the request runs again.
-                 */
-            }
-        } else if (r->lo < tp->nsock) {
-            if (is_read(r->call) || r->call == C_ACCEPT) {
-                want[r->lo] |= 1;
-            } else if (is_write(r->call) || r->call == C_CONNECT) {
-                want[r->lo] |= 2;
-            }
-        }
-    }
-    for (i = 0; i < tp->nsock; i++) {
-        TcpSock *so = tp->socks[i];
-
-        if (so && so->fd >= 0) {
-            qemu_set_fd_handler(so->fd, want[i] & 1 ? sock_event : NULL,
-                                want[i] & 2 ? sock_event : NULL, tp);
-        }
-    }
 }
 
 /* the initialization message: "IUCVAPI ", maxsock, apitype, subtask */
@@ -1533,6 +1931,7 @@ static int tcpip_connect(IUCVService *svc, IUCVPath *path,
 
 static void tcpip_message(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
 {
+    IUCVTcpip *s = IUCV_TCPIP(svc);
     TcpPath *tp = iucv_path_get_opaque(path);
     TcpReq *r;
 
@@ -1554,7 +1953,7 @@ static void tcpip_message(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
     }
     if (tp->nreqs >= REQS_MAX) {
         tp->last_rc = -1;
-        tp->last_errno = 55;
+        tp->last_errno = VE_NOBUFS;
         iucv_reject(svc, path, msg);
         return;
     }
@@ -1568,6 +1967,7 @@ static void tcpip_message(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
     QTAILQ_INSERT_TAIL(&tp->reqs, r, next);
     tp->nreqs++;
     tcp_pump(tp);
+    stack_run(s);
 }
 
 /* the guest withdrew a call with PURGE: no reply */
@@ -1583,7 +1983,6 @@ static void tcpip_cancelled(IUCVService *svc, IUCVPath *path,
             break;
         }
     }
-    sock_update_handlers(tp);
 }
 
 static void tcpip_severed(IUCVService *svc, IUCVPath *path)
@@ -1607,6 +2006,87 @@ static void tcpip_severed(IUCVService *svc, IUCVPath *path)
     g_free(tp->socks);
     g_free(tp);
     iucv_path_set_opaque(path, NULL);
+    stack_run(s);
+}
+
+/* the network backend */
+
+static bool stack_can_receive(NetClientState *nc)
+{
+    return true;
+}
+
+static ssize_t stack_receive(NetClientState *nc, const uint8_t *buf,
+                             size_t size)
+{
+    IUCVTcpip *s = qemu_get_nic_opaque(nc);
+    GByteArray *f;
+
+    if (size < SIZEOF_ETH_HDR || size > 0xffff ||
+        g_queue_get_length(&s->rxq) >= RXQ_MAX) {
+        return size;
+    }
+    /* unicast for other stations (a bridge floods unknown ones) */
+    if (!(buf[0] & 1) && memcmp(buf, s->conf.macaddr.a, ETH_HWADDR_LEN)) {
+        return size;
+    }
+    f = g_byte_array_sized_new(size);
+    g_byte_array_append(f, buf, size);
+    g_queue_push_tail(&s->rxq, f);
+    kick(s);
+    return size;
+}
+
+static void stack_link_status_changed(NetClientState *nc)
+{
+    IUCVTcpip *s = qemu_get_nic_opaque(nc);
+
+    if (nc->link_down) {
+        netif_set_link_down(&s->netif);
+    } else {
+        netif_set_link_up(&s->netif);
+    }
+    stack_run(s);
+}
+
+static NetClientInfo stack_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = stack_can_receive,
+    .receive = stack_receive,
+    .link_status_changed = stack_link_status_changed,
+};
+
+static err_t stack_linkoutput(struct netif *nif, struct pbuf *p)
+{
+    IUCVTcpip *s = nif->state;
+    NetClientState *nc = qemu_get_queue(s->nic);
+
+    if (!p->next) {
+        qemu_send_packet(nc, p->payload, p->len);
+    } else {
+        g_autofree uint8_t *f = g_malloc(p->tot_len);
+
+        pbuf_copy_partial(p, f, p->tot_len, 0);
+        qemu_send_packet(nc, f, p->tot_len);
+    }
+    return ERR_OK;
+}
+
+static err_t stack_netif_init(struct netif *nif)
+{
+    IUCVTcpip *s = nif->state;
+
+    nif->name[0] = 'e';
+    nif->name[1] = 'n';
+    nif->output = etharp_output;
+    nif->linkoutput = stack_linkoutput;
+    nif->mtu = s->mtu;
+    nif->hwaddr_len = ETH_HWADDR_LEN;
+    memcpy(nif->hwaddr, s->conf.macaddr.a, ETH_HWADDR_LEN);
+    nif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP |
+                 NETIF_FLAG_ETHERNET;
+    return ERR_OK;
 }
 
 /* configuration */
@@ -1620,6 +2100,11 @@ static bool parse_ip(const char *str, uint32_t *ip, uint32_t *mask,
     int bits = 32;
 
     if (slash) {
+        if (!mask) {
+            error_setg(errp, "'%s' must be an address without a prefix",
+                       str);
+            return false;
+        }
         *slash = 0;
         if (qemu_strtoi(slash + 1, NULL, 10, &bits) || bits < 0 ||
             bits > 32) {
@@ -1638,88 +2123,30 @@ static bool parse_ip(const char *str, uint32_t *ip, uint32_t *mask,
     return true;
 }
 
-/* hostfwd=tcp:HOSTPORT-GUESTPORT;udp:...  (';' or '+' separated) */
-static bool parse_fwds(IUCVTcpip *s, Error **errp)
+/* dns=A[;B...]: the name servers the guest is configured with */
+static bool parse_dns(IUCVTcpip *s, Error **errp)
 {
     g_auto(GStrv) v = NULL;
     int i;
 
-    if (!s->hostfwd || !*s->hostfwd) {
+    if (!s->dns_str || !*s->dns_str) {
         return true;
     }
-    v = g_strsplit_set(s->hostfwd, ";+", -1);
-    s->fwds = g_new0(HostFwd, g_strv_length(v));
-    for (i = 0; v[i]; i++) {
-        HostFwd *f = &s->fwds[s->nfwds];
-        unsigned hp, gp;
-        char proto[4];
-
-        if (!*v[i]) {
-            continue;
-        }
-        if (sscanf(v[i], "%3[a-z]:%u-%u", proto, &hp, &gp) != 3 ||
-            (strcmp(proto, "tcp") && strcmp(proto, "udp")) ||
-            !hp || hp > 65535 || !gp || gp > 65535) {
-            error_setg(errp, "bad hostfwd entry '%s' (want tcp:HOST-GUEST)",
-                       v[i]);
-            return false;
-        }
-        f->udp = !strcmp(proto, "udp");
-        f->host_port = hp;
-        f->guest_port = gp;
-        s->nfwds++;
-    }
-    return true;
-}
-
-static bool parse_deny(IUCVTcpip *s, Error **errp)
-{
-    g_auto(GStrv) v = NULL;
-    int i;
-
-    if (!s->deny || !*s->deny) {
-        return true;
-    }
-    v = g_strsplit_set(s->deny, ";+", -1);
-    s->deny_net = g_new0(uint32_t, g_strv_length(v));
-    s->deny_mask = g_new0(uint32_t, g_strv_length(v));
+    v = g_strsplit_set(s->dns_str, ";+", -1);
     for (i = 0; v[i]; i++) {
         if (!*v[i]) {
             continue;
         }
-        if (!parse_ip(v[i], &s->deny_net[s->ndeny], &s->deny_mask[s->ndeny],
-                      errp)) {
+        if (s->ndns == DNS_MAX) {
+            error_setg(errp, "at most %d name servers", DNS_MAX);
             return false;
         }
-        s->deny_net[s->ndeny] &= s->deny_mask[s->ndeny];
-        s->ndeny++;
+        if (!parse_ip(v[i], &s->dns[s->ndns], NULL, errp)) {
+            return false;
+        }
+        s->ndns++;
     }
     return true;
-}
-
-/* the first name server of the host serves the guest's DNS address */
-static void find_resolver(IUCVTcpip *s)
-{
-    g_autofree char *conf = NULL;
-    g_auto(GStrv) lines = NULL;
-    struct in_addr a;
-    int i;
-
-    if (!g_file_get_contents("/etc/resolv.conf", &conf, NULL, NULL)) {
-        return;
-    }
-    lines = g_strsplit(conf, "\n", -1);
-    for (i = 0; lines[i]; i++) {
-        char addr[64];
-
-        if (sscanf(lines[i], " nameserver %63s", addr) == 1 &&
-            inet_aton(addr, &a)) {
-            s->resolver.sin_family = AF_INET;
-            s->resolver.sin_port = htons(53);
-            s->resolver.sin_addr = a;
-            return;
-        }
-    }
 }
 
 static void tcpip_realize(DeviceState *dev, Error **errp)
@@ -1728,53 +2155,131 @@ static void tcpip_realize(DeviceState *dev, Error **errp)
     IUCVTcpip *s = IUCV_TCPIP(dev);
     DeviceClass *parent = DEVICE_CLASS(object_class_get_parent(
                               object_class_by_name(TYPE_IUCV_TCPIP)));
+    ip4_addr_t ip, mask, gw;
 
+    if (the_stack) {
+        error_setg(errp, "only one iucv-tcpip device is possible: the "
+                   "TCP/IP stack exists once per process");
+        return;
+    }
+    if (!s->conf.peers.ncs[0]) {
+        error_setg(errp, "iucv-tcpip needs a network backend (netdev=)");
+        return;
+    }
     if (!s->ip_str) {
         error_setg(errp, "iucv-tcpip needs ip=<address>/<prefix>");
         return;
     }
     if (!parse_ip(s->ip_str, &s->ip, &s->mask, errp) ||
-        (s->dns_str && !parse_ip(s->dns_str, &s->dns, NULL, errp)) ||
-        !parse_fwds(s, errp) || !parse_deny(s, errp)) {
+        (s->gateway_str && !parse_ip(s->gateway_str, &s->gateway, NULL,
+                                     errp)) ||
+        !parse_dns(s, errp)) {
         return;
     }
-    if (!s->fwd_addr_str) {
-        s->fwd_addr.s_addr = htonl(INADDR_ANY);
-    } else if (!inet_aton(s->fwd_addr_str, &s->fwd_addr)) {
-        error_setg(errp, "bad hostfwd-addr '%s'", s->fwd_addr_str);
+    if (!s->ip || (s->ip >> 24) == 127 || (s->ip & 0xf0000000) >= 0xe0000000 ||
+        (s->mask < 0xfffffffe &&
+         ((s->ip & ~s->mask) == 0 || (s->ip & ~s->mask) == ~s->mask))) {
+        error_setg(errp, "'%s' is not a host address", s->ip_str);
+        return;
+    }
+    if (s->gateway && ((s->gateway & s->mask) != (s->ip & s->mask) ||
+                       s->gateway == s->ip)) {
+        error_setg(errp, "the gateway must be another address in the "
+                   "subnet of %s", s->ip_str);
+        return;
+    }
+    if (s->mtu < MTU_MIN || s->mtu > MTU_MAX) {
+        error_setg(errp, "mtu must be %d to %d", MTU_MIN, MTU_MAX);
         return;
     }
     if (s->max_sockets < NSOCK_MIN || s->max_sockets > 4096) {
         error_setg(errp, "max-sockets must be %d to 4096", NSOCK_MIN);
         return;
     }
-    if (!s->max_host_sockets || s->max_host_sockets > 65536) {
-        error_setg(errp, "max-host-sockets must be 1 to 65536");
+    if (!s->max_open || s->max_open > MEMP_NUM_TCP_PCB) {
+        error_setg(errp, "max-open-sockets must be 1 to %d",
+                   MEMP_NUM_TCP_PCB);
         return;
-    }
-    if (s->dns) {
-        find_resolver(s);
     }
     parent->realize(dev, errp);
     if (*errp) {
         return;
     }
     QTAILQ_INIT(&s->paths);
+    g_queue_init(&s->rxq);
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&stack_net_info, &s->conf,
+                          object_get_typename(OBJECT(s)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+    s->bh = qemu_bh_new_guarded(stack_bh, s, &dev->mem_reentrancy_guard);
+    s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, stack_timer, s);
+
+    if (!lwip_ready) {
+        lwip_init();
+        lwip_ready = true;
+    }
+    ip4_addr_set_u32(&ip, htonl(s->ip));
+    ip4_addr_set_u32(&mask, htonl(s->mask));
+    ip4_addr_set_u32(&gw, htonl(s->gateway));
+    netif_add(&s->netif, &ip, &mask, &gw, s, stack_netif_init,
+              ethernet_input);
+    s->netif_added = true;
+    netif_set_default(&s->netif);
+    if (!qemu_get_queue(s->nic)->link_down) {
+        netif_set_link_up(&s->netif);
+    }
+    /* announces the address (gratuitous ARP) */
+    netif_set_up(&s->netif);
+    the_stack = s;
+    stack_run(s);
+}
+
+static void tcpip_unrealize(DeviceState *dev)
+{
+    IUCVTcpip *s = IUCV_TCPIP(dev);
+    DeviceClass *parent = DEVICE_CLASS(object_class_get_parent(
+                              object_class_by_name(TYPE_IUCV_TCPIP)));
+
+    /* severs the paths, which closes their sockets */
+    parent->unrealize(dev);
+    if (s->netif_added) {
+        netif_remove(&s->netif);
+        s->netif_added = false;
+    }
+    if (s->timer) {
+        timer_free(s->timer);
+        s->timer = NULL;
+    }
+    if (s->bh) {
+        qemu_bh_delete(s->bh);
+        s->bh = NULL;
+    }
+    while (!g_queue_is_empty(&s->rxq)) {
+        g_byte_array_free(g_queue_pop_head(&s->rxq), true);
+    }
+    if (s->nic) {
+        qemu_del_nic(s->nic);
+        s->nic = NULL;
+    }
+    if (the_stack == s) {
+        the_stack = NULL;
+    }
 }
 
 static const Property tcpip_properties[] = {
+    DEFINE_NIC_PROPERTIES(IUCVTcpip, conf),
     DEFINE_PROP_STRING("ip", IUCVTcpip, ip_str),
-    DEFINE_PROP_STRING("hostname", IUCVTcpip, hostname),
-    DEFINE_PROP_STRING("hostfwd", IUCVTcpip, hostfwd),
-    DEFINE_PROP_STRING("hostfwd-addr", IUCVTcpip, fwd_addr_str),
+    DEFINE_PROP_STRING("gateway", IUCVTcpip, gateway_str),
+    /* informational: the guest's resolver uses them itself */
     DEFINE_PROP_STRING("dns", IUCVTcpip, dns_str),
-    DEFINE_PROP_STRING("deny", IUCVTcpip, deny),
-    DEFINE_PROP_BOOL("allow-host", IUCVTcpip, allow_host, false),
-    DEFINE_PROP_BOOL("raw", IUCVTcpip, raw, false),
+    DEFINE_PROP_STRING("hostname", IUCVTcpip, hostname),
+    DEFINE_PROP_STRING("domain", IUCVTcpip, domain),
+    DEFINE_PROP_UINT32("mtu", IUCVTcpip, mtu, 1500),
     /* socket numbers of one path (its table) */
     DEFINE_PROP_UINT32("max-sockets", IUCVTcpip, max_sockets, 256),
-    /* host sockets of all paths together */
-    DEFINE_PROP_UINT32("max-host-sockets", IUCVTcpip, max_host_sockets, 512),
+    /* sockets of the stack, all paths together */
+    DEFINE_PROP_UINT32("max-open-sockets", IUCVTcpip, max_open, 512),
 };
 
 static void tcpip_class_init(ObjectClass *oc, const void *data)
@@ -1783,7 +2288,10 @@ static void tcpip_class_init(ObjectClass *oc, const void *data)
     IUCVServiceClass *sc = IUCV_SERVICE_CLASS(oc);
 
     dc->realize = tcpip_realize;
-    dc->desc = "IUCV TCP/IP service (socket interface on host sockets)";
+    dc->unrealize = tcpip_unrealize;
+    dc->desc = "IUCV TCP/IP service (socket interface, own TCP/IP stack "
+               "on a network backend)";
+    dc->hotpluggable = false;
     device_class_set_props(dc, tcpip_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     sc->max_message = SEND_MAX + 64;
