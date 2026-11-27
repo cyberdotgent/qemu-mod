@@ -10,6 +10,12 @@
  * address: it answers ARP for it and resolves the next hop (an address on
  * the guest's subnet, or the gateway) itself.
  *
+ * Linux netiucv uses an MTU of 9216 by default, more than an Ethernet
+ * network carries. Packets of the guest that do not fit the MTU of the
+ * Ethernet side (property mtu) are fragmented, or, with Don't Fragment
+ * set, answered with an ICMP "fragmentation needed" message that carries
+ * the MTU, so that path MTU discovery of the guest adapts.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -23,7 +29,9 @@
 #include "hw/s390x/iucv.h"
 #include "net/net.h"
 #include "net/eth.h"
+#include "net/checksum.h"
 #include "trace.h"
+#include <netinet/ip_icmp.h>
 
 #define TYPE_IUCV_NET "iucv-net"
 OBJECT_DECLARE_SIMPLE_TYPE(IUCVNet, IUCV_NET)
@@ -37,6 +45,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IUCVNet, IUCV_NET)
 #define NET_QUEUE_MAX   512     /* packets waiting for the guest */
 #define NET_ARP_ENTRIES 16
 #define NET_ARP_PENDING 32
+#define NET_MTU_MIN     576     /* RFC 791: every host takes 576 bytes */
+#define NET_MTU_MAX     65535
+#define IP_DF           0x4000
+#define IP_MF           0x2000
+#define IP_OFFMASK      0x1fff
 
 typedef struct ArpEntry {
     uint32_t ip;
@@ -51,6 +64,7 @@ struct IUCVNet {
     NICState *nic;
     char *ip_str;
     char *gateway_str;
+    uint32_t mtu;
 
     uint32_t ip;
     uint32_t mask;
@@ -82,23 +96,26 @@ static void net_flush(IUCVNet *n)
            iucv_send_outstanding(n->path) < iucv_path_msglim(n->path)) {
         g_autoptr(GByteArray) b = g_byte_array_new();
         uint8_t hdr[2];
+        unsigned count = 0;
+        GList *l;
 
-        while (!g_queue_is_empty(&n->to_guest)) {
-            GByteArray *p = g_queue_peek_head(&n->to_guest);
+        for (l = n->to_guest.head; l; l = l->next, count++) {
+            GByteArray *p = l->data;
 
             if (b->len && b->len + 2 + p->len + 2 > NET_BUNDLE_MAX) {
                 break;
             }
-            g_queue_pop_head(&n->to_guest);
             stw_be_p(hdr, b->len + 2 + p->len);
             g_byte_array_append(b, hdr, 2);
             g_byte_array_append(b, p->data, p->len);
-            g_byte_array_free(p, true);
         }
         stw_be_p(hdr, 0);
         g_byte_array_append(b, hdr, 2);
         if (!iucv_send(svc, n->path, 0, b->data, b->len, false, 0)) {
-            break;
+            break;              /* the packets stay queued */
+        }
+        while (count--) {
+            g_byte_array_free(g_queue_pop_head(&n->to_guest), true);
         }
     }
 }
@@ -107,8 +124,8 @@ static void net_to_guest(IUCVNet *n, const uint8_t *ip, size_t len)
 {
     GByteArray *p;
 
-    if (!n->path || len < 20 || g_queue_get_length(&n->to_guest) >=
-                                NET_QUEUE_MAX) {
+    if (!n->path || len < 20 || len > NET_BUNDLE_MAX - 4 ||
+        g_queue_get_length(&n->to_guest) >= NET_QUEUE_MAX) {
         return;
     }
     p = g_byte_array_sized_new(len);
@@ -188,17 +205,14 @@ static void arp_learn(IUCVNet *n, uint32_t ip, const uint8_t *mac)
     }
 }
 
-/* towards the network: one IPv4 packet of the guest */
-static void net_from_guest(IUCVNet *n, const uint8_t *ip, size_t len)
+/* towards the network: one IPv4 packet that fits the MTU */
+static void net_send_ip(IUCVNet *n, const uint8_t *ip, size_t len)
 {
     uint32_t dst, hop;
     GByteArray *f;
     ArpEntry *e;
     uint8_t hdr[ETH_HDR];
 
-    if (len < 20 || (ip[0] >> 4) != 4) {
-        return;
-    }
     dst = ldl_be_p(ip + 16);
     memcpy(hdr + 6, n->conf.macaddr.a, ETH_ALEN);
     stw_be_p(hdr + 12, ETHERTYPE_IP);
@@ -244,6 +258,95 @@ static void net_from_guest(IUCVNet *n, const uint8_t *ip, size_t len)
     g_byte_array_append(f, ip, len);
     qemu_send_packet(qemu_get_queue(n->nic), f->data, f->len);
     g_byte_array_free(f, true);
+}
+
+/* ICMP destination unreachable, fragmentation needed, to the guest */
+static void net_frag_needed(IUCVNet *n, const uint8_t *ip, size_t len)
+{
+    size_t quote = MIN(len, (size_t)(ip[0] & 0xf) * 4 + 8);
+    g_autofree uint8_t *p = g_malloc0(20 + 8 + quote);
+    uint32_t src = n->gateway ? n->gateway : ldl_be_p(ip + 16);
+
+    if (lduw_be_p(ip + 6) & IP_OFFMASK) {
+        return;                 /* only about the first fragment */
+    }
+    if (ip[9] == IPPROTO_ICMP && len > (ip[0] & 0xf) * 4) {
+        switch (ip[(ip[0] & 0xf) * 4]) {
+        case ICMP_DEST_UNREACH:
+        case ICMP_SOURCE_QUENCH:
+        case ICMP_REDIRECT:
+        case ICMP_TIME_EXCEEDED:
+        case ICMP_PARAMETERPROB:
+            return;             /* no ICMP errors about ICMP errors */
+        }
+    }
+    p[0] = 0x45;
+    stw_be_p(p + 2, 20 + 8 + quote);
+    p[8] = 64;
+    p[9] = IPPROTO_ICMP;
+    stl_be_p(p + 12, src);
+    memcpy(p + 16, ip + 12, 4);         /* back to the sender */
+    stw_be_p(p + 10, net_raw_checksum(p, 20));
+    p[20] = ICMP_DEST_UNREACH;
+    p[21] = ICMP_FRAG_NEEDED;
+    stw_be_p(p + 26, n->mtu);
+    memcpy(p + 28, ip, quote);
+    stw_be_p(p + 22, net_raw_checksum(p + 20, 8 + quote));
+    net_to_guest(n, p, 20 + 8 + quote);
+}
+
+/* towards the network: one IPv4 packet of the guest */
+static void net_from_guest(IUCVNet *n, const uint8_t *ip, size_t len)
+{
+    size_t hl, data, off, chunk;
+    uint16_t frag;
+
+    if (len < 20 || (ip[0] >> 4) != 4) {
+        return;
+    }
+    hl = (ip[0] & 0xf) * 4;
+    if (hl < 20 || lduw_be_p(ip + 2) < hl || lduw_be_p(ip + 2) > len) {
+        return;
+    }
+    len = lduw_be_p(ip + 2);
+    if (len <= n->mtu) {
+        net_send_ip(n, ip, len);
+        return;
+    }
+    frag = lduw_be_p(ip + 6);
+    if (frag & IP_DF) {
+        net_frag_needed(n, ip, len);
+        return;
+    }
+
+    /*
+     * Fragments with a copy of the whole header (options included) and
+     * data in multiples of 8 bytes; the last one keeps the MF flag of the
+     * packet, which may itself be a fragment.
+     */
+    data = (n->mtu - hl) & ~7;
+    if (!data || (frag & IP_OFFMASK) + (len - hl) / 8 > IP_OFFMASK) {
+        return;
+    }
+    {
+        g_autofree uint8_t *f = g_malloc(hl + data);
+
+        for (off = 0; hl + off < len; off += chunk) {
+            bool last;
+
+            chunk = MIN(data, len - hl - off);
+            last = hl + off + chunk == len;
+            memcpy(f, ip, hl);
+            memcpy(f + hl, ip + hl + off, chunk);
+            stw_be_p(f + 2, hl + chunk);
+            stw_be_p(f + 6, (frag & ~IP_OFFMASK & ~IP_MF) |
+                            ((frag & IP_OFFMASK) + off / 8) |
+                            (last ? frag & IP_MF : IP_MF));
+            stw_be_p(f + 10, 0);
+            stw_be_p(f + 10, net_raw_checksum(f, hl));
+            net_send_ip(n, f, hl + chunk);
+        }
+    }
 }
 
 /* the network backend */
@@ -402,12 +505,17 @@ static bool parse_ip(const char *str, uint32_t *ip, uint32_t *mask,
 
 static void net_realize(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();
     IUCVNet *n = IUCV_NET(dev);
     DeviceClass *parent = DEVICE_CLASS(object_class_get_parent(
                               object_class_by_name(TYPE_IUCV_NET)));
 
     if (!n->ip_str) {
         error_setg(errp, "iucv-net needs ip=<address>/<prefix>");
+        return;
+    }
+    if (n->mtu < NET_MTU_MIN || n->mtu > NET_MTU_MAX) {
+        error_setg(errp, "mtu must be %d to %d", NET_MTU_MIN, NET_MTU_MAX);
         return;
     }
     if (!parse_ip(n->ip_str, &n->ip, &n->mask, errp) ||
@@ -427,6 +535,19 @@ static void net_realize(DeviceState *dev, Error **errp)
     g_queue_init(&n->arp_wait);
 }
 
+static void net_reset(DeviceState *dev);
+
+static void net_unrealize(DeviceState *dev)
+{
+    IUCVNet *n = IUCV_NET(dev);
+    DeviceClass *parent = DEVICE_CLASS(object_class_get_parent(
+                              object_class_by_name(TYPE_IUCV_NET)));
+
+    net_reset(dev);
+    qemu_del_nic(n->nic);
+    parent->unrealize(dev);
+}
+
 static void net_reset(DeviceState *dev)
 {
     IUCVNet *n = IUCV_NET(dev);
@@ -443,6 +564,8 @@ static const Property net_properties[] = {
     DEFINE_NIC_PROPERTIES(IUCVNet, conf),
     DEFINE_PROP_STRING("ip", IUCVNet, ip_str),
     DEFINE_PROP_STRING("gateway", IUCVNet, gateway_str),
+    /* of the Ethernet side; larger packets of the guest are fragmented */
+    DEFINE_PROP_UINT32("mtu", IUCVNet, mtu, 1500),
 };
 
 static void net_class_init(ObjectClass *oc, const void *data)
@@ -451,10 +574,12 @@ static void net_class_init(ObjectClass *oc, const void *data)
     IUCVServiceClass *sc = IUCV_SERVICE_CLASS(oc);
 
     dc->realize = net_realize;
+    dc->unrealize = net_unrealize;
     device_class_set_legacy_reset(dc, net_reset);
     device_class_set_props(dc, net_properties);
     dc->desc = "IUCV point-to-point IP link (netiucv)";
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+    sc->max_message = 65536 + 8;     /* bundles of Linux go up to 64 KiB */
     sc->connect = net_connect;
     sc->message = net_message;
     sc->received = net_received;
