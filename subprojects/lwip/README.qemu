@@ -1,0 +1,26 @@
+lwIP for QEMU
+=============
+
+This directory holds the parts of lwIP (https://savannah.nongnu.org/projects/lwip/)
+that QEMU uses, unchanged, from the release tag STABLE-2_2_1_RELEASE
+(commit 77dcd25a72509eb83f72b033d219b1d40cd8eb95):
+
+  COPYING, README                 the licence (BSD-3-Clause) and the upstream README
+  src/core/*.c, src/core/ipv4/*.c the core, IPv4, ARP, ICMP, IP fragmentation, raw, UDP, TCP
+                                  (without ACD, AutoIP, DHCP, IGMP, DNS, IPv6)
+  src/netif/ethernet.c            the Ethernet layer
+  src/include/lwip, .../netif     the headers (without the apps and PPP headers)
+
+Added for QEMU:
+
+  port/lwipopts.h                 the compile-time options (NO_SYS, raw API, pools)
+  port/arch/cc.h                  the platform definitions
+  meson.build                     builds a static library and provides the dependency 'lwip'
+
+lwIP is configured at compile time (lwipopts.h decides the layout of its
+structures), so it is built with QEMU's options instead of using a system
+library. The user is hw/s390x/iucv-tcpip.c, the IUCV TCP/IP service, which
+runs the stack in QEMU's main loop.
+
+To update: copy the same files from a newer release, keep port/ and meson.build,
+and adjust the commit above.

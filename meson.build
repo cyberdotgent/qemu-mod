@@ -2083,6 +2083,14 @@ if fdt_opt == 'internal'
   fdt = libfdt_proj.get_variable('libfdt_dep')
 endif
 
+# lwIP for the IUCV TCP/IP service of s390x (vendored, see subprojects/lwip)
+lwip = not_found
+if have_system and 's390x-softmmu' in target_dirs and host_os == 'linux'
+  lwip_proj = subproject('lwip', required: true,
+                         default_options: ['warning_level=1', 'werror=false'])
+  lwip = lwip_proj.get_variable('lwip_dep')
+endif
+
 rdma = not_found
 if not get_option('rdma').auto() or have_system
   rdma_libs = [cc.find_library('rdmacm', has_headers: ['rdma/rdma_cma.h'],
