@@ -62,7 +62,7 @@ void s390_zvm_diag8(S390CPU *cpu, int rx, int ry)
 {
     CPUS390XState *env = &cpu->env;
     uint32_t ylen = env->regs[ry];
-    uint32_t clen = ylen & 0xff;
+    uint32_t clen = ylen & 0x00ffffff;
     bool want = ylen & DIAG8_RESPONSE;
     uint8_t ebc[DIAG8_CMD_MAX];
     char cmd[DIAG8_CMD_MAX + 1], buf[DIAG8_CMD_MAX + 32];
@@ -114,6 +114,8 @@ void s390_zvm_diag8(S390CPU *cpu, int rx, int ry)
             env->regs[ry + 1] = deposit64(env->regs[ry + 1], 0, 32, rlen);
             setcc(cpu, 0);
         }
+    } else {
+        setcc(cpu, 0);
     }
     env->regs[ry] = deposit64(env->regs[ry], 0, 32, rc);
 }
