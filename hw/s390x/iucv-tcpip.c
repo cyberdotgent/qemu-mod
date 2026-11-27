@@ -13,8 +13,11 @@
  * is configured with), connections to the host itself, link-local and
  * configured addresses are refused unless allowed, and the guest can only
  * accept connections on ports that are forwarded to it explicitly.
- * Raw sockets are limited to ICMP echo through unprivileged ICMP sockets,
- * and only when allowed.
+ * Broadcasts are not offered: SO_BROADCAST is refused, and so are the
+ * network and broadcast addresses of the host's own subnets. Raw sockets
+ * are limited to ICMP echo through unprivileged ICMP sockets, and only
+ * when allowed. The host sockets of all paths together are limited
+ * (max-host-sockets).
  *
  * Written from the description of the interface in the VM TCP/IP
  * programmer's documentation.
@@ -140,11 +143,11 @@ struct TcpPath {
     QTAILQ_ENTRY(TcpPath) next;
 };
 
+/* the host port is bound when the guest binds the guest port */
 typedef struct HostFwd {
     bool udp;
     uint16_t host_port;
     uint16_t guest_port;
-    int fd;                     /* host listener, also while unused */
 } HostFwd;
 
 struct IUCVTcpip {
@@ -159,7 +162,9 @@ struct IUCVTcpip {
     bool allow_host;
     bool raw;
     uint32_t max_sockets;
+    uint32_t max_host_sockets;
 
+    uint32_t nfds;              /* host sockets open */
     uint32_t ip;
     uint32_t mask;
     uint32_t dns;
@@ -251,6 +256,7 @@ static bool dst_allowed(IUCVTcpip *s, uint32_t ip)
     if ((ip >> 24) == 0 || (ip >> 24) == 127 ||
         (ip & 0xffff0000) == 0xa9fe0000 ||      /* 169.254/16 */
         (ip & 0xf0000000) >= 0xe0000000) {      /* multicast, reserved */
+        /* the deny list does not apply to the host's loopback */
         return s->allow_host && (ip >> 24) == 127;
     }
     for (n = 0; n < s->ndeny; n++) {
@@ -258,14 +264,22 @@ static bool dst_allowed(IUCVTcpip *s, uint32_t ip)
             return false;
         }
     }
-    if (s->allow_host) {
-        return true;
-    }
     if (!getifaddrs(&ifa)) {
         for (i = ifa; i && !host; i = i->ifa_next) {
-            if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET &&
-                ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr)
-                == ip) {
+            uint32_t a, m;
+
+            if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) {
+                continue;
+            }
+            a = ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr);
+            m = i->ifa_netmask ?
+                ntohl(((struct sockaddr_in *)i->ifa_netmask)->sin_addr.s_addr)
+                : 0xffffffff;
+            /* the host itself, or a broadcast to one of its subnets */
+            if ((ip == a && !s->allow_host) ||
+                (m != 0xffffffff && m != 0xfffffffe &&
+                 (ip & m) == (a & m) &&
+                 ((ip & ~m) == 0 || (ip & ~m) == ~m))) {
                 host = true;
             }
         }
@@ -376,6 +390,7 @@ static void sock_close(TcpPath *tp, uint32_t n, bool reset)
             setsockopt(so->fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
         }
         close(so->fd);
+        tp->s->nfds--;
     }
     g_free(so);
     tp->socks[n] = NULL;
@@ -449,6 +464,10 @@ static bool c_socket(TcpReq *r)
         reply_err(r, VE_AFNOSUPPORT);
         return true;
     }
+    if (tp->s->nfds >= tp->s->max_host_sockets) {
+        reply_err(r, VE_MFILE);
+        return true;
+    }
     so = g_new0(TcpSock, 1);
     so->type = type;
     switch (type) {
@@ -489,6 +508,7 @@ static bool c_socket(TcpReq *r)
     }
     qemu_set_blocking(fd, false, NULL);
     so->fd = fd;
+    tp->s->nfds++;
     tp->socks[n] = so;
     reply(r, n, 0, NULL, 0);
     return true;
@@ -550,8 +570,12 @@ static bool c_listen(TcpReq *r, TcpSock *so)
     }
     if (!fwd_find(r->tp->s, false, so->port)) {
         /* nothing can reach it: no host socket listens */
-        close(so->fd);
-        so->fd = -1;
+        if (so->fd >= 0) {
+            qemu_set_fd_handler(so->fd, NULL, NULL, NULL);
+            close(so->fd);
+            so->fd = -1;
+            r->tp->s->nfds--;
+        }
     } else if (listen(so->fd, MAX(1, MIN(backlog, 64)))) {
         reply_err(r, vm_errno(errno));
         return true;
@@ -586,6 +610,10 @@ static bool c_accept(TcpReq *r, TcpSock *so, bool first)
     if (!first) {
         return false;
     }
+    if (tp->s->nfds >= tp->s->max_host_sockets) {
+        reply_err(r, VE_MFILE);
+        return true;
+    }
     fd = so->fd < 0 ? -1 : accept(so->fd, (struct sockaddr *)&a, &l);
     if (fd < 0) {
         if (so->fd >= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -599,6 +627,7 @@ static bool c_accept(TcpReq *r, TcpSock *so, bool first)
         return false;
     }
     qemu_set_blocking(fd, false, NULL);
+    tp->s->nfds++;
     ns = g_new0(TcpSock, 1);
     ns->fd = fd;
     ns->type = 1;
@@ -616,11 +645,12 @@ static bool c_connect(TcpReq *r, TcpSock *so, bool first)
     int err, e;
     socklen_t l = sizeof(e);
 
-    if (so->connecting) {
+    if (so->connecting || so->so_error) {
         if (!first) {
             return false;
         }
-        if (!(sock_poll(so) & (POLLOUT | POLLERR | POLLHUP))) {
+        if (so->connecting &&
+            !(sock_poll(so) & (POLLOUT | POLLERR | POLLHUP))) {
             if (so->nonblock) {
                 reply_err(r, VE_ALREADY);
                 return true;
@@ -629,6 +659,8 @@ static bool c_connect(TcpReq *r, TcpSock *so, bool first)
         }
         so->connecting = false;
         getsockopt(so->fd, SOL_SOCKET, SO_ERROR, &e, &l);
+        e = e ? e : so->so_error;
+        so->so_error = 0;
         if (e) {
             reply_err(r, vm_errno(e));
         } else {
@@ -846,9 +878,8 @@ static bool sockopt_map(uint32_t level, uint32_t name, int *hl, int *hn)
         case 0x0010:
             *hn = SO_DONTROUTE;
             return true;
-        case 0x0020:
-            *hn = SO_BROADCAST;
-            return true;
+        case 0x0020:            /* SO_BROADCAST: not offered */
+            return false;
         case 0x0080:
             *hn = SO_LINGER;
             return true;
@@ -881,12 +912,18 @@ static bool sockopt_map(uint32_t level, uint32_t name, int *hl, int *hn)
 static bool c_sockopt(TcpReq *r, TcpSock *so, bool set)
 {
     const uint8_t *b = r->msg->data;
-    uint32_t level = ldl_be_p(b), name = ldl_be_p(b + 4);
+    uint32_t level, name;
     int hl, hn, v = 0;
     struct linger lg = {};
     socklen_t l;
     uint8_t out[8];
 
+    if (r->msg->len < 8) {
+        reply_err(r, VE_BADLEN);
+        return true;
+    }
+    level = ldl_be_p(b);
+    name = ldl_be_p(b + 4);
     if (!sockopt_map(level, name, &hl, &hn)) {
         reply_err(r, VE_NOPROTOOPT);
         return true;
@@ -935,6 +972,9 @@ static bool c_sockopt(TcpReq *r, TcpSock *so, bool set)
         return true;
     }
     if (hn == SO_ERROR) {
+        /* a failed connect that SELECT has seen */
+        v = v ? v : so->so_error;
+        so->so_error = 0;
         v = v ? vm_errno(v) : 0;
     } else if (hn == SO_TYPE) {
         v = so->type;
@@ -1095,12 +1135,13 @@ static bool c_takesocket(TcpReq *r)
         reply_err(r, VE_ACCES);
         return true;
     }
-    fd = dup(so->fd);
+    fd = tp->s->nfds < tp->s->max_host_sockets ? dup(so->fd) : -1;
     if (fd < 0) {
         reply_err(r, VE_MFILE);
         return true;
     }
     qemu_set_blocking(fd, false, NULL);
+    tp->s->nfds++;
     ns = g_new0(TcpSock, 1);
     ns->fd = fd;
     ns->type = 1;
@@ -1410,9 +1451,11 @@ static void sock_update_handlers(TcpPath *tp)
                 if (ldl_be_p(b + 12) && fd_isset(b + 28 + fdsize, d)) {
                     want[d] |= 2;
                 }
-                if (ldl_be_p(b + 16) && fd_isset(b + 28 + 2 * fdsize, d)) {
-                    want[d] |= 1;
-                }
+                /*
+                 * Exceptions (out-of-band data, a taken socket) are not
+                 * watched: read interest would fire on ordinary data and
+                 * spin. They are seen when the request runs again.
+                 */
             }
         } else if (r->lo < tp->nsock) {
             if (is_read(r->call) || r->call == C_ACCEPT) {
@@ -1498,6 +1541,15 @@ static void tcpip_message(IUCVService *svc, IUCVPath *path, IUCVMessage *msg)
     }
     if (!tp->ready) {
         tcp_init(tp, msg);
+        return;
+    }
+    if (!msg->prmdata && msg->len < 8) {
+        /* every call has at least two words */
+        uint8_t out[8];
+
+        stl_be_p(out, -1);
+        stl_be_p(out + 4, VE_BADLEN);
+        iucv_reply(svc, path, msg, out, MIN(8, msg->reply_max));
         return;
     }
     if (tp->nreqs >= REQS_MAX) {
@@ -1615,7 +1667,6 @@ static bool parse_fwds(IUCVTcpip *s, Error **errp)
         f->udp = !strcmp(proto, "udp");
         f->host_port = hp;
         f->guest_port = gp;
-        f->fd = -1;
         s->nfwds++;
     }
     return true;
@@ -1673,6 +1724,7 @@ static void find_resolver(IUCVTcpip *s)
 
 static void tcpip_realize(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();
     IUCVTcpip *s = IUCV_TCPIP(dev);
     DeviceClass *parent = DEVICE_CLASS(object_class_get_parent(
                               object_class_by_name(TYPE_IUCV_TCPIP)));
@@ -1696,6 +1748,10 @@ static void tcpip_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "max-sockets must be %d to 4096", NSOCK_MIN);
         return;
     }
+    if (!s->max_host_sockets || s->max_host_sockets > 65536) {
+        error_setg(errp, "max-host-sockets must be 1 to 65536");
+        return;
+    }
     if (s->dns) {
         find_resolver(s);
     }
@@ -1715,7 +1771,10 @@ static const Property tcpip_properties[] = {
     DEFINE_PROP_STRING("deny", IUCVTcpip, deny),
     DEFINE_PROP_BOOL("allow-host", IUCVTcpip, allow_host, false),
     DEFINE_PROP_BOOL("raw", IUCVTcpip, raw, false),
+    /* socket numbers of one path (its table) */
     DEFINE_PROP_UINT32("max-sockets", IUCVTcpip, max_sockets, 256),
+    /* host sockets of all paths together */
+    DEFINE_PROP_UINT32("max-host-sockets", IUCVTcpip, max_host_sockets, 512),
 };
 
 static void tcpip_class_init(ObjectClass *oc, const void *data)
@@ -1727,6 +1786,7 @@ static void tcpip_class_init(ObjectClass *oc, const void *data)
     dc->desc = "IUCV TCP/IP service (socket interface on host sockets)";
     device_class_set_props(dc, tcpip_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+    sc->max_message = SEND_MAX + 64;
     sc->connect = tcpip_connect;
     sc->message = tcpip_message;
     sc->cancelled = tcpip_cancelled;
